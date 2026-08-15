@@ -15,7 +15,7 @@ import { ProcessProvider } from '../src/providers/process.ts';
 const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const cli = join(here, '..', 'src', 'cli', 'main.ts');
-const harness = join(here, 'fixtures', 'e2e-harness.mjs');
+const harness = join(here, '..', 'fixtures', 'e2e-harness.mjs');
 
 // Integration test against real child processes and a live HTTP long-poll:
 // deterministic/fake timers cannot drive an external process's clock, so a
