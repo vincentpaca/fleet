@@ -1,44 +1,64 @@
 # Fleet
 
-**Fleet is not a service you connect to — it is infrastructure you stand up, in your own account, for your project.**
+Fleet runs coding-agent jobs in containers on your own AWS account. You dispatch a ticket, keep working (or close your laptop), and the job runs remotely, asks you when it's stuck, and finishes as a pull request.
 
-Bring a repo with a minimal harness (one headless-runnable command + a critic), an AWS account, and your keys. `terraform apply` creates the substrate — an ECS cluster that scales from zero, a small always-on daemon, zero open ports. Your repo carries the contract (`.fleet/manifest.json`). Then `fleet delegate TICKET-1` runs your existing slash command in a disposable container that behaves like your machine — same capability where the manifest declares it, tighter permissions everywhere else — pings you on blockers, hands back a merge-ready PR, and scales back to zero.
+It's built for repos that already use an agent harness: Claude Code with slash commands, agent definitions, and rules. If you run something like `/dev-sprint TICKET-123` locally today, Fleet runs that same command on cloud compute instead. Same repo, same config, same behavior, without your machine in the loop.
 
-Both planes are yours: the compute **and** the control plane. Hosted coding agents run their infra; self-hosted runners keep the vendor's control plane; BYO-cloud platforms keep their platform. Fleet keeps no vendor in the loop, and the contract lives in the repo, so it ports across substrates.
+Everything runs in your account with your credentials. There is no hosted service and no third-party control plane.
 
-## Phase 0 — contracts (current state)
+## How it works
 
-Five versioned contracts and their exit tests. Phase 1's code must obey these; the tests make disobeying them loud.
+1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
+2. A Terraform module sets up the infrastructure in your AWS account: an ECS cluster that scales from zero, a small daemon that tracks jobs, and no publicly reachable ports.
+3. `fleet delegate TICKET-123` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back.
+4. When the agent hits a question it can't answer on its own, the job pauses and you get a notification. You answer with `fleet answer`, and the job resumes. Agents cannot answer their own questions; the answer API is only reachable with your credentials.
+5. The job ends as a pull request. A human merges it. Fleet never merges and never deploys.
 
-| Contract | File | What it pins |
-|---|---|---|
-| Manifest (environment) | `schemas/manifest.schema.json` | What a sandbox needs to be your environment: setup (devcontainer preferred), workspace/sync, env names (never values), services + scopes, harness + mandatory critic, mandatory pickup gate, limits |
-| Work order (dispatch) | `schemas/work-order.schema.json` | What a dispatch says: mode (assess/implement/investigate/followthrough/review/compare), target, truth, authority as capabilities (merge/deploy never grantable in v1), scope fences, finish rung on the 13-rung evidence ladder |
-| Events (wire) | `schemas/events.schema.json` | What a runner emits: state/phase/progress/pair/agent/think/log/decision/answer/settle. The required core (state, phase, decision, settle) is CLI-independent |
-| Decision file (harness-side) | `schemas/decision-file.schema.json` | How a command raises a human decision from inside the sandbox: write `.fleet/out/decision.json` (question + ≥2 options with stable ids, exactly one recommended — schema-enforced) and end the turn; the runner wraps it into a `decision` event and blocks the job |
-| Job states | `schemas/job-states.json` | queued → running → blocked ⇄ running → done (+ cancelled); parked/stale as blocked markers; wall-clock pauses while blocked |
+## Status
 
-Supporting artifacts — all generic; this repo carries no data from any real deployment:
+Early. Only the contracts exist: the schemas below and their tests. The CLI, daemon, and Terraform module are not written yet. You cannot delegate anything today.
 
-- `examples/greenfield.manifest.json` — the minimal valid manifest; what `fleet init` scaffolds for a new project (schema-minimality is tested).
-- `examples/full.manifest.json` — a full-featured manifest exercising every field.
-- `examples/work-orders.json` — one reference work order per mode, collectively exercising every contract field.
-- `presets/modes.json` — the six dispatch modes with default authority + finish rung.
-- `fixtures/synthetic-history.json` — synthetic run history covering every outcome shape variant.
-- `src/history-events.mjs` — lossless converter between run-history records and the event stream. Compatibility with a real deployment's history is verified by pointing `FLEET_DEMO_HISTORY` at its history file; that data never enters this repo.
-- `test/sanitized.test.mjs` — the sanitization gate: the tree is scanned for client/operator-specific content on every test run.
+## What's in this repo
 
-## Verify
+| File | What it defines |
+|---|---|
+| `schemas/manifest.schema.json` | The environment description a repo checks in |
+| `schemas/work-order.schema.json` | What a dispatch says: job type, scope, permissions, finish line |
+| `schemas/events.schema.json` | The progress events a running job emits |
+| `schemas/decision-file.schema.json` | How an agent asks a human a question from inside the sandbox |
+| `schemas/job-states.json` | The job lifecycle: queued, running, blocked, done, cancelled |
+
+Supporting files:
+
+- `examples/` – a minimal manifest, a full-featured one, and one example work order per job type
+- `presets/modes.json` – default permissions and finish line for each of the six job types
+- `fixtures/synthetic-history.json` – invented run history used by the round-trip tests
+- `src/history-events.mjs` – converts run-history records to event streams and back, losslessly
+
+Rules the schemas enforce, because prose rules get ignored:
+
+- Every command must name a reviewer agent. No reviewer, no job.
+- Jobs can never be granted merge or deploy permission.
+- A question to a human must offer at least two real options, with exactly one recommended.
+- A job's final report must name exactly one next action.
+- The test suite scans the whole repo for client- or user-specific content and fails if it finds any. This is a generic tool and stays that way.
+
+## Running the tests
 
 ```
 npm install
 npm test
 ```
 
-## Phase 1 — first real delegated run (next)
+To check compatibility against a real run-history file, point `FLEET_DEMO_HISTORY` at it:
 
-- `infra/terraform/` — one `terraform apply`: VPC, ECS cluster + capacity provider (ASG min 0), ECR, IAM, the daemon service, SSM-only access, budget alarm.
-- `fleet` CLI: `init` (scaffold a manifest; `--existing` for brownfield), `doctor` (build a sandbox, diff it against your local checkout before spending model tokens), `delegate`, `status`, `logs`, `attach`, `answer`, `cancel`.
-- Runner: pickup gate → harness CLI headless → structured stream → events → PR → settle, with the evidence rung verified by the daemon, never self-certified.
+```
+FLEET_DEMO_HISTORY=path/to/history.json npm test
+```
 
-Exit: one real ticket goes delegate → blocker → laptop shut mid-job → answered from another machine → merge-ready PR → cluster back at zero.
+## Roadmap
+
+- **Phase 1:** Terraform module, daemon, ECS provider, runner, and the CLI (`init`, `doctor`, `delegate`, `status`, `logs`, `attach`, `answer`, `cancel`). Done means: a real ticket goes from `fleet delegate` to a merge-ready PR with the laptop closed mid-job.
+- **Phase 2:** credential broker issuing short-lived scoped tokens, network egress restricted to an allowlist, and a kill switch (`fleet stop`) with a drill that proves it works.
+- **Phase 3:** a web UI for watching jobs and answering their questions.
+- **Later:** managed sandbox providers, parallel batches, overnight runs.
