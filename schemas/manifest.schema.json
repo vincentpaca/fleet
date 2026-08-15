@@ -29,7 +29,7 @@
       "required": ["repo", "strategy"],
       "additionalProperties": false,
       "properties": {
-        "repo": { "type": "string", "description": "Git remote URL." },
+        "repo": { "type": "string", "description": "Git remote URL, or the sentinel \"origin\": resolve the URL from the workspace's origin remote at dispatch. Prefer the sentinel — it keeps the manifest portable across forks and mirrors and keeps org-specific URLs out of the file." },
         "strategy": {
           "enum": ["branch-per-job"],
           "description": "branch-per-job: branch fleet/<ticket>-<job-id>, based on the remote default branch at dispatch, pushed at creation so retain-for-evidence holds even if the container dies."

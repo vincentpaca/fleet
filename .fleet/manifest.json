@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "setup": {
+    "image": "node:24",
+    "script": ".fleet/setup.sh"
+  },
+  "workspace": {
+    "repo": "origin",
+    "strategy": "branch-per-job",
+    "sync": []
+  },
+  "env": {
+    "vars": ["ANTHROPIC_API_KEY"]
+  },
+  "services": [
+    { "kind": "github", "scope": ["repo:origin"], "permissions": ["contents:rw", "pull_requests:rw"] }
+  ],
+  "harness": {
+    "cli": "claude-code",
+    "agents": ".claude/agents",
+    "commands": [
+      { "path": ".claude/commands/dev.md", "critic": "code-reviewer" }
+    ]
+  },
+  "gates": {
+    "pickup": "node .fleet/gate.mjs",
+    "default_finish": "implemented"
+  },
+  "limits": {
+    "wall_clock": "2h",
+    "block_hot": "30m",
+    "decision_timeout": "24h"
+  }
+}
