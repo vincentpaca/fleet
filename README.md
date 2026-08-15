@@ -6,6 +6,8 @@ It's built for repos that already use an agent harness: Claude Code with slash c
 
 Everything runs in your account with your credentials. There is no hosted service and no third-party control plane.
 
+Context lives in this repo: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs.
+
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
