@@ -1,0 +1,1 @@
+{"question":"Migration conflicts with an unmerged branch. How should I proceed?","options":[{"id":"rebase","label":"Rebase onto the branch and renumber","recommended":true},{"id":"wait","label":"Park until the branch merges"}],"who":"engineer","note":"A sequencing call the agent cannot make alone."}

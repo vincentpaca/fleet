@@ -1,0 +1,9 @@
+{"type":"system","subtype":"init","model":"generic-model","cwd":"/workspace","tools":["Read","Write"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Planning the change to the acme service for APP-123."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"src/index.js"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"text","text":"console.log('hello from example.com');"}]}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Implementing the feature now."},{"type":"tool_use","id":"toolu_02","name":"Write","input":{"file_path":"src/feature.js","content":"export const feature = true;"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"ok"}]}}
+{"type":"mystery","payload":{"answer":42}}
+this line is not json at all
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":4,"result":"Implemented the feature for example.com."}

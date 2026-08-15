@@ -1,0 +1,115 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { startMockDaemon } from './runner-mock-daemon.ts';
+
+const runnerMain = fileURLToPath(new URL('../src/runner/main.ts', import.meta.url));
+
+function writeManifest(workspace: string, pickup: string): void {
+  mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
+  writeFileSync(
+    join(workspace, '.fleet', 'manifest.json'),
+    JSON.stringify({
+      version: 1,
+      setup: { image: 'node:22', script: '.fleet/setup.sh' },
+      workspace: { repo: 'git@github.com:acme/example.git', strategy: 'branch-per-job' },
+      harness: {
+        cli: 'claude-code',
+        commands: [{ path: '.claude/commands/dev.md', critic: 'code-reviewer' }],
+      },
+      gates: { pickup },
+    }),
+  );
+}
+
+test('pickup gate failure settles BLOCKED and cancels with reason pickup-gate', async () => {
+  const token = 'test-token-gate';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-gate-'));
+  try {
+    writeManifest(
+      workspace,
+      `node -e "console.log('missing dependency: widget'); console.log('more detail'); process.exit(3)"`,
+    );
+
+    const child = spawn(process.execPath, [runnerMain], {
+      env: {
+        ...process.env,
+        FLEET_JOB_ID: 'job-gate-1',
+        FLEET_DAEMON_URL: daemon.url,
+        FLEET_RUNNER_TOKEN: token,
+        FLEET_WORKSPACE: workspace,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const exited = Promise.withResolvers<number>();
+    child.on('close', (code) => exited.resolve(code ?? -1));
+    const exitCode = await exited.promise;
+
+    // Nonzero-clean: failure exit code, but every event flushed and accepted.
+    assert.equal(exitCode, 1);
+    assert.deepEqual(daemon.rejected, []);
+    assert.equal(daemon.badTokenCount, 0);
+
+    assert.deepEqual(
+      daemon.events.map((event) => event.type),
+      ['state', 'settle', 'state'],
+    );
+    assert.deepEqual(daemon.events.map((event) => event.seq), [0, 1, 2]);
+    assert.ok(daemon.events.every((event) => event.job === 'job-gate-1'));
+
+    const [running, settle, cancelled] = daemon.events;
+    assert.equal(running.state, 'running');
+
+    assert.deepEqual(settle.outcome, { produced: [], findings: 0, decisions: 0 });
+    assert.deepEqual(settle.report, {
+      status: 'BLOCKED',
+      next_action: 'fix pickup gate: missing dependency: widget',
+    });
+
+    assert.equal(cancelled.state, 'cancelled');
+    assert.equal(cancelled.reason, 'pickup-gate');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('gate failure with stderr-only output uses the stderr first line', async () => {
+  const token = 'test-token-gate-2';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-gate-'));
+  try {
+    writeManifest(
+      workspace,
+      `node -e "console.error('fetch failed: remote unreachable'); process.exit(1)"`,
+    );
+
+    const child = spawn(process.execPath, [runnerMain], {
+      env: {
+        ...process.env,
+        FLEET_JOB_ID: 'job-gate-2',
+        FLEET_DAEMON_URL: daemon.url,
+        FLEET_RUNNER_TOKEN: token,
+        FLEET_WORKSPACE: workspace,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const exited = Promise.withResolvers<number>();
+    child.on('close', (code) => exited.resolve(code ?? -1));
+    assert.equal(await exited.promise, 1);
+
+    const settle = daemon.events.find((event) => event.type === 'settle');
+    assert.ok(settle, 'settle event posted');
+    const report = settle.report;
+    assert.ok(report && typeof report === 'object' && 'next_action' in report);
+    assert.equal(report.next_action, 'fix pickup gate: fetch failed: remote unreachable');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
