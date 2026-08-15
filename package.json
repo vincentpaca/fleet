@@ -1,13 +1,24 @@
 {
   "name": "fleet",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Fleet — delegate harness work to sandboxed remote execution. Phase 0: contracts.",
+  "description": "Run coding-agent jobs in containers on your own AWS account.",
+  "engines": {
+    "node": ">=23.6"
+  },
+  "bin": {
+    "fleet": "src/cli/main.ts"
+  },
   "scripts": {
     "test": "node --test"
   },
   "devDependencies": {
+    "@types/node": "^24.0.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  },
+  "dependencies": {
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1"
   }
