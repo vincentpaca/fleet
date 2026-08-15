@@ -480,7 +480,7 @@ test("running -> blocked with parked marker is accepted; blocked -> blocked re-a
   assert.match(reassert.body, /illegal transition/);
 });
 
-test("slack webhook fires on decision when configured", async (t) => {
+test("notify webhook fires on decision when configured", async (t) => {
   const home = tempHome();
   const posts: unknown[] = [];
   const hook = http.createServer((req, res) => {
@@ -504,7 +504,7 @@ test("slack webhook fires on decision when configured", async (t) => {
     home,
     provider,
     longPollMs: LONG_POLL_MS,
-    slackWebhook: `http://127.0.0.1:${hookPort}/hook`,
+    notifyWebhooks: [`http://127.0.0.1:${hookPort}/hook`],
   });
   const { socketPath } = await daemon.start();
   t.after(() => daemon.stop());

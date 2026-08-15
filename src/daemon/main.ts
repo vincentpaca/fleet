@@ -1,6 +1,7 @@
 // Fleet daemon entrypoint: `node src/daemon/main.ts`.
 // Env: FLEET_HOME (default ~/.fleet), FLEET_PORT (optional TCP listener),
-// FLEET_PROVIDER (process | docker | ecs; default process), FLEET_SLACK_WEBHOOK.
+// FLEET_PROVIDER (process | docker | ecs; default process), FLEET_NOTIFY_WEBHOOK
+// (optional, comma-separated URLs; {text} payload per decision).
 import { mkdirSync } from "node:fs";
 import { fleetHome } from "../shared/home.ts";
 import { FleetDaemon } from "./server.ts";

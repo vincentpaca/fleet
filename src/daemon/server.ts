@@ -33,8 +33,13 @@ export type DaemonOptions = {
   port?: number;
   /** Long-poll window for follow/answer endpoints; default 25s. */
   longPollMs?: number;
-  /** Slack webhook for decision notifications; default FLEET_SLACK_WEBHOOK. */
-  slackWebhook?: string;
+  /**
+   * Decision-notification webhooks; default FLEET_NOTIFY_WEBHOOK (comma-separated
+   * URLs). Payload is {text}; Slack accepts it natively, anything else can front
+   * it with a relay. Optional: with no webhook, blocked jobs surface via
+   * `fleet status` (blocked-first) — the pull loop needs no channel at all.
+   */
+  notifyWebhooks?: string[];
 };
 
 type IntakeError = { status: number; errors: unknown[] };
@@ -473,7 +478,7 @@ export class FleetDaemon {
         optionIds: decision.options.map((option) => option.id),
       });
       this.registry.updateJob(job.id, { state: "blocked" });
-      this.#notifySlack(job.id, decision.question);
+      this.#notify(job.id, decision.question);
       return;
     }
     if (event.type === "settle") {
@@ -485,16 +490,18 @@ export class FleetDaemon {
     }
   }
 
-  #notifySlack(jobId: string, question: string): void {
-    const webhook = this.#options.slackWebhook ?? process.env.FLEET_SLACK_WEBHOOK;
-    if (!webhook) return;
-    fetch(webhook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: `Fleet job ${jobId} is blocked on a decision: ${question}` }),
-    }).catch(() => {
-      // Best-effort notification; the decision event is already persisted.
-    });
+  #notify(jobId: string, question: string): void {
+    const webhooks = this.#options.notifyWebhooks
+      ?? (process.env.FLEET_NOTIFY_WEBHOOK ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    for (const webhook of webhooks) {
+      fetch(webhook, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: `Fleet job ${jobId} is blocked on a decision: ${question}` }),
+      }).catch(() => {
+        // Best-effort notification; the decision event is already persisted.
+      });
+    }
   }
 
   async #answerPoll(job: JobRecord, url: URL, res: ServerResponse): Promise<void> {
