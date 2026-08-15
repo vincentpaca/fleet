@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet.harnessx.net/schemas/work-order.schema.json",
+  "title": "Fleet work order (dispatch contract)",
+  "description": "What a dispatch must say: mode, target, truth, authority, scope, finish, report. Generalizes battle-tested operator playbooks into a schema so the delegation contract is enforced, not restated in prose per prompt. Travels with `fleet delegate`; mode presets keep dispatch terse.",
+  "type": "object",
+  "required": ["mode", "target", "finish"],
+  "additionalProperties": false,
+  "properties": {
+    "mode": { "$ref": "#/$defs/mode" },
+    "target": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Ticket key, PR reference, branch pair, or symptom statement."
+    },
+    "truth": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Authoritative sources, in precedence order — VERIFIED at pickup, never assumed. An explicitly named base outranks older specs. Requirements truth and implementation truth that conflict must surface, not silently resolve."
+    },
+    "authority": { "$ref": "#/$defs/authority" },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": { "type": "array", "items": { "type": "string" } },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Checked against the diff at settle; a violation fails the implemented rung."
+        }
+      }
+    },
+    "finish": {
+      "$ref": "#/$defs/targetableRung",
+      "description": "Target rung on the evidence ladder. The runner reports the rung actually reached and may never overstate it."
+    },
+    "report": {
+      "enum": ["status-first"],
+      "default": "status-first",
+      "description": "Settle payload shape: Status line first (READY/BLOCKED/...), then rung reached vs target, SHAs/PR, verification, self-review, not-done, one exact next action."
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-dispatch overrides of manifest limits.",
+      "properties": {
+        "wall_clock": { "type": "string", "pattern": "^[0-9]+(m|h)$" },
+        "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$" },
+        "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$" }
+      }
+    }
+  },
+  "$defs": {
+    "mode": {
+      "enum": ["assess", "implement", "investigate", "followthrough", "review", "compare"],
+      "description": "assess: binary ready/blocked + blockers, read-only. implement: worktree, smallest complete change, tests, draft PR. investigate: evidence before edits; classify code vs config/seed/permission/deployment; edit unlocks only after the cause is recorded. followthrough: take an existing PR to terminal state. review: read-only quality/PR review. compare: semantic conflict assessment of branches/designs."
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Capability grants — enforced by the broker (tokens), not requested in prose. v1 hard limits: merge and deploy are never grantable.",
+      "properties": {
+        "edit": { "type": "boolean", "default": false },
+        "publish": { "type": "boolean", "default": false, "description": "Push + PR create/update." },
+        "jira": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["read", "comment", "transition"] }
+        },
+        "merge": { "const": false, "description": "v1: never grantable. The GitHub token is minted without merge capability." },
+        "deploy": { "const": false, "description": "v1: never grantable. Deploy is out of scope (Post-Build doctrine)." },
+        "runtime_read": { "type": "boolean", "default": false, "description": "Read-only env/log evidence for investigate mode. The only runtime capability in v1." }
+      }
+    },
+    "rung": {
+      "enum": [
+        "inspected",
+        "implemented",
+        "focused-green",
+        "static-green",
+        "pushed",
+        "pr-open",
+        "ci-green",
+        "reviews-clear",
+        "mergeable",
+        "merge-ready",
+        "merged",
+        "deployed",
+        "runtime-accepted"
+      ],
+      "description": "The unified evidence ladder. mergeable is explicitly weak (conflict-free only). merged is a human act (Fleet verifies post-hoc). deployed/runtime-accepted exist on the ladder but are not v1-targetable."
+    },
+    "targetableRung": {
+      "enum": [
+        "inspected",
+        "implemented",
+        "focused-green",
+        "static-green",
+        "pushed",
+        "pr-open",
+        "ci-green",
+        "reviews-clear",
+        "merge-ready"
+      ],
+      "description": "Rungs a v1 work order may target. Excludes mergeable (weak, never a goal), merged (human act), deployed and runtime-accepted (out of v1 scope)."
+    }
+  }
+}

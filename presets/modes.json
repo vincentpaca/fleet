@@ -1,0 +1,42 @@
+{
+  "description": "Per-mode work-order defaults. `fleet delegate <target>` = implement preset; overrides are explicit flags. Each preset merged with a target yields a valid work order.",
+  "modes": {
+    "assess": {
+      "mode": "assess",
+      "authority": { "edit": false, "publish": false, "jira": ["read"], "merge": false, "deploy": false, "runtime_read": false },
+      "finish": "inspected",
+      "report": "status-first"
+    },
+    "implement": {
+      "mode": "implement",
+      "authority": { "edit": true, "publish": true, "jira": ["read", "comment", "transition"], "merge": false, "deploy": false, "runtime_read": false },
+      "finish": "merge-ready",
+      "report": "status-first"
+    },
+    "investigate": {
+      "mode": "investigate",
+      "authority": { "edit": false, "publish": false, "jira": ["read", "comment"], "merge": false, "deploy": false, "runtime_read": true },
+      "finish": "inspected",
+      "report": "status-first",
+      "note": "edit/publish unlock only after the evidence artifact is recorded; the daemon re-mints authority at that point."
+    },
+    "followthrough": {
+      "mode": "followthrough",
+      "authority": { "edit": true, "publish": true, "jira": ["read", "comment"], "merge": false, "deploy": false, "runtime_read": false },
+      "finish": "merge-ready",
+      "report": "status-first"
+    },
+    "review": {
+      "mode": "review",
+      "authority": { "edit": false, "publish": false, "jira": ["read"], "merge": false, "deploy": false, "runtime_read": false },
+      "finish": "inspected",
+      "report": "status-first"
+    },
+    "compare": {
+      "mode": "compare",
+      "authority": { "edit": false, "publish": false, "jira": ["read"], "merge": false, "deploy": false, "runtime_read": false },
+      "finish": "inspected",
+      "report": "status-first"
+    }
+  }
+}

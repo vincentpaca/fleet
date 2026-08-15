@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet.harnessx.net/schemas/events.schema.json",
+  "title": "Fleet event (wire schema)",
+  "description": "JSON Lines the runner emits over its connection to the daemon, persisted verbatim as the job's event log. Vocabulary adopted from the Operating Plane demo's beat sheets (scan/walk/ring excluded as demo-only visualisation beats). Required core (state, phase, decision, settle) derives only from runner-owned facts and is CLI-independent; think/log/agent/pair ride the vendor stream format and are best-effort per adapter.",
+  "type": "object",
+  "required": ["job", "seq", "type"],
+  "unevaluatedProperties": false,
+  "properties": {
+    "job": { "type": "string", "minLength": 1 },
+    "seq": { "type": "integer", "minimum": 0, "description": "Monotonic per job; replay order." },
+    "at": { "type": "string", "description": "Timestamp (ISO 8601) or date; optional on intermediate events." },
+    "type": { "enum": ["state", "phase", "progress", "pair", "agent", "think", "log", "decision", "answer", "settle"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "state" } } },
+      "then": {
+        "required": ["state"],
+        "properties": {
+          "state": { "enum": ["queued", "running", "blocked", "done", "cancelled"] },
+          "reason": { "type": "string", "description": "e.g. wall-clock on cancellation." },
+          "marker": { "enum": ["parked", "stale"], "description": "Markers on blocked, not states: parked = WIP committed, task exited; stale = decision_timeout elapsed." },
+          "meta": { "$ref": "#/$defs/jobMeta" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "phase" } } },
+      "then": { "required": ["text"], "properties": { "text": { "type": "string" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "progress" } } },
+      "then": { "required": ["value"], "properties": { "value": { "type": "number", "minimum": 0, "maximum": 1 } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "pair" } } },
+      "then": {
+        "required": ["worker", "critic"],
+        "properties": {
+          "worker": { "type": "string" },
+          "critic": { "type": "string" },
+          "team": { "type": ["string", "null"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "agent" } } },
+      "then": {
+        "required": ["name", "state"],
+        "properties": {
+          "name": { "type": "string" },
+          "state": { "enum": ["idle", "work", "block", "retry", "done"] },
+          "role": { "type": "string" },
+          "team": { "type": ["string", "null"] },
+          "instances": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "enum": ["think", "log"] } } },
+      "then": { "required": ["text"], "properties": { "text": { "type": "string" }, "who": { "type": "string" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "decision" } } },
+      "then": {
+        "required": ["id", "question", "options"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "who": { "type": "string" },
+          "question": { "type": "string", "minLength": 1 },
+          "options": {
+            "$ref": "#/$defs/decisionOptions",
+            "description": "Real options with stable ids; exactly one recommended — schema-enforced via contains. Free text always allowed on the answer."
+          },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "answer" } } },
+      "then": {
+        "required": ["decision"],
+        "properties": {
+          "decision": { "type": "string", "description": "Decision event id being answered." },
+          "option": { "type": "string", "description": "Chosen option id; absent = free text only." },
+          "text": { "type": "string", "description": "Free text or supplement to a chosen option." },
+          "by": { "type": "string", "description": "Operator identity. An agent may never resolve its own blocker; answers arrive only via the daemon." }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "settle" } } },
+      "then": {
+        "required": ["outcome"],
+        "properties": {
+          "rung": {
+            "$ref": "work-order.schema.json#/$defs/rung",
+            "description": "Evidence-ladder rung actually reached — never overstated; the daemon verifies target rungs mechanically. Optional for runs that predate work orders (demo history replay)."
+          },
+          "minutes": { "type": "number", "minimum": 0 },
+          "report": { "$ref": "#/$defs/report" },
+          "outcome": { "$ref": "#/$defs/outcome" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "decisionOptions": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "unevaluatedProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "label": { "type": "string" },
+          "detail": { "type": "string" },
+          "recommended": { "type": "boolean" }
+        }
+      },
+      "contains": {
+        "type": "object",
+        "required": ["recommended"],
+        "properties": { "recommended": { "const": true } }
+      },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "report": {
+      "type": "object",
+      "description": "Status-first settle report (optional; work orders with report: status-first expect it). Leads with the operational conclusion, then the minimum evidence to defend it, then one exact next action.",
+      "required": ["status", "next_action"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "status": { "enum": ["READY", "BLOCKED", "STALE", "NOT-DEPLOYED", "CODE-READY-RUNTIME-UNVERIFIED", "PARTIAL"] },
+        "target_rung": { "$ref": "work-order.schema.json#/$defs/rung" },
+        "base_sha": { "type": "string" },
+        "head_sha": { "type": "string" },
+        "pr": { "type": "string" },
+        "implemented": { "type": "array", "items": { "type": "string" } },
+        "verification": { "type": "array", "items": { "type": "string" } },
+        "self_review": { "type": "array", "items": { "type": "string" } },
+        "not_done": { "type": "array", "items": { "type": "string" } },
+        "next_action": { "type": "string", "minLength": 1 }
+      }
+    },
+    "jobMeta": {
+      "type": "object",
+      "description": "Dispatch metadata; carried on the first (queued) state event.",
+      "required": ["kind", "label", "target", "where", "fleet"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "kind": { "enum": ["delegated", "brainstorm"] },
+        "label": { "type": "string" },
+        "target": { "type": "string" },
+        "where": { "type": "string", "description": "Provider: local | cloud (demo) | ecs | managed." },
+        "fleet": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "role"],
+            "unevaluatedProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "role": { "enum": ["author", "critic", "orchestrator", "specialist", "human"] },
+              "team": { "type": ["string", "null"] },
+              "instances": { "type": "integer", "minimum": 1 },
+              "state": { "enum": ["idle", "work", "block", "retry", "done"] }
+            }
+          }
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "description": "Run-history outcome, demo-compatible shape (data/history.json).",
+      "required": ["produced", "findings", "decisions"],
+      "unevaluatedProperties": false,
+      "properties": {
+        "produced": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "type", "title"],
+            "unevaluatedProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "type": { "type": "string" },
+              "title": { "type": "string" },
+              "version": { "type": "string" },
+              "status": { "type": "string" }
+            }
+          }
+        },
+        "more": { "type": "integer", "minimum": 0, "description": "Count of produced artifacts elided from the list (demo batch runs: 'and N more'). Discovered by the round-trip exit test, not the scouts' shape summary — which is the point of the test." },
+        "from": { "type": ["string", "null"] },
+        "approvedBy": { "type": ["string", "null"] },
+        "gate": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["kind"],
+              "unevaluatedProperties": false,
+              "properties": {
+                "kind": { "type": "string" },
+                "signatures": { "type": "integer" },
+                "date": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "findings": { "type": "integer", "minimum": 0 },
+        "decisions": { "type": "integer", "minimum": 0 },
+        "decidedBy": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

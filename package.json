@@ -1,0 +1,14 @@
+{
+  "name": "fleet",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Fleet — delegate harness work to sandboxed remote execution. Phase 0: contracts.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}

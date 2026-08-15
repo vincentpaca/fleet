@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet.harnessx.net/schemas/manifest.schema.json",
+  "title": "Fleet manifest (environment contract)",
+  "description": "Repo-owned declaration of everything a sandbox needs to be the developer's environment, elsewhere. Canonical path: .fleet/manifest.json (root-level fleet.json accepted as fallback; both present = dispatch error).",
+  "type": "object",
+  "required": ["version", "setup", "workspace", "harness", "gates"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "setup": {
+      "description": "How the job image is built. Preferred: point at the repo's devcontainer. Fallback: image/dockerfile + setup script.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "devcontainer": { "type": "string", "description": "Path to devcontainer.json (image/build/postCreateCommand subset, built via @devcontainers/cli)." },
+        "image": { "type": "string", "description": "Base image (fallback form)." },
+        "dockerfile": { "type": "string", "description": "Dockerfile path (fallback form, mutually exclusive with image)." },
+        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run." }
+      },
+      "oneOf": [
+        { "required": ["devcontainer"], "not": { "anyOf": [{ "required": ["image"] }, { "required": ["dockerfile"] }] } },
+        { "required": ["image"], "not": { "anyOf": [{ "required": ["devcontainer"] }, { "required": ["dockerfile"] }] } },
+        { "required": ["dockerfile"], "not": { "anyOf": [{ "required": ["devcontainer"] }, { "required": ["image"] }] } }
+      ]
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["repo", "strategy"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "type": "string", "description": "Git remote URL." },
+        "strategy": {
+          "enum": ["branch-per-job"],
+          "description": "branch-per-job: branch fleet/<ticket>-<job-id>, based on the remote default branch at dispatch, pushed at creation so retain-for-evidence holds even if the container dies."
+        },
+        "sync": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Gitignored runtime config shipped from the operator's CLI to the daemon at dispatch. Phase 1: may carry secret values (laptop trust class); Phase 2 lints .env* out and moves values to env.vars + broker. Injected env vars win over file-loaded values where the process environment is consulted."
+        }
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vars": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "description": "Names only — values injected at task start, never stored in the manifest. Phase 1 lookup: exact name in the dispatching shell's environment; missing value fails dispatch loudly."
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["github", "jira", "confluence", "mcp"] },
+          "name": { "type": "string" },
+          "scope": { "type": "array", "items": { "type": "string" } },
+          "permissions": { "type": "array", "items": { "type": "string" } },
+          "config": { "type": "string", "description": "For mcp: <path>#<key> where key is the entry under mcpServers in the referenced file. Phase 1: creds ride the synced config, broker-exempt; Phase 2: broker templates the config and injects short-lived tokens." }
+        }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "required": ["cli", "commands"],
+      "additionalProperties": false,
+      "properties": {
+        "cli": { "enum": ["claude-code", "codex", "opencode"], "description": "Phase 1 runner adapter: claude-code only; others when an adopter needs them." },
+        "cli_version": { "type": "string", "description": "Pin the CLI version in the image — format churn arrives only when the repo chooses to upgrade." },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Harness-runtime env flags baked into the task (e.g. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1). Not secrets."
+        },
+        "agents": { "type": "string", "description": "Path to the agent definitions directory (e.g. .claude/agents). Phase 2: every agent file must match a registry entry by frontmatter name or dispatch refuses." },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "critic"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string" },
+              "critic": { "type": "string", "description": "Named critic agent — the manifest lint enforcing the no-run-without-a-critic rule." }
+            }
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "required": ["pickup"],
+      "additionalProperties": false,
+      "properties": {
+        "pickup": { "type": "string", "description": "REQUIRED command; must exit 0 or the job aborts before model spend. The gate script owns its own force-fetch; the runner treats every nonzero exit identically." },
+        "default_finish": {
+          "$ref": "work-order.schema.json#/$defs/targetableRung",
+          "default": "merge-ready",
+          "description": "Repo-default target rung when the work order does not name one."
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wall_clock": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained." },
+        "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "30m", "description": "How long a blocked container stays hot before parking (WIP committed, task exits)." },
+        "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "24h", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered." },
+        "model_spend": { "type": "string", "description": "OPEN — unenforced until the Phase 2 metering spike; the Terraform budget alarm is the interim backstop." },
+        "egress": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Hostname allowlist, applies after setup completes. Phase 1: declared, unenforced. Phase 2+: absent field denies everything except hosts implied by services and the model API. TBD = DENY."
+        }
+      }
+    }
+  }
+}

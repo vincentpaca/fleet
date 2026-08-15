@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "setup": {
+    "image": "node:22",
+    "script": ".fleet/setup.sh"
+  },
+  "workspace": {
+    "repo": "git@github.com:you/your-project.git",
+    "strategy": "branch-per-job"
+  },
+  "harness": {
+    "cli": "claude-code",
+    "commands": [
+      { "path": ".claude/commands/dev-sprint.md", "critic": "code-reviewer" }
+    ]
+  },
+  "gates": {
+    "pickup": "node .fleet/check-ready.js"
+  }
+}

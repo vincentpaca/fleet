@@ -1,0 +1,26 @@
+{
+  "$id": "https://fleet.harnessx.net/schemas/job-states.json",
+  "title": "Fleet job state machine",
+  "description": "The Operating Plane demo's states verbatim (core/jobs.js: queued → running → blocked ⇄ running → done), plus cancelled. Dispatch/provisioning/worker-start work stays under the single externally visible 'queued' state — no new states. parked/stale are markers on blocked, not states. Evidence-ladder rungs ride in the settle payload and stay orthogonal to job states.",
+  "states": ["queued", "running", "blocked", "done", "cancelled"],
+  "initial": "queued",
+  "terminal": ["done", "cancelled"],
+  "transitions": [
+    { "from": "queued", "to": "running" },
+    { "from": "queued", "to": "cancelled", "note": "abort before start (pickup gate failure settles as cancelled with the gate output as evidence)" },
+    { "from": "running", "to": "blocked", "note": "decision raised; turn passes to the human" },
+    { "from": "blocked", "to": "running", "note": "answer delivered by the daemon; parked jobs resume by re-entry (fresh task), not session restore" },
+    { "from": "running", "to": "done", "note": "settle emitted; daemon then verifies the target rung mechanically" },
+    { "from": "running", "to": "cancelled", "note": "operator cancel, fleet stop, or wall-clock expiry (SIGTERM + grace → settle with partial outcome)" },
+    { "from": "blocked", "to": "cancelled", "note": "operator cancel or fleet stop while blocked/parked" }
+  ],
+  "markers": {
+    "parked": { "on": "blocked", "meaning": "block_hot window expired: WIP committed to the job branch, task exited, capacity scaled in. A parked job consumes nothing." },
+    "stale": { "on": "blocked", "meaning": "decision_timeout elapsed unanswered: surfaced in status/digest, stays parked, never auto-answered." }
+  },
+  "rules": [
+    "settle is emitted on done AND on cancelled (partial outcome).",
+    "wall_clock counts agent runtime only; the meter pauses while blocked.",
+    "blocked-first ordering everywhere a job list renders (demo RANK: anything waiting on you sorts first)."
+  ]
+}

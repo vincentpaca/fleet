@@ -1,0 +1,104 @@
+[
+  {
+    "id": "run-SPEC-1",
+    "kind": "delegated",
+    "label": "Decompose REQ-1",
+    "target": "REQ-1",
+    "where": "cloud",
+    "state": "done",
+    "at": "2026-01-10",
+    "minutes": 12,
+    "fleet": [
+      { "name": "spec-author", "role": "author", "team": "Spec", "instances": 1, "state": "idle" },
+      { "name": "spec-critic", "role": "critic", "team": "Spec", "instances": 1, "state": "idle" }
+    ],
+    "outcome": {
+      "produced": [
+        { "id": "SPEC-1", "type": "spec", "title": "Functional specification for REQ-1", "version": "1", "status": "needs-review" }
+      ],
+      "from": "REQ-1",
+      "approvedBy": "Review board",
+      "gate": null,
+      "findings": 1,
+      "decisions": 0,
+      "decidedBy": null
+    }
+  },
+  {
+    "id": "run-TICKET-9",
+    "kind": "delegated",
+    "label": "Implement TICKET-9",
+    "target": "TICKET-9",
+    "where": "cloud",
+    "state": "done",
+    "at": "2026-01-11",
+    "minutes": 47,
+    "fleet": [
+      { "name": "engineer", "role": "author", "team": "Dev", "instances": 3, "state": "idle" },
+      { "name": "code-reviewer", "role": "critic", "team": "Dev", "instances": 1, "state": "idle" },
+      { "name": "orchestrator", "role": "orchestrator", "team": "Dev", "instances": 1, "state": "idle" }
+    ],
+    "outcome": {
+      "produced": [
+        { "id": "PR-42", "type": "ticket", "title": "TICKET-9 implementation", "version": "1", "status": "in-progress" }
+      ],
+      "more": 3,
+      "from": "TICKET-9",
+      "approvedBy": "Chief Architect",
+      "gate": { "kind": "review-board", "signatures": 3, "date": "2026-01-11" },
+      "findings": 2,
+      "decisions": 2,
+      "decidedBy": "Operator One"
+    }
+  },
+  {
+    "id": "run-TICKET-12",
+    "kind": "delegated",
+    "label": "Extend coverage on TICKET-12",
+    "target": "TICKET-12",
+    "where": "local",
+    "state": "cancelled",
+    "at": "2026-01-12",
+    "minutes": 240,
+    "fleet": [
+      { "name": "qa-author", "role": "author", "team": "QA", "instances": 2, "state": "idle" },
+      { "name": "qa-critic", "role": "critic", "team": "QA", "instances": 1, "state": "idle" }
+    ],
+    "outcome": {
+      "produced": [],
+      "more": 0,
+      "from": "TICKET-12",
+      "approvedBy": null,
+      "gate": null,
+      "findings": 0,
+      "decisions": 1,
+      "decidedBy": "Operator One"
+    }
+  },
+  {
+    "id": "run-REQ-2-brainstorm",
+    "kind": "brainstorm",
+    "label": "Brainstorm — REQ-2",
+    "target": "REQ-2",
+    "where": "local",
+    "state": "done",
+    "at": "2026-01-13",
+    "minutes": 18,
+    "fleet": [
+      { "name": "analyst", "role": "author", "team": "Spec", "instances": 1, "state": "idle" },
+      { "name": "sceptic", "role": "critic", "team": "Spec", "instances": 1, "state": "idle" },
+      { "name": "you", "role": "human", "team": null, "instances": 1, "state": "idle" }
+    ],
+    "outcome": {
+      "produced": [
+        { "id": "REQ-2-notes", "type": "note", "title": "Brainstorm notes for REQ-2", "version": "1", "status": "open" }
+      ],
+      "from": "REQ-2",
+      "approvedBy": null,
+      "gate": null,
+      "findings": 0,
+      "decisions": 1,
+      "decidedBy": "Operator One"
+    }
+  }
+]
