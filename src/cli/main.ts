@@ -18,11 +18,13 @@ Usage: fleet <command> [options]
 Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/)
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
-  delegate <target> [--mode m] [--finish rung] [--manifest path]
+  delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
+                                           (--watch: follow the job, answer decisions from stdin)
   status [jobId]                           List jobs (blocked first) or show one job
   logs <jobId> [--after seq]               Dump job events
-  attach <jobId>                           Follow job events until done/cancelled
+  attach <jobId> [--answer]                Follow job events until done/cancelled
+                                           (--answer: respond to decisions from stdin)
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
   doctor                                   Environment checks (Phase 1 stub)
@@ -190,7 +192,7 @@ function loadPresets(): Record<string, ModePreset> {
 async function cmdDelegate(args: string[]): Promise<number> {
   const { values, positionals } = parseCommand(
     args,
-    { mode: { type: 'string' }, finish: { type: 'string' }, manifest: { type: 'string' } },
+    { mode: { type: 'string' }, finish: { type: 'string' }, manifest: { type: 'string' }, watch: { type: 'boolean' } },
     1,
     1,
   );
@@ -244,6 +246,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   // Daemon API contract: POST /jobs → 201 {job}.
   const created = res.json as { job: { id: string; state: string } };
   console.log(`${created.job.id} ${created.job.state}`);
+  if (values.watch === true) return followJob(created.job.id, true);
   return EXIT_OK;
 }
 
@@ -385,11 +388,34 @@ async function cmdLogs(args: string[]): Promise<number> {
   return EXIT_OK;
 }
 
-async function cmdAttach(args: string[]): Promise<number> {
-  const { positionals } = parseCommand(args, {}, 1, 1);
-  const jobId = positionals[0];
+/**
+ * Read one answer line from stdin for a pending decision.
+ * Grammar: "<option-id> [supplementary text]" | "text: <free text>" | "" (skip).
+ */
+async function readAnswerLine(prompt: string): Promise<{ option?: string; text?: string } | undefined> {
+  const readline = await import('node:readline/promises'); // lazy: only in interactive watch mode
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const line = (await rl.question(prompt)).trim();
+    if (line === '') return undefined;
+    if (line.startsWith('text:')) return { text: line.slice('text:'.length).trim() };
+    const [option, ...restWords] = line.split(/\s+/);
+    const text = restWords.join(' ');
+    return text ? { option, text } : { option };
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Follow a job to a terminal state, printing events. With answerMode, pending
+ * decisions are answered from stdin between poll cycles. Watching is a view,
+ * never a lifeline: disconnecting changes nothing for the job.
+ */
+async function followJob(jobId: string, answerMode: boolean): Promise<number> {
   let after: number | undefined;
   let terminal = false;
+  let pendingDecision: FleetEvent | undefined;
 
   while (!terminal) {
     const query = after === undefined ? '?follow=1' : `?after=${after}&follow=1`;
@@ -397,13 +423,29 @@ async function cmdAttach(args: string[]): Promise<number> {
       const event = printEventLine(line);
       if (!event) return;
       if (typeof event.seq === 'number') after = event.seq;
+      if (event.type === 'decision') pendingDecision = event;
+      if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
       if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
         terminal = true;
       }
     });
     if (res.status !== 200) return daemonFailure(res, 'attach');
+    if (!terminal && answerMode && pendingDecision) {
+      const ids = (pendingDecision.options ?? []).map((o) => o.id).join(' | ');
+      const answer = await readAnswerLine(`answer [${ids}] ("<id> [note]" or "text: ..." or empty to keep waiting): `);
+      if (answer) {
+        const posted = await daemonCall('POST', `/jobs/${encodeURIComponent(jobId)}/answer`, answer);
+        if (posted.status !== 200) daemonFailure(posted, 'answer'); // print and keep watching
+        else pendingDecision = undefined;
+      }
+    }
   }
   return EXIT_OK;
+}
+
+async function cmdAttach(args: string[]): Promise<number> {
+  const { values, positionals } = parseCommand(args, { answer: { type: 'boolean' } }, 1, 1);
+  return followJob(positionals[0], values.answer === true);
 }
 
 async function cmdAnswer(args: string[]): Promise<number> {
