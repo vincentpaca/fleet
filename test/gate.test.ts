@@ -46,6 +46,16 @@ test('branch for a different issue does not block', () => {
   assert.equal(evaluate({ ...ready, branches: ['fleet/70-other', 'fleet/17-x'] }).ready, true);
 });
 
+test("the job's own branch never counts as a claim (creation-push and re-entry)", () => {
+  const own = { ...ready, jobId: 'job-9', branches: ['fleet/7-job-9'] };
+  assert.equal(evaluate(own).ready, true, 'own branch tripped the collision guard');
+  const foreign = { ...own, branches: ['fleet/7-job-9', 'fleet/7-job-OTHER'] };
+  const { ready: ok, findings } = evaluate(foreign);
+  assert.equal(ok, false);
+  assert.match(findings.join('\n'), /fleet\/7-job-OTHER/);
+  assert.ok(!findings.join('\n').includes('fleet/7-job-9,'), 'own branch must not be named a claimant');
+});
+
 test('closed issue fails', () => {
   const { ready: ok, findings } = evaluate({ ...ready, state: 'CLOSED' });
   assert.equal(ok, false);

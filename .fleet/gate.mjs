@@ -12,10 +12,13 @@ import { execFileSync } from 'node:child_process';
 
 /**
  * Pure readiness decision — fixture-testable, no network.
- * @param {{ state?: string, labels: string[], body: string, branches: string[], issue: string }} facts
+ * The job's OWN branch never counts as a claim: the runner pushes
+ * fleet/<issue>-<jobId> at creation BEFORE the gate runs, and a parked job
+ * re-enters onto its existing branch — neither may trip the collision guard.
+ * @param {{ state?: string, labels: string[], body: string, branches: string[], issue: string, jobId?: string }} facts
  * @returns {{ ready: boolean, findings: string[] }}
  */
-export function evaluate({ state, labels, body, branches, issue }) {
+export function evaluate({ state, labels, body, branches, issue, jobId }) {
   const findings = [];
   if (state !== undefined && state.toUpperCase() !== 'OPEN') {
     findings.push(`issue ${issue} is ${state}, not open`);
@@ -27,7 +30,8 @@ export function evaluate({ state, labels, body, branches, issue }) {
     findings.push(`issue ${issue} body has no "## Acceptance" section`);
   }
   const prefix = `fleet/${issue}-`;
-  const taken = branches.filter((b) => b.startsWith(prefix));
+  const own = jobId ? `${prefix}${jobId}` : undefined;
+  const taken = branches.filter((b) => b.startsWith(prefix) && b !== own);
   if (taken.length > 0) {
     findings.push(`branch already claims this issue: ${taken.join(', ')}`);
   }
@@ -68,6 +72,7 @@ function main() {
     });
     facts = {
       issue,
+      jobId: process.env.FLEET_JOB_ID,
       state: view.state,
       labels: view.labels.map((l) => l.name),
       body: view.body ?? '',
