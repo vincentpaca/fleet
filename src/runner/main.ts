@@ -133,10 +133,14 @@ async function main(): Promise<void> {
   const cmd = plan.cmd;
 
   const startedAt = Date.now();
+  // Capture is runner-scoped: strip it from the harness child so nested
+  // fleet test-runners inside the workspace cannot pollute the capture file
+  // (the delegated agent running `npm test` did exactly that once).
+  const { FLEET_STREAM_CAPTURE: capture, ...childEnv } = process.env;
   const child = spawn(cmd, {
     shell: true,
     cwd: workspace,
-    env: process.env,
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -148,7 +152,6 @@ async function main(): Promise<void> {
   });
 
   const emits: Promise<unknown>[] = [];
-  const capture = process.env.FLEET_STREAM_CAPTURE;
   const lines = createInterface({ input: child.stdout });
   lines.on('line', (line) => {
     if (capture) appendFileSync(capture, line + '\n');
