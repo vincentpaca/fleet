@@ -7,6 +7,9 @@ import { join } from 'node:path';
 const out = join(process.cwd(), '.fleet', 'out');
 mkdirSync(out, { recursive: true });
 
+
+// Real work product: proves the settle push carries the harness's edits.
+writeFileSync('work.txt', 'implemented by the fake harness\n');
 const line = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
 
 line({ type: 'assistant', message: { content: [{ type: 'text', text: 'Reading the ticket and the module boundary.' }] } });

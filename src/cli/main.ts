@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // fleet — operator CLI. Exit codes: 0 ok, 1 failure, 2 usage.
 import { parseArgs } from 'node:util';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -183,10 +184,17 @@ function cmdLint(args: string[]): number {
 // ---------- delegate ----------
 
 type Manifest = {
-  workspace?: { sync?: string[] };
+  workspace?: { repo?: string; sync?: string[] };
   env?: { vars?: string[] };
   gates?: { default_finish?: string };
 };
+
+/** git stdout in cwd, or undefined on any failure. */
+function gitValue(args: string[]): string | undefined {
+  const res = spawnSync('git', args, { encoding: 'utf8' });
+  const out = res.status === 0 ? res.stdout.trim() : '';
+  return out === '' ? undefined : out;
+}
 
 type ModePreset = {
   mode: string;
@@ -253,6 +261,21 @@ async function cmdDelegate(args: string[]): Promise<number> {
     const value = process.env[name];
     if (value === undefined) fail(`missing env var: ${name} (listed in manifest env.vars, not set in this shell)`);
     env[name] = value;
+  }
+
+  // Workspace git (#2): resolve the repo URL at dispatch — including the
+  // "origin" sentinel — and ship the operator's git identity. The runner
+  // activates git mode only when FLEET_GIT_URL is present.
+  const repoUrl = manifest.workspace?.repo;
+  if (typeof repoUrl === 'string' && repoUrl !== '') {
+    const resolved = repoUrl === 'origin' ? gitValue(['remote', 'get-url', 'origin']) : repoUrl;
+    if (!resolved) fail('workspace.repo is "origin" but this checkout has no origin remote');
+    const name = gitValue(['config', 'user.name']);
+    const email = gitValue(['config', 'user.email']);
+    if (!name || !email) fail('git identity missing: set git config user.name and user.email — job commits are authored as you');
+    env.FLEET_GIT_URL = resolved;
+    env.FLEET_GIT_NAME = name;
+    env.FLEET_GIT_EMAIL = email;
   }
 
   const res = await daemonCall('POST', '/jobs', { workOrder, manifest, env, sync });

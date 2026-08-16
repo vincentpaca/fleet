@@ -12,17 +12,15 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { EventSink } from './events.ts';
 import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { composeSettle } from './settle.ts';
-
-const HARNESS_DEFAULTS: Record<string, string> = {
-  'claude-code': 'claude -p --output-format stream-json --verbose',
-};
+import { setupWorkspace, pushWork } from './git.ts';
+import { buildHarnessCommand, parseVersion } from './harness.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -54,6 +52,37 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Work-order target: names the job branch and rides into the harness prompt.
+  let target = 'work';
+  try {
+    const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
+    if (typeof order.target === 'string' && order.target !== '') target = order.target;
+  } catch {
+    // No staged order (direct runner invocation): branch/prompt fall back.
+  }
+
+  // --- Workspace git lifecycle (#2): branch pushed at creation. ---
+  // Activated by FLEET_GIT_URL, resolved by the CLI at dispatch; providers
+  // stay git-agnostic and git-less tests simply do not set it.
+  const gitUrl = process.env.FLEET_GIT_URL;
+  let branch: string | undefined;
+  if (gitUrl) {
+    try {
+      branch = setupWorkspace(workspace, {
+        url: gitUrl,
+        jobId,
+        target,
+        name: process.env.FLEET_GIT_NAME,
+        email: process.env.FLEET_GIT_EMAIL,
+      });
+      await sink.emit({ type: 'log', text: `workspace on branch ${branch} (pushed)`, who: 'runner' });
+    } catch (err) {
+      const firstLine = String(err instanceof Error ? err.message : err).split('\n')[0];
+      await settleBlocked(sink, `fix workspace git: ${firstLine}`);
+      await sink.emit({ type: 'state', state: 'cancelled', reason: 'git' });
+      process.exit(1);
+    }
+  }
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
   const gates = (manifest.gates ?? {}) as Record<string, unknown>;
   const pickup = typeof gates.pickup === 'string' ? gates.pickup : '';
@@ -79,13 +108,25 @@ async function main(): Promise<void> {
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
-  const cmd = process.env.FLEET_HARNESS_CMD ?? HARNESS_DEFAULTS[cli];
-  if (!cmd) {
+  const probe = !process.env.FLEET_HARNESS_CMD && cli === 'claude-code'
+    ? spawnSync('claude', ['--version'], { encoding: 'utf8' })
+    : undefined;
+  const plan = buildHarnessCommand({
+    manifest,
+    target,
+    override: process.env.FLEET_HARNESS_CMD,
+    actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
+  });
+  if (!plan) {
     await watcher.stop();
-    await settleBlocked(sink, `no harness command known for cli "${cli}"`);
+    await settleBlocked(sink, `no harness command derivable for cli "${cli}" — set harness.commands or FLEET_HARNESS_CMD`);
     await sink.emit({ type: 'state', state: 'cancelled', reason: 'harness-cmd' });
     process.exit(1);
   }
+  for (const note of plan.notes) {
+    await sink.emit({ type: 'log', text: note, who: 'runner' });
+  }
+  const cmd = plan.cmd;
 
   const startedAt = Date.now();
   const child = spawn(cmd, {
@@ -103,8 +144,10 @@ async function main(): Promise<void> {
   });
 
   const emits: Promise<unknown>[] = [];
+  const capture = process.env.FLEET_STREAM_CAPTURE;
   const lines = createInterface({ input: child.stdout });
   lines.on('line', (line) => {
+    if (capture) appendFileSync(capture, line + '\n');
     const translated = translateLine(line);
     const bodies = translated.filter((item) => item.type !== 'result');
     // {"type":"result"} marks the end of the run; it precedes settle and is
@@ -121,6 +164,19 @@ async function main(): Promise<void> {
   await linesDone.promise;
   await Promise.all(emits);
   await watcher.stop();
+
+  // Deliver the work (#2): commit and push whatever the harness produced —
+  // partial work included; evidence over tidiness.
+  let pushNote: string | undefined;
+  if (gitUrl && branch) {
+    try {
+      const outcome = pushWork(workspace, target, jobId, exitCode === 0);
+      pushNote = outcome === 'pushed' ? `work pushed to ${branch}` : `workspace clean; nothing beyond ${branch} creation`;
+    } catch (err) {
+      pushNote = `WORK PUSH FAILED: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
+    }
+    await sink.emit({ type: 'log', text: pushNote, who: 'runner' });
+  }
 
   const ok = exitCode === 0;
   const { body, notes } = composeSettle({

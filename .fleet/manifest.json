@@ -10,16 +10,28 @@
     "sync": []
   },
   "env": {
-    "vars": ["ANTHROPIC_API_KEY"]
+    "vars": []
   },
   "services": [
-    { "kind": "github", "scope": ["repo:origin"], "permissions": ["contents:rw", "pull_requests:rw"] }
+    {
+      "kind": "github",
+      "scope": [
+        "repo:origin"
+      ],
+      "permissions": [
+        "contents:rw",
+        "pull_requests:rw"
+      ]
+    }
   ],
   "harness": {
     "cli": "claude-code",
     "agents": ".claude/agents",
     "commands": [
-      { "path": ".claude/commands/dev.md", "critic": "code-reviewer" }
+      {
+        "path": ".claude/commands/dev.md",
+        "critic": "code-reviewer"
+      }
     ]
   },
   "gates": {

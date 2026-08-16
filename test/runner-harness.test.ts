@@ -1,0 +1,54 @@
+// Harness command derivation (#4): the exact launch line comes from the
+// manifest + work-order target; the env override wins verbatim; version
+// requirements are checked, never guessed.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { buildHarnessCommand, versionSatisfies, parseVersion } from '../src/runner/harness.ts';
+
+const manifest = {
+  harness: {
+    cli: 'claude-code',
+    cli_version: '>=2.1.0',
+    commands: [{ path: '.claude/commands/dev.md', critic: 'code-reviewer' }],
+  },
+};
+
+test('derives the claude-code launch line from the first command and the target', () => {
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  assert.ok(plan);
+  assert.equal(
+    plan.cmd,
+    'claude -p "/dev APP-14" --output-format stream-json --verbose --allowedTools "Bash" "Edit" "Write" "Read" "Glob" "Grep" "Task" "TodoWrite"',
+  );
+  assert.deepStrictEqual(plan.notes, []);
+});
+
+test('override wins verbatim, no notes, no derivation', () => {
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', override: 'node fake-harness.mjs' });
+  assert.deepStrictEqual(plan, { cmd: 'node fake-harness.mjs', notes: [] });
+});
+
+test('version violations become notes, not failures', () => {
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.0.9' });
+  assert.ok(plan);
+  assert.match(plan.notes[0], /2\.0\.9 violates .*>=2\.1\.0/);
+});
+
+test('underivable setups return undefined (unknown cli, missing commands)', () => {
+  assert.equal(buildHarnessCommand({ manifest: { harness: { cli: 'codex' } }, target: 'X' }), undefined);
+  assert.equal(buildHarnessCommand({ manifest: { harness: { cli: 'claude-code', commands: [] } }, target: 'X' }), undefined);
+});
+
+test('versionSatisfies: >= comparisons and exact-prefix pins', () => {
+  assert.equal(versionSatisfies('2.1.220', '>=2.1.0'), true);
+  assert.equal(versionSatisfies('2.1.0', '>=2.1.220'), false);
+  assert.equal(versionSatisfies('3.0.0', '>=2.9.9'), true);
+  assert.equal(versionSatisfies('2.1.220', '2.1'), true);
+  assert.equal(versionSatisfies('2.2.0', '2.1'), false);
+  assert.equal(versionSatisfies('2.1.220', '~2.1'), undefined, 'unsupported syntax is reported, never guessed');
+});
+
+test('parseVersion pulls the semver out of CLI banners', () => {
+  assert.equal(parseVersion('2.1.220 (Claude Code)'), '2.1.220');
+  assert.equal(parseVersion('no version here'), undefined);
+});

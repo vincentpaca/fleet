@@ -1,0 +1,9 @@
+{
+  "status": "READY",
+  "verification": [
+    "node --test test/cli-version.test.ts",
+    "npm test"
+  ],
+  "not_done": [],
+  "next_action": "Review and merge the branch."
+}

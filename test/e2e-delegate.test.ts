@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { FleetDaemon } from '../src/daemon/server.ts';
 import { ProcessProvider } from '../src/providers/process.ts';
@@ -26,10 +26,25 @@ const delay = (ms: number): Promise<void> => {
   return promise;
 };
 
-const manifest = {
+/** Bare git remote seeded with main — the job branch and work push land here. */
+function makeRemote(dir: string): string {
+  const bare = join(dir, 'remote.git');
+  const seed = join(dir, 'seed');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  mkdirSync(seed, { recursive: true });
+  writeFileSync(join(seed, 'README.md'), 'seed\n');
+  const g = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
+  execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+  execFileSync('git', [...g, 'add', '-A'], { cwd: seed });
+  execFileSync('git', [...g, 'commit', '-q', '-m', 'seed'], { cwd: seed });
+  execFileSync('git', [...g, 'push', '-q', bare, 'main'], { cwd: seed });
+  return bare;
+}
+
+const manifest = (repo: string) => ({
   version: 1,
   setup: { image: 'node:22', script: '.fleet/setup.sh' },
-  workspace: { repo: 'git@github.com:acme/webapp.git', strategy: 'branch-per-job', sync: ['.env.fleet'] },
+  workspace: { repo, strategy: 'branch-per-job', sync: ['.env.fleet'] },
   env: { vars: ['FLEET_HARNESS_CMD'] },
   harness: {
     cli: 'claude-code',
@@ -37,13 +52,14 @@ const manifest = {
     commands: [{ path: '.claude/commands/dev-sprint.md', critic: 'code-reviewer' }],
   },
   gates: { pickup: 'node -e "process.exit(0)"', default_finish: 'implemented' },
-};
+});
 
 test('delegate -> blocked -> answer -> done, over the real wire', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'fleet-e2e-home-'));
   const project = mkdtempSync(join(tmpdir(), 'fleet-e2e-proj-'));
+  const remote = makeRemote(mkdtempSync(join(tmpdir(), 'fleet-e2e-git-')));
   mkdirSync(join(project, '.fleet'), { recursive: true });
-  writeFileSync(join(project, '.fleet', 'manifest.json'), JSON.stringify(manifest, null, 2));
+  writeFileSync(join(project, '.fleet', 'manifest.json'), JSON.stringify(manifest(remote), null, 2));
   writeFileSync(join(project, '.env.fleet'), 'EXAMPLE=1\n');
 
   const daemon = new FleetDaemon({ home, provider: new ProcessProvider(), port: 0, longPollMs: 1_000 });
@@ -93,6 +109,17 @@ test('delegate -> blocked -> answer -> done, over the real wire', async (t) => {
   }
   assert.match(log, /rebase/, 'answered option should appear in the transcript');
   assert.match(log, /open the pull request/, 'report next_action should appear in settle');
+
+  // Workspace git (#2): the job branch was pushed at creation and the work
+  // commit carries the harness's edit — while the dispatch payload stays out.
+  const heads = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  const branchRef = heads.split('\n').find((l) => l.includes('refs/heads/fleet/APP-123-'));
+  assert.ok(branchRef, `job branch missing on the remote:\n${heads}`);
+  const branch = branchRef.split('refs/heads/')[1];
+  const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
+  assert.match(tree, /work\.txt/, 'work push must carry the harness edit');
+  assert.ok(!tree.includes('.fleet/order.json'), 'dispatch payload must never be pushed');
+  assert.ok(!tree.includes('.env.fleet'), 'sync files must never be pushed');
 
   // Event log on disk is the source of truth and every line is valid JSON.
   const jobsDir = join(home, 'jobs');
