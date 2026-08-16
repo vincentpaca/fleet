@@ -19,7 +19,7 @@ harness session or terminal       daemon (small ECS service)      container
 - **Daemon** (`src/daemon/`): passive coordinator. Validates every incoming event against the schemas before persisting it, enforces the job state machine, holds the answer API, launches and terminates containers through a provider. It never generates work and never answers questions.
 - **Runner** (`src/runner/`): lives inside the job container. Runs the pickup gate, runs the repo's own harness command headless, translates its output stream into events, watches for the decision file, reports the settle honestly.
 - **Providers** (`src/providers/`): `launch`/`terminate` against a substrate. `ecs` is the real one (tasks on an autoscaling group that scales from zero); `docker` and `process` exist for development and tests.
-- **Terraform** (`infra/terraform/`): the substrate itself — cluster, capacity provider, ECR, IAM, the daemon service, SSM-only access, a budget alarm. One apply per AWS account.
+- **Infra units** (`infra/<cloud>/`): one self-contained Terraform module per cloud — each satisfies the same requirements (on-demand container execution, daemon hosting with durable state, image registry, operator access with no public ingress, scale to zero, cost backstop) its own way, and pairs with a `src/providers/` implementation. `infra/aws/` is the first unit: ECS cluster + capacity provider, ECR, IAM, EFS-backed daemon service, SSM-only access, budget alarm. One apply per account. See `docs/decisions.md#d12`.
 
 ## The contracts
 

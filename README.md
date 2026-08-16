@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent jobs in containers on your own AWS account. You dispatch a ticket, keep working (or close your laptop), and the job runs remotely, asks you when it's stuck, and finishes as a pull request.
+Fleet runs coding-agent jobs in containers in your own cloud account. You dispatch a ticket, keep working (or close your laptop), and the job runs remotely, asks you when it's stuck, and finishes as a pull request.
 
 It's built for repos that already use an agent harness: Claude Code with slash commands, agent definitions, and rules. If you run something like `/dev-sprint TICKET-123` locally today, Fleet runs that same command on cloud compute instead. Same repo, same config, same behavior, without your machine in the loop.
 
@@ -11,7 +11,7 @@ Context lives in this repo: [docs/architecture.md](docs/architecture.md) (how it
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
-2. A Terraform module sets up the infrastructure in your AWS account: an ECS cluster that scales from zero, a small daemon that tracks jobs, and no publicly reachable ports.
+2. A Terraform module sets up the infrastructure in your cloud account — one self-contained module per cloud under `infra/<cloud>/`, AWS first (an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports). Multi-cloud is a layout property, not a feature: each unit ships its module, provider, tests, and docs together.
 3. `fleet delegate TICKET-123` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back.
 4. When the agent hits a question it can't answer on its own, the job pauses and you get a notification. You answer with `fleet answer`, and the job resumes. Agents cannot answer their own questions; the answer API is only reachable with your credentials.
 5. The job ends as a pull request. A human merges it. Fleet never merges and never deploys.

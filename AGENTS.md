@@ -1,13 +1,13 @@
 # Working on this repo
 
-Fleet runs coding-agent jobs in containers on the owner's own AWS. `docs/architecture.md` explains the system; `docs/decisions.md` records settled calls — don't relitigate them in code, reopen them with a human.
+Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/architecture.md` explains the system; `docs/decisions.md` records settled calls — don't relitigate them in code, reopen them with a human.
 
 ## Build and test
 
 - Node ≥ 23.6, no build step: `.ts` runs directly via type stripping. **Erasable syntax only** — no enums, no namespaces, no parameter properties. If `node --test` can't run it, it's wrong.
 - `npm test` = full suite. Focused: `node --test test/<area>-*.test.ts` (areas: `daemon-`, `runner-`, `cli-`, plus `gate`, `e2e-delegate`, `harness-mirrors`). Optional: `FLEET_DEMO_HISTORY=<path> npm test` round-trips an external history file.
 - **Zero new runtime dependencies.** Node builtins + the existing `ajv`. Shelling out to `git`, `gh`, `docker`, `aws` is fine.
-- Terraform: `terraform fmt` clean; validate via `examples/basic`; never add a resource with an ingress rule (EFS mount targets are the one SG-referenced exception, documented in `infra/terraform/main.tf`).
+- Terraform: `terraform fmt` clean; validate via the unit's `examples/basic`; never add a resource with an ingress rule (AWS EFS mount targets are the one SG-referenced exception, documented in `infra/aws/main.tf`).
 
 ## Invariants that break if you're not looking
 
@@ -32,7 +32,7 @@ Fleet runs coding-agent jobs in containers on the owner's own AWS. `docs/archite
 
 ## Layout
 
-`schemas/` contracts · `src/daemon|runner|cli|providers|shared/` per `docs/architecture.md#the-pieces` · `agents/` canonical playbooks · `.fleet/` this repo's own manifest + pickup gate (Fleet delegates work on itself) · `docs/` architecture, decisions, roadmap · `infra/terraform/` substrate · `fixtures/` executable fixtures + synthetic data.
+`schemas/` contracts · `src/daemon|runner|cli|providers|shared/` per `docs/architecture.md#the-pieces` · `agents/` canonical playbooks · `.fleet/` this repo's own manifest + pickup gate (Fleet delegates work on itself) · `docs/` architecture, decisions, roadmap · `infra/<cloud>/` one self-contained unit per cloud (see `docs/decisions.md#d12`) · `fixtures/` executable fixtures + synthetic data.
 
 ## Sandboxed runs (when you ARE the delegated job)
 

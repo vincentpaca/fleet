@@ -45,3 +45,7 @@ Fleet is a standalone tool. Knowledge from real deployments informs its design a
 ## D11 — GitHub Issues are the work source for this repo
 
 A delegatable ticket needs an identifier, a readable spec, a machine-checkable readiness state, and a place for results to land. For this repo that is a GitHub issue (id, body with acceptance criteria, `ready` label, PR link-back), with `docs/tasks/<n>-*.md` files for specs too large for an issue body. The pickup gate checks issue readiness via `gh`.
+
+## D12 — Clouds are self-contained units; core defines requirements, not choices
+
+Fleet is two steps: (1) stand up infrastructure — on any cloud, possibly several; (2) `fleet delegate` against whatever exists, including on repositories that predate Fleet. Core therefore defines *requirements* a cloud unit must satisfy — run containers on demand, host the daemon with durable state, store images, give the operator access without public ingress, scale to zero, carry a cost backstop — and each cloud satisfies them its own way inside its own unit: `infra/<cloud>/` (module, variables, outputs, README, example) paired with a `src/providers/<name>.ts` implementation and both of their tests. AWS is the first unit, not the architecture; D2's "ECS on EC2" binds only `infra/aws/`. Enforced mechanically: core code cannot import a concrete provider (composition root excepted) and every infra unit must ship complete — `test/cloud-agnostic.test.ts`.

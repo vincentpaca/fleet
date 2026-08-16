@@ -20,7 +20,7 @@ A web surface that consumes the same events and answer API the CLI uses: live jo
 
 ## Phase 4 — managed sandbox substrates
 
-One provider over a managed microVM substrate, for per-job isolation beyond shared-kernel containers and proof that the manifest ports off AWS. Raw additional IaaS providers only when someone funds one.
+One provider over a managed microVM substrate, for per-job isolation beyond shared-kernel containers and proof that the manifest ports across substrates. Additional cloud units (`infra/<cloud>/` + provider + tests, per `docs/decisions.md#d12`) when someone needs one.
 
 ## Phase 5 — fleet operations
 
