@@ -14,7 +14,8 @@ locals {
   ) : var.subnet_ids
   subnet_count = local.create_vpc ? var.az_count : length(var.subnet_ids)
 
-  daemon_image = var.daemon_image != "" ? var.daemon_image : "${aws_ecr_repository.runner.repository_url}:daemon"
+  daemon_image          = var.daemon_image != "" ? var.daemon_image : "${aws_ecr_repository.runner.repository_url}:daemon"
+  runner_container_name = "${var.name}-runner"
 
   tags = merge(var.tags, { "fleet:module" = var.name })
 }
@@ -200,7 +201,8 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 # Task role: deliberately minimal. The only permissions are the SSM messaging
-# channels required for `aws ecs execute-command` (the SSM-only access path).
+# channels required for `aws ecs execute-command` (the SSM-only access path),
+# plus GetParameter on the fleet-config SSM parameter the daemon reads at boot.
 resource "aws_iam_role" "task" {
   name               = "${var.name}-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
@@ -223,6 +225,22 @@ resource "aws_iam_role_policy" "task_ecs_exec" {
           "ssmmessages:OpenDataChannel",
         ]
         Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "task_ssm_config" {
+  name = "ssm-fleet-config-read"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = aws_ssm_parameter.fleet_config.arn
       },
     ]
   })
@@ -390,6 +408,68 @@ resource "aws_cloudwatch_log_group" "runner" {
   tags              = local.tags
 }
 
+# --- Runner task definition -------------------------------------------------------
+# Each job runs as a one-off ecs run-task using this definition as the template.
+# The runner image is the same ECR repository as the daemon but with the "runner"
+# tag.  The daemon reads this definition's family name from the SSM fleet-config
+# parameter at boot so no hand-set FLEET_ECS_TASK_DEF is needed.
+# Network mode is bridge (EC2 only): the run-task call does not need
+# --network-configuration because container networking is handled at the EC2
+# instance level.
+
+resource "aws_ecs_task_definition" "runner" {
+  family                   = "${var.name}-runner"
+  requires_compatibilities = ["EC2"]
+  network_mode             = "bridge"
+  task_role_arn            = aws_iam_role.task.arn
+  execution_role_arn       = aws_iam_role.task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = local.runner_container_name
+      image     = "${aws_ecr_repository.runner.repository_url}:runner"
+      essential = true
+      cpu       = var.runner_cpu
+      memory    = var.runner_memory
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.runner.name
+          awslogs-region        = data.aws_region.current.region
+          awslogs-stream-prefix = "runner"
+        }
+      }
+    },
+  ])
+
+  tags = local.tags
+}
+
+# --- Fleet-config SSM parameter ---------------------------------------------------
+# Stores the provider configuration the daemon reads at startup via the
+# FLEET_ECS_CONFIG_SSM_PATH env var.  Subnets and security groups are intentionally
+# omitted: the runner task uses bridge networking and must not pass
+# --network-configuration to ecs run-task.
+
+resource "aws_ssm_parameter" "fleet_config" {
+  name = "/${var.name}/fleet-config"
+  type = "String"
+  value = jsonencode({
+    provider               = "ecs"
+    cluster                = aws_ecs_cluster.this.name
+    capacity_provider      = aws_ecs_capacity_provider.ec2.name
+    runner_task_definition = aws_ecs_task_definition.runner.family
+    runner_container_name  = local.runner_container_name
+    runner_log_group       = aws_cloudwatch_log_group.runner.name
+    launch_type            = "EC2"
+    subnets                = []
+    security_groups        = []
+  })
+
+  tags = local.tags
+}
+
 # --- Daemon service ---------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "daemon" {
@@ -418,6 +498,11 @@ resource "aws_ecs_task_definition" "daemon" {
 
       environment = [
         { name = "FLEET_HOME", value = var.fleet_home_path },
+        # FLEET_PROVIDER selects the ECS backend; FLEET_ECS_CONFIG_SSM_PATH tells
+        # the daemon where to read fleet_config at boot — no hand-set FLEET_ECS_*
+        # variables are needed in a production deployment.
+        { name = "FLEET_PROVIDER", value = "ecs" },
+        { name = "FLEET_ECS_CONFIG_SSM_PATH", value = aws_ssm_parameter.fleet_config.name },
       ]
 
       mountPoints = [

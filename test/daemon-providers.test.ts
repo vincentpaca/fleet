@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
-import { EcsProvider, ecsConfigFromEnv } from "../src/providers/ecs.ts";
+import { EcsProvider, ecsConfigFromEnv, ecsConfigFromFleetConfig, parseFleetConfigSsmResponse } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import type { LaunchSpec } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
@@ -58,6 +58,76 @@ test("DockerProvider falls back to the default image when the spec has none", ()
   const provider = new DockerProvider({ defaultImage: "node:22" });
   const args = provider.buildRunArgs({ ...SPEC, image: undefined });
   assert.ok(args.includes("node:22"));
+});
+
+test("ecsConfigFromFleetConfig maps fleet_config keys to EcsConfig", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet-cluster",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    launch_type: "EC2",
+    subnets: [],
+    security_groups: [],
+  });
+  assert.equal(config.cluster, "fleet-cluster");
+  assert.equal(config.taskDefinition, "fleet-runner");
+  assert.equal(config.containerName, "fleet-runner");
+  assert.equal(config.launchType, "EC2");
+  assert.deepEqual(config.subnets, []);
+  assert.deepEqual(config.securityGroups, []);
+  assert.equal(config.assignPublicIp, "DISABLED");
+});
+
+test("ecsConfigFromFleetConfig treats missing subnets/security_groups as empty", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "c",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    launch_type: "EC2",
+  });
+  // Bridge-mode tasks omit these; ecsConfigFromFleetConfig must not throw.
+  assert.deepEqual(config.subnets, []);
+  assert.deepEqual(config.securityGroups, []);
+  // Missing subnets → no --network-configuration added in buildRunTaskArgs.
+  const provider = new EcsProvider(config);
+  assert.ok(!provider.buildRunTaskArgs(SPEC).includes("--network-configuration"));
+});
+
+test("parseFleetConfigSsmResponse extracts the nested Parameter.Value JSON", () => {
+  const inner = {
+    provider: "ecs",
+    cluster: "fleet-cluster",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    launch_type: "EC2",
+    subnets: [],
+    security_groups: [],
+  };
+  const ssmJson = JSON.stringify({ Parameter: { Name: "/fleet/fleet-config", Value: JSON.stringify(inner) } });
+  const parsed = parseFleetConfigSsmResponse(ssmJson);
+  assert.equal(parsed.cluster, "fleet-cluster");
+  assert.equal(parsed.runner_task_definition, "fleet-runner");
+  assert.deepEqual(parsed.subnets, []);
+});
+
+test("parseFleetConfigSsmResponse throws when Parameter.Value is absent", () => {
+  assert.throws(() => parseFleetConfigSsmResponse(JSON.stringify({ Parameter: {} })), /Parameter\.Value/);
+  assert.throws(() => parseFleetConfigSsmResponse(JSON.stringify({})), /Parameter\.Value/);
+});
+
+test("ecsConfigFromFleetConfig throws on missing required fields", () => {
+  const base = {
+    provider: "ecs",
+    cluster: "c",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    launch_type: "EC2",
+  };
+  assert.throws(() => ecsConfigFromFleetConfig({ ...base, cluster: "" }), /cluster/);
+  assert.throws(() => ecsConfigFromFleetConfig({ ...base, runner_task_definition: "" }), /runner_task_definition/);
+  assert.throws(() => ecsConfigFromFleetConfig({ ...base, runner_container_name: "" }), /runner_container_name/);
 });
 
 test("ecsConfigFromEnv reads FLEET_ECS_* and names missing required vars", () => {

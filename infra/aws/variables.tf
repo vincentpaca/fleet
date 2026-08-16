@@ -84,6 +84,18 @@ variable "daemon_memory" {
   default     = 512
 }
 
+variable "runner_cpu" {
+  description = "CPU units reserved for a runner container."
+  type        = number
+  default     = 256
+}
+
+variable "runner_memory" {
+  description = "Hard memory limit (MiB) for a runner container."
+  type        = number
+  default     = 1024
+}
+
 variable "fleet_home_path" {
   description = "Container path for FLEET_HOME; backed by the EFS volume so job state survives task replacement."
   type        = string
