@@ -62,7 +62,7 @@ FLEET_DEMO_HISTORY=path/to/history.json npm test
 
 ## Roadmap
 
-- **Phase 1:** Terraform module, daemon, ECS provider, runner, and the CLI (`init`, `doctor`, `delegate`, `status`, `logs`, `attach`, `answer`, `cancel`). Done means: a real ticket goes from `fleet delegate` to a merge-ready PR with the laptop closed mid-job.
+- **Phase 1** (in progress — most of this exists; see the `phase-1` issues for what remains): Terraform units, daemon, ECS provider, runner, and the CLI (`init`, `lint`, `delegate --watch`, `status`, `logs`, `attach --answer`, `answer`, `cancel`; `doctor` and the interactive `setup` wizard are open issues). Done means: a real ticket goes from `fleet delegate` to a merge-ready PR with the laptop closed mid-job.
 - **Phase 2:** credential broker issuing short-lived scoped tokens, network egress restricted to an allowlist, and a kill switch (`fleet stop`) with a drill that proves it works.
 - **Phase 3:** a web UI for watching jobs and answering their questions.
 - **Later:** managed sandbox providers, parallel batches, overnight runs.
