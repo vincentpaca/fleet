@@ -38,8 +38,12 @@ function writeWorkspace(pickup: string): string {
 }
 
 function runRunner(env: Record<string, string>): Promise<number> {
+  // Strip fleet job env vars that the test process inherits from its own runner
+  // context — if FLEET_GIT_URL is set, the child runner would try to use it and
+  // emit unexpected log events that break the event-sequence assertions.
+  const { FLEET_GIT_URL: _gitUrl, FLEET_GIT_NAME: _gitName, FLEET_GIT_EMAIL: _gitEmail, ...parentEnv } = process.env;
   const child = spawn(process.execPath, [runnerMain], {
-    env: { ...process.env, ...env },
+    env: { ...parentEnv, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const exited = Promise.withResolvers<number>();

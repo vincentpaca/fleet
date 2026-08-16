@@ -19,7 +19,7 @@ import { EventSink } from './events.ts';
 import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { composeSettle } from './settle.ts';
-import { setupWorkspace, pushWork } from './git.ts';
+import { setupWorkspace, pushWork, getHeadSha, createDraftPr } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 
 function requireEnv(name: string): string {
@@ -54,9 +54,11 @@ async function main(): Promise<void> {
 
   // Work-order target: names the job branch and rides into the harness prompt.
   let target = 'work';
+  let authorityPublish = false;
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
+    authorityPublish = order?.authority?.publish === true;
   } catch {
     // No staged order (direct runner invocation): branch/prompt fall back.
   }
@@ -66,15 +68,18 @@ async function main(): Promise<void> {
   // stay git-agnostic and git-less tests simply do not set it.
   const gitUrl = process.env.FLEET_GIT_URL;
   let branch: string | undefined;
+  let base: string | undefined;
   if (gitUrl) {
     try {
-      branch = setupWorkspace(workspace, {
+      const setup = setupWorkspace(workspace, {
         url: gitUrl,
         jobId,
         target,
         name: process.env.FLEET_GIT_NAME,
         email: process.env.FLEET_GIT_EMAIL,
       });
+      branch = setup.branch;
+      base = setup.base;
       await sink.emit({ type: 'log', text: `workspace on branch ${branch} (pushed)`, who: 'runner' });
     } catch (err) {
       const firstLine = String(err instanceof Error ? err.message : err).split('\n')[0];
@@ -186,12 +191,47 @@ async function main(): Promise<void> {
   }
 
   const ok = exitCode === 0;
+
+  // PR delivery (#3): open a draft PR when authority.publish is granted and
+  // the harness succeeded. Never merges — createDraftPr has no merge path.
+  let prUrl: string | undefined;
+  let settleRung: string | undefined;
+  if (ok) {
+    if (gitUrl && branch && base && authorityPublish) {
+      try {
+        // Collect the harness report for the PR body; fall back to a minimal string.
+        let prBody: string;
+        try {
+          const rawReport = readFileSync(join(workspace, '.fleet', 'out', 'report.json'), 'utf8');
+          prBody = rawReport;
+        } catch {
+          prBody = `Fleet job ${jobId}: ${target}`;
+        }
+        prUrl = createDraftPr(workspace, { base, branch, title: target, body: prBody });
+        const headSha = getHeadSha(workspace);
+        await sink.emit({ type: 'log', text: `draft PR opened: ${prUrl} (head ${headSha})`, who: 'runner' });
+        settleRung = 'pr-open';
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err).split('\n')[0];
+        await sink.emit({ type: 'log', text: `PR creation failed (proceeding as pushed): ${msg}`, who: 'runner' });
+        settleRung = 'pushed';
+      }
+    } else if (gitUrl && branch) {
+      // Git is set up but authority.publish not granted — branch was pushed at
+      // creation and again at pushWork; the runner reached at least 'pushed'.
+      settleRung = 'pushed';
+    } else {
+      settleRung = 'implemented';
+    }
+  }
+
   const { body, notes } = composeSettle({
     jobId,
     startedAt,
     decisions: watcher.count,
     workspace,
-    ...(ok ? { rung: 'implemented' } : {}),
+    ...(settleRung !== undefined ? { rung: settleRung } : {}),
+    prUrl,
   });
   for (const note of notes) {
     await sink.emit({ type: 'log', text: note, who: 'runner' });

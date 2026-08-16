@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -47,8 +47,9 @@ const opts = (url: string) => ({ url, jobId: 'job-1', target: 'APP-7', name: 'Op
 test('branch is pushed at creation, before any work exists', () => {
   const remote = makeRemote();
   const workspace = makeWorkspace();
-  const branch = setupWorkspace(workspace, opts(remote));
+  const { branch, base } = setupWorkspace(workspace, opts(remote));
   assert.equal(branch, 'fleet/APP-7-job-1');
+  assert.equal(base, 'main');
   const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
   assert.match(refs, /refs\/heads\/fleet\/APP-7-job-1/);
   // The clone is real: seed content is present.
@@ -58,7 +59,7 @@ test('branch is pushed at creation, before any work exists', () => {
 test('dispatch payload survives the clone and is never committed', () => {
   const remote = makeRemote();
   const workspace = makeWorkspace();
-  setupWorkspace(workspace, opts(remote));
+  const { branch: _branch } = setupWorkspace(workspace, opts(remote));
   // Dispatched manifest wins over the repo's tracked copy...
   assert.match(readFileSync(join(workspace, '.fleet', 'manifest.json'), 'utf8'), /sync/);
   // ...and order/sync/out never reach the remote even after a full work push.
@@ -78,7 +79,7 @@ test('dispatch payload survives the clone and is never committed', () => {
 test('pushWork is honest about a clean tree; pushWip lands a park commit', () => {
   const remote = makeRemote();
   const workspace = makeWorkspace();
-  setupWorkspace(workspace, opts(remote));
+  const { branch: _branch2 } = setupWorkspace(workspace, opts(remote));
   assert.equal(pushWork(workspace, 'APP-7', 'job-1', true), 'clean');
   writeFileSync(join(workspace, 'half-done.txt'), 'wip\n');
   assert.equal(pushWip(workspace, 'block_hot expired'), 'pushed');
@@ -89,7 +90,7 @@ test('pushWork is honest about a clean tree; pushWip lands a park commit', () =>
 test('partial work is pushed with a partial marker — evidence over tidiness', () => {
   const remote = makeRemote();
   const workspace = makeWorkspace();
-  setupWorkspace(workspace, opts(remote));
+  const { branch: _branch3 } = setupWorkspace(workspace, opts(remote));
   writeFileSync(join(workspace, 'attempt.txt'), 'incomplete\n');
   assert.equal(pushWork(workspace, 'APP-7', 'job-1', false), 'pushed');
   const subject = run(workspace, ['log', '-1', '--format=%s', 'origin/fleet/APP-7-job-1']);
@@ -105,4 +106,55 @@ test('setup fails loudly on an unreachable remote', () => {
   const workspace = makeWorkspace();
   assert.throws(() => setupWorkspace(workspace, opts(join(tmpdir(), 'nope-does-not-exist.git'))));
   assert.ok(existsSync(join(workspace, '.fleet', 'manifest.json')), 'payload untouched on failure');
+});
+
+test('getHeadSha returns the current HEAD SHA after a commit', () => {
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  setupWorkspace(workspace, opts(remote));
+  writeFileSync(join(workspace, 'work.txt'), 'some work\n');
+  pushWork(workspace, 'APP-7', 'job-1', true);
+  const sha = getHeadSha(workspace);
+  assert.match(sha, /^[0-9a-f]{40}$/);
+  // The SHA matches what git reports for HEAD on the remote.
+  const remoteHead = run(workspace, ['rev-parse', `origin/fleet/APP-7-job-1`]).trim();
+  assert.equal(sha, remoteHead);
+});
+
+test('createDraftPr calls gh with correct args and returns trimmed URL', () => {
+  // Inject a mock ghRun to avoid real GitHub API calls.
+  const calls: string[][] = [];
+  const mockGh = (args: string[]): string => {
+    calls.push(args);
+    return 'https://github.com/owner/repo/pull/42\n';
+  };
+  const workspace = makeWorkspace(); // path used as cwd context only
+  const prUrl = createDraftPr(workspace, {
+    base: 'main',
+    branch: 'fleet/APP-7-job-1',
+    title: 'APP-7',
+    body: '{"status":"READY","next_action":"review"}',
+    ghRun: mockGh,
+  });
+  assert.equal(prUrl, 'https://github.com/owner/repo/pull/42');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], [
+    'pr', 'create',
+    '--draft',
+    '--base', 'main',
+    '--head', 'fleet/APP-7-job-1',
+    '--title', 'APP-7',
+    '--body', '{"status":"READY","next_action":"review"}',
+  ]);
+});
+
+test('createDraftPr propagates gh failures as thrown errors', () => {
+  const failingGh = (_args: string[]): string => {
+    throw new Error('gh: Pull request create failed: already exists');
+  };
+  const workspace = makeWorkspace();
+  assert.throws(
+    () => createDraftPr(workspace, { base: 'main', branch: 'fleet/x-j1', title: 'x', body: '', ghRun: failingGh }),
+    /already exists/,
+  );
 });

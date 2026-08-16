@@ -25,6 +25,8 @@ export function composeSettle(opts: {
   workspace: string;
   rung?: string;
   report?: EventBody;
+  /** PR URL from authority.publish — merged into report.pr (issue #3). */
+  prUrl?: string;
 }): SettleComposition {
   const notes: string[] = [];
   const minutes = Math.max(
@@ -38,7 +40,16 @@ export function composeSettle(opts: {
   };
   if (opts.rung !== undefined) body.rung = opts.rung;
 
-  const report = opts.report ?? readReportFile(opts.workspace, notes);
+  let report = opts.report ?? readReportFile(opts.workspace, notes);
+  // Merge the PR URL into the report when the runner opened a PR (issue #3).
+  // The runner-derived URL is authoritative over anything the harness wrote.
+  if (opts.prUrl && report !== null && report !== undefined) {
+    report = { ...report as Record<string, unknown>, pr: opts.prUrl } as EventBody;
+  } else if (opts.prUrl) {
+    // No harness report but we have a PR URL — create a minimal report so the
+    // URL is preserved in the event log.
+    report = { status: 'READY', next_action: 'review the draft PR', pr: opts.prUrl } as unknown as EventBody;
+  }
   if (report !== null && report !== undefined) {
     // Validate the report block in situ: build the candidate settle event and
     // run it through the events schema. Invalid → omit the report, keep the
