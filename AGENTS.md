@@ -42,6 +42,7 @@ This repo is two things, and every path belongs to exactly one. **SHIP** = what 
 | `presets/` | SHIP | The six dispatch-mode defaults |
 | `examples/` | SHIP | Reference manifests and work orders — generic, always |
 | `integrations/` | SHIP | Skill files users copy into their coding harness |
+| `images/` | SHIP | Runner base Dockerfile + build script; consumed via git source, not npm (`docs/architecture.md#two-layer-job-images`) |
 | `infra/<cloud>/` | SHIP | One self-contained Terraform unit per cloud (`docs/decisions.md#d12`); consumed by git source, not npm |
 | `docs/` | SHIP | Architecture, decisions, roadmap — issues link here; keep anchors stable |
 | `AGENTS.md` `CLAUDE.md` `agents/` `.claude/` | BUILD | This repo's own harness: rules, canonical playbooks, per-harness pointers |

@@ -21,6 +21,33 @@ harness session or terminal       daemon (small ECS service)      container
 - **Providers** (`src/providers/`): `launch`/`terminate` against a substrate. `ecs` is the real one (tasks on an autoscaling group that scales from zero); `docker` and `process` exist for development and tests.
 - **Infra units** (`infra/<cloud>/`): one self-contained Terraform module per cloud — each satisfies the same requirements (on-demand container execution, daemon hosting with durable state, image registry, operator access with no public ingress, scale to zero, cost backstop) its own way, and pairs with a `src/providers/` implementation. `infra/aws/` is the first unit: ECS cluster + capacity provider, ECR, IAM, EFS-backed daemon service, SSM-only access, budget alarm. One apply per account. See `docs/decisions.md#d12`.
 
+## Two-layer job images
+
+Fleet containers use two image layers so the expensive base never rebuilds unnecessarily:
+
+```
+Layer 1 — runner base (Fleet publishes)
+  fleet-runner:<harness-cli>-<cli_version>
+  FROM node:22  +  harness CLI installed globally  +  Fleet runner source
+  Built once per CLI release by Fleet maintainers; pushed to the operator's ECR.
+  Dockerfile: images/runner/Dockerfile   Build script: images/runner/build.sh
+
+Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
+  fleet-job:<hash>  (hash = sha256(base-tag + \0 + setup-inputs)[:16])
+  FROM fleet-runner:<cli>-<version>  +  repo setup layer (optional)
+  Rebuilt only when the base tag or setup inputs change.
+```
+
+**Activation:** only when `manifest.harness.cli_version` is set. Without it the daemon launches whatever `manifest.setup.image` names — existing manifests and simple setups are unaffected.
+
+**Image selection at dispatch:** `fleet delegate` computes the hash and checks locally. If the job image exists it is reused; if not, it builds it from the runner base. The resulting tag is passed to the daemon as an optional `image` field in the POST body; the daemon forwards it to the provider, which uses it in preference to `manifest.setup.image`.
+
+**Hash inputs:** `sha256(runnerBaseTag + "\0" + JSON({script, devcontainer, dockerfile}))[:16]`. Setup-script content is hashed, not just the path. `setup.image` is intentionally excluded — in two-layer mode the runner base *is* the image.
+
+**Workspace materialisation:** the Docker provider passes `FLEET_MANIFEST_JSON`, `FLEET_WORK_ORDER_JSON`, and `FLEET_SYNC_JSON` as base64 env vars. The runner writes these to `FLEET_WORKSPACE` before any file reads. Process-provider jobs already have the files on disk; `materializeWorkspace` is a no-op for them.
+
+**Auth note:** API keys (`ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, …) are never baked into an image layer — they enter the container only at start via `-e` flags. This is enforced in the Dockerfile (no `ARG`/`ENV` for secrets) and verified in `test/cli-image.test.ts`. Delegated jobs bill via the operator's own API key, which is never stored in or transmitted through the image.
+
 ## The contracts
 
 | Contract | Schema | Consumed by |
