@@ -28,6 +28,10 @@ Commands:
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
   doctor                                   Environment checks (Phase 1 stub)
+  version                                  Print version and exit
+
+Flags:
+  --version                                Print version and exit
 
 Daemon address: FLEET_DAEMON_URL, or unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).`;
 
@@ -524,6 +528,15 @@ export async function main(argv: string[]): Promise<number> {
       case '-h':
         console.log(HELP);
         return command === undefined ? EXIT_USAGE : EXIT_OK;
+      case 'version':
+      case '--version': {
+        const pkg = readJsonFile(
+          fileURLToPath(new URL('../../package.json', import.meta.url)),
+          'package.json',
+        ) as { version: string };
+        console.log(pkg.version);
+        return EXIT_OK;
+      }
       case 'init':
         return cmdInit(rest);
       case 'lint':
