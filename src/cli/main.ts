@@ -402,7 +402,10 @@ async function cmdStatus(args: string[]): Promise<number> {
     if (res.status !== 200) return daemonFailure(res, 'status');
     // Daemon API contract: GET /jobs → 200 {jobs: [...]}.
     const listed = res.json as { jobs: Job[] };
-    if (listed.jobs.length === 0) console.log('no jobs');
+    if (listed.jobs.length === 0) {
+      console.log('no jobs — delegate one with: fleet delegate <target>');
+      return EXIT_OK;
+    }
     for (const job of listed.jobs) console.log(formatJob(job));
     return EXIT_OK;
   }

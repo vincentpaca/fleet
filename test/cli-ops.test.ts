@@ -150,6 +150,21 @@ test('cancel posts to the cancel endpoint', async (t) => {
   assert.equal(daemon.requests[0].method, 'POST');
 });
 
+test('status prints friendly empty-state with delegate hint when no jobs', async (t) => {
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+  });
+  t.after(daemon.close);
+  const env = { FLEET_DAEMON_URL: daemon.url };
+
+  const res = await runCli(['status'], { env });
+  assert.equal(res.code, 0, res.stderr);
+  const lines = res.stdout.trim().split('\n');
+  assert.equal(lines.length, 1, 'exactly one line printed');
+  assert.match(lines[0], /no jobs/);
+  assert.match(lines[0], /fleet delegate <target>/);
+});
+
 test('client reaches the daemon over the FLEET_HOME unix socket', async (t) => {
   const home = makeTempDir('fleet-cli-home-');
   const daemon = await startMockDaemon(
@@ -160,7 +175,7 @@ test('client reaches the daemon over the FLEET_HOME unix socket', async (t) => {
 
   const res = await runCli(['status'], { env: { FLEET_HOME: home } });
   assert.equal(res.code, 0, res.stderr);
-  assert.match(res.stdout, /no jobs/);
+  assert.match(res.stdout, /no jobs — delegate one with: fleet delegate <target>/);
 });
 
 test('daemon-backed commands fail readably when the daemon is unreachable', async () => {
