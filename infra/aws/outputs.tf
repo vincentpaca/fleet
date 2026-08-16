@@ -44,13 +44,21 @@ output "connect_hint" {
 output "fleet_config" {
   description = "The unit's shape, self-described for Fleet's runtime provider. Every infra unit must expose this output (test/cloud-agnostic.test.ts): it is the contract that lets Fleet predict the infrastructure it created instead of discovering it."
   value = {
-    provider              = "ecs"
-    cluster               = aws_ecs_cluster.this.name
-    capacity_provider     = aws_ecs_capacity_provider.ec2.name
-    runner_repository_url = aws_ecr_repository.runner.repository_url
-    runner_log_group      = aws_cloudwatch_log_group.runner.name
-    subnets               = local.create_vpc ? (var.enable_nat_gateway ? aws_subnet.private[*].id : aws_subnet.public[*].id) : var.subnet_ids
-    security_groups       = [aws_security_group.instances.id]
-    launch_type           = "EC2"
+    provider               = "ecs"
+    cluster                = aws_ecs_cluster.this.name
+    capacity_provider      = aws_ecs_capacity_provider.ec2.name
+    runner_repository_url  = aws_ecr_repository.runner.repository_url
+    runner_task_definition = aws_ecs_task_definition.runner.family
+    runner_container_name  = local.runner_container_name
+    runner_log_group       = aws_cloudwatch_log_group.runner.name
+    # Runner tasks use bridge networking on EC2; ecs run-task must not receive
+    # --network-configuration for bridge-mode tasks.  Subnets and security groups
+    # are intentionally empty in both this output and the SSM fleet-config parameter
+    # so the values remain consistent and consumers do not pass them to run-task.
+    # A future Fargate unit would populate these from its own VPC/SG resources.
+    subnets                = []
+    security_groups        = []
+    launch_type            = "EC2"
+    ssm_config_path        = aws_ssm_parameter.fleet_config.name
   }
 }

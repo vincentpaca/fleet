@@ -1,4 +1,7 @@
-// EcsProvider: `aws ecs run-task` shell-out, configured from FLEET_ECS_* env.
+// EcsProvider: `aws ecs run-task` shell-out.
+// Configuration sources (highest priority first):
+//   1. ecsConfigFromEnv()   — FLEET_ECS_* env vars (tests / manual override)
+//   2. ecsConfigFromSsm()   — SSM parameter written by the infra unit (production)
 // Phase 1: methods implemented, integration untested — command construction
 // is the unit-tested surface.
 import { execFile } from "node:child_process";
@@ -18,6 +21,69 @@ export type EcsConfig = {
   launchType: string;
   assignPublicIp: string;
 };
+
+/**
+ * The shape written to the SSM fleet-config parameter by the infra unit.
+ * All fields mirror the Terraform fleet_config output.  Required fields are the
+ * minimum the provider needs for ecs run-task; optional fields are included for
+ * completeness and to avoid silent loss on round-trip.
+ */
+export type FleetConfig = {
+  provider: string;
+  cluster: string;
+  capacity_provider?: string;
+  runner_task_definition: string;
+  runner_container_name: string;
+  runner_log_group?: string;
+  launch_type: string;
+  subnets?: string[];
+  security_groups?: string[];
+};
+
+/** Build an EcsConfig from a parsed fleet_config value, validating required fields. */
+export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
+  const required = (key: string, val: string | undefined): string => {
+    if (!val) throw new Error(`fleet_config missing required field: ${key}`);
+    return val;
+  };
+  return {
+    cluster: required("cluster", config.cluster),
+    taskDefinition: required("runner_task_definition", config.runner_task_definition),
+    containerName: required("runner_container_name", config.runner_container_name),
+    subnets: config.subnets ?? [],
+    securityGroups: config.security_groups ?? [],
+    launchType: required("launch_type", config.launch_type),
+    assignPublicIp: "DISABLED",
+  };
+}
+
+/**
+ * Parse the raw JSON string returned by `aws ssm get-parameter --output json`.
+ * Pure function — testable without shelling out.
+ */
+export function parseFleetConfigSsmResponse(ssmJson: string): FleetConfig {
+  const response = JSON.parse(ssmJson) as { Parameter?: { Value?: string } };
+  const value = response?.Parameter?.Value;
+  if (!value) throw new Error("SSM get-parameter response missing Parameter.Value");
+  return JSON.parse(value) as FleetConfig;
+}
+
+/**
+ * Shell out to `aws ssm get-parameter` and return an EcsConfig.
+ * Used at daemon startup when FLEET_ECS_CONFIG_SSM_PATH is set and no
+ * FLEET_ECS_CLUSTER override is present.
+ */
+export async function ecsConfigFromSsm(path: string): Promise<EcsConfig> {
+  const { stdout } = await run("aws", [
+    "ssm",
+    "get-parameter",
+    "--name",
+    path,
+    "--output",
+    "json",
+  ]);
+  return ecsConfigFromFleetConfig(parseFleetConfigSsmResponse(stdout));
+}
 
 /**
  * Read FLEET_ECS_* config. Required: FLEET_ECS_CLUSTER, FLEET_ECS_TASK_DEF,
