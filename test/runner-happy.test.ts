@@ -16,7 +16,7 @@ const fixturePath = fileURLToPath(
 // mid-run — like a real harness; the runner wipes .fleet/out at startup, so
 // pre-staged reports never survive (that is the ghost-decision fix).
 const REPLAY_CMD =
-  `node -e "const fs=require('node:fs');fs.writeFileSync('.fleet/out/report.json',process.env.FLEET_REPORT);process.stdout.write(fs.readFileSync(process.env.FLEET_FIXTURE,'utf8'))"`;
+  `node -e "const fs=require('node:fs');fs.writeFileSync('.fleet/out/report.json',process.env.TEST_REPORT);process.stdout.write(fs.readFileSync(process.env.TEST_FIXTURE,'utf8'))"`;
 
 function writeWorkspace(pickup: string): string {
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-happy-'));
@@ -69,8 +69,8 @@ test('full happy path: running → gate ok → harness replay → settle → don
       FLEET_RUNNER_TOKEN: token,
       FLEET_WORKSPACE: workspace,
       FLEET_HARNESS_CMD: REPLAY_CMD,
-      FLEET_FIXTURE: fixturePath,
-      FLEET_REPORT: JSON.stringify(report),
+      TEST_FIXTURE: fixturePath,
+      TEST_REPORT: JSON.stringify(report),
     });
     assert.equal(exitCode, 0);
 

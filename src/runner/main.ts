@@ -138,10 +138,16 @@ async function main(): Promise<void> {
   const cmd = plan.cmd;
 
   const startedAt = Date.now();
-  // Capture is runner-scoped: strip it from the harness child so nested
-  // fleet test-runners inside the workspace cannot pollute the capture file
-  // (the delegated agent running `npm test` did exactly that once).
-  const { FLEET_STREAM_CAPTURE: capture, ...childEnv } = process.env;
+  // The harness child gets NO runner-scoped FLEET_* env: nested fleet
+  // processes inside the workspace (the delegated agent running this repo's
+  // own tests, a nested CLI call) must never inherit this job's identity,
+  // token, git activation, or capture sink. Both leak classes happened live:
+  // FLEET_STREAM_CAPTURE polluted a calibration fixture; FLEET_GIT_URL made
+  // nested test-runners attempt real clones.
+  const capture = process.env.FLEET_STREAM_CAPTURE;
+  const childEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith('FLEET_')),
+  );
   const child = spawn(cmd, {
     shell: true,
     cwd: workspace,
