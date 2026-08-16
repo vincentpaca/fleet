@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
+import { cmdBoard } from './board.ts';
 
 const EXIT_OK = 0;
 const EXIT_FAILURE = 1;
@@ -28,6 +29,7 @@ Commands:
                                            (--answer: respond to decisions from stdin)
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
+  board [--once]                           Full-screen live view (--once or non-TTY: static render)
   doctor                                   Environment checks (Phase 1 stub)
   version                                  Print version and exit
 
@@ -579,6 +581,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdAnswer(rest);
       case 'cancel':
         return await cmdCancel(rest);
+      case 'board':
+        return await cmdBoard(rest);
       case 'doctor':
         return cmdDoctor(rest);
       default:
