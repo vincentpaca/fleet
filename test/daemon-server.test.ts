@@ -410,13 +410,21 @@ test("settle then done records settle and a verified doneCheck; gh rungs stay un
   assert.equal(doneJob.doneCheck?.verified, true);
   assert.equal(doneJob.doneCheck?.target, "implemented");
 
+  // A pr-open job settle without a PR URL in report — daemon tried gh but
+  // had no URL to call, so it stays unverified.
   const gh = await createJob(ctx, { ...WORK_ORDER, finish: "pr-open" });
   await runnerPost(ctx.sock, gh.id, gh.token, event(gh.id, 0, { type: "state", state: "running" }));
   await runnerPost(ctx.sock, gh.id, gh.token, event(gh.id, 1, { ...SETTLE, rung: "pr-open" }));
   await runnerPost(ctx.sock, gh.id, gh.token, event(gh.id, 2, { type: "state", state: "done" }));
   const ghJob = jobOf((await op(ctx.sock, "GET", `/jobs/${gh.id}`)).json);
   assert.equal(ghJob.doneCheck?.verified, false);
-  assert.deepEqual(ghJob.doneCheck?.notes, ["unverified: requires gh"]);
+  // The settle has no report.pr, so verifyWithGh returns "no PR URL" before
+  // ever calling gh. A plausible regression: if the URL guard were removed,
+  // gh would be called with undefined and produce a different error.
+  assert.ok(
+    ghJob.doneCheck?.notes[0]?.includes("no PR URL"),
+    `expected "no PR URL" note, got: ${JSON.stringify(ghJob.doneCheck?.notes)}`,
+  );
 });
 
 test("registry survives a daemon restart over the same FLEET_HOME", async (t) => {

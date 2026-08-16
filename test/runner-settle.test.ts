@@ -105,3 +105,56 @@ test('unparseable report.json is omitted with a note', () => {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+test('prUrl is merged into an existing report and validated', () => {
+  const workspace = makeWorkspace();
+  try {
+    const report = {
+      status: 'READY',
+      next_action: 'review the pull request',
+      verification: ['tests pass'],
+    };
+    writeFileSync(join(workspace, '.fleet', 'out', 'report.json'), JSON.stringify(report));
+    const { body, notes } = composeSettle({
+      jobId: 'job-s5',
+      startedAt: Date.now(),
+      decisions: 0,
+      workspace,
+      rung: 'pr-open',
+      prUrl: 'https://github.com/owner/repo/pull/42',
+    });
+    assert.deepEqual(notes, []);
+    assert.equal(body.rung, 'pr-open');
+    const r = body.report as Record<string, unknown>;
+    assert.ok(r, 'report present');
+    assert.equal(r.pr, 'https://github.com/owner/repo/pull/42');
+    assert.equal(r.status, 'READY');
+    const { ok } = validateEvent({ job: 'job-s5', seq: 0, ...body });
+    assert.ok(ok, 'settle with pr URL validates');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('prUrl creates a minimal report when no report.json exists', () => {
+  const workspace = makeWorkspace();
+  try {
+    const { body, notes } = composeSettle({
+      jobId: 'job-s6',
+      startedAt: Date.now(),
+      decisions: 0,
+      workspace,
+      rung: 'pr-open',
+      prUrl: 'https://github.com/owner/repo/pull/7',
+    });
+    assert.deepEqual(notes, []);
+    const r = body.report as Record<string, unknown>;
+    assert.ok(r, 'report present even without report.json');
+    assert.equal(r.pr, 'https://github.com/owner/repo/pull/7');
+    assert.equal(r.status, 'READY');
+    const { ok } = validateEvent({ job: 'job-s6', seq: 0, ...body });
+    assert.ok(ok, 'minimal pr report validates');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

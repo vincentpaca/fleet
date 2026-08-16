@@ -1,6 +1,7 @@
 // Fleet daemon HTTP server. Operator endpoints trust socket permissions;
 // runner endpoints trust the per-job X-Fleet-Runner-Token. Every event is
 // schema-validated at intake; reject, never coerce.
+import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
@@ -61,6 +62,16 @@ function stringRecord(value: unknown, what: string): Record<string, string> {
   }
   // Every entry checked above.
   return value as Record<string, string>;
+}
+
+/**
+ * gh CLI runner for rung verification. If gh is absent or the call fails,
+ * verifyRung catches the thrown error and records it as "gh error: ..." in
+ * the doneCheck notes — no special treatment needed here.
+ */
+function defaultGhRunner(): import("./verify.ts").GhRunner {
+  return (args: string[]) =>
+    execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
 /** Target rung from a work order already validated at job creation. */
@@ -462,9 +473,10 @@ export class FleetDaemon {
       }
       if (isTerminal(nextState)) {
         // Settle rides ahead of the terminal state event; verify the target
-        // rung mechanically (Phase 1: local rungs only, gh rungs stay a seam).
+        // rung — locally for lower rungs, via gh for upper rungs.
         const target = targetRung(job.workOrder);
-        const doneCheck = verifyRung(job.settle, target);
+        const ghRunner = defaultGhRunner();
+        const doneCheck = verifyRung(job.settle, target, { ghRunner });
         this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
       }
       return;

@@ -4,6 +4,11 @@
  * dies — commit and push the work at settle, and expose the WIP push that
  * parking (#6) will call.
  *
+ * PR delivery (issue #3): createDraftPr opens a draft PR when authority.publish
+ * is granted. getHeadSha exposes the current HEAD for logging and the settle
+ * report. setupWorkspace now returns {branch, base} so the caller knows the
+ * base branch without re-querying the remote.
+ *
  * Activation: the runner calls setupWorkspace only when FLEET_GIT_URL is set.
  * The CLI resolves the manifest's workspace.repo at dispatch (including the
  * "origin" sentinel) and ships it as env; providers stay git-agnostic.
@@ -18,6 +23,9 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+
+/** Inject a gh executor in tests; defaults to the real gh CLI. */
+export type GhRunner = (args: string[]) => string;
 
 export type GitSetupOptions = {
   url: string;
@@ -66,9 +74,9 @@ function defaultRef(workspace: string, url: string): string {
 
 /**
  * Turn the staged workspace into a checkout of the repo on the job branch,
- * and push the branch immediately. Returns the branch name.
+ * and push the branch immediately. Returns the branch name and base branch.
  */
-export function setupWorkspace(workspace: string, opts: GitSetupOptions): string {
+export function setupWorkspace(workspace: string, opts: GitSetupOptions): { branch: string; base: string } {
   const branch = jobBranch(opts.target, opts.jobId);
 
   // Capture the dispatch payload before git touches the tree.
@@ -101,7 +109,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): string
   appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
 
   git(workspace, ['push', '-q', '-u', 'origin', branch]);
-  return branch;
+  return { branch, base };
 }
 
 /** Commit everything and push. Returns 'clean' when there was nothing to commit. */
@@ -122,4 +130,39 @@ export function pushWork(workspace: string, target: string, jobId: string, ok: b
 /** The WIP commit when a blocked job parks (#6 calls this). */
 export function pushWip(workspace: string, reason: string): 'pushed' | 'clean' {
   return commitAndPush(workspace, `wip(park): ${reason}`);
+}
+
+/** HEAD SHA after all commits; used for settle reporting. */
+export function getHeadSha(workspace: string): string {
+  return git(workspace, ['rev-parse', 'HEAD']).trim();
+}
+
+/**
+ * Open a draft PR and return its URL (issue #3: authority.publish).
+ * Caller provides a ghRun callback for testability; the real runner uses the
+ * default which shells out to `gh`.
+ *
+ * The PR body receives the settle report verbatim so reviewers see what the
+ * agent claims it accomplished. The URL is returned so the runner can embed it
+ * in the settle event's report.pr field.
+ *
+ * Never merges — no code path in this function can call a merge API.
+ */
+export function createDraftPr(workspace: string, opts: {
+  base: string;
+  branch: string;
+  title: string;
+  body: string;
+  ghRun?: GhRunner;
+}): string {
+  const run = opts.ghRun ?? ((args: string[]) =>
+    execFileSync('gh', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  return run([
+    'pr', 'create',
+    '--draft',
+    '--base', opts.base,
+    '--head', opts.branch,
+    '--title', opts.title,
+    '--body', opts.body,
+  ]).trim();
 }

@@ -88,3 +88,126 @@ test("rung ladder matches the work-order schema order", () => {
   assert.equal(RUNG_LADDER.length, 13);
   assert.ok(RUNG_LADDER.indexOf("merge-ready") < RUNG_LADDER.indexOf("merged"));
 });
+
+// --- gh-runner verification (issue #3) ---
+
+function prSettle(rung: string, pr?: string): import("../src/daemon/verify.ts").SettleFacts {
+  return {
+    rung,
+    outcome: { produced: [], findings: 0, decisions: 0 },
+    ...(pr !== undefined ? { report: { status: "READY", next_action: "review", pr } } : {}),
+  };
+}
+
+const PR = "https://github.com/owner/repo/pull/1";
+
+test("verifyRung: gh-dependent rung without ghRunner stays unverified: requires gh", () => {
+  // Without a ghRunner, gh-dependent rungs must still return the legacy note.
+  for (const target of ["pushed", "pr-open", "ci-green", "reviews-clear", "mergeable", "merge-ready"]) {
+    const result = verifyRung(prSettle(target, PR), target);
+    assert.equal(result.verified, false);
+    assert.deepEqual(result.notes, ["unverified: requires gh"]);
+  }
+});
+
+test("verifyRung: gh-dependent rung without PR URL reports missing URL", () => {
+  const mockGh = (_args: string[]) => { throw new Error("should not be called"); };
+  const result = verifyRung({ rung: "pr-open" }, "pr-open", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /no PR URL/);
+});
+
+test("verifyRung: reached rung below target fails before gh is called", () => {
+  const mockGh = (_args: string[]) => { throw new Error("should not be called"); };
+  const result = verifyRung(prSettle("pushed", PR), "pr-open", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /below target/);
+});
+
+test("verifyRung: pr-open verified when gh reports OPEN", () => {
+  const mockGh = (args: string[]) => {
+    assert.ok(args.includes(PR));
+    return JSON.stringify({ state: "OPEN" });
+  };
+  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+  assert.equal(result.verified, true);
+  assert.match(result.notes.join(" "), /OPEN/);
+});
+
+test("verifyRung: pr-open fails when gh reports CLOSED", () => {
+  const mockGh = (_args: string[]) => JSON.stringify({ state: "CLOSED" });
+  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /CLOSED/);
+});
+
+test("verifyRung: pushed verified by confirming PR head branch via gh", () => {
+  const mockGh = (_args: string[]) => JSON.stringify({ headRefName: "fleet/APP-7-job-1" });
+  const result = verifyRung(prSettle("pushed", PR), "pushed", { ghRunner: mockGh });
+  assert.equal(result.verified, true);
+  assert.match(result.notes.join(" "), /fleet\/APP-7-job-1/);
+});
+
+test("verifyRung: ci-green passes when all checks COMPLETED SUCCESS", () => {
+  const checks = [
+    { name: "unit", status: "COMPLETED", conclusion: "SUCCESS" },
+    { name: "lint", status: "COMPLETED", conclusion: "NEUTRAL" },
+  ];
+  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
+  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+  assert.equal(result.verified, true);
+  assert.match(result.notes.join(" "), /2 check/);
+});
+
+test("verifyRung: ci-green fails when checks are absent (CI not configured)", () => {
+  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: [] });
+  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /absent or pending/);
+});
+
+test("verifyRung: ci-green fails when a check is still pending", () => {
+  const checks = [
+    { name: "unit", status: "COMPLETED", conclusion: "SUCCESS" },
+    { name: "deploy-preview", status: "IN_PROGRESS", conclusion: null },
+  ];
+  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
+  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /deploy-preview/);
+});
+
+test("verifyRung: reviews-clear passes with no blocking reviews", () => {
+  const mockGh = (_args: string[]) =>
+    JSON.stringify({ reviews: [{ state: "APPROVED" }], reviewDecision: "APPROVED" });
+  const result = verifyRung(prSettle("reviews-clear", PR), "reviews-clear", { ghRunner: mockGh });
+  assert.equal(result.verified, true);
+});
+
+test("verifyRung: reviews-clear fails when CHANGES_REQUESTED", () => {
+  const mockGh = (_args: string[]) =>
+    JSON.stringify({ reviews: [{ state: "CHANGES_REQUESTED" }], reviewDecision: "CHANGES_REQUESTED" });
+  const result = verifyRung(prSettle("reviews-clear", PR), "reviews-clear", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /CHANGES_REQUESTED/);
+});
+
+test("verifyRung: merge-ready passes when mergeStateStatus is CLEAN", () => {
+  const mockGh = (_args: string[]) => JSON.stringify({ mergeStateStatus: "CLEAN" });
+  const result = verifyRung(prSettle("merge-ready", PR), "merge-ready", { ghRunner: mockGh });
+  assert.equal(result.verified, true);
+});
+
+test("verifyRung: merge-ready fails when CI is pending (UNSTABLE)", () => {
+  const mockGh = (_args: string[]) => JSON.stringify({ mergeStateStatus: "UNSTABLE" });
+  const result = verifyRung(prSettle("merge-ready", PR), "merge-ready", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /UNSTABLE/);
+});
+
+test("verifyRung: gh errors are caught and reported as unverified", () => {
+  const mockGh = (_args: string[]) => { throw new Error("rate limit exceeded"); };
+  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+  assert.equal(result.verified, false);
+  assert.match(result.notes.join(" "), /rate limit/);
+});

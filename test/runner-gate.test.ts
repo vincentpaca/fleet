@@ -36,9 +36,12 @@ test('pickup gate failure settles BLOCKED and cancels with reason pickup-gate', 
       `node -e "console.log('missing dependency: widget'); console.log('more detail'); process.exit(3)"`,
     );
 
+    // Strip fleet job env vars that the test process inherits from its own runner
+    // context — if FLEET_GIT_URL is set the child runner tries to use it.
+    const { FLEET_GIT_URL: _gitUrl, FLEET_GIT_NAME: _gitName, FLEET_GIT_EMAIL: _gitEmail, ...parentEnv } = process.env;
     const child = spawn(process.execPath, [runnerMain], {
       env: {
-        ...process.env,
+        ...parentEnv,
         FLEET_JOB_ID: 'job-gate-1',
         FLEET_DAEMON_URL: daemon.url,
         FLEET_RUNNER_TOKEN: token,
@@ -89,9 +92,10 @@ test('gate failure with stderr-only output uses the stderr first line', async ()
       `node -e "console.error('fetch failed: remote unreachable'); process.exit(1)"`,
     );
 
+    const { FLEET_GIT_URL: _gitUrl2, FLEET_GIT_NAME: _gitName2, FLEET_GIT_EMAIL: _gitEmail2, ...parentEnv2 } = process.env;
     const child = spawn(process.execPath, [runnerMain], {
       env: {
-        ...process.env,
+        ...parentEnv2,
         FLEET_JOB_ID: 'job-gate-2',
         FLEET_DAEMON_URL: daemon.url,
         FLEET_RUNNER_TOKEN: token,
