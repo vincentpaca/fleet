@@ -95,6 +95,14 @@ function initManifest(): unknown {
   };
 }
 
+// Runtime and per-deployment artifacts never belong in the user's repo:
+// out/ is the job's decision/answer/report channel; infra/ holds generated
+// terraform + local state + the per-deployment fleet-config.json (two people
+// on the same repo can point at different infra).
+const FLEET_GITIGNORE = `out/
+infra/
+`;
+
 function cmdInit(args: string[]): number {
   const { values } = parseCommand(args, { existing: { type: 'boolean' } }, 0, 0);
   const existing = values.existing === true;
@@ -115,6 +123,8 @@ function cmdInit(args: string[]): number {
   fs.writeFileSync(manifestPath, `${JSON.stringify(initManifest(), null, 2)}\n`);
   if (!setupExists) fs.writeFileSync(setupPath, SETUP_STUB, { mode: 0o755 });
   if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
+  const gitignorePath = path.join(fleetDir, '.gitignore');
+  if (!fs.existsSync(gitignorePath)) fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
 
   console.log(`wrote ${manifestPath}`);
   if (setupExists) console.log(`kept existing ${setupPath}`);

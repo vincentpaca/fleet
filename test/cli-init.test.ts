@@ -26,6 +26,10 @@ test('init scaffolds .fleet/ and the manifest passes lint', async () => {
 
   const lint = await runCli(['lint'], { cwd });
   assert.equal(lint.code, 0, lint.stderr);
+
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  assert.match(gitignore, /^out\/$/m, 'job artifacts (decisions, answers, reports) never enter the repo');
+  assert.match(gitignore, /^infra\/$/m, 'generated terraform, local state, per-deployment config stay untracked');
 });
 
 test('init refuses to overwrite an existing manifest', async () => {
