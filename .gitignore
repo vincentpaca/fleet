@@ -2,3 +2,4 @@ node_modules/
 .terraform/
 *.tfstate*
 .terraform.lock.hcl
+.fleet/out/

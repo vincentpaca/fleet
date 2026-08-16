@@ -12,7 +12,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { EventSink } from './events.ts';
@@ -103,6 +103,10 @@ async function main(): Promise<void> {
   }
 
   // --- Harness ---
+  // Fresh out/ channel: a decision.json or report.json that arrived with the
+  // clone (committed by accident upstream) must never speak for this job.
+  rmSync(join(workspace, '.fleet', 'out'), { recursive: true, force: true });
+  mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
   const watcher = new DecisionWatcher({ workspace, sink });
   watcher.start();
 

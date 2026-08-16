@@ -12,9 +12,11 @@ const fixturePath = fileURLToPath(
   new URL('./fixtures/harness-stream.ndjson', import.meta.url),
 );
 
-// Fake harness: replays the fixture stream on stdout.
+// Fake harness: replays the fixture stream on stdout and writes its report
+// mid-run — like a real harness; the runner wipes .fleet/out at startup, so
+// pre-staged reports never survive (that is the ghost-decision fix).
 const REPLAY_CMD =
-  `node -e "process.stdout.write(require('node:fs').readFileSync(process.env.FLEET_FIXTURE,'utf8'))"`;
+  `node -e "const fs=require('node:fs');fs.writeFileSync('.fleet/out/report.json',process.env.FLEET_REPORT);process.stdout.write(fs.readFileSync(process.env.FLEET_FIXTURE,'utf8'))"`;
 
 function writeWorkspace(pickup: string): string {
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-happy-'));
@@ -56,7 +58,6 @@ test('full happy path: running → gate ok → harness replay → settle → don
       implemented: ['generic feature'],
       verification: ['fixture replay completed'],
     };
-    writeFileSync(join(workspace, '.fleet', 'out', 'report.json'), JSON.stringify(report));
 
     const exitCode = await runRunner({
       FLEET_JOB_ID: 'job-happy-1',
@@ -65,6 +66,7 @@ test('full happy path: running → gate ok → harness replay → settle → don
       FLEET_WORKSPACE: workspace,
       FLEET_HARNESS_CMD: REPLAY_CMD,
       FLEET_FIXTURE: fixturePath,
+      FLEET_REPORT: JSON.stringify(report),
     });
     assert.equal(exitCode, 0);
 
