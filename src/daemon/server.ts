@@ -232,6 +232,12 @@ export class FleetDaemon {
     } catch (error) {
       return sendJson(res, 422, { errors: [{ instancePath: "", message: String(error) }] });
     }
+    // Optional image override: when the CLI has pre-built the per-repo job
+    // image (two-layer model, issue #5), it passes the computed tag here so
+    // the daemon does not need to inspect the manifest setup section.
+    const imageOverride = "image" in body && typeof body.image === "string"
+      ? body.image
+      : undefined;
     // Schema-validated above: work order requires mode + target strings.
     const order = workOrder as { mode: string; target: string };
     // Schema-validated above: manifest setup.image is an optional string.
@@ -266,7 +272,7 @@ export class FleetDaemon {
         jobId: id,
         daemonUrl: this.daemonUrl,
         runnerToken: record.runnerToken,
-        image: manifestDoc.setup?.image,
+        image: imageOverride ?? manifestDoc.setup?.image,
         env,
         sync,
         manifest,

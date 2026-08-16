@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
 import { EcsProvider, ecsConfigFromEnv, ecsConfigFromFleetConfig, parseFleetConfigSsmResponse } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
+import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { LaunchSpec } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
@@ -199,6 +200,16 @@ test("EcsProvider omits network configuration when no subnets are configured", (
   assert.ok(!provider.buildRunTaskArgs(SPEC).includes("--network-configuration"));
 });
 
+test("DockerProvider includes FLEET_WORK_ORDER_JSON in env", () => {
+  const provider = new DockerProvider();
+  const args = provider.buildRunArgs(SPEC);
+  const envPairs = args.filter((_, i) => args[i - 1] === "-e");
+  const orderPair = envPairs.find((pair) => pair.startsWith("FLEET_WORK_ORDER_JSON="));
+  assert.ok(orderPair, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
+  const decoded = JSON.parse(Buffer.from(orderPair.split("=")[1], "base64").toString());
+  assert.deepEqual(decoded, WORK_ORDER);
+});
+
 test("prepareWorkspace materialises manifest, order, and sync files; refuses path escapes", () => {
   const root = mkdtempSync(join(tmpdir(), "fleet-ws-"));
   const workspace = prepareWorkspace(SPEC, root);
@@ -212,6 +223,97 @@ test("prepareWorkspace materialises manifest, order, and sync files; refuses pat
     () => prepareWorkspace({ ...SPEC, sync: { "../evil.txt": Buffer.from("x").toString("base64") } }, root),
     /escapes workspace/,
   );
+});
+
+test("materializeWorkspace writes manifest, order, and sync files from env vars", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
+  const origEnv = { ...process.env };
+  try {
+    process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
+    process.env.FLEET_WORK_ORDER_JSON = Buffer.from(JSON.stringify(WORK_ORDER)).toString("base64");
+    process.env.FLEET_SYNC_JSON = Buffer.from(
+      JSON.stringify({ ".env.development": Buffer.from("A=1\n").toString("base64") }),
+    ).toString("base64");
+    materializeWorkspace(workspace);
+
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(workspace, ".fleet/manifest.json"), "utf8")),
+      MANIFEST,
+    );
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(workspace, ".fleet/order.json"), "utf8")),
+      WORK_ORDER,
+    );
+    assert.equal(readFileSync(join(workspace, ".env.development"), "utf8"), "A=1\n");
+    assert.ok(existsSync(join(workspace, ".fleet/out")));
+  } finally {
+    // Restore env: test isolation requires no FLEET_* vars leak to other tests.
+    for (const key of ["FLEET_MANIFEST_JSON", "FLEET_WORK_ORDER_JSON", "FLEET_SYNC_JSON"]) {
+      if (key in origEnv) {
+        process.env[key] = origEnv[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+  }
+});
+
+test("materializeWorkspace drops path-traversal sync entries and logs a warning", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
+  const origEnv = { ...process.env };
+  const stderrLines: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => stderrLines.push(args.join(" "));
+  try {
+    process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
+    process.env.FLEET_SYNC_JSON = Buffer.from(
+      JSON.stringify({ "../evil.txt": Buffer.from("x").toString("base64") }),
+    ).toString("base64");
+    materializeWorkspace(workspace);
+
+    // The traversal entry must not have landed outside the workspace.
+    assert.ok(!existsSync(join(workspace, "../evil.txt")));
+    // A warning must have been emitted so operators can diagnose the dropped file.
+    assert.ok(
+      stderrLines.some((line) => line.includes("../evil.txt")),
+      `expected a warning mentioning the dropped path; got: ${JSON.stringify(stderrLines)}`,
+    );
+  } finally {
+    console.error = origError;
+    for (const key of ["FLEET_MANIFEST_JSON", "FLEET_SYNC_JSON"]) {
+      if (key in origEnv) {
+        process.env[key] = origEnv[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+  }
+});
+
+test("materializeWorkspace is a no-op when the manifest file already exists on disk", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-noop-"));
+  const fleetDir = join(workspace, ".fleet");
+  mkdirSync(fleetDir, { recursive: true });
+  writeFileSync(join(fleetDir, "manifest.json"), JSON.stringify({ version: 1, _source: "already-there" }));
+
+  const origEnv = { ...process.env };
+  try {
+    // FLEET_MANIFEST_JSON is set but should be ignored because the file exists.
+    process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
+    materializeWorkspace(workspace);
+
+    // Original content must be untouched.
+    assert.equal(
+      JSON.parse(readFileSync(join(fleetDir, "manifest.json"), "utf8"))._source,
+      "already-there",
+    );
+  } finally {
+    if (origEnv.FLEET_MANIFEST_JSON !== undefined) {
+      process.env.FLEET_MANIFEST_JSON = origEnv.FLEET_MANIFEST_JSON;
+    } else {
+      delete process.env.FLEET_MANIFEST_JSON;
+    }
+  }
 });
 
 // Fake runner: exercises the full ProcessProvider round-trip against a real

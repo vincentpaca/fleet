@@ -8,6 +8,16 @@ import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
 import { cmdBoard } from './board.ts';
+import {
+  twoLayerEnabled,
+  computeImageHash,
+  runnerBaseTag,
+  jobImageTag,
+  imageExistsLocally,
+  buildJobImage,
+  pushToEcr,
+  type ImageManifest,
+} from './images.ts';
 
 const EXIT_OK = 0;
 const EXIT_FAILURE = 1;
@@ -23,6 +33,11 @@ Commands:
   delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
+                                           When harness.cli_version is set, computes the per-repo
+                                           job image hash, builds on miss, passes tag to daemon.
+  image build [--manifest path] [--push] [--registry ECR_URI] [--region AWS_REGION]
+                                           Build the per-repo job image (two-layer model).
+                                           Skips the build when the computed tag already exists.
   status [jobId]                           List jobs (blocked first) or show one job
   logs <jobId> [--after seq]               Dump job events
   attach <jobId> [--answer]                Follow job events until done/cancelled
@@ -189,6 +204,7 @@ type Manifest = {
   workspace?: { repo?: string; sync?: string[] };
   env?: { vars?: string[] };
   gates?: { default_finish?: string };
+  harness?: { cli?: string; cli_version?: string };
 };
 
 /** git stdout in cwd, or undefined on any failure. */
@@ -280,12 +296,100 @@ async function cmdDelegate(args: string[]): Promise<number> {
     env.FLEET_GIT_EMAIL = email;
   }
 
-  const res = await daemonCall('POST', '/jobs', { workOrder, manifest, env, sync });
+  // Two-layer image model (#5): when harness.cli_version is set, compute the
+  // per-repo job image hash, build the image if it doesn't exist locally, and
+  // pass the computed tag to the daemon as an image override.
+  let imageOverride: string | undefined;
+  if (twoLayerEnabled(rawManifest as ImageManifest)) {
+    const hash = computeImageHash(rawManifest as ImageManifest);
+    const tag = jobImageTag(hash);
+    const base = runnerBaseTag(rawManifest as ImageManifest);
+    if (!imageExistsLocally(tag)) {
+      console.log(`fleet: building job image ${tag} from ${base} ...`);
+      buildJobImage({ tag, baseTag: base, manifest: rawManifest as ImageManifest });
+      console.log(`fleet: job image ready: ${tag}`);
+    } else {
+      console.log(`fleet: job image exists (${tag}), skipping build`);
+    }
+    imageOverride = tag;
+  }
+
+  const body: Record<string, unknown> = { workOrder, manifest, env, sync };
+  if (imageOverride !== undefined) body.image = imageOverride;
+
+  const res = await daemonCall('POST', '/jobs', body);
   if (res.status !== 201) return daemonFailure(res, 'delegate');
   // Daemon API contract: POST /jobs → 201 {job}.
   const created = res.json as { job: { id: string; state: string } };
   console.log(`${created.job.id} ${created.job.state}`);
   if (values.watch === true) return followJob(created.job.id, true);
+  return EXIT_OK;
+}
+
+// ---------- image ----------
+
+async function cmdImage(args: string[]): Promise<number> {
+  const [subcommand, ...rest] = args;
+  if (subcommand === 'build') return cmdImageBuild(rest);
+  if (!subcommand) {
+    console.error('fleet image: subcommand required (build)');
+    return EXIT_USAGE;
+  }
+  console.error(`fleet image: unknown subcommand: ${subcommand}`);
+  return EXIT_USAGE;
+}
+
+async function cmdImageBuild(args: string[]): Promise<number> {
+  const { values } = parseCommand(
+    args,
+    {
+      manifest: { type: 'string' },
+      push: { type: 'boolean' },
+      registry: { type: 'string' },
+      region: { type: 'string' },
+    },
+    0,
+    0,
+  );
+  const manifestPath = typeof values.manifest === 'string' ? values.manifest : path.join('.fleet', 'manifest.json');
+  const rawManifest = readJsonFile(manifestPath, 'manifest');
+  const manifestCheck = validateManifest(rawManifest);
+  if (!manifestCheck.ok) {
+    for (const line of formatFindings(manifestPath, manifestCheck.errors)) console.error(line);
+    return EXIT_FAILURE;
+  }
+  const imageManifest = rawManifest as ImageManifest;
+  if (!twoLayerEnabled(imageManifest)) {
+    console.error('fleet image build: harness.cli_version is not set — two-layer image model not enabled');
+    console.error('  Set harness.cli_version in your manifest to use per-repo job images.');
+    return EXIT_FAILURE;
+  }
+
+  const hash = computeImageHash(imageManifest);
+  const tag = jobImageTag(hash);
+  const base = runnerBaseTag(imageManifest);
+
+  if (imageExistsLocally(tag)) {
+    console.log(`image exists: ${tag} (base ${base})`);
+    console.log('nothing to build — setup inputs have not changed.');
+  } else {
+    console.log(`building job image: ${tag}`);
+    console.log(`  base: ${base}`);
+    buildJobImage({ tag, baseTag: base, manifest: imageManifest });
+    console.log(`built: ${tag}`);
+  }
+
+  if (values.push === true) {
+    if (typeof values.registry !== 'string') {
+      console.error('fleet image build --push requires --registry <ECR_URI>');
+      return EXIT_FAILURE;
+    }
+    const region = typeof values.region === 'string' ? values.region : undefined;
+    console.log(`pushing to ${values.registry} ...`);
+    const remoteTag = pushToEcr({ localTag: tag, registryUri: values.registry, region });
+    console.log(`pushed: ${remoteTag}`);
+  }
+
   return EXIT_OK;
 }
 
@@ -583,6 +687,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdCancel(rest);
       case 'board':
         return await cmdBoard(rest);
+      case 'image':
+        return await cmdImage(rest);
       case 'doctor':
         return cmdDoctor(rest);
       default:

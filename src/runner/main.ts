@@ -21,6 +21,7 @@ import { DecisionWatcher } from './decisions.ts';
 import { composeSettle } from './settle.ts';
 import { setupWorkspace, pushWork, getHeadSha, createDraftPr } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
+import { materializeWorkspace } from './workspace.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -36,6 +37,8 @@ async function main(): Promise<void> {
   const daemonUrl = requireEnv('FLEET_DAEMON_URL');
   const token = requireEnv('FLEET_RUNNER_TOKEN');
   const workspace = requireEnv('FLEET_WORKSPACE');
+
+  materializeWorkspace(workspace);
 
   const sink = new EventSink({ jobId, daemonUrl, token });
   await sink.emit({ type: 'state', state: 'running' });
