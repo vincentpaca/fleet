@@ -54,8 +54,8 @@ test('each infra unit self-describes its shape via fleet_config', () => {
   for (const unit of readdirSync(infra)) {
     if (!statSync(join(infra, unit)).isDirectory()) continue;
     const outputs = readFileSync(join(infra, unit, 'outputs.tf'), 'utf8');
-    for (const required of ['output "fleet_config"', 'output "connect_hint"', '"provider"']) {
     for (const required of ['output "fleet_config"', 'output "connect_hint"', 'provider ']) {
+      assert.ok(outputs.includes(required), `infra/${unit}/outputs.tf missing ${required}`);
     }
   }
 });
