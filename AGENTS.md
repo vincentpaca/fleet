@@ -24,6 +24,7 @@ Both must be green before you finish. New behavior gets a test that fails on a p
 
 - `schemas/` — the five contracts. `src/daemon/` `src/runner/` `src/cli/` `src/providers/` `src/shared/` — see `docs/architecture.md#the-pieces`.
 - `docs/` — architecture, decisions, roadmap. Issues reference these; keep anchors stable.
+- `agents/` — the CANONICAL command playbooks and agent charters, harness-neutral. Per-harness files (`.claude/commands/*`, `.claude/agents/*`, and any future `.opencode/`/`.codex/` mirrors) are three-line pointers to these and carry no content. Edit canonicals only; `test/harness-mirrors.test.ts` fails on drift.
 - `.fleet/` — this repo's own manifest, setup script, and pickup gate (yes, Fleet delegates work on itself).
 - `infra/terraform/` — the substrate module. `terraform fmt` clean; do not add resources with ingress rules.
 
