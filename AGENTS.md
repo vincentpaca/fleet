@@ -30,9 +30,24 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 - A rule worth adding is worth a checkpoint (schema, gate, or test) in the same change — or an honest comment that it's prompt-level. This repo's whole thesis is that prose rules don't hold.
 - Keep `docs/` anchors stable; GitHub issues link to them.
 
-## Layout
+## Repository map
 
-`schemas/` contracts · `src/daemon|runner|cli|providers|shared/` per `docs/architecture.md#the-pieces` · `agents/` canonical playbooks · `.fleet/` this repo's own manifest + pickup gate (Fleet delegates work on itself) · `docs/` architecture, decisions, roadmap · `infra/<cloud>/` one self-contained unit per cloud (see `docs/decisions.md#d12`) · `fixtures/` executable fixtures + synthetic data.
+This repo is two things, and every path belongs to exactly one. **SHIP** = what users consume (the npm package via the `files` allowlist, the Terraform unit via git subdirectory source, the skill file). **BUILD** = the harness for developing Fleet itself — users never see it. `test/packaging.test.ts` enforces the boundary against `npm pack`.
+
+| Path | Side | What it is |
+|---|---|---|
+| `schemas/` | SHIP | The five contracts — source of truth for every data shape |
+| `src/cli/` `src/daemon/` `src/runner/` `src/providers/` `src/shared/` | SHIP | The product: CLI, coordinator, in-sandbox runner, cloud providers, helpers (`docs/architecture.md#the-pieces`) |
+| `src/validate.mjs` `src/history-events.mjs` | SHIP | Schema validators; history⇄events converter |
+| `presets/` | SHIP | The six dispatch-mode defaults |
+| `examples/` | SHIP | Reference manifests and work orders — generic, always |
+| `integrations/` | SHIP | Skill files users copy into their coding harness |
+| `infra/<cloud>/` | SHIP | One self-contained Terraform unit per cloud (`docs/decisions.md#d12`); consumed by git source, not npm |
+| `docs/` | SHIP | Architecture, decisions, roadmap — issues link here; keep anchors stable |
+| `AGENTS.md` `CLAUDE.md` `agents/` `.claude/` | BUILD | This repo's own harness: rules, canonical playbooks, per-harness pointers |
+| `.fleet/` | BUILD | This repo as a Fleet target: manifest, setup script, issue-readiness gate |
+| `test/` `fixtures/` | BUILD | The suite (incl. sanitization, mirror-drift, cloud-agnostic, packaging gates); executable fixtures + synthetic data |
+
 
 ## Sandboxed runs (when you ARE the delegated job)
 

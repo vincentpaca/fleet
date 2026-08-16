@@ -7,6 +7,14 @@
   "engines": {
     "node": ">=23.6"
   },
+  "files": [
+    "src",
+    "schemas",
+    "presets",
+    "examples",
+    "integrations",
+    "docs"
+  ],
   "bin": {
     "fleet": "src/cli/main.ts"
   },

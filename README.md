@@ -8,6 +8,8 @@ Everything runs in your account with your credentials. There is no hosted servic
 
 Context lives in this repo: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs.
 
+**Using Fleet vs building Fleet:** users consume three things — the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness. Everything else here (AGENTS.md, `.claude/`, `.fleet/`, `agents/`, `test/`) is the harness for building Fleet itself and never ships — the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
+
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
