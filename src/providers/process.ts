@@ -2,7 +2,7 @@
 // workspace. This is the no-docker e2e path: daemon and runner on one host,
 // runner reaching the daemon over 127.0.0.1.
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { LaunchSpec, Provider } from "./provider.ts";
@@ -50,6 +50,12 @@ export class ProcessProvider implements Provider {
       env: { ...process.env, ...runnerEnv(spec, workspace) },
       stdio: "ignore",
       detached: false,
+    });
+    // Workspaces are as disposable as containers: evidence lives in the job
+    // branch (pushed) and the daemon's event log, never in the directory.
+    // FLEET_KEEP_WORKSPACE=1 keeps it for debugging a crashed runner.
+    child.once("exit", () => {
+      if (!process.env.FLEET_KEEP_WORKSPACE) rmSync(workspace, { recursive: true, force: true });
     });
     const { promise, resolve: ready, reject } = Promise.withResolvers<{ handle: string }>();
     child.once("spawn", () => {

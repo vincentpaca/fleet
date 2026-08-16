@@ -229,11 +229,12 @@ test("ProcessProvider round-trips a fake runner: events, decision, answer, settl
   assert.equal(events.find((e) => e.type === "think")?.text, "answered: go");
   assert.equal(events[events.length - 1].state, "done");
 
-  // The provider materialised the workspace for this job.
-  const wsDir = readdirSync(workspaceRoot).find((name) => name.startsWith(`fleet-${id}-`));
-  assert.ok(wsDir, "workspace dir not created");
-  const manifestOnDisk = JSON.parse(readFileSync(join(workspaceRoot, wsDir, ".fleet/manifest.json"), "utf8"));
-  assert.deepEqual(manifestOnDisk, MANIFEST);
+  // Workspaces are as disposable as containers: gone once the runner exits.
+  // (Materialisation itself is covered by the prepareWorkspace unit test.)
+  await until(
+    async () => readdirSync(workspaceRoot).every((name) => !name.startsWith(`fleet-${id}-`)),
+    10_000,
+  );
 });
 
 test("ProcessProvider.terminate kills the child and is idempotent", async () => {
