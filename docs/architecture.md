@@ -65,6 +65,17 @@ Invariant across all three: **watching is a view, never a lifeline.** Disconnect
 
 A work order names a target rung on the evidence ladder (`schemas/work-order.schema.json`, `$defs.rung`): inspected → implemented → focused-green → static-green → pushed → pr-open → ci-green → reviews-clear → mergeable → merge-ready → merged → deployed → runtime-accepted. The runner reports the rung actually reached; the daemon verifies claims mechanically where it can and records verified-vs-claimed. `merged` is always a human act. `deployed` and `runtime-accepted` exist on the ladder but cannot be targeted: Fleet never merges and never deploys, and jobs can never be granted those permissions (schema-invalid to request).
 
+
+## The delivery model
+
+What a job hands back is decided by where its delivery contract lives — three sources, ranked:
+
+1. **The command owns it (the ideal).** A repo's harness command ends in a defined delivery: a draft PR, or an external-system update (wiki page, tracker ticket) performed with the manifest's service credentials. Versioned, gated, critic-reviewed; this is why Fleet expects repos to bring a harness.
+2. **The prompt owns it (supported, degraded).** A detailed dispatch can carry the workflow inline ("do X, then open a PR"). Mechanically identical, but it is a prompt-level contract — no reusable gate, no wired critic, re-typed per dispatch. Right for one-offs; an ad-hoc prompt that worked twice should be promoted into a command.
+3. **Nobody owns it.** Then the delivery is the evidence itself — and that is not a fallback but the universal floor: every job delivers its transcript, its settle report, and its artifacts (`.fleet/out/artifacts/`, listed in `produced[]`). Stronger deliveries stack on top of the floor, never replace it.
+
+Vagueness changes the **mode**, not the mechanism: an open-ended request is an honest `assess`/`investigate` dispatch whose deliverable is the report artifact, while a vague `implement` dispatch should die at the pickup gate — implement-mode readiness requires acceptance criteria. The layering underneath: **capability** comes from the manifest (env, services; enforced physically from the credentials phase on), the **contract** comes from the command or the prompt, and the **evidence** comes from Fleet regardless.
+
 ## Security model, current honesty
 
 - Runner endpoints authenticate with a random per-job token valid only for that job; the token authorizes posting events and polling for answers, nothing else.
