@@ -40,3 +40,17 @@ output "connect_hint" {
     aws ecs execute-command --cluster ${aws_ecs_cluster.this.name} --task "$TASK" --container ${var.name}-daemon --interactive --command /bin/sh
   EOT
 }
+
+output "fleet_config" {
+  description = "The unit's shape, self-described for Fleet's runtime provider. Every infra unit must expose this output (test/cloud-agnostic.test.ts): it is the contract that lets Fleet predict the infrastructure it created instead of discovering it."
+  value = {
+    provider              = "ecs"
+    cluster               = aws_ecs_cluster.this.name
+    capacity_provider     = aws_ecs_capacity_provider.ec2.name
+    runner_repository_url = aws_ecr_repository.runner.repository_url
+    runner_log_group      = aws_cloudwatch_log_group.runner.name
+    subnets               = local.create_vpc ? (var.enable_nat_gateway ? aws_subnet.private[*].id : aws_subnet.public[*].id) : var.subnet_ids
+    security_groups       = [aws_security_group.instances.id]
+    launch_type           = "EC2"
+  }
+}
