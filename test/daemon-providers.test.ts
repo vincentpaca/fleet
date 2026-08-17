@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, exist
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
-import { EcsProvider, ecsConfigFromEnv, ecsConfigFromFleetConfig, parseFleetConfigSsmResponse } from "../src/providers/ecs.ts";
+import { EcsProvider, ecsConfigFromEnv, ecsConfigFromFleetConfig, parseFleetConfigSsmResponse, checkResourceFit } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { LaunchSpec } from "../src/providers/provider.ts";
@@ -430,4 +430,159 @@ test("ProcessProvider.terminate kills the child and is idempotent", async () => 
   });
   // Second terminate on an exited pid must not throw (ESRCH swallowed).
   await provider.terminate(handle);
+});
+
+// --- Resource request / capacity-fit tests ------------------------------------
+
+test("DockerProvider adds --cpus and --memory when resources are specified", () => {
+  const provider = new DockerProvider();
+  const args = provider.buildRunArgs({ ...SPEC, resources: { cpu: 1024, memory: 2048 } });
+
+  // --cpus: 1024 ECS units = 1.000 vCPU cores.
+  const cpusIdx = args.indexOf("--cpus");
+  assert.ok(cpusIdx !== -1, "--cpus flag must be present");
+  assert.equal(args[cpusIdx + 1], "1.000");
+
+  // --memory: 2048 MiB with 'm' suffix.
+  const memIdx = args.indexOf("--memory");
+  assert.ok(memIdx !== -1, "--memory flag must be present");
+  assert.equal(args[memIdx + 1], "2048m");
+
+  // Flags come before the env section (before first -e).
+  const firstEnvIdx = args.indexOf("-e");
+  assert.ok(cpusIdx < firstEnvIdx && memIdx < firstEnvIdx);
+});
+
+test("DockerProvider omits resource flags when no resources are specified", () => {
+  const provider = new DockerProvider();
+  const args = provider.buildRunArgs({ ...SPEC, resources: undefined });
+  assert.ok(!args.includes("--cpus") && !args.includes("--memory"));
+});
+
+test("DockerProvider omits --cpus when only memory is specified", () => {
+  const provider = new DockerProvider();
+  const args = provider.buildRunArgs({ ...SPEC, resources: { memory: 512 } });
+  assert.ok(!args.includes("--cpus"));
+  assert.ok(args.includes("--memory"));
+  assert.equal(args[args.indexOf("--memory") + 1], "512m");
+});
+
+test("EcsProvider.buildRunTaskArgs adds task-level cpu/memory overrides when resources are specified", () => {
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { cpu: 2048, memory: 4096 } });
+  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as {
+    cpu?: string; memory?: string; containerOverrides: unknown[];
+  };
+  // ECS task-level override values must be strings.
+  assert.equal(overrides.cpu, "2048");
+  assert.equal(overrides.memory, "4096");
+});
+
+test("EcsProvider.buildRunTaskArgs omits task-level cpu/memory when no resources are specified", () => {
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  const args = provider.buildRunTaskArgs({ ...SPEC, resources: undefined });
+  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  assert.ok(!("cpu" in overrides));
+  assert.ok(!("memory" in overrides));
+});
+
+test("EcsProvider.buildRunTaskArgs sets only cpu override when only cpu is specified", () => {
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { cpu: 1024 } });
+  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  assert.equal(overrides.cpu, "1024");
+  assert.ok(!("memory" in overrides));
+});
+
+test("EcsProvider.buildRunTaskArgs sets only memory override when only memory is specified", () => {
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { memory: 2048 } });
+  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  assert.ok(!("cpu" in overrides));
+  assert.equal(overrides.memory, "2048");
+});
+
+test("checkResourceFit passes when the request fits within at least one tier", () => {
+  const tiers = [{ cpu: 1024, memory: 2048 }, { cpu: 4096, memory: 8192 }];
+  // Fits the first tier.
+  assert.doesNotThrow(() => checkResourceFit({ cpu: 512, memory: 1024 }, tiers));
+  // Fits only the second tier.
+  assert.doesNotThrow(() => checkResourceFit({ cpu: 2048, memory: 4096 }, tiers));
+  // Exactly at a tier boundary.
+  assert.doesNotThrow(() => checkResourceFit({ cpu: 4096, memory: 8192 }, tiers));
+});
+
+test("checkResourceFit throws with exact numbers when the request exceeds all tiers", () => {
+  const tiers = [{ cpu: 2048, memory: 3584 }];
+  let caught: Error | null = null;
+  try {
+    checkResourceFit({ cpu: 4096, memory: 3584 }, tiers);
+  } catch (error) {
+    caught = error as Error;
+  }
+  assert.ok(caught !== null, "checkResourceFit must throw when request exceeds all tiers");
+  assert.ok(caught.message.includes("cpu=4096"), `expected message to include requested cpu; got: ${caught.message}`);
+  assert.ok(caught.message.includes("memory=3584"), `expected message to include requested memory; got: ${caught.message}`);
+  assert.ok(caught.message.includes("cpu=2048"), `expected message to include offered cpu; got: ${caught.message}`);
+});
+
+test("checkResourceFit is a no-op when no tiers are declared (legacy config)", () => {
+  // No tiers = no infra config yet; skip check rather than block everything.
+  assert.doesNotThrow(() => checkResourceFit({ cpu: 999999, memory: 999999 }, []));
+});
+
+test("checkResourceFit is a no-op when no resources are requested", () => {
+  const tiers = [{ cpu: 256, memory: 512 }];
+  assert.doesNotThrow(() => checkResourceFit({}, tiers));
+});
+
+test("ecsConfigFromFleetConfig carries capacity_tiers from fleet_config", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "c",
+    runner_task_definition: "t",
+    runner_container_name: "runner",
+    launch_type: "EC2",
+    capacity_tiers: [{ cpu: 2048, memory: 3584 }],
+  });
+  assert.deepEqual(config.capacityTiers, [{ cpu: 2048, memory: 3584 }]);
+});
+
+test("ecsConfigFromFleetConfig defaults capacityTiers to [] when absent", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "c",
+    runner_task_definition: "t",
+    runner_container_name: "runner",
+    launch_type: "EC2",
+  });
+  assert.deepEqual(config.capacityTiers, []);
+});
+
+test("EcsProvider.checkResources delegates to checkResourceFit with the config tiers", () => {
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [{ cpu: 2048, memory: 3584 }],
+  });
+  // Within capacity: no throw.
+  assert.doesNotThrow(() => provider.checkResources({ cpu: 1024, memory: 2048 }));
+  // Exceeds capacity: throws.
+  assert.throws(() => provider.checkResources({ cpu: 4096, memory: 3584 }), /exceeds offered capacity/);
 });

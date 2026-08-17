@@ -6,6 +6,7 @@ import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { request } from "../src/shared/http.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost, until } from "./daemon-helpers.ts";
+import type { ResourceRequest } from "../src/providers/provider.ts";
 
 const LONG_POLL_MS = 300;
 
@@ -582,4 +583,91 @@ test("notify webhook fires on decision when configured", async (t) => {
   const payload = posts[0] as { text: string };
   assert.match(payload.text, /blocked on a decision/);
   assert.match(payload.text, new RegExp(id));
+});
+
+// --- Dispatch-time resource check tests --------------------------------------
+
+/** Provider stub with a configurable checkResources that throws when set. */
+class CheckingProvider extends StubProvider {
+  #refusal: string | null = null;
+
+  refuseWith(message: string): void {
+    this.#refusal = message;
+  }
+
+  override checkResources(_resources: ResourceRequest): void {
+    if (this.#refusal !== null) throw new Error(this.#refusal);
+  }
+}
+
+/** Manifest with limits.resources set to the given values. */
+function manifestWithResources(resources: ResourceRequest): typeof MANIFEST & { limits: { resources: ResourceRequest } } {
+  return { ...MANIFEST, limits: { resources } };
+}
+
+test("POST /jobs rejects oversized resource request at dispatch with 422 before creating a job", async (t) => {
+  const provider = new CheckingProvider();
+  provider.refuseWith("resource request exceeds offered capacity: requested cpu=4096, memory=3584 but max offered is cpu=2048, memory=3584");
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: manifestWithResources({ cpu: 4096, memory: 3584 }),
+  });
+
+  assert.equal(res.status, 422);
+  const { errors } = res.json as { errors: { instancePath: string; message: string }[] };
+  assert.ok(errors.length > 0);
+  assert.ok(errors.some((e) => e.instancePath === "/limits/resources"), `expected /limits/resources error; got: ${JSON.stringify(errors)}`);
+  assert.ok(errors.some((e) => e.message.includes("cpu=4096")), `expected requested cpu in message; got: ${JSON.stringify(errors)}`);
+
+  // No job must have been created or launched.
+  const list = await op(sock, "GET", "/jobs");
+  assert.deepEqual((list.json as { jobs: unknown[] }).jobs, []);
+  assert.equal(provider.launches.length, 0);
+});
+
+test("POST /jobs launches normally when resources fit within offered capacity", async (t) => {
+  const provider = new CheckingProvider();
+  // refuseWith not called → checkResources does not throw.
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: manifestWithResources({ cpu: 1024, memory: 2048 }),
+  });
+
+  assert.equal(res.status, 201, res.body);
+  assert.equal(provider.launches.length, 1);
+  // resources must be carried through to the LaunchSpec.
+  assert.deepEqual(provider.launches[0].resources, { cpu: 1024, memory: 2048 });
+});
+
+test("POST /jobs passes resources from manifest to the LaunchSpec", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const manifest = manifestWithResources({ cpu: 512, memory: 1024, disk: 20 });
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest });
+  assert.equal(res.status, 201, res.body);
+
+  const launch = ctx.provider.launches[0];
+  assert.ok(launch, "provider.launch must have been called");
+  assert.deepEqual(launch.resources, { cpu: 512, memory: 1024, disk: 20 });
+});
+
+test("POST /jobs with no limits.resources passes undefined resources to the LaunchSpec", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+
+  const launch = ctx.provider.launches[0];
+  assert.ok(launch, "provider.launch must have been called");
+  assert.equal(launch.resources, undefined);
 });

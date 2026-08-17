@@ -43,6 +43,11 @@ export class DockerProvider implements Provider {
       env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString("base64");
     }
     const args = ["run", "-d", "--name", `fleet-${spec.jobId}`, "--label", `fleet.job=${spec.jobId}`];
+    // Resource constraints from manifest limits.resources.
+    // cpu is in ECS units (1024 = 1 vCPU); --cpus takes fractional cores.
+    if (spec.resources?.cpu != null) args.push("--cpus", (spec.resources.cpu / 1024).toFixed(3));
+    // memory is in MiB; Docker --memory accepts a number + unit suffix.
+    if (spec.resources?.memory != null) args.push("--memory", `${spec.resources.memory}m`);
     for (const [key, value] of Object.entries(env).sort(([a], [b]) => a.localeCompare(b))) {
       args.push("-e", `${key}=${value}`);
     }

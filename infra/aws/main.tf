@@ -330,9 +330,25 @@ resource "aws_autoscaling_group" "instances" {
   # Required for ECS managed termination protection.
   protect_from_scale_in = true
 
-  launch_template {
-    id      = aws_launch_template.instances.id
-    version = "$Latest"
+  # Scale-in cooldown: how long after a scale-in event before the next one.
+  # Increase if jobs are being terminated mid-run by aggressive scale-in.
+  default_cooldown = var.scaling_cooldown_seconds
+
+  # Mixed instances policy: controls on-demand vs spot split.
+  # on_demand_base_capacity: instances always on-demand (for baseline reliability).
+  # on_demand_percentage_above_base: 0 = all additional capacity is spot; 100 = all on-demand.
+  mixed_instances_policy {
+    instances_distribution {
+      on_demand_base_capacity                  = var.on_demand_base_capacity
+      on_demand_percentage_above_base_capacity = var.on_demand_percentage_above_base
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.instances.id
+        version            = "$Latest"
+      }
+    }
   }
 
   tag {
@@ -465,6 +481,10 @@ resource "aws_ssm_parameter" "fleet_config" {
     launch_type            = "EC2"
     subnets                = []
     security_groups        = []
+    # Offered capacity: the daemon rejects manifests whose limits.resources
+    # exceed every tier here, surfacing the mismatch at dispatch rather than
+    # letting the job queue forever against capacity it can never obtain.
+    capacity_tiers = [{ cpu = var.offered_cpu_units, memory = var.offered_memory_mib }]
   })
 
   tags = local.tags

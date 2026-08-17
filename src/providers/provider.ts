@@ -1,5 +1,15 @@
 // Provider contract: how the daemon launches and terminates job sandboxes.
 
+/** Resource requirements from manifest limits.resources. */
+export type ResourceRequest = {
+  /** CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU). */
+  cpu?: number;
+  /** Memory limit in MiB. */
+  memory?: number;
+  /** Ephemeral disk in GiB (advisory; not all providers enforce it). */
+  disk?: number;
+};
+
 export type LaunchSpec = {
   jobId: string;
   /** How the runner reaches the daemon: http://127.0.0.1:port, or unix:<path>. */
@@ -12,12 +22,20 @@ export type LaunchSpec = {
   sync: Record<string, string>;
   manifest: unknown;
   workOrder: unknown;
+  /** Resource requirements from manifest limits.resources; absent = use task-def defaults. */
+  resources?: ResourceRequest;
 };
 
 export interface Provider {
   readonly name: string;
   launch(spec: LaunchSpec): Promise<{ handle: string }>;
   terminate(handle: string): Promise<void>;
+  /**
+   * Optional: validate that the requested resources fit within the offered capacity.
+   * Throws with the exact requested vs available numbers when the request cannot be served.
+   * Called at dispatch time before launch() so failures surface immediately.
+   */
+  checkResources?(resources: ResourceRequest): void;
 }
 
 /** FLEET_* env every provider injects into the sandbox. */

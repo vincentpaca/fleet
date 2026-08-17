@@ -264,8 +264,21 @@ export class FleetDaemon {
       : undefined;
     // Schema-validated above: work order requires mode + target strings.
     const order = workOrder as { mode: string; target: string };
-    // Schema-validated above: manifest setup.image is an optional string.
-    const manifestDoc = manifest as { setup?: { image?: string } };
+    // Schema-validated above: manifest setup.image is an optional string;
+    // limits.resources is an optional object with integer cpu/memory/disk.
+    const manifestDoc = manifest as { setup?: { image?: string }; limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
+    const resources = manifestDoc.limits?.resources;
+
+    // Dispatch-time resource check: reject before creating a job record if the
+    // request cannot be served by any offered capacity tier.  This prevents
+    // jobs queuing forever against capacity that can never satisfy them.
+    if (resources && this.#options.provider.checkResources) {
+      try {
+        this.#options.provider.checkResources(resources);
+      } catch (error) {
+        return sendJson(res, 422, { errors: [{ instancePath: "/limits/resources", message: String(error) }] });
+      }
+    }
 
     const id = newId("job");
     const now = new Date().toISOString();
@@ -313,6 +326,7 @@ export class FleetDaemon {
         sync,
         manifest,
         workOrder,
+        resources,
       });
       const updated = this.registry.updateJob(id, { handle });
       return sendJson(res, 201, { job: publicJob(updated) });

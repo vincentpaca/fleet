@@ -120,6 +120,16 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Hostname allowlist, applies after setup completes. Phase 1: declared, unenforced. Phase 2+: absent field denies everything except hosts implied by services and the model API. TBD = DENY."
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Resource requirements for the sandbox container. ECS: injected as task-level cpu/memory overrides on run-task. Docker: --cpus/--memory flags. Process: noted but not enforced. A request that exceeds every offered capacity tier is rejected at dispatch with the exact numbers.",
+          "properties": {
+            "cpu": { "type": "integer", "minimum": 1, "description": "CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU)." },
+            "memory": { "type": "integer", "minimum": 1, "description": "Memory limit in MiB." },
+            "disk": { "type": "integer", "minimum": 1, "description": "Ephemeral disk in GiB (advisory; not all providers enforce it)." }
+          }
         }
       }
     }
