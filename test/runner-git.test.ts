@@ -228,3 +228,17 @@ test('composeDraftPrText: thin inputs degrade honestly, not to machine exhaust',
   assert.match(body, /## Verification\n- none reported/);
   assert.doesNotMatch(body, /Closes/, 'non-issue targets never claim to close an issue');
 });
+
+test('pushWork delivers commits the agent made itself (not just uncommitted changes)', () => {
+  // #34's second run: the agent committed per the playbook, pushWork saw a
+  // clean status and skipped the push - the delivery vanished with the workspace.
+  const remote = makeRemote();
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-ws-'));
+  const { branch } = setupWorkspace(workspace, { gitUrl: remote, target: 'APP-9', jobId: 'job-self' });
+  writeFileSync(join(workspace, 'work.txt'), 'agent work\n');
+  run(workspace, ['add', '-A']);
+  run(workspace, ['commit', '-q', '-m', 'agent commits its own work']);
+  assert.equal(pushWork(workspace, 'APP-9', 'job-self', true), 'pushed');
+  const remoteLog = run(remote, ['log', '--oneline', branch]);
+  assert.match(remoteLog, /agent commits its own work/);
+});

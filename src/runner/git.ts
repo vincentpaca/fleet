@@ -132,12 +132,18 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   return { branch, base };
 }
 
-/** Commit everything and push. Returns 'clean' when there was nothing to commit. */
+/**
+ * Commit everything and push. 'clean' means nothing to deliver: no uncommitted
+ * changes AND no local commits ahead of the remote. An agent that commits its
+ * own work must still get pushed — conflating "nothing dirty" with "nothing to
+ * push" silently dropped a whole job's delivery (#34's second run).
+ */
 function commitAndPush(workspace: string, message: string): 'pushed' | 'clean' {
   git(workspace, ['add', '-A']);
   const staged = git(workspace, ['status', '--porcelain']).trim();
-  if (staged === '') return 'clean';
-  git(workspace, ['commit', '-q', '-m', message]);
+  if (staged !== '') git(workspace, ['commit', '-q', '-m', message]);
+  const ahead = git(workspace, ['rev-list', '--count', '@{upstream}..HEAD']).trim();
+  if (staged === '' && ahead === '0') return 'clean';
   git(workspace, ['push', '-q']);
   return 'pushed';
 }
