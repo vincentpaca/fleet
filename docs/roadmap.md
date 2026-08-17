@@ -6,9 +6,9 @@ Work is tracked as GitHub issues; this file holds the phase structure and exit c
 
 **Exit:** a real ticket goes `fleet delegate` from a laptop → the autoscaling group scales from zero → the job blocks on a real decision → the laptop is shut mid-job → the job keeps running → the decision is answered from another machine → a merge-ready PR with green CI exists → the transcript replays from the daemon's event log → the cluster is back at zero instances.
 
-Done so far: the five schema contracts and their tests; daemon (validated event intake, state machine, answer API, restart survival); runner (pickup gate, stream translation, decision loop, settle); CLI (init, lint, delegate `--watch`, status, logs, attach `--answer`, answer, cancel); process/docker/ecs providers; the Terraform module (validates clean); an end-to-end test of the full loop on the process provider; the harness integration skill.
+Done so far: the five schema contracts and their tests; daemon (validated event intake, state machine, answer API, restart survival); runner (pickup gate, stream translation, decision loop, park/re-entry, wall-clock caps, artifact collection, settle with PR delivery per the AGENTS.md delivery standard); CLI (init, lint, delegate `--watch`, status, logs, attach `--answer`, answer, cancel, doctor, artifacts, board with drill-down); process/docker/ecs providers; two-layer job images with ECR publish; self-describing infra via `fleet_config`; right-sizing; legible event logs; the harness integration skill. All of it dogfooded — this repo's own tickets are implemented by Fleet jobs.
 
-Remaining: see the open `phase-1` issues. The critical path is the git/PR delivery layer — clone onto a job branch, push at creation, WIP commit on park, PR at settle, `gh`-backed verification of the upper rungs.
+Remaining: see the open `phase-1` issues. The critical path is the AWS substrate: an external review found four concrete defects that prevent the first real cloud job (daemon reachability from runner tasks, capacity-provider launch strategy, scale-to-zero blocked by the daemon's own service, missing daemon image) — those land first, then the operator bring-up (#9), whose exit scenario becomes a repeatable acceptance test.
 
 ## Phase 2 — credentials and enforcement
 

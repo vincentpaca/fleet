@@ -1,68 +1,67 @@
 # Fleet
 
-Fleet runs coding-agent jobs in containers in your own cloud account. You dispatch a ticket, keep working (or close your laptop), and the job runs remotely, asks you when it's stuck, and finishes as a pull request.
+**Fleet lets you delegate the harness you already use, detach from it, and safely pick it up anywhere.**
 
-It's built for repos that already use an agent harness: Claude Code with slash commands, agent definitions, and rules. If you run something like `/dev-sprint TICKET-123` locally today, Fleet runs that same command on cloud compute instead. Same repo, same config, same behavior, without your machine in the loop.
+If you run something like `/dev-sprint TICKET-123` in Claude Code locally today, Fleet runs that same command on compute you control — your Docker, your cloud account — and hands you back a pull request. You dispatch, close the laptop, answer a question from another machine if the agent gets stuck, and review the result. Same repo, same config, same behavior, without your machine in the loop.
 
 Everything runs in your account with your credentials. There is no hosted service and no third-party control plane.
 
-Context lives in this repo: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs.
+## What Fleet owns
 
-**Using Fleet vs building Fleet:** users consume three things — the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness. Everything else here (AGENTS.md, `.claude/`, `.fleet/`, `agents/`, `test/`) is the harness for building Fleet itself and never ships — the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
+Fleet is a thin delegation layer. It owns exactly four things:
+
+1. **Dispatch** — package a task and its repo-owned environment contract; refuse work that isn't ready before any model spend.
+2. **Remote execution** — run the repo's existing harness on suitable compute, isolated, with only the credentials the job needs.
+3. **Continuity** — survive the initiating terminal or laptop disappearing; blocked jobs park at zero cost and resume on answer.
+4. **The return path** — stream honest progress, route human decisions to wherever the human is, and deliver a branch, PR, or report with evidence.
+
+Everything else belongs to someone else: the harness owns reasoning, tools, and review behavior; the cloud provider owns compute; GitHub owns source control and CI. Fleet connects them. A proposed feature that isn't one of the four is someone else's layer.
+
+## What Fleet refuses to become
+
+- **Not a coding agent.** Fleet never has its own agent loop. The harness you already trust — Claude Code, Codex, OpenCode — is the agent; Fleet is the pipe. If Fleet ever competes with your harness, it has failed.
+- **Not a hosted platform.** No vendor control plane, no relay that sees your code, no account with us. Regulated and paranoid environments are first-class citizens.
+- **Not a workspace product or dashboard.** No cloud IDE, no workflow editor, no model picker. The CLI flow must be reliable before any UI exists, and any UI consumes the same event stream the CLI does.
+- **Not a merger or deployer.** No code path can merge a PR or deploy. Humans own merges. This is schema-enforced, not a policy.
+- **Not configuration you write twice.** The manifest describes the environment; the harness config stays the harness's. Fleet asking you to duplicate what your repo already encodes is a defect.
+
+## Design commitments
+
+- **Concepts invisible, behavior reliable.** Under the hood there is an evidence ladder, a state machine, six dispatch modes, and five schema contracts. You should experience them as: dispatch works, questions reach you, status never lies, the PR says what was verified. The contracts are the spine, not the face.
+- **Truth before action.** A job that can't prove readiness doesn't start; a claim that wasn't verified doesn't ship. Reports say `PARTIAL` honestly instead of `READY` optimistically, and the daemon verifies claimed rungs mechanically where it can.
+- **Prompt-level permission is not enforcement.** Every rule worth having gets a checkpoint — a schema, a gate, or a test. Until the credential broker lands (Phase 2), Fleet says plainly: sandboxes carry operator credentials, single-operator use only.
+- **Humans are load-bearing, not decorative.** The pickup gate before model spend, the decision protocol mid-run, the merge at the end. Agents cannot answer their own questions — the answer API is unreachable with a job's credentials, by construction.
+- **One vertical path before breadth.** One harness (Claude Code), one cloud unit proven end to end, then adapters and substrates from demand — never speculatively.
 
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
-2. A Terraform module sets up the infrastructure in your cloud account — one self-contained module per cloud under `infra/<cloud>/`, AWS first (an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports). Multi-cloud is a layout property, not a feature: each unit ships its module, provider, tests, and docs together.
+2. A Terraform unit sets up the infrastructure in your cloud account — one self-contained module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports.
 3. `fleet delegate TICKET-123` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back.
-4. When the agent hits a question it can't answer on its own, the job pauses and you get a notification. You answer with `fleet answer`, and the job resumes. Agents cannot answer their own questions; the answer API is only reachable with your credentials.
-5. The job ends as a pull request. A human merges it. Fleet never merges and never deploys.
+4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
+5. The job ends as a draft pull request (or a report with downloadable artifacts, for investigation work). A human merges it. Fleet never merges and never deploys.
+
+Watch it all live with `fleet board`: blocked decisions float to the top, `enter` opens a job's streaming transcript, and you can answer without leaving the terminal.
 
 ## Status
 
-Early. Only the contracts exist: the schemas below and their tests. The CLI, daemon, and Terraform module are not written yet. You cannot delegate anything today.
+Honest, per our own rules:
 
-## What's in this repo
+- **The local loop is real and dogfooded.** Fleet develops itself: tickets on this repo are delegated to Fleet, run headless, and come back as PRs — including most of the features in this README. Process and Docker providers work end to end; park/resume, wall-clock caps, artifacts, and the board are all live and tested.
+- **The AWS path is written but has never completed a real job.** An external review identified four concrete substrate defects (daemon reachability, capacity-provider launch, scale-to-zero vs. the daemon's own service, missing daemon image) — tracked as open issues, being fixed before the first live run. The Phase-1 exit scenario will land as a repeatable acceptance test, not a demo.
+- **Not yet published to npm** — deliberately, until the cloud path is exercised for real. The version you can't install is the version we won't overstate.
 
-| File | What it defines |
-|---|---|
-| `schemas/manifest.schema.json` | The environment description a repo checks in |
-| `schemas/work-order.schema.json` | What a dispatch says: job type, scope, permissions, finish line |
-| `schemas/events.schema.json` | The progress events a running job emits |
-| `schemas/decision-file.schema.json` | How an agent asks a human a question from inside the sandbox |
-| `schemas/job-states.json` | The job lifecycle: queued, running, blocked, done, cancelled |
+## Using Fleet vs. building Fleet
 
-Supporting files:
+Users consume three things: the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness. Everything else in this repo — `AGENTS.md`, `agents/`, `.claude/`, `.fleet/`, `test/` — is the harness for building Fleet itself and never ships; the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
 
-- `examples/` – a minimal manifest, a full-featured one, and one example work order per job type
-- `presets/modes.json` – default permissions and finish line for each of the six job types
-- `fixtures/synthetic-history.json` – invented run history used by the round-trip tests
-- `src/history-events.mjs` – converts run-history records to event streams and back, losslessly
+## Working on this repo
 
-Rules the schemas enforce, because prose rules get ignored:
-
-- Every command must name a reviewer agent. No reviewer, no job.
-- Jobs can never be granted merge or deploy permission.
-- A question to a human must offer at least two real options, with exactly one recommended.
-- A job's final report must name exactly one next action.
-- The test suite scans the whole repo for client- or user-specific content and fails if it finds any. This is a generic tool and stays that way.
-
-## Running the tests
+Start with [AGENTS.md](AGENTS.md) — build/test mechanics, the invariants that break if you're not looking, the delivery standard for commits and PRs. The deeper context: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way — settled calls are reopened with a human, not relitigated in code), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs and must carry acceptance criteria before the pickup gate lets anyone — human or agent — start them.
 
 ```
 npm install
 npm test
 ```
 
-To check compatibility against a real run-history file, point `FLEET_DEMO_HISTORY` at it:
-
-```
-FLEET_DEMO_HISTORY=path/to/history.json npm test
-```
-
-## Roadmap
-
-- **Phase 1** (in progress — most of this exists; see the `phase-1` issues for what remains): Terraform units, daemon, ECS provider, runner, and the CLI (`init`, `lint`, `delegate --watch`, `status`, `logs`, `attach --answer`, `answer`, `cancel`; `doctor` and the interactive `setup` wizard are open issues). Done means: a real ticket goes from `fleet delegate` to a merge-ready PR with the laptop closed mid-job.
-- **Phase 2:** credential broker issuing short-lived scoped tokens, network egress restricted to an allowlist, and a kill switch (`fleet stop`) with a drill that proves it works.
-- **Phase 3:** a web UI for watching jobs and answering their questions.
-- **Later:** managed sandbox providers, parallel batches, overnight runs.
+Rules the schemas enforce, because prose rules get ignored: every command names a reviewer; jobs can never hold merge or deploy permission; a question to a human offers real options with exactly one recommended; a final report names exactly one next action; and the suite scans the whole tree for client- or operator-specific content — this is a generic tool and stays that way.

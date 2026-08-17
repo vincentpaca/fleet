@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,20 +26,23 @@ const DENYLIST = [
 ];
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const SKIP = new Set(['node_modules', '.git', 'sanitized.test.mjs']);
 
-function* files(dir) {
-  for (const name of readdirSync(dir)) {
-    if (SKIP.has(name)) continue;
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) yield* files(p);
-    else yield p;
+// Scan everything COMMITTABLE: tracked + untracked-unignored, per git.
+// Deliberately-ignored local files (.envrc, editor droppings) are the
+// operator's own; the gate defends what could reach the repo.
+function* files() {
+  const out = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], {
+    cwd: root, encoding: 'utf8',
+  });
+  for (const rel of out.split('\n')) {
+    if (!rel || rel === 'test/sanitized.test.mjs') continue;
+    yield join(root, rel);
   }
 }
 
 test('repo content carries no client- or operator-specific material', () => {
   const hits = [];
-  for (const file of files(root)) {
+  for (const file of files()) {
     const text = readFileSync(file, 'utf8');
     for (const pattern of DENYLIST) {
       if (pattern.test(text)) hits.push(`${file.slice(root.length + 1)}: ${pattern}`);
