@@ -6,10 +6,18 @@
 // is the unit-tested surface.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { LaunchSpec, Provider } from "./provider.ts";
+import type { LaunchSpec, Provider, ResourceRequest } from "./provider.ts";
 import { runnerEnv } from "./provider.ts";
 
 const run = promisify(execFile);
+
+/** One capacity tier offered by the infra: max cpu/memory a task may request. */
+export type CapacityTier = {
+  /** Max CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU). */
+  cpu: number;
+  /** Max memory in MiB. */
+  memory: number;
+};
 
 export type EcsConfig = {
   cluster: string;
@@ -20,6 +28,12 @@ export type EcsConfig = {
   securityGroups: string[];
   launchType: string;
   assignPublicIp: string;
+  /**
+   * Capacity tiers offered by the infra (from fleet_config.capacity_tiers).
+   * Used to reject oversized resource requests at dispatch time.
+   * Empty means no check is performed.
+   */
+  capacityTiers: CapacityTier[];
 };
 
 /**
@@ -38,6 +52,11 @@ export type FleetConfig = {
   launch_type: string;
   subnets?: string[];
   security_groups?: string[];
+  /**
+   * Capacity tiers offered by the infra unit — what the largest task can request.
+   * Emitted by the Terraform unit; absent in legacy configs means no check.
+   */
+  capacity_tiers?: CapacityTier[];
 };
 
 /** Build an EcsConfig from a parsed fleet_config value, validating required fields. */
@@ -54,7 +73,32 @@ export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
     securityGroups: config.security_groups ?? [],
     launchType: required("launch_type", config.launch_type),
     assignPublicIp: "DISABLED",
+    capacityTiers: config.capacity_tiers ?? [],
   };
+}
+
+/**
+ * Check whether a resource request fits within at least one offered capacity tier.
+ * Throws with the exact requested vs available numbers when nothing fits.
+ * Pure function — exported for unit testing without a live ECS config.
+ */
+export function checkResourceFit(resources: ResourceRequest, tiers: CapacityTier[]): void {
+  if (tiers.length === 0) return; // no tiers declared → no check (legacy config)
+  const { cpu, memory } = resources;
+  if (cpu == null && memory == null) return; // nothing requested → always fits
+  const fits = tiers.some(
+    (tier) => (!cpu || cpu <= tier.cpu) && (!memory || memory <= tier.memory),
+  );
+  if (fits) return;
+
+  // Report the best tier (highest cpu; break ties by memory) alongside the request.
+  const best = tiers.reduce((a, b) => (a.cpu > b.cpu || (a.cpu === b.cpu && a.memory >= b.memory) ? a : b));
+  const requestedStr = [cpu != null ? `cpu=${cpu}` : null, memory != null ? `memory=${memory}` : null]
+    .filter((s) => s !== null)
+    .join(", ");
+  throw new Error(
+    `resource request exceeds offered capacity: requested ${requestedStr} but max offered is cpu=${best.cpu}, memory=${best.memory}`,
+  );
 }
 
 /**
@@ -90,6 +134,7 @@ export async function ecsConfigFromSsm(path: string): Promise<EcsConfig> {
  * FLEET_ECS_CONTAINER. Optional: FLEET_ECS_SUBNETS / FLEET_ECS_SECURITY_GROUPS
  * (comma-separated), FLEET_ECS_LAUNCH_TYPE (default EC2),
  * FLEET_ECS_ASSIGN_PUBLIC_IP (default DISABLED).
+ * Capacity tiers cannot be set via env vars — use fleet_config (SSM) for production.
  */
 export function ecsConfigFromEnv(env: Record<string, string | undefined> = process.env): EcsConfig {
   const required = (name: string): string => {
@@ -107,6 +152,7 @@ export function ecsConfigFromEnv(env: Record<string, string | undefined> = proce
     securityGroups: list(env.FLEET_ECS_SECURITY_GROUPS),
     launchType: env.FLEET_ECS_LAUNCH_TYPE ?? "EC2",
     assignPublicIp: env.FLEET_ECS_ASSIGN_PUBLIC_IP ?? "DISABLED",
+    capacityTiers: [],
   };
 }
 
@@ -129,7 +175,7 @@ export class EcsProvider implements Provider {
     if (Object.keys(spec.sync).length > 0) {
       env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString("base64");
     }
-    const overrides = {
+    const overrides: Record<string, unknown> = {
       containerOverrides: [
         {
           name: this.config.containerName,
@@ -139,6 +185,11 @@ export class EcsProvider implements Provider {
         },
       ],
     };
+    // Task-level cpu/memory overrides let jobs request more (or less) than the
+    // task-definition default without re-registering the task definition.
+    // ECS task-level override values must be strings.
+    if (spec.resources?.cpu != null) overrides.cpu = String(spec.resources.cpu);
+    if (spec.resources?.memory != null) overrides.memory = String(spec.resources.memory);
     const args = [
       "ecs",
       "run-task",
@@ -166,6 +217,14 @@ export class EcsProvider implements Provider {
       args.push("--network-configuration", JSON.stringify(network));
     }
     return args;
+  }
+
+  /**
+   * Validate that the requested resources fit within at least one offered capacity tier.
+   * Throws with exact numbers when the request cannot be served — call before launch().
+   */
+  checkResources(resources: ResourceRequest): void {
+    checkResourceFit(resources, this.config.capacityTiers);
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {

@@ -56,9 +56,14 @@ output "fleet_config" {
     # are intentionally empty in both this output and the SSM fleet-config parameter
     # so the values remain consistent and consumers do not pass them to run-task.
     # A future Fargate unit would populate these from its own VPC/SG resources.
-    subnets                = []
-    security_groups        = []
-    launch_type            = "EC2"
-    ssm_config_path        = aws_ssm_parameter.fleet_config.name
+    subnets         = []
+    security_groups = []
+    launch_type     = "EC2"
+    ssm_config_path = aws_ssm_parameter.fleet_config.name
+    # Offered capacity tiers: the daemon rejects manifests whose limits.resources
+    # exceed every tier here at dispatch time.  Operators set offered_cpu_units /
+    # offered_memory_mib to match their actual instance type; the defaults match
+    # a t3.medium leaving ~512 MiB for the ECS agent and OS.
+    capacity_tiers = [{ cpu = var.offered_cpu_units, memory = var.offered_memory_mib }]
   }
 }

@@ -56,6 +56,36 @@ variable "max_instances" {
   default     = 4
 }
 
+variable "on_demand_base_capacity" {
+  description = "Number of instances in the auto scaling group that are always launched as on-demand (not spot). Set above zero when you need guaranteed baseline capacity."
+  type        = number
+  default     = 0
+}
+
+variable "on_demand_percentage_above_base" {
+  description = "Percentage of additional instances above on_demand_base_capacity that are on-demand; the remainder are spot. 0 = all spot above the base; 100 = all on-demand."
+  type        = number
+  default     = 0
+}
+
+variable "scaling_cooldown_seconds" {
+  description = "Auto scaling group scale-in protection cooldown in seconds. Increase if jobs are terminated mid-run by aggressive scale-in."
+  type        = number
+  default     = 300
+}
+
+variable "offered_cpu_units" {
+  description = "Maximum CPU (in ECS units, 1024 = 1 vCPU) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default matches a t3.medium (2 vCPU = 2048 units)."
+  type        = number
+  default     = 2048
+}
+
+variable "offered_memory_mib" {
+  description = "Maximum memory (in MiB) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default leaves ~512 MiB for the ECS agent and OS on a t3.medium (4096 MiB total)."
+  type        = number
+  default     = 3584
+}
+
 # --- Images -----------------------------------------------------------------
 
 variable "project_repos" {
