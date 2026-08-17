@@ -190,7 +190,7 @@ export function renderFrame(
   }
 
   lines.push('─'.repeat(w));
-  lines.push(visualClip(col('  ↑↓ select  enter expand  a answer  q quit', 90), w));
+  lines.push(visualClip(col('  ↑↓ select  a answer  q quit', 90), w));
 
   return lines.join('\n');
 }
