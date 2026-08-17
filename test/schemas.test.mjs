@@ -46,6 +46,12 @@ test('manifest rejects devcontainer+image both set', () => {
   assert.equal(validateManifest(m).ok, false, 'setup forms are mutually exclusive');
 });
 
+test('work order title: accepts non-empty string; rejects empty string', () => {
+  const base = { mode: 'implement', target: 'APP-123', finish: 'merge-ready' };
+  assert.equal(validateWorkOrder({ ...base, title: 'Fix the login bug' }).ok, true, 'non-empty title is valid');
+  assert.equal(validateWorkOrder({ ...base, title: '' }).ok, false, 'empty string title must fail minLength: 1');
+});
+
 test('work order rejects merge/deploy grants (v1 hard limit)', () => {
   const base = { mode: 'implement', target: 'APP-123', finish: 'merge-ready' };
   assert.equal(validateWorkOrder({ ...base, authority: { merge: true } }).ok, false);

@@ -47,6 +47,8 @@ export type JobRecord = {
   runnerToken: string;
   settle?: Record<string, unknown>;
   doneCheck?: Record<string, unknown>;
+  /** Most recent think/log event text + timestamp. Computed at event intake; no log scan at list time. */
+  lastActivity?: { text: string; at: string };
 };
 
 /** Daemon-internal bookkeeping persisted alongside the record in job.json. */
@@ -231,6 +233,12 @@ export class Registry extends EventEmitter {
     appendFileSync(join(dir, "events.jsonl"), `${JSON.stringify(stored)}\n`);
     entry.events.push(stored);
     entry.lastSeq = stored.seq;
+    // Update lastActivity for think/log events — intake-computed so listJobs()
+    // never has to scan event files (O(1) per job at list time).
+    if ((stored.type === "think" || stored.type === "log") && typeof stored.text === "string" && stored.text) {
+      entry.record.lastActivity = { text: stored.text, at: stored.at as string };
+      this.#persist(entry);
+    }
     this.emit("event", id, stored);
     return stored;
   }

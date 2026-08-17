@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
-import { formatEvent, logsNoColor } from '../src/cli/format.ts';
+import { formatEvent, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
 
 const RUNNING_JOB = {
   id: 'job-1',
@@ -59,6 +59,29 @@ test('formatEvent: settle green for READY, red for non-READY (ANSI code check)',
   assert.ok(formatEvent(partial, false).includes(RED), 'PARTIAL → red');
 });
 
+test('isNarrativeEvent: narrative mode includes spine; excludes tool lines and progress/pair/agent', () => {
+  // Narrative includes: state, phase, think, decision, answer, settle, non-tool log.
+  assert.ok(isNarrativeEvent({ seq: 0, type: 'state', state: 'running' }, false));
+  assert.ok(isNarrativeEvent({ seq: 1, type: 'phase', text: 'reading' }, false));
+  assert.ok(isNarrativeEvent({ seq: 2, type: 'think', text: 'thinking' }, false));
+  assert.ok(isNarrativeEvent({ seq: 3, type: 'decision', id: 'd1', question: 'Q?', options: [] }, false));
+  assert.ok(isNarrativeEvent({ seq: 4, type: 'answer', decision: 'd1' }, false));
+  assert.ok(isNarrativeEvent({ seq: 5, type: 'settle' }, false));
+  assert.ok(isNarrativeEvent({ seq: 6, type: 'log', text: 'runner note: pushed to branch' }, false));
+  // Tool lines excluded from narrative.
+  assert.ok(!isNarrativeEvent({ seq: 7, type: 'log', text: 'tool_use Bash: {}' }, false), 'tool_use excluded');
+  assert.ok(!isNarrativeEvent({ seq: 8, type: 'log', text: 'tool_result id: data' }, false), 'tool_result excluded');
+  // Tool lines included with tools=true.
+  assert.ok(isNarrativeEvent({ seq: 7, type: 'log', text: 'tool_use Bash: {}' }, true), 'tool_use included with tools=true');
+  assert.ok(isNarrativeEvent({ seq: 8, type: 'log', text: 'tool_result id: data' }, true), 'tool_result included with tools=true');
+  // Operational events always excluded.
+  assert.ok(!isNarrativeEvent({ seq: 9, type: 'progress', value: 0.5 }, false), 'progress excluded');
+  assert.ok(!isNarrativeEvent({ seq: 10, type: 'pair', worker: 'w', critic: 'c' }, false), 'pair excluded');
+  assert.ok(!isNarrativeEvent({ seq: 11, type: 'agent', name: 'a', state: 'work' }, false), 'agent excluded');
+  // Even with tools=true, progress/pair/agent stay excluded.
+  assert.ok(!isNarrativeEvent({ seq: 9, type: 'progress', value: 0.5 }, true), 'progress excluded even with tools=true');
+});
+
 test('formatEvent: log compacts tool_use and tool_result', () => {
   const toolUse = { seq: 0, type: 'log', text: 'tool_use Bash: {"command":"npm test"}' };
   const toolResult = { seq: 1, type: 'log', text: 'tool_result toolu_01: lots of output here' };
@@ -97,6 +120,39 @@ test('status lists jobs and shows a single job', async (t) => {
 
   const gone = await runCli(['status', 'job-9'], { env });
   assert.equal(gone.code, 1, 'unknown job fails');
+});
+
+test('status: shows #<n> <title> when work order has a title', async (t) => {
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jobs: [
+          {
+            id: 'job-3',
+            state: 'running',
+            workOrder: { mode: 'implement', target: '37', title: 'Add legibility features' },
+          },
+        ],
+      }),
+    'GET /jobs/job-3': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        job: {
+          id: 'job-3',
+          state: 'running',
+          workOrder: { mode: 'implement', target: '37', title: 'Add legibility features' },
+        },
+      }),
+  });
+  t.after(daemon.close);
+  const env = { FLEET_DAEMON_URL: daemon.url };
+
+  const list = await runCli(['status'], { env });
+  assert.equal(list.code, 0, list.stderr);
+  assert.match(list.stdout, /#37 Add legibility features/, 'title shown as #<n> <title>');
+
+  const one = await runCli(['status', 'job-3'], { env });
+  assert.equal(one.code, 0, one.stderr);
+  assert.match(one.stdout, /#37 Add legibility features/, 'title shown for single job');
 });
 
 test('logs dumps events and forwards --after', async (t) => {
@@ -149,7 +205,7 @@ test('logs --full emits raw JSON per line, parseable', async (t) => {
   }
 });
 
-test('logs renders decision yellow (NO_COLOR off) and think dim; tool_use/tool_result compact', async (t) => {
+test('logs: default (narrative) filters tool_use/tool_result; --tools includes them; --full is raw JSON', async (t) => {
   const events = [
     {
       job: 'job-1', seq: 0, type: 'decision', id: 'd1',
@@ -168,21 +224,26 @@ test('logs renders decision yellow (NO_COLOR off) and think dim; tool_use/tool_r
   t.after(daemon.close);
   const env = { FLEET_DAEMON_URL: daemon.url };
 
-  // NO_COLOR: plain text, no ANSI codes, but all content present.
-  const noColor = await runCli(['logs', 'job-1'], { env: { ...env, NO_COLOR: '1' } });
-  assert.equal(noColor.code, 0, noColor.stderr);
-  assert.match(noColor.stdout, /\[0\] decision d1: Which approach\?/);
-  assert.match(noColor.stdout, /- a \(recommended\)/);
-  assert.doesNotMatch(noColor.stdout, /\x1b\[/, 'NO_COLOR must suppress all ANSI codes');
-  // tool_use compact: show name + file_path, not raw JSON
-  assert.match(noColor.stdout, /\[1\] log tool_use Read file_path=\/src\/main\.ts/);
-  // tool_result compact: byte-count summary
-  assert.match(noColor.stdout, /\[2\] log tool_result toolu_01 \(\d+ bytes\)/);
-  // think present
-  assert.match(noColor.stdout, /\[3\] think Considering options\./);
-  // settle with status
-  assert.match(noColor.stdout, /\[4\] settle rung=merge-ready status=READY/);
-  assert.match(noColor.stdout, /\[5\] settle rung=blocked status=PARTIAL/);
+  // Default (narrative) mode: tool_use/tool_result lines are filtered out; spine is present.
+  const narrative = await runCli(['logs', 'job-1'], { env: { ...env, NO_COLOR: '1' } });
+  assert.equal(narrative.code, 0, narrative.stderr);
+  assert.match(narrative.stdout, /\[0\] decision d1: Which approach\?/, 'decision in narrative');
+  assert.match(narrative.stdout, /- a \(recommended\)/, 'decision option in narrative');
+  assert.doesNotMatch(narrative.stdout, /\x1b\[/, 'NO_COLOR suppresses all ANSI codes');
+  assert.doesNotMatch(narrative.stdout, /tool_use/, 'tool_use filtered from narrative');
+  assert.doesNotMatch(narrative.stdout, /tool_result/, 'tool_result filtered from narrative');
+  assert.match(narrative.stdout, /\[3\] think Considering options\./, 'think in narrative');
+  assert.match(narrative.stdout, /\[4\] settle rung=merge-ready status=READY/, 'settle READY in narrative');
+  assert.match(narrative.stdout, /\[5\] settle rung=blocked status=PARTIAL/, 'settle PARTIAL in narrative');
+
+  // --tools mode: tool_use/tool_result rendered in compact form (superset of narrative).
+  const withTools = await runCli(['logs', 'job-1', '--tools'], { env: { ...env, NO_COLOR: '1' } });
+  assert.equal(withTools.code, 0, withTools.stderr);
+  assert.match(withTools.stdout, /\[0\] decision d1: Which approach\?/, 'decision in --tools');
+  assert.match(withTools.stdout, /\[1\] log tool_use Read file_path=\/src\/main\.ts/, 'tool_use compact in --tools');
+  assert.match(withTools.stdout, /\[2\] log tool_result toolu_01 \(\d+ bytes\)/, 'tool_result compact in --tools');
+  assert.match(withTools.stdout, /\[3\] think Considering options\./, 'think in --tools');
+  assert.match(withTools.stdout, /\[4\] settle rung=merge-ready status=READY/, 'settle in --tools');
 });
 
 test('attach follows long-poll cycles until the job reaches a terminal state', async (t) => {

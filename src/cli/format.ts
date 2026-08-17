@@ -91,6 +91,22 @@ export function formatLogText(text: string): string {
   return text;
 }
 
+/**
+ * Return true when the event belongs in the narrative spine (default logs view).
+ * Narrative = state, phase, think, decision, answer, settle + log lines that are
+ * NOT tool_use/tool_result. With tools=true, tool lines are included too.
+ * progress/pair/agent are always omitted — they're operational noise.
+ */
+export function isNarrativeEvent(event: FleetEvent, tools: boolean): boolean {
+  if (event.type === 'progress' || event.type === 'pair' || event.type === 'agent') return false;
+  if (event.type === 'log') {
+    const text = event.text ?? '';
+    const isToolLine = text.startsWith('tool_use ') || text.startsWith('tool_result ');
+    return tools || !isToolLine;
+  }
+  return true;
+}
+
 /** Format one persisted Fleet event for human display. Never throws. */
 export function formatEvent(event: FleetEvent, noColor: boolean): string {
   const col = makeStyledText(noColor);

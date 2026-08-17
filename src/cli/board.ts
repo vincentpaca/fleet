@@ -3,6 +3,7 @@
 import { parseArgs } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { request, describeTarget } from './client.ts';
+import { formatLogText } from './format.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -16,10 +17,11 @@ export type BoardJob = {
   id: string;
   state: string;
   marker?: string;
-  workOrder?: { mode?: string; target?: string };
+  workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
-  lastPhase?: string;       // last think/log/phase text enriched from event stream
+  lastPhase?: string;       // last think/log/phase text enriched from event stream (live follow)
+  lastActivity?: { text: string; at: string }; // most recent think/log from server (all jobs)
   decision?: BoardDecision; // pending decision enriched from event stream
 };
 
@@ -431,14 +433,20 @@ export function renderDetailFrame(
   // Header: context strip with job line (3 lines).
   const elapsed = jobElapsed(job, now);
   const mode = job.workOrder?.mode ?? '?';
-  const target = job.workOrder?.target ?? '?';
+  const rawTarget = job.workOrder?.target ?? '?';
+  const title = job.workOrder?.title;
+  // Detail header shows title in full (context strip clips to terminal width).
+  // Separator is colon here (e.g. "#42: Fix login") vs. space in the roster (e.g. "#42 Fix login"):
+  // the detail line is a full contextual header; the roster is compact tabular data.
+  const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
+  const targetFull = title ? `${ref}: ${title}` : rawTarget;
   const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
   const stateColor = job.state === 'blocked' ? 33 : job.state === 'running' ? 32 : 90;
   const jobLineContent = [
     col(job.id, 1),
     col(stateDisplay, stateColor),
     mode,
-    visualClip(target, 30),
+    targetFull,
     elapsed,
   ].filter(Boolean).join('  ');
 
@@ -554,13 +562,17 @@ export function renderFrame(
     const sel = isSel ? col('▶', 36) : ' ';
     const elapsed = jobElapsed(job, now);
     const mode = job.workOrder?.mode ?? '?';
-    const target = job.workOrder?.target ?? '?';
+    const rawTarget = job.workOrder?.target ?? '?';
+    const title = job.workOrder?.title;
+    // Prefer "#<n> <title>" when both are present.
+    const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
+    const targetDisplay = title ? `${ref} ${title}` : rawTarget;
     const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
 
     if (job.state === 'blocked') {
       // Urgency marker pulses on a ~600ms cycle.
       const urgency = pulse ? col('!!', 1, 31) : col('!!', 33);
-      const row = `${sel} ${urgency} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 33)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
+      const row = `${sel} ${urgency} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 33)}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
 
       if (job.decision) {
@@ -574,16 +586,22 @@ export function renderFrame(
       lines.push('');
     } else if (job.state === 'running' || job.state === 'queued') {
       const glyph = col('●', 32) + ' ';
-      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(job.state.padEnd(9), 32)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
+      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(job.state.padEnd(9), 32)}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
-      if (job.lastPhase) {
+      // Show lastActivity (server-sourced, all running/queued jobs) or lastPhase (live-follow, selected only).
+      const activity = job.lastActivity;
+      if (activity) {
+        const age = fmtElapsed(now - new Date(activity.at).getTime());
+        const ageStr = age ? ` (${age})` : '';
+        lines.push(visualClip(`     ${col(`now: ${formatLogText(activity.text)}${ageStr}`, 90)}`, w));
+      } else if (job.lastPhase) {
         lines.push(visualClip(`     ${col(job.lastPhase, 90)}`, w));
       }
       lines.push('');
     } else {
       // Terminal states: done, cancelled.
       const glyph = col('·', 90) + ' ';
-      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 90)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
+      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 90)}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
     }
   }
@@ -601,9 +619,10 @@ type RawJob = {
   id: string;
   state: string;
   marker?: string;
-  workOrder?: { mode?: string; target?: string };
+  workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
+  lastActivity?: { text: string; at: string };
 };
 
 type WireEvent = {
@@ -656,7 +675,15 @@ export async function fetchBoardJobs(
       return { ok: false, error: `daemon returned ${res.status}` };
     }
     const listed = res.json as { jobs: RawJob[] };
-    const jobs: BoardJob[] = listed.jobs as BoardJob[];
+    const jobs: BoardJob[] = listed.jobs.map((r) => ({
+      id: r.id,
+      state: r.state,
+      marker: r.marker,
+      workOrder: r.workOrder,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      lastActivity: r.lastActivity,
+    }));
     for (const job of jobs) {
       if (job.state === 'blocked') {
         job.decision = await fetchDecision(job.id, env);
@@ -930,6 +957,8 @@ export async function cmdBoard(args: string[]): Promise<number> {
         if (oj) {
           nj.lastPhase = oj.lastPhase;
           nj.decision = oj.decision;
+          // lastActivity comes from the server; carry it if the new listing doesn't have it yet.
+          if (!nj.lastActivity && oj.lastActivity) nj.lastActivity = oj.lastActivity;
         }
         // Fetch decisions for newly blocked jobs.
         if (nj.state === 'blocked' && !nj.decision) {
