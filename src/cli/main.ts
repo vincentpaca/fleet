@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
+import { formatEvent, logsNoColor, type FleetEvent } from './format.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -39,7 +40,7 @@ Commands:
                                            Build the per-repo job image (two-layer model).
                                            Skips the build when the computed tag already exists.
   status [jobId]                           List jobs (blocked first) or show one job
-  logs <jobId> [--after seq]               Dump job events
+  logs <jobId> [--after seq] [--full]       Dump job events (--full: raw JSON per line)
   attach <jobId> [--answer]                Follow job events until done/cancelled
                                            (--answer: respond to decisions from stdin)
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
@@ -394,60 +395,13 @@ async function cmdImageBuild(args: string[]): Promise<number> {
 }
 
 // ---------- job event rendering ----------
+// formatEvent, logsNoColor, FleetEvent — imported from ./format.ts
 
-type FleetEvent = {
-  seq: number;
-  type: string;
-  state?: string;
-  reason?: string;
-  marker?: string;
-  text?: string;
-  value?: number;
-  id?: string;
-  question?: string;
-  options?: Array<{ id: string; label?: string; recommended?: boolean }>;
-  decision?: string;
-  option?: string;
-  by?: string;
-  rung?: string;
-  minutes?: number;
-  report?: { status?: string; next_action?: string };
-};
-
-function formatEvent(event: FleetEvent): string {
-  const head = `[${event.seq}] ${event.type}`;
-  switch (event.type) {
-    case 'state': {
-      const extras = [event.reason && `reason=${event.reason}`, event.marker && `marker=${event.marker}`]
-        .filter(Boolean)
-        .join(' ');
-      return `${head} ${event.state}${extras ? ` ${extras}` : ''}`;
-    }
-    case 'phase':
-    case 'think':
-    case 'log':
-      return `${head} ${event.text ?? ''}`;
-    case 'progress':
-      return `${head} ${Math.round((event.value ?? 0) * 100)}%`;
-    case 'decision': {
-      const options = (event.options ?? [])
-        .map((o) => `  - ${o.id}${o.recommended ? ' (recommended)' : ''}${o.label ? `: ${o.label}` : ''}`)
-        .join('\n');
-      return `${head} ${event.id}: ${event.question}\n${options}\n  answer with: fleet answer <jobId> --option <id> [--text s]`;
-    }
-    case 'answer':
-      return `${head} ${event.decision} → ${event.option ?? '(free text)'}${event.text ? ` "${event.text}"` : ''}${event.by ? ` by ${event.by}` : ''}`;
-    case 'settle':
-      return `${head} rung=${event.rung ?? '?'} status=${event.report?.status ?? '?'}${event.report?.next_action ? ` next: ${event.report.next_action}` : ''}`;
-    default:
-      return `${head} ${JSON.stringify({ ...event, seq: undefined, type: undefined })}`;
-  }
-}
-
-function printEventLine(line: string): FleetEvent | undefined {
+/** Print one NDJSON event line from the daemon. Returns the parsed event on success. */
+function printEventLine(line: string, noColor: boolean): FleetEvent | undefined {
   try {
     const event: FleetEvent = JSON.parse(line);
-    console.log(formatEvent(event));
+    console.log(formatEvent(event, noColor));
     return event;
   } catch {
     console.log(line); // never crash on a malformed daemon line
@@ -524,12 +478,22 @@ async function cmdStatus(args: string[]): Promise<number> {
 }
 
 async function cmdLogs(args: string[]): Promise<number> {
-  const { values, positionals } = parseCommand(args, { after: { type: 'string' } }, 1, 1);
+  const { values, positionals } = parseCommand(
+    args,
+    { after: { type: 'string' }, full: { type: 'boolean' } },
+    1,
+    1,
+  );
   const jobId = positionals[0];
   const after = typeof values.after === 'string' ? values.after : undefined;
+  const full = values.full === true;
   if (after !== undefined && !/^-?\d+$/.test(after)) throw new UsageError('--after takes an integer sequence number');
   const query = after === undefined ? '' : `?after=${after}`;
-  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, printEventLine);
+  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY ?? false);
+  const onLine = full
+    ? (line: string) => { console.log(line); }
+    : (line: string) => { printEventLine(line, noColor); };
+  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, onLine);
   if (res.status !== 200) return daemonFailure(res, 'logs');
   return EXIT_OK;
 }
@@ -562,11 +526,12 @@ async function followJob(jobId: string, answerMode: boolean): Promise<number> {
   let after: number | undefined;
   let terminal = false;
   let pendingDecision: FleetEvent | undefined;
+  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY ?? false);
 
   while (!terminal) {
     const query = after === undefined ? '?follow=1' : `?after=${after}&follow=1`;
     const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, (line) => {
-      const event = printEventLine(line);
+      const event = printEventLine(line, noColor);
       if (!event) return;
       if (typeof event.seq === 'number') after = event.seq;
       if (event.type === 'decision') pendingDecision = event;

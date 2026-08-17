@@ -165,14 +165,14 @@ test('renderFrame: NO_COLOR output is stable (snapshot)', () => {
   const expected = [
     '┌ FLEET ────────────────────────────────────────────────────blk:1 run:1 done:0 ┐',
     '└──────────────────────────────────────────────────────────────────────────────┘',
-    '  JOB                       STATE     MODE        TARGET             ELAPSED',
+    '     JOB                     STATE      MODE        TARGET             ELAPSED',
     '  ──────────────────────────────────────────────────────────────────────────────',
-    '  !! job-blk  blocked  assess  docs  ',
+    '  !! job-blk                 blocked    assess      docs               ',
     '     Deploy now?',
     '     [go] Deploy now ★',
     '     [wait] Wait for review',
     '',
-    '  ● job-run  running  implement  app  ',
+    '  ●  job-run                 running    implement   app                ',
     '',
     '  ↑↓ navigate  enter expand  a answer  q quit',
   ].join('\n');
