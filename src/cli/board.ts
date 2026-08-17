@@ -54,17 +54,111 @@ export type FrameOpts = {
   now?: number;
   context?: ContextInfo;
   showBanner?: boolean;
+  colorLevel?: ColorLevel;
 };
 
 // ── Visual identity ───────────────────────────────────────────────────────────
 
-/** Small Fleet ASCII wordmark. Shown when the board starts; also `fleet --help`. */
-export const FLEET_BANNER = [
-  '  ___ _     ___  ___ _____',
-  ' | __| |   | __|| __|_   _|',
-  ' | _|| |__ | _| | _|  | |  ',
-  ' |_| |____||___||___|  |_|  ',
-].join('\n');
+/**
+ * Paper-airplane pixel art, 16×8. Rendered as half-blocks (two pixel rows per
+ * character row) with a blue-chrome gradient; plain blocks under NO_COLOR.
+ */
+const PLANE_PX = [
+  '..............##',
+  '..........#####.',
+  '......########..',
+  '..###########...',
+  '############....',
+  '..########......',
+  '....#####.......',
+  '......##........',
+];
+
+/** Under-wing fold: same silhouette, darker shade — the crease that reads "paper". */
+function foldAt(x: number, y: number): boolean {
+  return y >= 4 && x >= 8;
+}
+
+/** Blue-chrome ramp: deep blue → blue → sky → near-white highlight. */
+const RAMP: Array<[number, [number, number, number]]> = [
+  [0.0, [10, 47, 122]],
+  [0.45, [37, 99, 235]],
+  [0.75, [56, 189, 248]],
+  [1.0, [223, 243, 255]],
+];
+
+/** Diagonal gradient position → rgb, lerped across the ramp. */
+function rampAt(t: number): [number, number, number] {
+  for (let i = 1; i < RAMP.length; i++) {
+    const [t0, c0] = RAMP[i - 1];
+    const [t1, c1] = RAMP[i];
+    if (t <= t1) {
+      const f = (t - t0) / (t1 - t0);
+      return [0, 1, 2].map((k) => Math.round(c0[k] + (c1[k] - c0[k]) * f)) as [number, number, number];
+    }
+  }
+  return RAMP[RAMP.length - 1][1];
+}
+
+/** rgb → nearest xterm-256 colour-cube index, for terminals without truecolor. */
+function cube256([r, g, b]: [number, number, number]): number {
+  const q = (v: number) => Math.round((v / 255) * 5);
+  return 16 + 36 * q(r) + 6 * q(g) + q(b);
+}
+
+export type ColorLevel = '24bit' | '256';
+
+/** Detect the terminal's colour depth from the environment. */
+export function detectColorLevel(env: Record<string, string | undefined>): ColorLevel {
+  const ct = env.COLORTERM ?? '';
+  return ct.includes('truecolor') || ct.includes('24bit') ? '24bit' : '256';
+}
+
+function pxAt(x: number, y: number): boolean {
+  return PLANE_PX[y]?.[x] === '#';
+}
+
+function fg(c: [number, number, number], level: ColorLevel): string {
+  return level === '24bit' ? `\x1b[38;2;${c[0]};${c[1]};${c[2]}m` : `\x1b[38;5;${cube256(c)}m`;
+}
+
+function bg(c: [number, number, number], level: ColorLevel): string {
+  return level === '24bit' ? `\x1b[48;2;${c[0]};${c[1]};${c[2]}m` : `\x1b[48;5;${cube256(c)}m`;
+}
+
+/** Gradient colour of pixel (x, y): diagonal sweep, nose brightest. */
+function planeColor(x: number, y: number): [number, number, number] {
+  const c = rampAt((x + 0.6 * (7 - y)) / (15 + 0.6 * 7));
+  if (!foldAt(x, y)) return c;
+  return c.map((v) => Math.round(v * 0.55)) as [number, number, number];
+}
+
+/** Build the 4 banner lines: half-block plane + wordmark. Plain when level omitted. */
+function buildBanner(level?: ColorLevel): string[] {
+  const wide = PLANE_PX[0].length;
+  const lines: string[] = [];
+  for (let row = 0; row < PLANE_PX.length / 2; row++) {
+    let line = ' ';
+    for (let x = 0; x < wide; x++) {
+      const top = pxAt(x, row * 2);
+      const bot = pxAt(x, row * 2 + 1);
+      if (!top && !bot) { line += ' '; continue; }
+      if (!level) { line += top && bot ? '█' : top ? '▀' : '▄'; continue; }
+      const tc = planeColor(x, row * 2);
+      const bc = planeColor(x, row * 2 + 1);
+      if (top && bot) line += `${fg(tc, level)}${bg(bc, level)}▀\x1b[0m`;
+      else if (top) line += `${fg(tc, level)}▀\x1b[0m`;
+      else line += `${fg(bc, level)}▄\x1b[0m`;
+    }
+    lines.push(line);
+  }
+  lines[1] += !level ? '   F L E E T' : `   \x1b[1;38;5;153mF L E E T\x1b[0m`;
+  lines[2] += !level ? '   your cloud' : `   \x1b[2myour cloud\x1b[0m`;
+  return lines;
+}
+
+/** Small Fleet wordmark, plain form. Shown when the board starts; also `fleet --help`. */
+export const FLEET_BANNER = buildBanner().join('\n');
 
 /**
  * Footer key manifests: every label advertised in the footer must appear here
@@ -177,12 +271,10 @@ function visualClip(s: string, maxLen: number): string {
 
 // ── Pure frame renderers (new) ────────────────────────────────────────────────
 
-/** Render the Fleet ASCII wordmark, clipped to width. */
-export function renderBanner(width: number, noColor: boolean): string {
-  const col = makeCol(noColor);
-  return FLEET_BANNER.split('\n')
-    .map((line) => visualClip(col(line, 90), width))
-    .join('\n');
+/** Render the Fleet banner: gradient plane when colour is on, plain blocks otherwise. */
+export function renderBanner(width: number, noColor: boolean, level: ColorLevel = '256'): string {
+  const lines = noColor ? FLEET_BANNER.split('\n') : buildBanner(level);
+  return lines.map((line) => visualClip(line, width)).join('\n');
 }
 
 /**
@@ -426,7 +518,7 @@ export function renderFrame(
 
   // ── Banner (interactive mode only) ───────────────────────────────────────
   if (opts.showBanner) {
-    lines.push(renderBanner(w, noColor));
+    lines.push(renderBanner(w, noColor, opts.colorLevel ?? '256'));
   }
 
   // ── Context strip ─────────────────────────────────────────────────────────
@@ -781,6 +873,7 @@ export async function cmdBoard(args: string[]): Promise<number> {
       const clampedSel = Math.max(0, Math.min(selection, sorted.length - 1));
       frame = renderFrame(sorted, clampedSel, w(), {
         noColor, endpoint, pulseOn: pulse, now, context: contextInfo, showBanner: true,
+        colorLevel: detectColorLevel(process.env),
       });
     }
 

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
-import { cmdBoard } from './board.ts';
+import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -761,6 +761,7 @@ export async function main(argv: string[]): Promise<number> {
       case 'help':
       case '--help':
       case '-h':
+        console.log(renderBanner(80, !process.stdout.isTTY || 'NO_COLOR' in process.env, detectColorLevel(process.env)) + '\n');
         console.log(HELP);
         return command === undefined ? EXIT_USAGE : EXIT_OK;
       case 'version':
