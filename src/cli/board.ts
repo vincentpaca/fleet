@@ -17,6 +17,7 @@ export type BoardJob = {
   state: string;
   marker?: string;
   workOrder?: { mode?: string; target?: string };
+  createdAt?: string;
   updatedAt?: string;
   lastPhase?: string;       // last think/log/phase text enriched from event stream
   decision?: BoardDecision; // pending decision enriched from event stream
@@ -428,7 +429,7 @@ export function renderDetailFrame(
   const now = opts.now ?? 0;
 
   // Header: context strip with job line (3 lines).
-  const elapsed = elapsedStr(job.updatedAt, now);
+  const elapsed = jobElapsed(job, now);
   const mode = job.workOrder?.mode ?? '?';
   const target = job.workOrder?.target ?? '?';
   const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
@@ -473,9 +474,7 @@ export function stateRank(j: BoardJob): number {
 
 // ── Elapsed time ──────────────────────────────────────────────────────────────
 
-function elapsedStr(iso: string | undefined, nowMs: number): string {
-  if (!iso) return '';
-  const ms = nowMs - new Date(iso).getTime();
+function fmtElapsed(ms: number): string {
   if (ms <= 0) return '';
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -483,6 +482,24 @@ function elapsedStr(iso: string | undefined, nowMs: number): string {
   if (h > 0) return m % 60 > 0 ? `${h}h${m % 60}m` : `${h}h`;
   if (m > 0) return `${m}m`;
   return `${s}s`;
+}
+
+function elapsedStr(iso: string | undefined, nowMs: number): string {
+  if (!iso) return '';
+  return fmtElapsed(nowMs - new Date(iso).getTime());
+}
+
+/**
+ * A job's elapsed column: live jobs count from dispatch to now; settled jobs
+ * freeze at their total runtime (createdAt → updatedAt) — a done job must
+ * never appear to keep aging.
+ */
+function jobElapsed(job: BoardJob, nowMs: number): string {
+  const start = job.createdAt ? new Date(job.createdAt).getTime() : NaN;
+  if (Number.isNaN(start)) return elapsedStr(job.updatedAt, nowMs);
+  const settled = job.state === 'done' || job.state === 'cancelled';
+  const end = settled && job.updatedAt ? new Date(job.updatedAt).getTime() : nowMs;
+  return fmtElapsed(end - start);
 }
 
 // ── Pure frame renderer ───────────────────────────────────────────────────────
@@ -535,7 +552,7 @@ export function renderFrame(
     const job = sorted[i];
     const isSel = i === selection;
     const sel = isSel ? col('▶', 36) : ' ';
-    const elapsed = elapsedStr(job.updatedAt, now);
+    const elapsed = jobElapsed(job, now);
     const mode = job.workOrder?.mode ?? '?';
     const target = job.workOrder?.target ?? '?';
     const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
@@ -585,6 +602,7 @@ type RawJob = {
   state: string;
   marker?: string;
   workOrder?: { mode?: string; target?: string };
+  createdAt?: string;
   updatedAt?: string;
 };
 

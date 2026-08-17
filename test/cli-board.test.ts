@@ -32,6 +32,25 @@ const CLI = join(here, '..', 'src', 'cli', 'main.ts');
 
 // ── renderFrame unit tests ────────────────────────────────────────────────────
 
+test('elapsed: settled jobs freeze at total runtime; live jobs keep counting', () => {
+  const done: BoardJob = {
+    id: 'job-done', state: 'done', workOrder: { mode: 'implement', target: '3' },
+    createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:12:00Z',
+  };
+  const run: BoardJob = {
+    id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: '4' },
+    createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:12:00Z',
+  };
+  const at = (min: number) => Date.parse('2026-01-01T00:00:00Z') + min * 60_000;
+  const frame = (j: BoardJob, now: number) => renderFrame([j], -1, 100, { noColor: true, now });
+  // Done: 12m at settle, still 12m a day later.
+  assert.match(frame(done, at(20)), /job-done.*12m/);
+  assert.match(frame(done, at(60 * 24)), /job-done.*12m/);
+  // Running: counts from dispatch, not from last event.
+  assert.match(frame(run, at(20)), /job-run.*20m/);
+  assert.match(frame(run, at(45)), /job-run.*45m/);
+});
+
 test('renderFrame: blocked jobs sort before running and terminal jobs', () => {
   const jobs: BoardJob[] = [
     { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' }, updatedAt: '2026-01-01T00:00:00Z' },
