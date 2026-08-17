@@ -11,7 +11,7 @@
  * state cancelled reason "harness-exit" on nonzero harness exit).
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -21,7 +21,7 @@ import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { WallClockTimer } from './wall-clock.ts';
 import { composeSettle } from './settle.ts';
-import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs } from '../shared/time.ts';
@@ -336,15 +336,18 @@ async function main(): Promise<void> {
   if (ok) {
     if (gitUrl && branch && base && authorityPublish) {
       try {
-        // Collect the harness report for the PR body; fall back to a minimal string.
-        let prBody: string;
+        // Compose per the delivery standard: report sections, never raw JSON.
+        let report: Record<string, unknown> | undefined;
         try {
-          const rawReport = readFileSync(join(workspace, '.fleet', 'out', 'report.json'), 'utf8');
-          prBody = rawReport;
-        } catch {
-          prBody = `Fleet job ${jobId}: ${target}`;
-        }
-        prUrl = createDraftPr(workspace, { base, branch, title: target, body: prBody });
+          report = JSON.parse(readFileSync(join(workspace, '.fleet', 'out', 'report.json'), 'utf8'));
+        } catch { /* thin PR text is the honest fallback */ }
+        let issueTitle: string | undefined;
+        try {
+          issueTitle = execFileSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'],
+            { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || undefined;
+        } catch { /* non-issue targets or offline: title degrades to job id */ }
+        const pr = composeDraftPrText({ target, issueTitle, jobId, report });
+        prUrl = createDraftPr(workspace, { base, branch, title: pr.title, body: pr.body });
         const headSha = getHeadSha(workspace);
         await sink.emit({ type: 'log', text: `draft PR opened: ${prUrl} (head ${headSha})`, who: 'runner' });
         settleRung = 'pr-open';

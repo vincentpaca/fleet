@@ -158,6 +158,44 @@ export function getHeadSha(workspace: string): string {
 }
 
 /**
+ * Compose PR title and body per the delivery standard (AGENTS.md#delivery-standard).
+ * Pure: (target, issueTitle, report) → text. Title is never a bare number; body
+ * renders the settle report as sections, not raw JSON. Thin inputs degrade to
+ * honest minimal text, never to machine exhaust.
+ */
+export function composeDraftPrText(opts: {
+  target: string;
+  issueTitle?: string;
+  jobId: string;
+  report?: {
+    status?: string;
+    verification?: string[] | string;
+    not_done?: string[] | string;
+    next_action?: string;
+  };
+}): { title: string; body: string } {
+  const ref = /^\d+$/.test(opts.target) ? `#${opts.target}` : opts.target;
+  const title = opts.issueTitle ? `${ref}: ${opts.issueTitle}` : `${ref}: fleet job ${opts.jobId}`;
+  const list = (v: string[] | string | undefined): string[] =>
+    v === undefined ? [] : Array.isArray(v) ? v : [v];
+  const r = opts.report;
+  const lines: string[] = [
+    '## Problem',
+    `${opts.issueTitle ?? 'See the referenced work item.'}${/^\d+$/.test(opts.target) ? ` Closes ${ref}.` : ''}`,
+    '',
+    '## Status',
+    r?.status ? `${r.status}` : 'No report was produced — inspect the job transcript before reviewing.',
+  ];
+  const ver = list(r?.verification);
+  lines.push('', '## Verification', ...(ver.length ? ver.map((v) => `- ${v}`) : ['- none reported']));
+  const nd = list(r?.not_done);
+  lines.push('', '## Not done', ...(nd.length ? nd.map((v) => `- ${v}`) : ['- nothing']));
+  if (r?.next_action) lines.push('', `Next action: ${r.next_action}`);
+  lines.push('', `_Fleet job ${opts.jobId}; full transcript: \`fleet logs ${opts.jobId}\`._`);
+  return { title, body: lines.join('\n') };
+}
+
+/**
  * Open a draft PR and return its URL (issue #3: authority.publish).
  * Caller provides a ghRun callback for testability; the real runner uses the
  * default which shells out to `gh`.

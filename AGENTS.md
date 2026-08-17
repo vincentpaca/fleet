@@ -30,6 +30,13 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 - A rule worth adding is worth a checkpoint (schema, gate, or test) in the same change — or an honest comment that it's prompt-level. This repo's whole thesis is that prose rules don't hold.
 - Keep `docs/` anchors stable; GitHub issues link to them.
 
+## Delivery standard
+
+- **Branches:** `fleet/<issue>-<job>` (runner-owned); `<area>/<slug>` for hand work.
+- **Commits:** imperative subject ≤72 chars naming the change; body says why and what a reviewer must know. Nothing else.
+- **PRs:** title `#<issue>: <issue title>` — never a bare number. Body sections, in order: `## Problem` (one line + `Closes #<n>`), `## Status` (the report's `status` and rung, honestly), `## Verification` (exact commands run and their results), `## Not done` (gaps, or "nothing"). The diff speaks for the change itself.
+- **Draft until a human reviews.** The runner composes PR text from the settle report (`composeDraftPrText` in `src/runner/git.ts`); hand-opened PRs follow the same shape. A report too thin to fill these sections is not ready to open one.
+
 ## Repository map
 
 This repo is two things, and every path belongs to exactly one. **SHIP** = what users consume (the npm package via the `files` allowlist, the Terraform unit via git subdirectory source, the skill file). **BUILD** = the harness for developing Fleet itself — users never see it. `test/packaging.test.ts` enforces the boundary against `npm pack`.

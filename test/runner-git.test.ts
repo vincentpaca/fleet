@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr, composeDraftPrText } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -197,4 +197,34 @@ test('setupWorkspace reentry: checks out existing branch with WIP, no collision'
   const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
   assert.match(files, /half-done\.txt/);
   assert.match(files, /final\.txt/);
+});
+
+test('composeDraftPrText: full report renders per the delivery standard, never a bare number', () => {
+  const { title, body } = composeDraftPrText({
+    target: '18',
+    issueTitle: 'Artifact delivery lane',
+    jobId: 'job-abc',
+    report: {
+      status: 'READY',
+      verification: ['npm test → 140 pass', 'node --test test/runner-*.ts'],
+      not_done: [],
+      next_action: 'Review and merge.',
+    },
+  });
+  assert.equal(title, '#18: Artifact delivery lane');
+  assert.match(body, /## Problem\nArtifact delivery lane Closes #18\./);
+  assert.match(body, /## Status\nREADY/);
+  assert.match(body, /## Verification\n- npm test → 140 pass\n- node --test/);
+  assert.match(body, /## Not done\n- nothing/);
+  assert.match(body, /Next action: Review and merge\./);
+  assert.match(body, /fleet logs job-abc/);
+  assert.doesNotMatch(body, /[{}"]/, 'no raw JSON leaks into the PR body');
+});
+
+test('composeDraftPrText: thin inputs degrade honestly, not to machine exhaust', () => {
+  const { title, body } = composeDraftPrText({ target: 'APP-42', jobId: 'job-x' });
+  assert.equal(title, 'APP-42: fleet job job-x');
+  assert.match(body, /## Status\nNo report was produced/);
+  assert.match(body, /## Verification\n- none reported/);
+  assert.doesNotMatch(body, /Closes/, 'non-issue targets never claim to close an issue');
 });
