@@ -190,9 +190,12 @@ async function main(): Promise<void> {
   // FLEET_STREAM_CAPTURE polluted a calibration fixture; FLEET_GIT_URL made
   // nested test-runners attempt real clones.
   const capture = process.env.FLEET_STREAM_CAPTURE;
-  const childEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !key.startsWith('FLEET_')),
-  );
+  const childEnv = {
+    ...(plan.env ?? {}),
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.startsWith('FLEET_')),
+    ),
+  };
   const child = spawn(cmd, {
     shell: true,
     cwd: workspace,

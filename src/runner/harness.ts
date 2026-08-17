@@ -8,6 +8,8 @@ export type HarnessPlan = {
   cmd: string;
   /** Non-fatal findings to surface as log events (version drift, fallbacks). */
   notes: string[];
+  /** Harness-dialect env defaults; the job's real env always wins on conflict. */
+  env?: Record<string, string>;
 };
 
 // Phase 1: a fixed permissive tool grant — the sandbox is the blast-radius
@@ -81,5 +83,9 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion 
   return {
     cmd: `claude -p ${prompt} --output-format stream-json --verbose --allowedTools ${tools}`,
     notes,
+    // claude-code caps a single response at 32k output tokens by default; a
+    // whole-file Write can exceed it and kill the job (observed on #28).
+    // Dialect knob, so it lives here — never in the manifest.
+    env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
   };
 }
