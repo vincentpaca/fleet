@@ -248,7 +248,7 @@ export function renderContextStrip(
 /** Render the dim table-header row + separator rule for the roster. */
 export function renderTableHeader(w: number, noColor: boolean): string {
   const col = makeCol(noColor);
-  const header = '  JOB                       STATE     MODE        TARGET             ELAPSED';
+  const header = `     ${'JOB'.padEnd(22)}  ${'STATE'.padEnd(9)}  ${'MODE'.padEnd(10)}  ${'TARGET'.padEnd(17)}  ELAPSED`;
   const rule = `  ${'─'.repeat(Math.max(0, w - 2))}`;
   return [visualClip(col(header, 90), w), visualClip(col(rule, 90), w)].join('\n');
 }
@@ -451,7 +451,7 @@ export function renderFrame(
     if (job.state === 'blocked') {
       // Urgency marker pulses on a ~600ms cycle.
       const urgency = pulse ? col('!!', 1, 31) : col('!!', 33);
-      const row = `${sel} ${urgency} ${visualClip(job.id, 22)}  ${col(stateDisplay, 33)}  ${mode}  ${visualClip(target, 28)}  ${elapsed}`;
+      const row = `${sel} ${urgency} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 33)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
 
       if (job.decision) {
@@ -464,8 +464,8 @@ export function renderFrame(
       }
       lines.push('');
     } else if (job.state === 'running' || job.state === 'queued') {
-      const glyph = col('●', 32);
-      const row = `${sel} ${glyph} ${visualClip(job.id, 22)}  ${col(job.state, 32)}  ${mode}  ${visualClip(target, 28)}  ${elapsed}`;
+      const glyph = col('●', 32) + ' ';
+      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(job.state.padEnd(9), 32)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
       if (job.lastPhase) {
         lines.push(visualClip(`     ${col(job.lastPhase, 90)}`, w));
@@ -473,8 +473,8 @@ export function renderFrame(
       lines.push('');
     } else {
       // Terminal states: done, cancelled.
-      const glyph = col('·', 90);
-      const row = `${sel} ${glyph} ${visualClip(job.id, 22)}  ${col(stateDisplay, 90)}  ${mode}  ${visualClip(target, 28)}  ${elapsed}`;
+      const glyph = col('·', 90) + ' ';
+      const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), 90)}  ${mode.padEnd(10)}  ${visualClip(target, 17).padEnd(17)}  ${elapsed}`;
       lines.push(visualClip(row, w));
     }
   }
