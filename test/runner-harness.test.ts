@@ -18,7 +18,7 @@ test('derives the claude-code launch line from the first command and the target'
   assert.ok(plan);
   assert.equal(
     plan.cmd,
-    'claude -p "/dev APP-14" --output-format stream-json --verbose --allowedTools "Bash" "Edit" "Write" "Read" "Glob" "Grep" "Task" "TodoWrite"',
+    'claude -p "/dev APP-14" --output-format stream-json --verbose --allowedTools "Bash" "Edit" "Write" "Read" "Glob" "Grep" "Task" "TodoWrite" "WebSearch" "WebFetch"',
   );
   assert.deepStrictEqual(plan.notes, []);
 });

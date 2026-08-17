@@ -234,7 +234,7 @@ test('pushWork delivers commits the agent made itself (not just uncommitted chan
   // clean status and skipped the push - the delivery vanished with the workspace.
   const remote = makeRemote();
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-ws-'));
-  const { branch } = setupWorkspace(workspace, { gitUrl: remote, target: 'APP-9', jobId: 'job-self' });
+  const { branch } = setupWorkspace(workspace, { url: remote, target: 'APP-9', jobId: 'job-self', name: 'Operator One', email: 'op@example.com' });
   writeFileSync(join(workspace, 'work.txt'), 'agent work\n');
   run(workspace, ['add', '-A']);
   run(workspace, ['commit', '-q', '-m', 'agent commits its own work']);
