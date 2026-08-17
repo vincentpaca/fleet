@@ -1,6 +1,7 @@
 // fleet board — full-screen live terminal view of the fleet.
 // Zero dependencies: hand-rolled ANSI; erasable TS only.
 import { parseArgs } from 'node:util';
+import { spawnSync } from 'node:child_process';
 import { request, describeTarget } from './client.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -21,12 +22,70 @@ export type BoardJob = {
   decision?: BoardDecision; // pending decision enriched from event stream
 };
 
+/** Context info shown in the header strip. Gathered at startup; optional fields. */
+export type ContextInfo = {
+  repo?: string;           // e.g. "owner/repo"
+  branch?: string;         // e.g. "main"
+  provider?: string;       // e.g. "process" | "docker" | "ecs"
+  harnessCli?: string;     // e.g. "claude-code"
+  daemonReachable?: boolean;
+};
+
+/** A parsed event from a job's event stream. */
+export type BoardEvent = {
+  seq: number;
+  type: string;
+  text?: string;
+  id?: string;
+  question?: string;
+  options?: Array<{ id: string; label?: string; recommended?: boolean }>;
+  decision?: string;
+  option?: string;
+  by?: string;
+  state?: string;
+  rung?: string;
+  report?: { status?: string; next_action?: string };
+};
+
 export type FrameOpts = {
   noColor?: boolean;
   endpoint?: string;
   pulseOn?: boolean;
   now?: number;
+  context?: ContextInfo;
+  showBanner?: boolean;
 };
+
+// ── Visual identity ───────────────────────────────────────────────────────────
+
+/** Small Fleet ASCII wordmark. Shown when the board starts; also `fleet --help`. */
+export const FLEET_BANNER = [
+  '  ___ _     ___  ___ _____',
+  ' | __| |   | __|| __|_   _|',
+  ' | _|| |__ | _| | _|  | |  ',
+  ' |_| |____||___||___|  |_|  ',
+].join('\n');
+
+/**
+ * Footer key manifests: every label advertised in the footer must appear here
+ * with the rawKeys that trigger the handler. The test mechanically verifies parity.
+ * Adding a label without a rawKeys entry (or vice-versa) will fail that test.
+ */
+export const ROSTER_FOOTER_KEYS: Array<{ label: string; rawKeys: string[] }> = [
+  { label: '↑↓ navigate', rawKeys: ['\x1b[A', '\x1b[B', 'k', 'j'] },
+  { label: 'enter expand', rawKeys: ['\r', '\n'] },
+  { label: 'a answer', rawKeys: ['a'] },
+  { label: 'q quit', rawKeys: ['q', '\x03'] },
+];
+
+export const DETAIL_FOOTER_KEYS: Array<{ label: string; rawKeys: string[] }> = [
+  { label: '↑↓ scroll', rawKeys: ['\x1b[A', '\x1b[B', 'k', 'j'] },
+  { label: 'G re-stick', rawKeys: ['G'] },
+  { label: 'a answer', rawKeys: ['a'] },
+  { label: 'c cancel', rawKeys: ['c'] },
+  { label: 'o open', rawKeys: ['o'] },
+  { label: 'esc back', rawKeys: ['\x1b'] },
+];
 
 // ── Terminal sequences ────────────────────────────────────────────────────────
 
@@ -46,6 +105,43 @@ function ansi(...codes: number[]): string {
 
 function visualLength(s: string): number {
   return s.replace(ANSI_RE, '').length;
+}
+
+/** Build a col() helper bound to a specific noColor flag. */
+function makeCol(noColor: boolean): (text: string, ...codes: number[]) => string {
+  return (text, ...codes) => noColor ? text : `${ansi(...codes)}${text}${RESET}`;
+}
+
+// ── Key dispatch (pure; tested for parity with footer manifests) ──────────────
+
+export type KeyAction =
+  | 'navigate-up' | 'navigate-down'
+  | 'expand' | 'back'
+  | 'answer' | 'cancel' | 'open'
+  | 'scroll-up' | 'scroll-down' | 'restick'
+  | 'quit' | 'unknown';
+
+/** Map a raw key to a roster action. Must cover every rawKey in ROSTER_FOOTER_KEYS. */
+export function rosterKeyAction(key: string): KeyAction {
+  if (key === 'q' || key === '\x03') return 'quit';
+  if (key === '\r' || key === '\n') return 'expand';
+  if (key === '\x1b[A' || key === 'k') return 'navigate-up';
+  if (key === '\x1b[B' || key === 'j') return 'navigate-down';
+  if (key === 'a') return 'answer';
+  return 'unknown';
+}
+
+/** Map a raw key to a detail action. Must cover every rawKey in DETAIL_FOOTER_KEYS. */
+export function detailKeyAction(key: string): KeyAction {
+  // '\x1b' alone = standalone Escape; arrow keys arrive as '\x1b[A' etc. (3+ chars).
+  if (key === '\x1b') return 'back';
+  if (key === '\x1b[A' || key === 'k') return 'scroll-up';
+  if (key === '\x1b[B' || key === 'j') return 'scroll-down';
+  if (key === 'G') return 'restick';
+  if (key === 'a') return 'answer';
+  if (key === 'c') return 'cancel';
+  if (key === 'o') return 'open';
+  return 'unknown';
 }
 
 /**
@@ -77,6 +173,202 @@ function visualClip(s: string, maxLen: number): string {
     i++;
   }
   return `${out}…${hasAnsi ? RESET : ''}`;
+}
+
+// ── Pure frame renderers (new) ────────────────────────────────────────────────
+
+/** Render the Fleet ASCII wordmark, clipped to width. */
+export function renderBanner(width: number, noColor: boolean): string {
+  const col = makeCol(noColor);
+  return FLEET_BANNER.split('\n')
+    .map((line) => visualClip(col(line, 90), width))
+    .join('\n');
+}
+
+/**
+ * Render the two-line (roster) or three-line (detail) context strip.
+ * Always box-drawn; clips to width. jobLine adds a middle row (detail view only).
+ */
+export function renderContextStrip(
+  blockedCount: number,
+  runningCount: number,
+  doneCount: number,
+  w: number,
+  opts: FrameOpts,
+  jobLine?: string,
+): string {
+  const noColor = opts.noColor ?? false;
+  const col = makeCol(noColor);
+  const inner = w - 2; // chars between corner glyphs
+
+  // Assemble left-side parts.
+  const parts: string[] = [col('FLEET', 1, 36)];
+  const ctx = opts.context;
+  if (ctx?.repo) {
+    const repoStr = ctx.branch ? `${ctx.repo}/${ctx.branch}` : ctx.repo;
+    parts.push(col(repoStr, 36));
+  }
+  const endpoint = opts.endpoint;
+  if (endpoint) {
+    const dot = ctx?.daemonReachable === false ? col('○', 31) : col('●', 32);
+    parts.push(`${col(endpoint, 90)} ${dot}`);
+  }
+  if (ctx?.provider) parts.push(col(ctx.provider, 90));
+  if (ctx?.harnessCli) parts.push(col(ctx.harnessCli, 90));
+
+  const leftContent = ` ${parts.join('  ')} `;
+  const leftVLen = visualLength(leftContent);
+
+  // Right-side: semantic count labels.
+  const bLabel = blockedCount > 0 ? col(`blk:${blockedCount}`, 33) : col(`blk:0`, 90);
+  const rLabel = runningCount > 0 ? col(`run:${runningCount}`, 32) : col(`run:0`, 90);
+  const dLabel = col(`done:${doneCount}`, 90);
+  const countsStr = `${bLabel} ${rLabel} ${dLabel}`;
+  const countsVLen = visualLength(countsStr);
+
+  // Fill gap between left and right with dashes.
+  const dashCount = Math.max(1, inner - leftVLen - countsVLen - 1);
+  const dashes = col('─'.repeat(dashCount), 90);
+  const topContent = `${leftContent}${dashes}${countsStr} `;
+  const topLine = `┌${visualClip(topContent, inner)}┐`;
+
+  const lines: string[] = [visualClip(topLine, w)];
+
+  if (jobLine !== undefined) {
+    const rawLine = `│ ${jobLine}`;
+    const vLen = visualLength(rawLine);
+    const padded = rawLine + ' '.repeat(Math.max(0, w - 1 - vLen));
+    lines.push(visualClip(`${padded}│`, w));
+  }
+
+  lines.push(`└${'─'.repeat(Math.max(0, w - 2))}┘`);
+  return lines.join('\n');
+}
+
+/** Render the dim table-header row + separator rule for the roster. */
+export function renderTableHeader(w: number, noColor: boolean): string {
+  const col = makeCol(noColor);
+  const header = '  JOB                       STATE     MODE        TARGET             ELAPSED';
+  const rule = `  ${'─'.repeat(Math.max(0, w - 2))}`;
+  return [visualClip(col(header, 90), w), visualClip(col(rule, 90), w)].join('\n');
+}
+
+/** Convert a BoardEvent array to display lines for the detail view. */
+export function renderEventLines(events: BoardEvent[], w: number, noColor: boolean): string[] {
+  const col = makeCol(noColor);
+  const lines: string[] = [];
+  // Track pending decisions for "question → answer" rendering.
+  const pending = new Map<string, { question: string }>();
+
+  for (const ev of events) {
+    const prefix = col(`[${ev.seq}]`, 90);
+    switch (ev.type) {
+      case 'think':
+      case 'log':
+        lines.push(visualClip(`${prefix} ${col(ev.text ?? '', 90)}`, w));
+        break;
+      case 'phase':
+        lines.push(visualClip(`${prefix} ${col('phase', 90)} ${col(ev.text ?? '', 90)}`, w));
+        break;
+      case 'state': {
+        const c = ev.state === 'blocked' ? 33 : ev.state === 'running' ? 32 : 90;
+        lines.push(visualClip(`${prefix} ${col('→', 90)} ${col(ev.state ?? '', c)}`, w));
+        break;
+      }
+      case 'decision':
+        if (ev.id) {
+          pending.set(ev.id, { question: ev.question ?? '' });
+          lines.push(visualClip(`${prefix} ${col('?', 1, 33)} ${col(ev.question ?? '', 1)}`, w));
+          for (const opt of ev.options ?? []) {
+            const rec = opt.recommended ? col(' ★', 33) : '';
+            lines.push(visualClip(`     ${col(`[${opt.id}]`, 33)} ${opt.label ?? opt.id}${rec}`, w));
+          }
+        }
+        break;
+      case 'answer': {
+        const dec = ev.decision ? pending.get(ev.decision) : undefined;
+        const qText = dec ? col(`"${dec.question}"`, 90) : '';
+        const ansText = ev.option ? col(`[${ev.option}]`, 32) : col('(free text)', 90);
+        const byText = ev.by ? col(` by ${ev.by}`, 90) : '';
+        const summary = qText
+          ? `${prefix} ${col('✓', 32)} ${qText} → ${ansText}${byText}`
+          : `${prefix} ${col('✓', 32)} answer: ${ansText}${byText}`;
+        lines.push(visualClip(summary, w));
+        if (ev.decision) pending.delete(ev.decision);
+        break;
+      }
+      case 'settle':
+        lines.push(visualClip(
+          `${prefix} ${col('settle', 36)} rung=${col(ev.rung ?? '?', 36)} status=${col(ev.report?.status ?? '?', 36)}`,
+          w,
+        ));
+        break;
+      default:
+        lines.push(visualClip(`${prefix} ${col(ev.type, 90)}`, w));
+        break;
+    }
+  }
+  return lines;
+}
+
+/**
+ * Render the full-screen detail view frame. Pure function: (job, events, scroll,
+ * followMode, width, height, opts, counts) → string. Snapshot-testable.
+ *
+ * scroll=0 → top of event tail; clamped to [0, max].
+ * followMode=true → always shows tail (overrides scroll).
+ * Minimum usable: 80 col, 8 rows.
+ */
+export function renderDetailFrame(
+  job: BoardJob,
+  events: BoardEvent[],
+  scroll: number,
+  followMode: boolean,
+  width: number,
+  height: number,
+  opts: FrameOpts,
+  counts: { blocked: number; running: number; done: number } = { blocked: 0, running: 0, done: 0 },
+): string {
+  const noColor = opts.noColor ?? false;
+  const col = makeCol(noColor);
+  const w = Math.max(40, width);
+  const h = Math.max(8, height);
+  const now = opts.now ?? 0;
+
+  // Header: context strip with job line (3 lines).
+  const elapsed = elapsedStr(job.updatedAt, now);
+  const mode = job.workOrder?.mode ?? '?';
+  const target = job.workOrder?.target ?? '?';
+  const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
+  const stateColor = job.state === 'blocked' ? 33 : job.state === 'running' ? 32 : 90;
+  const jobLineContent = [
+    col(job.id, 1),
+    col(stateDisplay, stateColor),
+    mode,
+    visualClip(target, 30),
+    elapsed,
+  ].filter(Boolean).join('  ');
+
+  const contextLines = renderContextStrip(
+    counts.blocked, counts.running, counts.done, w, opts, jobLineContent,
+  ).split('\n');
+  const headerLineCount = contextLines.length; // 3
+
+  // Footer: 1 line.
+  const footerText = DETAIL_FOOTER_KEYS.map((k) => k.label).join('  ');
+  const footerLine = visualClip(col(`  ${footerText}`, 90), w);
+
+  const availableLines = Math.max(1, h - headerLineCount - 1);
+  const eventLines = renderEventLines(events, w, noColor);
+
+  // Clamp scroll; follow mode anchors to bottom.
+  const maxScroll = Math.max(0, eventLines.length - availableLines);
+  const clampedScroll = followMode ? maxScroll : Math.max(0, Math.min(scroll, maxScroll));
+
+  const visible = eventLines.slice(clampedScroll, clampedScroll + availableLines);
+  while (visible.length < availableLines) visible.push('');
+
+  return [...contextLines, ...visible, footerLine].join('\n');
 }
 
 // ── Job ordering ──────────────────────────────────────────────────────────────
@@ -122,10 +414,7 @@ export function renderFrame(
   const pulse = opts.pulseOn ?? false;
   const w = Math.max(40, width);
 
-  function col(text: string, ...codes: number[]): string {
-    if (noColor) return text;
-    return `${ansi(...codes)}${text}${RESET}`;
-  }
+  const col = makeCol(noColor);
 
   const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
 
@@ -135,15 +424,16 @@ export function renderFrame(
 
   const lines: string[] = [];
 
-  // ── Header ────────────────────────────────────────────────────────────────
-  const endpoint = opts.endpoint ?? '';
-  const bLabel = blockedCount > 0 ? col(`blocked:${blockedCount}`, 33) : `blocked:0`;
-  const rLabel = runningCount > 0 ? col(`running:${runningCount}`, 32) : `running:0`;
-  const headerParts = [col('fleet board', 1), endpoint, bLabel, rLabel, `done:${doneCount}`]
-    .filter(Boolean)
-    .join('  ');
-  lines.push(visualClip(headerParts, w));
-  lines.push('─'.repeat(w));
+  // ── Banner (interactive mode only) ───────────────────────────────────────
+  if (opts.showBanner) {
+    lines.push(renderBanner(w, noColor));
+  }
+
+  // ── Context strip ─────────────────────────────────────────────────────────
+  lines.push(renderContextStrip(blockedCount, runningCount, doneCount, w, opts));
+
+  // ── Table header ──────────────────────────────────────────────────────────
+  lines.push(renderTableHeader(w, noColor));
 
   if (sorted.length === 0) {
     lines.push(col('  no jobs — delegate one with: fleet delegate <target>', 90));
@@ -189,8 +479,9 @@ export function renderFrame(
     }
   }
 
-  lines.push('─'.repeat(w));
-  lines.push(visualClip(col('  ↑↓ select  a answer  q quit', 90), w));
+  // ── Footer ────────────────────────────────────────────────────────────────
+  const footerText = ROSTER_FOOTER_KEYS.map((k) => k.label).join('  ');
+  lines.push(visualClip(col(`  ${footerText}`, 90), w));
 
   return lines.join('\n');
 }
@@ -287,10 +578,56 @@ export async function answerJob(
   }
 }
 
+/** Cancel a job. Exported for tests. */
+export async function cancelJob(
+  jobId: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await request('POST', `/jobs/${encodeURIComponent(jobId)}/cancel`, {}, { env });
+    if (res.status === 200) return { ok: true };
+    const b = res.json as { error?: string } | undefined;
+    return { ok: false, error: b?.error ?? `HTTP ${res.status}` };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 // ── Interactive board ─────────────────────────────────────────────────────────
 
 const POLL_MS = 2_000;
 const FRAME_MS = 100; // ≤10fps
+
+/** Stream all events for a job into onEvent callbacks until signal aborts. */
+async function followDetailEvents(
+  jobId: string,
+  onEvent: (ev: BoardEvent) => void,
+  env: Record<string, string | undefined>,
+  signal: AbortSignal,
+): Promise<void> {
+  let after: number | undefined;
+  while (!signal.aborted) {
+    const q = after === undefined ? '?follow=1' : `?after=${after}&follow=1`;
+    try {
+      await request('GET', `/jobs/${encodeURIComponent(jobId)}/events${q}`, undefined, {
+        env,
+        onLine: (line) => {
+          try {
+            const ev = JSON.parse(line) as BoardEvent;
+            if (typeof ev.seq === 'number') after = ev.seq;
+            onEvent(ev);
+          } catch {
+            // ignore malformed events
+          }
+        },
+        timeoutMs: 30_000,
+      });
+    } catch {
+      if (signal.aborted) break;
+      await new Promise<void>((r) => setTimeout(r, 1_000));
+    }
+  }
+}
 
 /** Follow a job's events for live lastPhase updates until the signal aborts. */
 async function followJobEvents(
@@ -358,22 +695,50 @@ export async function cmdBoard(args: string[]): Promise<number> {
   }
 
   // ── Interactive mode ───────────────────────────────────────────────────────
+
+  // Gather context info at startup (best-effort; all fields optional).
+  const contextInfo: ContextInfo = {};
+  try {
+    const branchRes = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' });
+    if (branchRes.status === 0) contextInfo.branch = branchRes.stdout.trim();
+    const originRes = spawnSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' });
+    if (originRes.status === 0) {
+      const m = originRes.stdout.trim().match(/[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
+      if (m) contextInfo.repo = m[1];
+    }
+  } catch { /* not in a git repo, or git not available */ }
+
   let jobs: BoardJob[] = [];
   let selection = 0;
   let running = true;
   let dirty = true;
   let lastPollMs = 0;
   let lastRenderMs = 0;
+
+  // Roster phase-follow state.
   let followAbort: AbortController | null = null;
   let followedJobId: string | null = null;
+
+  // Detail view state.
+  let viewMode: 'roster' | 'detail' = 'roster';
+  let detailJob: BoardJob | null = null;
+  let detailEvents: BoardEvent[] = [];
+  let detailScroll = 0;
+  let detailFollowMode = true;
+  let detailAbort: AbortController | null = null;
 
   // Answer mode state.
   let answerMode = false;
   let answerInput = '';
   let answerJobId: string | null = null;
   let answerOptions: Array<{ id: string; label?: string; recommended?: boolean }> = [];
+  let statusMsg: string | null = null; // transient error shown on next render
+
+  // Cancel confirm state.
+  let confirmMode = false;
 
   const w = () => process.stdout.columns || 80;
+  const h = () => process.stdout.rows || 24;
 
   // Use named handlers so they can be removed in cleanup.
   const onSignal = () => { running = false; };
@@ -382,6 +747,7 @@ export async function cmdBoard(args: string[]): Promise<number> {
 
   const cleanup = () => {
     followAbort?.abort();
+    detailAbort?.abort();
     process.stdout.write(RESTORE_SEQ);
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.off('SIGINT', onSignal);
@@ -396,10 +762,27 @@ export async function cmdBoard(args: string[]): Promise<number> {
     if (now - lastRenderMs < FRAME_MS) return;
     lastRenderMs = now;
     dirty = false;
-    const pulse = Math.floor(now / 600) % 2 === 0;
-    const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
-    const clampedSel = Math.max(0, Math.min(selection, sorted.length - 1));
-    const frame = renderFrame(sorted, clampedSel, w(), { noColor, endpoint, pulseOn: pulse, now });
+
+    let frame: string;
+
+    if (viewMode === 'detail' && detailJob) {
+      const counts = {
+        blocked: jobs.filter((j) => j.state === 'blocked').length,
+        running: jobs.filter((j) => j.state === 'running' || j.state === 'queued').length,
+        done: jobs.filter((j) => j.state === 'done' || j.state === 'cancelled').length,
+      };
+      frame = renderDetailFrame(
+        detailJob, detailEvents, detailScroll, detailFollowMode,
+        w(), h(), { noColor, endpoint, context: contextInfo, now }, counts,
+      );
+    } else {
+      const pulse = Math.floor(now / 600) % 2 === 0;
+      const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
+      const clampedSel = Math.max(0, Math.min(selection, sorted.length - 1));
+      frame = renderFrame(sorted, clampedSel, w(), {
+        noColor, endpoint, pulseOn: pulse, now, context: contextInfo, showBanner: true,
+      });
+    }
 
     // Overwrite from top without clearing: calm, no flicker.
     let out = '\x1b[H'; // cursor home
@@ -409,10 +792,15 @@ export async function cmdBoard(args: string[]): Promise<number> {
       const pad = vLen < w() ? ' '.repeat(w() - vLen) : '';
       out += `${line}${pad}\r\n`;
     }
-    // Append answer prompt when active.
+    // Overlay prompts; clear transient status once it has been shown.
     if (answerMode) {
       const opts = answerOptions.map((o) => o.id).join(' | ');
       out += `  Answer [${opts}] (id [note] or empty to cancel): ${answerInput}_`;
+    } else if (confirmMode && detailJob) {
+      out += `  Cancel ${detailJob.id}? [y/N]: `;
+    } else if (statusMsg) {
+      out += `  ${statusMsg}`;
+      statusMsg = null;
     }
     out += '\x1b[J'; // clear to end of screen
     process.stdout.write(out);
@@ -438,32 +826,75 @@ export async function cmdBoard(args: string[]): Promise<number> {
         }
       }
       jobs = next;
+
+      // Refresh detailJob in-place when its state changes.
+      if (viewMode === 'detail' && detailJob) {
+        const updated = jobs.find((j) => j.id === detailJob!.id);
+        if (updated) detailJob = updated;
+      }
+
+      contextInfo.daemonReachable = true;
       dirty = true;
 
-      // Long-poll selected running job for live phase updates.
-      const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
-      const selJob = sorted[Math.max(0, Math.min(selection, sorted.length - 1))];
-      if (
-        selJob &&
-        selJob.id !== followedJobId &&
-        (selJob.state === 'running' || selJob.state === 'queued')
-      ) {
-        followAbort?.abort();
-        followAbort = new AbortController();
-        followedJobId = selJob.id;
-        followJobEvents(
-          selJob.id,
-          (text) => {
-            const j = jobs.find((jj) => jj.id === selJob.id);
-            if (j) { j.lastPhase = text; dirty = true; }
-          },
-          env,
-          followAbort.signal,
-        ).catch(() => {});
+      // Long-poll selected running job (roster phase line) unless in detail mode.
+      if (viewMode === 'roster') {
+        const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
+        const selJob = sorted[Math.max(0, Math.min(selection, sorted.length - 1))];
+        if (
+          selJob &&
+          selJob.id !== followedJobId &&
+          (selJob.state === 'running' || selJob.state === 'queued')
+        ) {
+          followAbort?.abort();
+          followAbort = new AbortController();
+          followedJobId = selJob.id;
+          followJobEvents(
+            selJob.id,
+            (text) => {
+              const j = jobs.find((jj) => jj.id === selJob.id);
+              if (j) { j.lastPhase = text; dirty = true; }
+            },
+            env,
+            followAbort.signal,
+          ).catch(() => {});
+        }
       }
     } catch {
+      contextInfo.daemonReachable = false;
       // Keep last known state on transient daemon errors.
     }
+  };
+
+  const openDetail = (job: BoardJob) => {
+    viewMode = 'detail';
+    detailJob = job;
+    detailEvents = [];
+    detailScroll = 0;
+    detailFollowMode = true;
+    detailAbort?.abort();
+    const ac = new AbortController();
+    detailAbort = ac;
+    followAbort?.abort();
+    followAbort = null;
+    followedJobId = null;
+    followDetailEvents(
+      job.id,
+      // Guard against stale callbacks from aborted follows writing into new sessions.
+      (ev) => { if (ac.signal.aborted) return; detailEvents = [...detailEvents, ev]; dirty = true; },
+      env,
+      ac.signal,
+    ).catch(() => {});
+    dirty = true;
+  };
+
+  const closeDetail = () => {
+    viewMode = 'roster';
+    detailAbort?.abort();
+    detailAbort = null;
+    detailJob = null;
+    detailEvents = [];
+    confirmMode = false;
+    dirty = true;
   };
 
   const handleKey = async (key: string) => {
@@ -477,7 +908,8 @@ export async function cmdBoard(args: string[]): Promise<number> {
           const body: { option?: string; text?: string } = {};
           if (optPart) body.option = optPart;
           if (rest.length > 0) body.text = rest.join(' ');
-          await answerJob(answerJobId, body, env);
+          const result = await answerJob(answerJobId, body, env);
+          if (!result.ok) statusMsg = `answer failed: ${result.error ?? 'unknown error'}`;
         }
         answerJobId = null;
         answerOptions = [];
@@ -504,24 +936,97 @@ export async function cmdBoard(args: string[]): Promise<number> {
       return;
     }
 
-    if (key === 'q' || key === '\x03') { running = false; return; }
-    if (key === '\x1b[A') {
-      // arrow up
-      selection = Math.max(0, selection - 1);
-      dirty = true;
-    } else if (key === '\x1b[B') {
-      // arrow down
-      selection = Math.min(jobs.length - 1, selection + 1);
-      dirty = true;
-    } else if (key === 'a') {
-      // Answer selected blocked job.
-      const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
-      const selJob = sorted[Math.max(0, Math.min(selection, sorted.length - 1))];
-      if (selJob?.state === 'blocked' && selJob.decision) {
-        answerMode = true;
-        answerJobId = selJob.id;
-        answerOptions = selJob.decision.options;
+    if (viewMode === 'detail') {
+      // Cancel confirm prompt.
+      if (confirmMode) {
+        if (key === 'y' || key === 'Y') {
+          confirmMode = false;
+          if (detailJob) {
+            await cancelJob(detailJob.id, env);
+            closeDetail();
+          }
+        } else {
+          confirmMode = false;
+          dirty = true;
+        }
+        return;
+      }
+
+      switch (detailKeyAction(key)) {
+        case 'back':
+          closeDetail();
+          break;
+        case 'scroll-up':
+          detailFollowMode = false;
+          detailScroll = Math.max(0, detailScroll - 1);
+          dirty = true;
+          break;
+        case 'scroll-down':
+          detailFollowMode = false;
+          detailScroll = detailScroll + 1;
+          dirty = true;
+          break;
+        case 'restick':
+          detailFollowMode = true;
+          dirty = true;
+          break;
+        case 'answer':
+          if (detailJob?.state === 'blocked' && detailJob.decision) {
+            answerMode = true;
+            answerJobId = detailJob.id;
+            answerOptions = detailJob.decision.options;
+            dirty = true;
+          }
+          break;
+        case 'cancel':
+          if (detailJob) {
+            confirmMode = true;
+            dirty = true;
+          }
+          break;
+        case 'open': {
+          // Print target to a status line in the frame (never launches a browser).
+          const target = detailJob?.workOrder?.target ?? '';
+          if (target) {
+            process.stdout.write(`\r\n  open: ${target}\r\n`);
+          }
+          break;
+        }
+      }
+      return;
+    }
+
+    // Roster mode.
+    switch (rosterKeyAction(key)) {
+      case 'quit':
+        running = false;
+        break;
+      case 'navigate-up':
+        selection = Math.max(0, selection - 1);
         dirty = true;
+        break;
+      case 'navigate-down': {
+        const sortedLen = jobs.length; // same count as sorted; filter-safe if filtering added later
+        selection = Math.min(sortedLen - 1, selection + 1);
+        dirty = true;
+        break;
+      }
+      case 'expand': {
+        const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
+        const selJob = sorted[Math.max(0, Math.min(selection, sorted.length - 1))];
+        if (selJob) openDetail(selJob);
+        break;
+      }
+      case 'answer': {
+        const sorted = [...jobs].sort((a, b) => stateRank(a) - stateRank(b));
+        const selJob = sorted[Math.max(0, Math.min(selection, sorted.length - 1))];
+        if (selJob?.state === 'blocked' && selJob.decision) {
+          answerMode = true;
+          answerJobId = selJob.id;
+          answerOptions = selJob.decision.options;
+          dirty = true;
+        }
+        break;
       }
     }
   };
