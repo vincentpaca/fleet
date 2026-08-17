@@ -15,7 +15,9 @@ export type HarnessPlan = {
 // Phase 1: a fixed permissive tool grant — the sandbox is the blast-radius
 // boundary; reach beyond it is governed by egress + broker in Phase 2, when
 // this list gets generated from the manifest's services.
-const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite'];
+// WebSearch/WebFetch: assess-mode research jobs are useless without them
+// (#35's first run analyzed the wrong protocol from stale training data).
+const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite', 'WebSearch', 'WebFetch'];
 
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
 export function parseVersion(output: string): string | undefined {

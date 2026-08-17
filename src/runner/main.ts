@@ -318,10 +318,12 @@ async function main(): Promise<void> {
   // Deliver the work (#2): commit and push whatever the harness produced —
   // partial work included; evidence over tidiness.
   let pushNote: string | undefined;
+  let workPushed = false;
   if (gitUrl && branch) {
     try {
       const outcome = pushWork(workspace, target, jobId, exitCode === 0);
-      pushNote = outcome === 'pushed' ? `work pushed to ${branch}` : `workspace clean; nothing beyond ${branch} creation`;
+      workPushed = outcome === 'pushed';
+      pushNote = workPushed ? `work pushed to ${branch}` : `workspace clean; nothing beyond ${branch} creation`;
     } catch (err) {
       pushNote = `WORK PUSH FAILED: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
     }
@@ -335,7 +337,17 @@ async function main(): Promise<void> {
   let prUrl: string | undefined;
   let settleRung: string | undefined;
   if (ok) {
-    if (gitUrl && branch && base && authorityPublish) {
+    if (gitUrl && branch && !workPushed) {
+      // Nothing landed on the branch: whatever the harness claims, there is no
+      // deliverable. Claiming 'pushed' here was a real bug (#34's first run:
+      // work done in harness-subagent worktrees, never applied, rung overstated).
+      settleRung = undefined;
+      await sink.emit({
+        type: 'log',
+        text: 'no work commits on the branch — no rung claimed; report claims are unverified',
+        who: 'runner',
+      });
+    } else if (gitUrl && branch && base && authorityPublish) {
       try {
         // Compose per the delivery standard: report sections, never raw JSON.
         let report: Record<string, unknown> | undefined;
