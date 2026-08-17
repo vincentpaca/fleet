@@ -5,6 +5,11 @@
  * the harness, delete decision.json, keep watching. Invalid file → write
  * decision-error.json with the validation errors, delete decision.json,
  * emit a log event, keep watching.
+ *
+ * block_hot (issue #6): when blockHotMs is set, a timer fires after that
+ * duration while awaiting an answer. On expiry the watcher signals parking
+ * via the `parked` promise (resolves with the decision id) and stops its
+ * loop. The runner then commits WIP, emits state blocked/parked, and exits.
  */
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -30,13 +35,28 @@ export class DecisionWatcher {
   private pendingRaw: string | null = null;
   /** Optional wall-clock timer: paused while awaiting answers. */
   private readonly wallClock?: WallClockTimer;
+  /** Optional block_hot limit in ms: fires when the hot window expires. */
+  private readonly blockHotMs: number | undefined;
+  /** Resolves with the decision id when block_hot fires (never resolves if unset). */
+  readonly parked: Promise<string>;
+  private readonly parkResolve: (id: string) => void;
 
-  constructor(opts: { workspace: string; sink: EventSink; intervalMs?: number; wallClock?: WallClockTimer }) {
+  constructor(opts: {
+    workspace: string;
+    sink: EventSink;
+    intervalMs?: number;
+    wallClock?: WallClockTimer;
+    blockHotMs?: number;
+  }) {
     this.sink = opts.sink;
     this.outDir = join(opts.workspace, '.fleet', 'out');
     this.decisionPath = join(this.outDir, 'decision.json');
     this.intervalMs = opts.intervalMs ?? 500;
     this.wallClock = opts.wallClock;
+    this.blockHotMs = opts.blockHotMs;
+    let resolve!: (id: string) => void;
+    this.parked = new Promise<string>((r) => { resolve = r; });
+    this.parkResolve = resolve;
   }
 
   start(): void {
@@ -98,7 +118,7 @@ export class DecisionWatcher {
     });
 
     const answer = await this.awaitAnswer(id);
-    if (answer === null) return; // stopped while waiting
+    if (answer === null) return; // stopped (or parked) while waiting
     writeFileSync(
       join(this.outDir, `answer-${id}.json`),
       JSON.stringify(answer, null, 2) + '\n',
@@ -119,13 +139,24 @@ export class DecisionWatcher {
     });
   }
 
-  /** Long-poll the daemon until the operator answers this decision. */
+  /** Long-poll the daemon until the operator answers this decision.
+   *  Returns null when stopped or when the block_hot timer fires (parking). */
   private async awaitAnswer(id: string): Promise<Answer | null> {
     // Pause the wall-clock meter: blocked time doesn't count against the budget.
     this.wallClock?.block();
     const url =
       `${this.sink.daemonUrl}/internal/jobs/${encodeURIComponent(this.sink.jobId)}` +
       `/answer?decision=${encodeURIComponent(id)}`;
+
+    // block_hot timer: when the hot window expires, signal parking and stop.
+    let parkTimer: ReturnType<typeof setTimeout> | null = null;
+    if (this.blockHotMs !== undefined) {
+      parkTimer = setTimeout(() => {
+        this.parkResolve(id);
+        this.stopped = true;
+      }, this.blockHotMs);
+    }
+
     try {
       while (!this.stopped) {
         let response: Response;
@@ -145,7 +176,9 @@ export class DecisionWatcher {
       }
       return null;
     } finally {
-      // Resume the meter whether an answer was received or the watcher was stopped.
+      if (parkTimer !== null) clearTimeout(parkTimer);
+      // Resume the meter whether an answer was received, the watcher was stopped,
+      // or the block_hot timer fired.
       this.wallClock?.resume();
     }
   }

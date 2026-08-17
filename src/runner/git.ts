@@ -36,6 +36,13 @@ export type GitSetupOptions = {
   email?: string;
   /** Fetch depth; enough history for context without full clones. */
   depth?: number;
+  /**
+   * Re-entry mode (issue #6): fetch and check out the existing job branch
+   * (which carries the WIP commit from parking) instead of creating a fresh
+   * branch from the base. Does NOT push — the branch already exists on the
+   * remote, so there is no collision guard to trip.
+   */
+  reentry?: boolean;
 };
 
 const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
@@ -91,8 +98,17 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   if (opts.email) git(workspace, ['config', 'user.email', opts.email]);
   git(workspace, ['remote', 'add', 'origin', opts.url]);
   const base = defaultRef(workspace, opts.url);
-  git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', base]);
-  git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
+  if (opts.reentry) {
+    // Re-entry: the job branch already exists on the remote (carries the WIP
+    // commit from parking). Fetch it, check it out, and set the upstream
+    // tracking so subsequent pushes work without specifying the remote.
+    git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', branch]);
+    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
+    git(workspace, ['branch', '--set-upstream-to', `origin/${branch}`, branch]);
+  } else {
+    git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', base]);
+    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
+  }
 
   // Restore the dispatch payload over whatever the clone brought in, and make
   // sure none of it can ever be committed or pushed.
@@ -108,7 +124,11 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
   appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
 
-  git(workspace, ['push', '-q', '-u', 'origin', branch]);
+  if (!opts.reentry) {
+    // Initial setup: push the branch immediately so evidence is preserved even
+    // if the container dies before any work is committed.
+    git(workspace, ['push', '-q', '-u', 'origin', branch]);
+  }
   return { branch, base };
 }
 

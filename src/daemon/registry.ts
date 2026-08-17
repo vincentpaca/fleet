@@ -61,6 +61,16 @@ type JobInternal = {
   wallClockActiveMs: number;
   /** Timestamp (ms) when the job last became active; null when not currently active. */
   wallClockActiveSince: number | null;
+  // Decision-timeout tracking (issue #6).
+  /** Total decision timeout in ms (from first block to stale); null = no limit. */
+  decisionTimeoutMs: number | null;
+  /** Timestamp (ms) when the current decision event first arrived; null if none active. */
+  decisionBlockedAt: number | null;
+  // Launch details stored for parked-job re-entry (issue #6).
+  launchManifest: unknown;
+  launchEnv: Record<string, string>;
+  launchSync: Record<string, string>;
+  launchImage: string | undefined;
 };
 
 type JobEntry = {
@@ -88,7 +98,13 @@ export class Registry extends EventEmitter {
       const recordPath = join(jobsRoot, id, "job.json");
       if (!existsSync(recordPath)) continue;
       const raw = JSON.parse(readFileSync(recordPath, "utf8")) as JobRecord & JobInternal;
-      const { lastRunnerSeq, openDecision, wallClockMs, wallClockActiveMs, wallClockActiveSince, ...record } = raw;
+      const {
+        lastRunnerSeq, openDecision,
+        wallClockMs, wallClockActiveMs, wallClockActiveSince,
+        decisionTimeoutMs, decisionBlockedAt,
+        launchManifest, launchEnv, launchSync, launchImage,
+        ...record
+      } = raw;
       const eventsPath = join(jobsRoot, id, "events.jsonl");
       const events = existsSync(eventsPath)
         ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
@@ -102,6 +118,12 @@ export class Registry extends EventEmitter {
           wallClockMs: wallClockMs ?? null,
           wallClockActiveMs: wallClockActiveMs ?? 0,
           wallClockActiveSince: wallClockActiveSince ?? null,
+          decisionTimeoutMs: decisionTimeoutMs ?? null,
+          decisionBlockedAt: decisionBlockedAt ?? null,
+          launchManifest: launchManifest ?? null,
+          launchEnv: launchEnv ?? {},
+          launchSync: launchSync ?? {},
+          launchImage: launchImage ?? undefined,
         },
         events,
         lastSeq,
@@ -128,6 +150,12 @@ export class Registry extends EventEmitter {
         wallClockMs: null,
         wallClockActiveMs: 0,
         wallClockActiveSince: null,
+        decisionTimeoutMs: null,
+        decisionBlockedAt: null,
+        launchManifest: null,
+        launchEnv: {},
+        launchSync: {},
+        launchImage: undefined,
       },
       events: [],
       lastSeq: -1,
@@ -266,6 +294,75 @@ export class Registry extends EventEmitter {
   /** Wall-clock limit in ms for the job; null if none. */
   wallClockLimitMs(id: string): number | null {
     return this.#entry(id).internal.wallClockMs;
+  }
+
+  // --- Decision-timeout tracking (issue #6) ---
+
+  /** Set the decision timeout for a job (called at job creation). */
+  initDecisionTimeout(id: string, limitMs: number): void {
+    const entry = this.#entry(id);
+    entry.internal.decisionTimeoutMs = limitMs;
+    this.#persist(entry);
+  }
+
+  /** Decision timeout limit in ms; null if none. */
+  decisionTimeLimitMs(id: string): number | null {
+    return this.#entry(id).internal.decisionTimeoutMs;
+  }
+
+  /** Timestamp (ms) when the current decision first arrived; null if no decision active. */
+  decisionBlockedAtMs(id: string): number | null {
+    return this.#entry(id).internal.decisionBlockedAt;
+  }
+
+  /** Record when a decision arrived (start of the decision_timeout clock). */
+  setDecisionBlockedAt(id: string, atMs: number | null): void {
+    const entry = this.#entry(id);
+    entry.internal.decisionBlockedAt = atMs;
+    this.#persist(entry);
+  }
+
+  // --- Launch details for parked-job re-entry (issue #6) ---
+
+  /** Store the launch spec fields needed to re-launch after parking. */
+  storeLaunchDetails(id: string, details: {
+    manifest: unknown;
+    env: Record<string, string>;
+    sync: Record<string, string>;
+    image: string | undefined;
+  }): void {
+    const entry = this.#entry(id);
+    entry.internal.launchManifest = details.manifest;
+    entry.internal.launchEnv = details.env;
+    entry.internal.launchSync = details.sync;
+    entry.internal.launchImage = details.image;
+    this.#persist(entry);
+  }
+
+  /** Retrieve the stored launch details for re-launching a parked job. */
+  getLaunchDetails(id: string): {
+    manifest: unknown;
+    env: Record<string, string>;
+    sync: Record<string, string>;
+    image: string | undefined;
+  } {
+    const internal = this.#entry(id).internal;
+    return {
+      manifest: internal.launchManifest,
+      env: internal.launchEnv,
+      sync: internal.launchSync,
+      image: internal.launchImage,
+    };
+  }
+
+  /**
+   * Reset the runner's seq counter (called on re-entry so the new runner
+   * can start its seq from 0 without triggering the monotonic-seq check).
+   */
+  resetRunnerSeq(id: string): void {
+    const entry = this.#entry(id);
+    entry.internal.lastRunnerSeq = null;
+    this.#persist(entry);
   }
 
   /**
