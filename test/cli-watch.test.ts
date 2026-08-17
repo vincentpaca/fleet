@@ -97,5 +97,5 @@ test('attach --answer posts the stdin answer and exits on done', async (t) => {
   assert.match(out, /decision d1: Rebase or wait\?/);
   assert.match(out, /rebase \(recommended\)/);
   assert.match(out, /settle rung=implemented status=READY next: open the pull request/);
-  assert.match(out, /state done/);
+  assert.match(out, /state → done/);
 });
