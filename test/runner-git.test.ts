@@ -158,3 +158,43 @@ test('createDraftPr propagates gh failures as thrown errors', () => {
     /already exists/,
   );
 });
+
+// --- Re-entry (issue #6): branch-collision guard ---
+
+test('setupWorkspace reentry: checks out existing branch with WIP, no collision', () => {
+  const remote = makeRemote();
+
+  // First: initial setup (creates the branch, pushes it).
+  const ws1 = makeWorkspace();
+  const { branch, base } = setupWorkspace(ws1, opts(remote));
+
+  // Simulate WIP: commit something and push.
+  writeFileSync(join(ws1, 'half-done.txt'), 'wip\n');
+  pushWip(ws1, 'block_hot expired');
+
+  // Verify the WIP commit is on the remote.
+  const subjects1 = run(ws1, ['log', '--format=%s', `origin/${branch}`]);
+  assert.match(subjects1, /wip\(park\)/);
+
+  // Second: re-entry with a fresh workspace (simulates a new container).
+  const ws2 = makeWorkspace();
+  const result = setupWorkspace(ws2, { ...opts(remote), reentry: true });
+
+  assert.equal(result.branch, branch);
+  assert.equal(result.base, base);
+
+  // The WIP file is present in the re-entry workspace.
+  assert.ok(existsSync(join(ws2, 'half-done.txt')), 'WIP file must be present on re-entry');
+  assert.equal(readFileSync(join(ws2, 'half-done.txt'), 'utf8'), 'wip\n');
+
+  // The re-entry does not push — the remote branch is unchanged.
+  const subjects2 = run(ws2, ['log', '--format=%s', `origin/${branch}`]);
+  assert.match(subjects2, /wip\(park\)/, 'remote still shows the WIP commit (no new push)');
+
+  // A subsequent pushWork on re-entry does not trip or duplicate the branch.
+  writeFileSync(join(ws2, 'final.txt'), 'done\n');
+  assert.equal(pushWork(ws2, 'APP-7', 'job-1', true), 'pushed');
+  const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
+  assert.match(files, /half-done\.txt/);
+  assert.match(files, /final\.txt/);
+});

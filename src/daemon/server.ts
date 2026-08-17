@@ -146,9 +146,12 @@ export class FleetDaemon {
       this.#port = typeof address === "object" && address !== null ? address.port : null;
     }
 
-    // Wall-clock backstop sweep: checks for overdue jobs and terminates them.
+    // Combined sweep: wall-clock backstop and decision-timeout (stale) marking.
     const sweepMs = this.#options.wallClockSweepIntervalMs ?? 10_000;
-    this.#sweepTimer = setInterval(() => { this.#wallClockSweep(); }, sweepMs);
+    this.#sweepTimer = setInterval(() => {
+      this.#wallClockSweep();
+      this.#decisionTimeoutSweep();
+    }, sweepMs);
     this.#sweepTimer.unref(); // don't prevent process exit
 
     return { socketPath: this.#sockPath, port: this.#port };
@@ -304,17 +307,29 @@ export class FleetDaemon {
       },
     });
 
-    // Initialise wall-clock backstop tracking when the manifest sets a limit.
+    // Initialise wall-clock and decision-timeout backstop tracking.
     const manifestLimits = (manifest as Record<string, unknown>).limits;
     if (manifestLimits && typeof manifestLimits === "object") {
-      const wallClockStr = (manifestLimits as Record<string, unknown>).wall_clock;
+      const limits = manifestLimits as Record<string, unknown>;
+      const wallClockStr = limits.wall_clock;
       if (typeof wallClockStr === "string") {
         const limitMs = parseDurationMs(wallClockStr);
-        if (limitMs !== undefined) {
-          this.registry.initWallClock(id, limitMs);
-        }
+        if (limitMs !== undefined) this.registry.initWallClock(id, limitMs);
+      }
+      const decisionTimeoutStr = limits.decision_timeout;
+      if (typeof decisionTimeoutStr === "string") {
+        const limitMs = parseDurationMs(decisionTimeoutStr);
+        if (limitMs !== undefined) this.registry.initDecisionTimeout(id, limitMs);
       }
     }
+
+    // Store launch details for potential re-entry after parking (issue #6).
+    this.registry.storeLaunchDetails(id, {
+      manifest,
+      env,
+      sync,
+      image: imageOverride,
+    });
 
     try {
       const { handle } = await this.#options.provider.launch({
@@ -409,8 +424,59 @@ export class FleetDaemon {
       ...(text !== undefined ? { text } : {}),
       by: "operator",
     });
-    // Answer delivery is the blocked -> running transition.
     this.registry.setOpenDecision(job.id, null);
+    this.registry.setDecisionBlockedAt(job.id, null);
+
+    // Parked (or stale) job: re-entry path. The old runner has already exited.
+    // Re-launch a fresh container with the answer pre-materialised so the
+    // status-driven harness can pick up where it left off. The state stays
+    // blocked until the new runner emits state:running (blocked → running is a
+    // valid transition). The runner seq resets so the fresh container starts at 0.
+    if (job.marker === "parked" || job.marker === "stale") {
+      this.registry.clearMarker(job.id);
+      this.registry.resetRunnerSeq(job.id);
+      const newToken = newRunnerToken();
+      const details = this.registry.getLaunchDetails(job.id);
+      const reAnswer: { option?: string; text?: string } = {};
+      if (option !== undefined) reAnswer.option = option;
+      if (text !== undefined) reAnswer.text = text;
+      // Derive resources from the stored manifest so the provider can apply
+      // any resource overrides declared in manifest.limits.resources.
+      const storedManifest = details.manifest as { limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
+      const resources = storedManifest?.limits?.resources;
+      try {
+        const { handle } = await this.#options.provider.launch({
+          jobId: job.id,
+          daemonUrl: this.daemonUrl,
+          runnerToken: newToken,
+          image: details.image,
+          env: details.env,
+          sync: details.sync,
+          manifest: details.manifest,
+          workOrder: job.workOrder,
+          resources,
+          reentryAnswer: { decisionId: decision.id, answer: reAnswer },
+        });
+        const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
+        return sendJson(res, 200, { job: publicJob(updated) });
+      } catch (error) {
+        // Re-launch failed: the old runner is dead and no new one is starting.
+        // Cancel the job so it reaches a terminal state the operator can reason
+        // about — leaving it in blocked with no runner and no marker would make
+        // it permanently unrecoverable without manual intervention.
+        this.registry.appendEvent(job.id, {
+          type: "log",
+          text: `re-launch failed after answer: ${String(error)}`,
+          who: "daemon",
+        });
+        this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-failed" });
+        this.registry.updateJob(job.id, { state: "cancelled" });
+        return sendJson(res, 500, { error: `re-launch failed: ${String(error)}` });
+      }
+    }
+
+    // Hot job: the existing runner is still alive and polling for its answer.
+    // The blocked → running transition happens immediately here.
     this.registry.clearMarker(job.id);
     const updated = this.registry.updateJob(job.id, { state: "running" });
     // Job is active again; resume the daemon-side wall-clock meter.
@@ -435,6 +501,7 @@ export class FleetDaemon {
     }
     this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "operator-cancel" });
     this.registry.setOpenDecision(job.id, null);
+    this.registry.setDecisionBlockedAt(job.id, null);
     this.registry.clearMarker(job.id);
     const updated = this.registry.updateJob(job.id, { state: "cancelled" });
     return sendJson(res, 200, { job: publicJob(updated) });
@@ -496,7 +563,13 @@ export class FleetDaemon {
       const nextState = event.state as JobState;
       const marker = event.marker as Marker | undefined;
       if (!canTransition(job.state, nextState)) {
-        return { status: 422, errors: [`illegal transition: ${job.state} -> ${nextState}`] };
+        // Special protocol: the runner emits state:blocked,marker:parked when
+        // block_hot expires on an already-blocked job. This is a marker update
+        // (not a new state transition) and is explicitly permitted.
+        const isParking = job.state === "blocked" && nextState === "blocked" && marker === "parked";
+        if (!isParking) {
+          return { status: 422, errors: [`illegal transition: ${job.state} -> ${nextState}`] };
+        }
       }
       if (marker !== undefined && !isMarkerAllowed(nextState, marker)) {
         return { status: 422, errors: [`marker "${marker}" not allowed on state ${nextState}`] };
@@ -554,6 +627,9 @@ export class FleetDaemon {
         optionIds: decision.options.map((option) => option.id),
       });
       this.registry.updateJob(job.id, { state: "blocked" });
+      // Record when this decision first arrived — the decision_timeout clock
+      // starts here (regardless of whether the job is hot or parked).
+      this.registry.setDecisionBlockedAt(job.id, Date.now());
       // The job is now waiting for an operator answer — operator wait time is
       // excluded from the wall-clock budget, same as the runner-side behaviour.
       this.registry.wallClockBecameInactive(job.id);
@@ -636,6 +712,7 @@ export class FleetDaemon {
 
     this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "wall-clock" });
     this.registry.setOpenDecision(job.id, null);
+    this.registry.setDecisionBlockedAt(job.id, null);
     this.registry.clearMarker(job.id);
     this.registry.wallClockBecameInactive(job.id);
     const updated = this.registry.updateJob(job.id, { state: "cancelled" });
@@ -644,6 +721,32 @@ export class FleetDaemon {
     const target = targetRung(updated.workOrder);
     const doneCheck = verifyRung(updated.settle, target, { ghRunner: defaultGhRunner() });
     this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
+  }
+
+  /**
+   * Periodic sweep: mark any parked job as stale once its decision_timeout
+   * has elapsed since the decision first arrived. Stale jobs stay parked and
+   * answerable — they just get the stale marker surfaced in fleet status.
+   */
+  #decisionTimeoutSweep(): void {
+    const now = Date.now();
+    for (const job of this.registry.listJobs()) {
+      if (job.state !== "blocked" || job.marker !== "parked") continue;
+      const limitMs = this.registry.decisionTimeLimitMs(job.id);
+      if (limitMs === null) continue;
+      const blockedAt = this.registry.decisionBlockedAtMs(job.id);
+      if (blockedAt === null) continue;
+      if (now - blockedAt < limitMs) continue;
+      this.#markStale(job);
+    }
+  }
+
+  /** Transition a parked job to stale; idempotent. */
+  #markStale(job: JobRecord): void {
+    const current = this.registry.getJob(job.id);
+    if (!current || current.state !== "blocked" || current.marker === "stale") return;
+    this.registry.appendEvent(job.id, { type: "state", state: "blocked", marker: "stale" });
+    this.registry.updateJob(job.id, { marker: "stale" });
   }
 
   #notify(jobId: string, question: string): void {

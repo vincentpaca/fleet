@@ -24,6 +24,12 @@ export type LaunchSpec = {
   workOrder: unknown;
   /** Resource requirements from manifest limits.resources; absent = use task-def defaults. */
   resources?: ResourceRequest;
+  /**
+   * Re-entry answer (issue #6): present only when re-launching a parked job.
+   * The runner writes the answer to .fleet/out/answer-<decisionId>.json after
+   * wiping the out/ channel so the status-driven harness finds it immediately.
+   */
+  reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
 };
 
 export interface Provider {
@@ -46,5 +52,9 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     FLEET_DAEMON_URL: spec.daemonUrl,
     FLEET_RUNNER_TOKEN: spec.runnerToken,
     FLEET_WORKSPACE: workspace,
+    // Re-entry answer: runner writes this to out/answer-<id>.json after wiping out/.
+    ...(spec.reentryAnswer !== undefined
+      ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
+      : {}),
   };
 }

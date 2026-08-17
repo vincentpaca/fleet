@@ -671,3 +671,176 @@ test("POST /jobs with no limits.resources passes undefined resources to the Laun
   assert.ok(launch, "provider.launch must have been called");
   assert.equal(launch.resources, undefined);
 });
+
+// --- Parked-job re-entry (issue #6) ---
+
+// (No manifest helper needed for decision_timeout tests — registry is seeded directly
+// because the manifest schema requires m|h units, which are too long for unit tests.)
+
+test("answer to parked job triggers re-launch with reentryAnswer; new token issued", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const { id, token } = await createJob(ctx);
+  // Runner emits: running → decision → parked
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  const parkedJob = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(parkedJob.state, "blocked");
+  assert.equal(parkedJob.marker, "parked");
+  assert.equal(ctx.provider.launches.length, 1);
+
+  // Operator answers. The daemon must re-launch (not just update state).
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+
+  // A second launch must have been triggered.
+  assert.equal(ctx.provider.launches.length, 2, "re-launch was expected");
+  const relaunch = ctx.provider.launches[1];
+  assert.equal(relaunch.jobId, id);
+  // The reentryAnswer carries the decision and the chosen option.
+  assert.ok(relaunch.reentryAnswer, "reentryAnswer must be set on re-launch");
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+  assert.equal(relaunch.reentryAnswer?.answer.option, "flag");
+
+  // The new runner token must differ from the first.
+  assert.notEqual(relaunch.runnerToken, token);
+
+  // Job state stays blocked until the new runner emits state:running.
+  const relaunchedJob = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(relaunchedJob.state, "blocked", "state must stay blocked until new runner emits running");
+  assert.equal(relaunchedJob.marker, undefined, "parked marker must be cleared");
+
+  // New runner (using the new token) can post state:running → job becomes running.
+  const newToken = relaunch.runnerToken;
+  const runningRes = await runnerPost(ctx.sock, id, newToken, event(id, 0, { type: "state", state: "running" }));
+  assert.equal(runningRes.status, 200, runningRes.body);
+  const runningJob = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(runningJob.state, "running");
+});
+
+test("answer to stale job also triggers re-launch", async (t) => {
+  // Drive stale through the real sweep path (not a direct registry mutation) so
+  // the state event emitted by #markStale is present in the event log.
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    wallClockSweepIntervalMs: 100,
+  });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+  const token = provider.launches[0].runnerToken;
+
+  await runnerPost(sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(sock, id, token, event(id, 1, DECISION));
+  await runnerPost(sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Seed an already-elapsed decision_timeout so the next sweep fires immediately.
+  daemon.registry.initDecisionTimeout(id, 100);
+  daemon.registry.setDecisionBlockedAt(id, Date.now() - 500);
+
+  // Wait for the sweep to mark it stale via #markStale (appends the state event).
+  await until(async () => {
+    const j = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+    return j.state === "blocked" && j.marker === "stale";
+  }, 2_000);
+
+  // The stale state event must appear in the event log (proving #markStale ran).
+  const eventsRes = await op(sock, "GET", `/jobs/${id}/events`);
+  const events = parseNdjson(eventsRes.body) as Array<{ type: string; state?: string; marker?: string }>;
+  const staleEvent = events.find((e) => e.type === "state" && e.state === "blocked" && e.marker === "stale");
+  assert.ok(staleEvent, "stale state event must be in the log");
+
+  // Answering a stale job must re-launch with a fresh runner and reentryAnswer.
+  const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+  assert.equal(provider.launches.length, 2, "stale job must trigger re-launch");
+  assert.equal(provider.launches[1].reentryAnswer?.decisionId, "d1");
+  assert.equal(provider.launches[1].reentryAnswer?.answer.option, "flag");
+
+  // Job state stays blocked until the new runner emits state:running.
+  const relaunchedJob = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(relaunchedJob.state, "blocked");
+  assert.equal(relaunchedJob.marker, undefined, "stale marker must be cleared after answer");
+});
+
+test("decision_timeout sweep marks parked job stale; job remains answerable", async (t) => {
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    // Fast sweep (200ms) so the stale marking fires quickly in the test.
+    wallClockSweepIntervalMs: 200,
+  });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  // Create a job and let it progress to blocked+parked.
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+  const token = provider.launches[0].runnerToken;
+
+  await runnerPost(sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(sock, id, token, event(id, 1, DECISION));
+  // Parked: block_hot expired, runner exited.
+  await runnerPost(sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Seed a very short decision_timeout (500ms) and a past decisionBlockedAt
+  // so the sweep fires immediately on its next tick.
+  daemon.registry.initDecisionTimeout(id, 500);
+  daemon.registry.setDecisionBlockedAt(id, Date.now() - 1000); // already elapsed
+
+  // The next sweep (≤ 200ms) must mark it stale.
+  await until(async () => {
+    const j = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+    return j.state === "blocked" && j.marker === "stale";
+  }, 2_000);
+
+  const staleJob = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(staleJob.state, "blocked");
+  assert.equal(staleJob.marker, "stale");
+
+  // Stale job is still answerable — it re-launches.
+  const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+  assert.equal(provider.launches.length, 2, "stale job must re-launch on answer");
+});
+
+test("re-launch failure after answer cancels the job — not stuck in blocked", async (t) => {
+  // If provider.launch throws during re-entry, the old runner is dead and no new
+  // one is starting. The daemon must cancel the job so it reaches a terminal state
+  // instead of hanging in blocked with no live runner and no open decision.
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const { id, token } = await createJob(ctx);
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Simulate a provider failure on the next launch.
+  ctx.provider.failNextLaunch = true;
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 500, answered.body);
+
+  // The job must be cancelled — not stuck in blocked.
+  const afterFail = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(afterFail.state, "cancelled", "job must be cancelled when re-launch fails");
+  assert.equal(afterFail.marker, undefined, "marker must be cleared");
+
+  // No open decision remains (job is terminal, second answer attempt returns 409).
+  const second = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(second.status, 409);
+});

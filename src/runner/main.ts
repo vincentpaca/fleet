@@ -12,7 +12,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
+import { appendFileSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -21,7 +21,7 @@ import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { WallClockTimer } from './wall-clock.ts';
 import { composeSettle } from './settle.ts';
-import { setupWorkspace, pushWork, getHeadSha, createDraftPr } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs } from '../shared/time.ts';
@@ -42,6 +42,22 @@ async function main(): Promise<void> {
   const workspace = requireEnv('FLEET_WORKSPACE');
 
   materializeWorkspace(workspace);
+
+  // Re-entry answer (issue #6): present when the daemon re-launches a parked
+  // job after an operator answer. The runner writes it to out/ after the wipe
+  // so the status-driven harness finds it immediately on its first check.
+  const reentryAnswerB64 = process.env.FLEET_REENTRY_ANSWER_JSON;
+  let reentryAnswer: { decisionId: string; answer: { option?: string; text?: string } } | undefined;
+  if (reentryAnswerB64) {
+    try {
+      reentryAnswer = JSON.parse(Buffer.from(reentryAnswerB64, 'base64').toString('utf8')) as {
+        decisionId: string;
+        answer: { option?: string; text?: string };
+      };
+    } catch {
+      // Ignore malformed env; proceed without pre-materialised answer.
+    }
+  }
 
   const sink = new EventSink({ jobId, daemonUrl, token });
   await sink.emit({ type: 'state', state: 'running' });
@@ -83,6 +99,9 @@ async function main(): Promise<void> {
         target,
         name: process.env.FLEET_GIT_NAME,
         email: process.env.FLEET_GIT_EMAIL,
+        // Re-entry: check out the existing job branch (WIP commit) instead of
+        // creating a fresh branch from the base. No push — no collision guard.
+        reentry: !!reentryAnswer,
       });
       branch = setup.branch;
       base = setup.base;
@@ -119,6 +138,15 @@ async function main(): Promise<void> {
   rmSync(join(workspace, '.fleet', 'out'), { recursive: true, force: true });
   mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
 
+  // Re-entry: write the pre-materialised answer file so the status-driven
+  // harness finds it immediately without needing to raise a new decision.
+  if (reentryAnswer) {
+    writeFileSync(
+      join(workspace, '.fleet', 'out', `answer-${reentryAnswer.decisionId}.json`),
+      JSON.stringify(reentryAnswer.answer, null, 2) + '\n',
+    );
+  }
+
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
   const probe = !process.env.FLEET_HARNESS_CMD && cli === 'claude-code'
@@ -142,14 +170,17 @@ async function main(): Promise<void> {
 
   const startedAt = Date.now();
 
-  // Parse wall-clock limit; build timer so the decision watcher can pause it
-  // while the job is blocked (blocked time doesn't count against the budget).
+  // Parse limits; build timers so the decision watcher can pause the wall-clock
+  // while blocked and park the job when block_hot expires.
   const limits = (manifest.limits ?? {}) as Record<string, unknown>;
   const wallClockStr = typeof limits.wall_clock === 'string' ? limits.wall_clock : undefined;
   const wallClockLimitMs = wallClockStr !== undefined ? parseDurationMs(wallClockStr) : undefined;
   const wallClock = wallClockLimitMs !== undefined ? new WallClockTimer(wallClockLimitMs, startedAt) : undefined;
 
-  const watcher = new DecisionWatcher({ workspace, sink, wallClock });
+  const blockHotStr = typeof limits.block_hot === 'string' ? limits.block_hot : undefined;
+  const blockHotMs = blockHotStr !== undefined ? parseDurationMs(blockHotStr) : undefined;
+
+  const watcher = new DecisionWatcher({ workspace, sink, wallClock, blockHotMs });
   watcher.start();
 
   // The harness child gets NO runner-scoped FLEET_* env: nested fleet
@@ -193,48 +224,87 @@ async function main(): Promise<void> {
   const linesDone = Promise.withResolvers<void>();
   lines.once('close', () => linesDone.resolve());
 
-  // --- Wall-clock enforcement ---
-  // Poll active time every 250ms; on expiry send SIGTERM, then wait grace
-  // period before SIGKILL so the harness can flush/settle gracefully.
+  // --- Harness exit race: wall-clock, block_hot (park), or normal exit ---
+  // All three are armed regardless; whichever fires first wins.
+  const graceMs =
+    parseInt(process.env.FLEET_WALL_CLOCK_GRACE_MS ?? '', 10) || 30_000;
+
   let wallClockFired = false;
   let exitCode: number;
 
-  if (wallClock !== undefined) {
-    const graceMs =
-      parseInt(process.env.FLEET_WALL_CLOCK_GRACE_MS ?? '', 10) || 30_000;
+  // Park signal: resolves with the decision id when block_hot fires.
+  // Silently never resolves if blockHotMs is not set.
+  const parkPromise = watcher.parked.then(
+    (decisionId) => ({ kind: 'parked' as const, decisionId }),
+  );
 
-    // Promise that resolves once active time >= limit.
-    const wallClockExpired = (async () => {
-      while (!wallClock.expired()) {
-        await delay(Math.min(250, Math.max(1, wallClock.remainingMs())));
+  // Wall-clock: resolves when active runtime >= limit. Never resolves if unset.
+  const wallClockExpired: Promise<void> = wallClock !== undefined
+    ? (async () => {
+        while (!wallClock.expired()) {
+          await delay(Math.min(250, Math.max(1, wallClock.remainingMs())));
+        }
+      })()
+    : new Promise<void>(() => {}); // never
+
+  const result = await Promise.race([
+    exit.promise.then((code) => ({ kind: 'exit' as const, code })),
+    wallClockExpired.then(() => ({ kind: 'wall-clock' as const })),
+    parkPromise,
+  ]);
+
+  if (result.kind === 'parked') {
+    // block_hot expired: commit WIP, emit blocked/parked, exit 0.
+    // The harness is still running (waiting for its answer); terminate it now.
+    child.kill('SIGTERM');
+    await Promise.race([exit.promise, delay(graceMs)]);
+    if (!child.killed) child.kill('SIGKILL');
+    await exit.promise;
+    await linesDone.promise;
+    await Promise.all(emits);
+    await watcher.stop(); // already stopped internally; awaits the loop wind-down
+
+    if (gitUrl && branch) {
+      try {
+        const wipOutcome = pushWip(workspace, `block_hot expired: ${result.decisionId}`);
+        await sink.emit({
+          type: 'log',
+          text: wipOutcome === 'pushed'
+            ? `wip pushed to ${branch} (parked)`
+            : `workspace clean at park; no new commit beyond ${branch}`,
+          who: 'runner',
+        });
+      } catch (err) {
+        await sink.emit({
+          type: 'log',
+          text: `wip push failed (parking anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+          who: 'runner',
+        });
       }
-    })();
-
-    const result = await Promise.race([
-      exit.promise.then((code) => ({ kind: 'exit' as const, code })),
-      wallClockExpired.then(() => ({ kind: 'wall-clock' as const })),
-    ]);
-
-    if (result.kind === 'wall-clock') {
-      wallClockFired = true;
-      await sink.emit({
-        type: 'log',
-        text: `wall-clock limit (${wallClockStr}) reached; sending SIGTERM`,
-        who: 'runner',
-      });
-      child.kill('SIGTERM');
-      // Grace period: let the harness shut down cleanly before SIGKILL.
-      await Promise.race([exit.promise, delay(graceMs)]);
-      if (!child.killed) child.kill('SIGKILL');
-      await exit.promise;
-      // Wall-clock cancellation always fails the job regardless of how the
-      // harness exited (it may exit 0 if it handles SIGTERM gracefully).
-      exitCode = 1;
-    } else {
-      exitCode = result.code;
     }
+
+    await sink.emit({ type: 'state', state: 'blocked', marker: 'parked' });
+    process.exit(0);
+  }
+
+  if (result.kind === 'wall-clock') {
+    wallClockFired = true;
+    await sink.emit({
+      type: 'log',
+      text: `wall-clock limit (${wallClockStr}) reached; sending SIGTERM`,
+      who: 'runner',
+    });
+    child.kill('SIGTERM');
+    // Grace period: let the harness shut down cleanly before SIGKILL.
+    await Promise.race([exit.promise, delay(graceMs)]);
+    if (!child.killed) child.kill('SIGKILL');
+    await exit.promise;
+    // Wall-clock cancellation always fails the job regardless of how the
+    // harness exited (it may exit 0 if it handles SIGTERM gracefully).
+    exitCode = 1;
   } else {
-    exitCode = await exit.promise;
+    // result.kind === 'exit'
+    exitCode = result.code;
   }
 
   await linesDone.promise;

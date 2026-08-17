@@ -163,3 +163,71 @@ test('non-JSON decision file is rejected after the mid-write grace tick', async 
     await daemon.close();
   }
 });
+
+// --- block_hot (issue #6): parking the watcher ---
+
+test('block_hot: watcher.parked resolves with decision id when hot window expires', async () => {
+  const token = 'test-token-park-1';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-dec-'));
+  const outDir = join(workspace, '.fleet', 'out');
+  mkdirSync(outDir, { recursive: true });
+
+  const sink = new EventSink({ jobId: 'job-park-1', daemonUrl: daemon.url, token });
+  // Use a very short block_hot so the test runs quickly.
+  const watcher = new DecisionWatcher({ workspace, sink, intervalMs: 25, blockHotMs: 200 });
+  watcher.start();
+  try {
+    writeFileSync(join(outDir, 'decision.json'), JSON.stringify(VALID_DECISION));
+
+    // Wait for the decision event to be raised before the hot window fires.
+    await until(() => daemon.events.some((e) => e.type === 'decision'));
+
+    // Let the hot window expire (200ms). The daemon never answers.
+    const parkedId = await watcher.parked;
+    assert.equal(parkedId, 'd1', 'parked resolves with the decision id');
+
+    // After parking, watcher is stopped — stop() should resolve immediately.
+    const stopTimeout = new Promise<void>((_, reject) => setTimeout(() => reject(new Error('stop() hung')), 500));
+    await Promise.race([watcher.stop(), stopTimeout]);
+
+    // The watcher raised the decision event but got no answer — count is 1.
+    assert.equal(watcher.count, 1);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('block_hot: watcher.parked does NOT fire when answer arrives before the hot window', async () => {
+  const token = 'test-token-park-2';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-dec-'));
+  const outDir = join(workspace, '.fleet', 'out');
+  mkdirSync(outDir, { recursive: true });
+
+  const sink = new EventSink({ jobId: 'job-park-2', daemonUrl: daemon.url, token });
+  // Long hot window — answer will arrive first.
+  const watcher = new DecisionWatcher({ workspace, sink, intervalMs: 25, blockHotMs: 10_000 });
+  watcher.start();
+  let parked = false;
+  watcher.parked.then(() => { parked = true; });
+  try {
+    daemon.answer('d1', { option: 's3' });
+    writeFileSync(join(outDir, 'decision.json'), JSON.stringify(VALID_DECISION));
+
+    // Answer file should appear (answer arrived before block_hot).
+    await until(() => existsSync(join(outDir, 'answer-d1.json')));
+    const answer = JSON.parse(readFileSync(join(outDir, 'answer-d1.json'), 'utf8'));
+    assert.deepEqual(answer, { option: 's3' });
+
+    // Give a moment to confirm parked is still false.
+    await delay(100);
+    assert.equal(parked, false, 'parked must not fire when answer arrives first');
+    assert.equal(watcher.count, 1);
+  } finally {
+    await watcher.stop();
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
