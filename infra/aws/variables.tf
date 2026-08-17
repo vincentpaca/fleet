@@ -103,15 +103,21 @@ variable "daemon_image" {
 # --- Daemon service ---------------------------------------------------------
 
 variable "daemon_cpu" {
-  description = "CPU units reserved for the daemon container."
+  description = "CPU units for the daemon Fargate task (task-level; must be a valid Fargate CPU value: 256, 512, 1024, 2048, or 4096)."
   type        = number
   default     = 256
 }
 
 variable "daemon_memory" {
-  description = "Hard memory limit (MiB) for the daemon container."
+  description = "Memory (MiB) for the daemon Fargate task (task-level; must be a valid Fargate memory value for the chosen CPU — e.g. 512-2048 for CPU=256)."
   type        = number
   default     = 512
+}
+
+variable "daemon_tcp_port" {
+  description = "TCP port the daemon binds inside its container. Runner tasks on the same VPC reach the daemon at this port. Exposed to operators via SSM port-forward (see the connect_hint output)."
+  type        = number
+  default     = 9000
 }
 
 variable "runner_cpu" {

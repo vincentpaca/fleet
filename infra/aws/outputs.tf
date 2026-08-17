@@ -34,18 +34,37 @@ output "vpc_id" {
 }
 
 output "connect_hint" {
-  description = "How to open a shell in the running daemon via SSM (ECS exec) — no inbound network access exists."
+  description = "SSM port-forward command to tunnel the daemon HTTP port to localhost. No security-group rule opens an inbound path from the internet; access is via SSM only. Run each line in order."
   value       = <<-EOT
-    TASK=$(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name ${aws_ecs_service.daemon.name} --query 'taskArns[0]' --output text)
-    aws ecs execute-command --cluster ${aws_ecs_cluster.this.name} --task "$TASK" --container ${var.name}-daemon --interactive --command /bin/sh
+    # 1. Find the running daemon task ARN.
+    TASK=$(aws ecs list-tasks \
+      --cluster ${aws_ecs_cluster.this.name} \
+      --service-name ${aws_ecs_service.daemon.name} \
+      --query 'taskArns[0]' --output text)
+
+    # 2. Get the container runtime ID (needed for the SSM target string).
+    RUNTIME_ID=$(aws ecs describe-tasks \
+      --cluster ${aws_ecs_cluster.this.name} \
+      --tasks "$TASK" \
+      --query "tasks[0].containers[?name=='${var.name}-daemon'].runtimeId" \
+      --output text)
+
+    # 3. Open the SSM port-forward session. The daemon HTTP API is then
+    #    reachable at http://localhost:${var.daemon_tcp_port} on your machine.
+    aws ssm start-session \
+      --target "ecs:${aws_ecs_cluster.this.name},$${TASK##*/},$RUNTIME_ID" \
+      --document-name AWS-StartPortForwardingSessionToRemoteHost \
+      --parameters '{"host":["localhost"],"portNumber":["${var.daemon_tcp_port}"],"localPortNumber":["${var.daemon_tcp_port}"]}'
   EOT
 }
 
 output "fleet_config" {
   description = "The unit's shape, self-described for Fleet's runtime provider. Every infra unit must expose this output (test/cloud-agnostic.test.ts): it is the contract that lets Fleet predict the infrastructure it created instead of discovering it."
   value = {
-    provider               = "ecs"
-    cluster                = aws_ecs_cluster.this.name
+    provider = "ecs"
+    cluster  = aws_ecs_cluster.this.name
+    # capacity_provider drives --capacity-provider-strategy in run-task so managed
+    # ASG scaling fires for every worker job.
     capacity_provider      = aws_ecs_capacity_provider.ec2.name
     runner_repository_url  = aws_ecr_repository.runner.repository_url
     runner_task_definition = aws_ecs_task_definition.runner.family
@@ -55,10 +74,8 @@ output "fleet_config" {
     # --network-configuration for bridge-mode tasks.  Subnets and security groups
     # are intentionally empty in both this output and the SSM fleet-config parameter
     # so the values remain consistent and consumers do not pass them to run-task.
-    # A future Fargate unit would populate these from its own VPC/SG resources.
     subnets         = []
     security_groups = []
-    launch_type     = "EC2"
     ssm_config_path = aws_ssm_parameter.fleet_config.name
     # Offered capacity tiers: the daemon rejects manifests whose limits.resources
     # exceed every tier here at dispatch time.  Operators set offered_cpu_units /

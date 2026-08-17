@@ -26,6 +26,13 @@ export type EcsConfig = {
   containerName: string;
   subnets: string[];
   securityGroups: string[];
+  /**
+   * ECS capacity provider to use for run-task (preferred over launchType when set).
+   * When set, buildRunTaskArgs emits --capacity-provider-strategy so managed scaling
+   * fires. When absent, falls back to --launch-type launchType (EC2 default).
+   */
+  capacityProvider?: string;
+  /** Fallback launch type when capacityProvider is not set. Default "EC2". */
   launchType: string;
   assignPublicIp: string;
   /**
@@ -45,11 +52,16 @@ export type EcsConfig = {
 export type FleetConfig = {
   provider: string;
   cluster: string;
+  /**
+   * ECS capacity provider name — preferred over launch_type when present.
+   * Run-task uses --capacity-provider-strategy so managed ASG scaling fires.
+   */
   capacity_provider?: string;
   runner_task_definition: string;
   runner_container_name: string;
   runner_log_group?: string;
-  launch_type: string;
+  /** Fallback when capacity_provider is absent. Default "EC2". */
+  launch_type?: string;
   subnets?: string[];
   security_groups?: string[];
   /**
@@ -71,7 +83,8 @@ export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
     containerName: required("runner_container_name", config.runner_container_name),
     subnets: config.subnets ?? [],
     securityGroups: config.security_groups ?? [],
-    launchType: required("launch_type", config.launch_type),
+    capacityProvider: config.capacity_provider,
+    launchType: config.launch_type ?? "EC2",
     assignPublicIp: "DISABLED",
     capacityTiers: config.capacity_tiers ?? [],
   };
@@ -190,6 +203,15 @@ export class EcsProvider implements Provider {
     // ECS task-level override values must be strings.
     if (spec.resources?.cpu != null) overrides.cpu = String(spec.resources.cpu);
     if (spec.resources?.memory != null) overrides.memory = String(spec.resources.memory);
+    // Prefer capacity-provider strategy so managed ASG scaling fires (defect #2).
+    // Fall back to --launch-type only when no capacity provider is configured
+    // (env-var overrides, tests, legacy SSM configs that predate this fix).
+    const launchArgs: string[] = this.config.capacityProvider
+      ? [
+          "--capacity-provider-strategy",
+          `capacityProvider=${this.config.capacityProvider},weight=1,base=0`,
+        ]
+      : ["--launch-type", this.config.launchType];
     const args = [
       "ecs",
       "run-task",
@@ -197,8 +219,7 @@ export class EcsProvider implements Provider {
       this.config.cluster,
       "--task-definition",
       this.config.taskDefinition,
-      "--launch-type",
-      this.config.launchType,
+      ...launchArgs,
       "--started-by",
       `fleet:${spec.jobId}`,
       "--overrides",

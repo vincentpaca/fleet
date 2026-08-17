@@ -17,6 +17,11 @@ locals {
   daemon_image          = var.daemon_image != "" ? var.daemon_image : "${aws_ecr_repository.runner.repository_url}:daemon"
   runner_container_name = "${var.name}-runner"
 
+  # Fargate daemon: assign a public IP when subnets are public (no NAT gateway)
+  # so the task can pull its image from ECR and write logs to CloudWatch.
+  # With a NAT gateway (private subnets) a public IP is not needed.
+  daemon_assign_public_ip = local.create_vpc ? (var.enable_nat_gateway ? "DISABLED" : "ENABLED") : "ENABLED"
+
   tags = merge(var.tags, { "fleet:module" = var.name })
 }
 
@@ -119,16 +124,17 @@ resource "aws_route_table_association" "private" {
 
 # --- Security groups ----------------------------------------------------------
 # Access is SSM-only: nothing accepts inbound traffic from outside the VPC.
-# The single ingress rule below is NFS from the instance security group to the
-# EFS mount targets — without it the FLEET_HOME volume cannot mount.
+# Intra-VPC ingress rules:
+#   - Runner tasks → daemon TCP port (instances SG → daemon SG)
+#   - Daemon + instances → EFS NFS port (both SGs → efs SG)
 
 resource "aws_security_group" "instances" {
   name        = "${var.name}-instances"
-  description = "Fleet ECS container instances: egress only, no inbound"
+  description = "Fleet ECS container instances: egress only, no public inbound"
   vpc_id      = local.vpc_id
 
   egress {
-    description = "All outbound (ECR, CloudWatch, SSM, EFS)"
+    description = "All outbound (ECR, CloudWatch, SSM, EFS, daemon)"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -138,17 +144,41 @@ resource "aws_security_group" "instances" {
   tags = merge(local.tags, { Name = "${var.name}-instances" })
 }
 
-resource "aws_security_group" "efs" {
-  name        = "${var.name}-efs"
-  description = "Fleet EFS mount targets: NFS from container instances only"
+resource "aws_security_group" "daemon" {
+  name        = "${var.name}-daemon"
+  description = "Fleet daemon Fargate task: TCP from runner instances only, no public inbound"
   vpc_id      = local.vpc_id
 
   ingress {
-    description     = "NFS from Fleet container instances"
+    description     = "Runner tasks → daemon HTTP (private VPC only)"
+    from_port       = var.daemon_tcp_port
+    to_port         = var.daemon_tcp_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.instances.id]
+  }
+
+  egress {
+    description = "All outbound (ECR, CloudWatch, SSM, EFS, ECS run-task)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${var.name}-daemon" })
+}
+
+resource "aws_security_group" "efs" {
+  name        = "${var.name}-efs"
+  description = "Fleet EFS mount targets: NFS from container instances and daemon task only"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    description     = "NFS from Fleet container instances and daemon task"
     from_port       = 2049
     to_port         = 2049
     protocol        = "tcp"
-    security_groups = [aws_security_group.instances.id]
+    security_groups = [aws_security_group.instances.id, aws_security_group.daemon.id]
   }
 
   tags = merge(local.tags, { Name = "${var.name}-efs" })
@@ -472,15 +502,18 @@ resource "aws_ssm_parameter" "fleet_config" {
   name = "/${var.name}/fleet-config"
   type = "String"
   value = jsonencode({
-    provider               = "ecs"
-    cluster                = aws_ecs_cluster.this.name
+    provider = "ecs"
+    cluster  = aws_ecs_cluster.this.name
+    # capacity_provider replaces launch_type: run-task uses --capacity-provider-strategy
+    # so ECS managed scaling fires and the ASG scales out for each job.
     capacity_provider      = aws_ecs_capacity_provider.ec2.name
     runner_task_definition = aws_ecs_task_definition.runner.family
     runner_container_name  = local.runner_container_name
     runner_log_group       = aws_cloudwatch_log_group.runner.name
-    launch_type            = "EC2"
-    subnets                = []
-    security_groups        = []
+    # Runner tasks use bridge networking on EC2; ecs run-task must not receive
+    # --network-configuration for bridge-mode tasks.
+    subnets         = []
+    security_groups = []
     # Offered capacity: the daemon rejects manifests whose limits.resources
     # exceed every tier here, surfacing the mismatch at dispatch rather than
     # letting the job queue forever against capacity it can never obtain.
@@ -491,13 +524,23 @@ resource "aws_ssm_parameter" "fleet_config" {
 }
 
 # --- Daemon service ---------------------------------------------------------------
+# The daemon runs on Fargate — its own substrate, independent of the worker
+# capacity provider and ASG.  This lets the worker ASG scale to zero when idle
+# while the daemon stays up to accept new jobs.
+#
+# Operator access: SSM port-forward (see the connect_hint output).  No inbound
+# network rule opens a path from the public internet; the daemon SG accepts
+# traffic only from the runner instances SG on the daemon TCP port.
 
 resource "aws_ecs_task_definition" "daemon" {
   family                   = "${var.name}-daemon"
-  requires_compatibilities = ["EC2"]
-  network_mode             = "bridge"
-  task_role_arn            = aws_iam_role.task.arn
-  execution_role_arn       = aws_iam_role.task_execution.arn
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  # Fargate requires cpu and memory at the task level (as strings).
+  cpu                = tostring(var.daemon_cpu)
+  memory             = tostring(var.daemon_memory)
+  task_role_arn      = aws_iam_role.task.arn
+  execution_role_arn = aws_iam_role.task_execution.arn
 
   volume {
     name = "fleet-home"
@@ -518,6 +561,11 @@ resource "aws_ecs_task_definition" "daemon" {
 
       environment = [
         { name = "FLEET_HOME", value = var.fleet_home_path },
+        # FLEET_PORT: daemon binds TCP so runner tasks can reach it.
+        # FLEET_DAEMON_HOST is NOT set here — the daemon auto-discovers its
+        # private IP from ECS container metadata at startup (awsvpc networking
+        # gives the task a VPC ENI whose IP appears in the metadata endpoint).
+        { name = "FLEET_PORT", value = tostring(var.daemon_tcp_port) },
         # FLEET_PROVIDER selects the ECS backend; FLEET_ECS_CONFIG_SSM_PATH tells
         # the daemon where to read fleet_config at boot — no hand-set FLEET_ECS_*
         # variables are needed in a production deployment.
@@ -530,6 +578,13 @@ resource "aws_ecs_task_definition" "daemon" {
           sourceVolume  = "fleet-home"
           containerPath = var.fleet_home_path
           readOnly      = false
+        },
+      ]
+
+      portMappings = [
+        {
+          containerPort = var.daemon_tcp_port
+          protocol      = "tcp"
         },
       ]
 
@@ -556,19 +611,20 @@ resource "aws_ecs_service" "daemon" {
   cluster                 = aws_ecs_cluster.this.id
   task_definition         = aws_ecs_task_definition.daemon.arn
   desired_count           = 1
+  launch_type             = "FARGATE"
   enable_execute_command  = true
   enable_ecs_managed_tags = true
 
-  capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.ec2.name
-    weight            = 1
+  network_configuration {
+    subnets          = local.subnet_ids
+    security_groups  = [aws_security_group.daemon.id]
+    assign_public_ip = local.daemon_assign_public_ip
   }
 
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
   depends_on = [
-    aws_ecs_cluster_capacity_providers.this,
     aws_efs_mount_target.fleet_home,
   ]
 

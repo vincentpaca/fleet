@@ -32,8 +32,23 @@ export const RANK: Record<JobState, number> = {
 export type DaemonOptions = {
   home: string;
   provider: Provider;
-  /** TCP listener on 127.0.0.1 when set (0 = ephemeral, for tests/providers). */
+  /**
+   * TCP listener port when set (0 = ephemeral, for tests/providers).
+   * Bind interface is tcpHost (default 127.0.0.1).
+   */
   port?: number;
+  /**
+   * IP/host to bind the TCP listener on.  Default 127.0.0.1.
+   * Set to 0.0.0.0 in containers so the daemon is reachable on any interface.
+   */
+  bindHost?: string;
+  /**
+   * IP/host to advertise in daemonUrl so runner tasks know where to connect.
+   * Defaults to bindHost.  In ECS set this to the container's private VPC IP
+   * (auto-discovered from ECS container metadata in main.ts) so runner tasks
+   * can reach the daemon even when bindHost is 0.0.0.0.
+   */
+  tcpHost?: string;
   /** Long-poll window for follow/answer endpoints; default 25s. */
   longPollMs?: number;
   /**
@@ -102,6 +117,10 @@ export class FleetDaemon {
   readonly #options: DaemonOptions;
   readonly #longPollMs: number;
   readonly #sockPath: string;
+  /** IP/host to bind the TCP listener on. */
+  readonly #bindHost: string;
+  /** IP/host to advertise in daemonUrl to runner tasks. */
+  readonly #tcpHost: string;
   #unixServer: Server | null = null;
   #tcpServer: Server | null = null;
   #port: number | null = null;
@@ -111,13 +130,16 @@ export class FleetDaemon {
     this.#options = options;
     this.#longPollMs = options.longPollMs ?? 25_000;
     this.#sockPath = socketPath(options.home);
+    this.#bindHost = options.bindHost ?? "127.0.0.1";
+    // tcpHost defaults to bindHost so a simple `port: 0` test still works.
+    this.#tcpHost = options.tcpHost ?? this.#bindHost;
     mkdirSync(options.home, { recursive: true });
     this.registry = new Registry(options.home);
   }
 
   /** URL the runner uses to reach this daemon (TCP preferred when enabled). */
   get daemonUrl(): string {
-    if (this.#port !== null) return `http://127.0.0.1:${this.#port}`;
+    if (this.#port !== null) return `http://${this.#tcpHost}:${this.#port}`;
     return `unix:${this.#sockPath}`;
   }
 
@@ -141,7 +163,7 @@ export class FleetDaemon {
     if (this.#options.port !== undefined) {
       this.#tcpServer = http.createServer(handler);
       const tcpListening = Promise.withResolvers<void>();
-      this.#tcpServer.listen(this.#options.port, "127.0.0.1", tcpListening.resolve);
+      this.#tcpServer.listen(this.#options.port, this.#bindHost, tcpListening.resolve);
       await tcpListening.promise;
       const address = this.#tcpServer.address();
       this.#port = typeof address === "object" && address !== null ? address.port : null;
@@ -223,6 +245,12 @@ export class FleetDaemon {
       if (parts[3] === "events" && method === "POST") return this.#intakeEvents(job, req, res);
       if (parts[3] === "answer" && method === "GET") return this.#answerPoll(job, url, res);
       if (parts[3] === "artifacts" && method === "POST") return this.#receiveArtifact(job, req, res);
+    }
+
+    // Health check: GET /health — answers without any state; used by the daemon
+    // Dockerfile HEALTHCHECK and by operators verifying the service is up.
+    if (url.pathname === "/health" && method === "GET") {
+      return sendJson(res, 200, { ok: true });
     }
 
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
