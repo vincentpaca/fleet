@@ -488,6 +488,63 @@ test("running -> blocked with parked marker is accepted; blocked -> blocked re-a
   assert.match(reassert.body, /illegal transition/);
 });
 
+test("wall-clock backstop terminates and cancels wedged job via daemon sweep", async (t) => {
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    // Fire the backstop 300ms after the 1s limit (1300ms total active).
+    wallClockBackstopMarginMs: 300,
+    // Sweep every 50ms so the test finishes quickly.
+    wallClockSweepIntervalMs: 50,
+  });
+  const { socketPath } = await daemon.start();
+  t.after(() => daemon.stop());
+  const ctx: Ctx = { daemon, sock: socketPath, provider, home };
+
+  // Manifest with a 1s wall_clock limit; schema now accepts 's' unit.
+  const manifest = { ...MANIFEST, limits: { wall_clock: "1s" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest });
+  assert.equal(res.status, 201, res.body);
+  const job = (res.json as { job: { id: string; handle?: string } }).job;
+  const launch = provider.launches.find((l) => l.jobId === job.id);
+  assert.ok(launch, "provider.launch must be called");
+  const { runnerToken: token } = launch;
+
+  // Runner signals running — this starts the active-time clock in the daemon.
+  await runnerPost(ctx.sock, job.id, token, event(job.id, 0, { type: "state", state: "running" }));
+
+  // The runner is now wedged (posts no more events).
+  // Wait for limit (1s) + margin (300ms) + a few sweep cycles (150ms buffer).
+  await sleep(1600);
+
+  const cancelled = (await op(ctx.sock, "GET", `/jobs/${job.id}`)).json as { job: Record<string, unknown> };
+  assert.equal(cancelled.job.state, "cancelled");
+
+  // Provider.terminate must have been called with the job's handle.
+  assert.ok(
+    provider.terminated.includes(job.handle ?? `stub:${job.id}`),
+    `expected handle in terminated list; got ${JSON.stringify(provider.terminated)}`,
+  );
+
+  // The daemon must have synthesised a settle event and a cancelled event.
+  const eventsRes = await op(ctx.sock, "GET", `/jobs/${job.id}/events`);
+  const events = parseNdjson(eventsRes.body) as Record<string, unknown>[];
+  const settleEvent = events.find((e) => e.type === "settle");
+  assert.ok(settleEvent, "settle event must be synthesised");
+  const report = settleEvent.report as Record<string, unknown> | undefined;
+  assert.ok(report, "synthesised settle must include report");
+  assert.equal(report.status, "PARTIAL");
+
+  const cancelledEvent = events.find(
+    (e) => e.type === "state" && (e as Record<string, unknown>).state === "cancelled",
+  );
+  assert.ok(cancelledEvent, "cancelled state event must be present");
+  assert.equal((cancelledEvent as Record<string, unknown>).reason, "wall-clock");
+});
+
 test("notify webhook fires on decision when configured", async (t) => {
   const home = tempHome();
   const posts: unknown[] = [];

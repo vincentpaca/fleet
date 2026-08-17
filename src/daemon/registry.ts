@@ -54,6 +54,13 @@ type JobInternal = {
   /** Highest seq the runner has claimed on intake; null until the first runner event. */
   lastRunnerSeq: number | null;
   openDecision: OpenDecision | null;
+  // Wall-clock backstop tracking (daemon-side, independent of runner).
+  /** Limit in ms; null = no limit. */
+  wallClockMs: number | null;
+  /** Active ms accumulated before the current running segment. */
+  wallClockActiveMs: number;
+  /** Timestamp (ms) when the job last became active; null when not currently active. */
+  wallClockActiveSince: number | null;
 };
 
 type JobEntry = {
@@ -81,7 +88,7 @@ export class Registry extends EventEmitter {
       const recordPath = join(jobsRoot, id, "job.json");
       if (!existsSync(recordPath)) continue;
       const raw = JSON.parse(readFileSync(recordPath, "utf8")) as JobRecord & JobInternal;
-      const { lastRunnerSeq, openDecision, ...record } = raw;
+      const { lastRunnerSeq, openDecision, wallClockMs, wallClockActiveMs, wallClockActiveSince, ...record } = raw;
       const eventsPath = join(jobsRoot, id, "events.jsonl");
       const events = existsSync(eventsPath)
         ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
@@ -89,7 +96,13 @@ export class Registry extends EventEmitter {
       const lastSeq = events.length > 0 ? events[events.length - 1].seq : -1;
       this.#jobs.set(id, {
         record,
-        internal: { lastRunnerSeq: lastRunnerSeq ?? null, openDecision: openDecision ?? null },
+        internal: {
+          lastRunnerSeq: lastRunnerSeq ?? null,
+          openDecision: openDecision ?? null,
+          wallClockMs: wallClockMs ?? null,
+          wallClockActiveMs: wallClockActiveMs ?? 0,
+          wallClockActiveSince: wallClockActiveSince ?? null,
+        },
         events,
         lastSeq,
       });
@@ -109,7 +122,13 @@ export class Registry extends EventEmitter {
     if (this.#jobs.has(record.id)) throw new Error(`job already exists: ${record.id}`);
     const entry: JobEntry = {
       record,
-      internal: { lastRunnerSeq: null, openDecision: null },
+      internal: {
+        lastRunnerSeq: null,
+        openDecision: null,
+        wallClockMs: null,
+        wallClockActiveMs: 0,
+        wallClockActiveSince: null,
+      },
       events: [],
       lastSeq: -1,
     };
@@ -197,6 +216,56 @@ export class Registry extends EventEmitter {
     return this.#entry(id).events.find(
       (event) => event.type === "answer" && event.decision === decisionId,
     );
+  }
+
+  /** Set the wall-clock limit for a job (called when the job is created). */
+  initWallClock(id: string, limitMs: number): void {
+    const entry = this.#entry(id);
+    entry.internal.wallClockMs = limitMs;
+    this.#persist(entry);
+  }
+
+  /**
+   * Record that the job became active (state → running).
+   * Idempotent: no-op if already marked active.
+   */
+  wallClockBecameActive(id: string, now = Date.now()): void {
+    const entry = this.#entry(id);
+    if (entry.internal.wallClockMs === null) return;
+    if (entry.internal.wallClockActiveSince !== null) return; // already active
+    entry.internal.wallClockActiveSince = now;
+    this.#persist(entry);
+  }
+
+  /**
+   * Record that the job stopped being active (state → blocked or terminal).
+   * Idempotent: no-op if not currently active.
+   */
+  wallClockBecameInactive(id: string, now = Date.now()): void {
+    const entry = this.#entry(id);
+    if (entry.internal.wallClockMs === null) return;
+    if (entry.internal.wallClockActiveSince === null) return; // already inactive
+    entry.internal.wallClockActiveMs += now - entry.internal.wallClockActiveSince;
+    entry.internal.wallClockActiveSince = null;
+    this.#persist(entry);
+  }
+
+  /**
+   * Compute current active ms for the job (accumulated + current segment).
+   * Returns null when the job has no wall-clock limit.
+   */
+  wallClockActiveMs(id: string, now = Date.now()): number | null {
+    const entry = this.#entry(id);
+    if (entry.internal.wallClockMs === null) return null;
+    const current = entry.internal.wallClockActiveSince !== null
+      ? now - entry.internal.wallClockActiveSince
+      : 0;
+    return entry.internal.wallClockActiveMs + current;
+  }
+
+  /** Wall-clock limit in ms for the job; null if none. */
+  wallClockLimitMs(id: string): number | null {
+    return this.#entry(id).internal.wallClockMs;
   }
 
   /**

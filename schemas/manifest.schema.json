@@ -112,7 +112,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "wall_clock": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained." },
+        "wall_clock": { "type": "string", "pattern": "^[0-9]+(s|m|h)$", "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained. Supports s/m/h units." },
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "30m", "description": "How long a blocked container stays hot before parking (WIP committed, task exits)." },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "24h", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered." },
         "model_spend": { "type": "string", "description": "OPEN — unenforced until the Phase 2 metering spike; the Terraform budget alarm is the interim backstop." },
