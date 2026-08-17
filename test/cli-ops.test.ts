@@ -184,11 +184,7 @@ test('daemon-backed commands fail readably when the daemon is unreachable', asyn
   assert.match(res.stderr, /cannot reach daemon at http:\/\/127\.0\.0\.1:9/);
 });
 
-test('doctor is an honest Phase 1 stub and unknown commands are usage errors', async () => {
-  const doctor = await runCli(['doctor'], {});
-  assert.equal(doctor.code, 1);
-  assert.match(doctor.stderr, /NOT IMPLEMENTED/);
-
+test('unknown commands are usage errors', async () => {
   const unknown = await runCli(['conquer'], {});
   assert.equal(unknown.code, 2);
   assert.match(unknown.stderr, /unknown command/);
