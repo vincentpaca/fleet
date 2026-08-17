@@ -190,7 +190,11 @@
               "type": { "type": "string" },
               "title": { "type": "string" },
               "version": { "type": "string" },
-              "status": { "type": "string" }
+              "status": { "type": "string" },
+              "path": { "type": "string", "description": "Artifact lane: relative path under .fleet/out/artifacts/ at time of delivery." },
+              "sha256": { "type": "string", "description": "Hex SHA-256 of the artifact bytes, verified by the daemon at intake." },
+              "bytes": { "type": "integer", "minimum": 0, "description": "Artifact size in bytes." },
+              "url": { "type": "string", "description": "External lane: canonical URL of the resource (e.g. Confluence page, Jira ticket)." }
             }
           }
         },

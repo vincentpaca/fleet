@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // fleet — operator CLI. Exit codes: 0 ok, 1 failure, 2 usage.
 import { parseArgs } from 'node:util';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -46,6 +47,8 @@ Commands:
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
   board [--once]                           Full-screen live view (--once or non-TTY: static render)
+  artifacts <jobId> [list]                 List artifacts delivered by a job
+  artifacts <jobId> get <path> [--out dir] Download an artifact (writes to dir/<filename>, or stdout)
   doctor [--manifest path]                 Check local environment against the manifest
   version                                  Print version and exit
 
@@ -586,6 +589,64 @@ async function cmdCancel(args: string[]): Promise<number> {
   return EXIT_OK;
 }
 
+// ---------- artifacts ----------
+
+async function cmdArtifacts(args: string[]): Promise<number> {
+  if (args.length === 0 || (args.length === 1 && (args[0] === '--help' || args[0] === '-h'))) {
+    console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
+    return EXIT_USAGE;
+  }
+  const [jobId, subcommand, ...rest] = args;
+  if (!jobId) {
+    console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
+    return EXIT_USAGE;
+  }
+
+  if (!subcommand || subcommand === 'list') {
+    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts`);
+    if (res.status !== 200) return daemonFailure(res, 'artifacts');
+    const body = res.json as { artifacts?: { path: string; bytes: number }[] };
+    if (!body.artifacts || body.artifacts.length === 0) {
+      console.log('no artifacts');
+      return EXIT_OK;
+    }
+    for (const artifact of body.artifacts) {
+      console.log(`${artifact.path}  ${artifact.bytes} bytes`);
+    }
+    return EXIT_OK;
+  }
+
+  if (subcommand === 'get') {
+    const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
+    const artifactPath = getPos[0];
+    // Encode each path segment separately so slashes are preserved.
+    const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
+    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts/${encodedPath}`);
+    if (res.status !== 200) return daemonFailure(res, 'artifacts get');
+    // Daemon returns JSON {path, content (base64), bytes, sha256}.
+    const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
+    if (!body.content) fail('artifacts get: daemon returned no content');
+    const buffer = Buffer.from(body.content, 'base64');
+    // Verify end-to-end integrity; the daemon stamps sha256 at store time.
+    if (body.sha256) {
+      const actual = createHash('sha256').update(buffer).digest('hex');
+      if (actual !== body.sha256) fail(`artifacts get: sha256 mismatch for ${artifactPath} — content corrupted in transit`);
+    }
+    if (typeof values.out === 'string') {
+      const filename = path.basename(artifactPath);
+      const outPath = path.join(values.out, filename);
+      fs.writeFileSync(outPath, buffer);
+      console.log(`saved to ${outPath}`);
+    } else {
+      process.stdout.write(buffer);
+    }
+    return EXIT_OK;
+  }
+
+  console.error(`fleet artifacts: unknown subcommand: ${subcommand}`);
+  return EXIT_USAGE;
+}
+
 // ---------- doctor ----------
 
 /** Known script interpreters: the first non-interpreter, non-flag token in a pickup command is the script file. */
@@ -758,6 +819,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdBoard(rest);
       case 'image':
         return await cmdImage(rest);
+      case 'artifacts':
+        return await cmdArtifacts(rest);
       case 'doctor':
         return cmdDoctor(rest);
       default:

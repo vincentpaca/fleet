@@ -55,6 +55,14 @@ fleet answer <jobId> --text "free text answer"
 
 Report the settle event's status-first report to the human, leading with its `status` line, the rung reached vs the target, and its one `next_action` — verbatim, not paraphrased. If the job cancelled (gate failure, wall-clock), say so plainly and quote the reason.
 
+If the settle's `produced[]` contains entries with `type: "file"`, the job delivered artifacts. List them to the human and offer to fetch them:
+
+```
+fleet artifacts <jobId>               # list artifact paths and sizes
+fleet artifacts <jobId> get <path>    # stream artifact to stdout
+fleet artifacts <jobId> get <path> -o <dir>  # save to dir/<filename>
+```
+
 ## Never
 
 - Never run `fleet cancel` without an explicit instruction.

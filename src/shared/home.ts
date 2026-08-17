@@ -17,3 +17,14 @@ export function jobDir(home: string, jobId: string): string {
 export function socketPath(home: string): string {
   return join(home, "daemon.sock");
 }
+
+/** Artifact storage directory for a job: $FLEET_HOME/jobs/<jobId>/artifacts. */
+export function artifactDir(home: string, jobId: string): string {
+  return join(home, "jobs", jobId, "artifacts");
+}
+
+/** Per-file artifact size cap enforced by both daemon (intake) and runner (pre-flight). */
+export const ARTIFACT_PER_FILE_CAP = 10 * 1024 * 1024; // 10 MB
+
+/** Total artifact size cap per job, enforced by daemon at intake. */
+export const ARTIFACT_TOTAL_CAP = 100 * 1024 * 1024;   // 100 MB
