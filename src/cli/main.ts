@@ -45,7 +45,7 @@ Commands:
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
   board [--once]                           Full-screen live view (--once or non-TTY: static render)
-  doctor                                   Environment checks (Phase 1 stub)
+  doctor [--manifest path]                 Check local environment against the manifest
   version                                  Print version and exit
 
 Flags:
@@ -203,7 +203,7 @@ function cmdLint(args: string[]): number {
 type Manifest = {
   workspace?: { repo?: string; sync?: string[] };
   env?: { vars?: string[] };
-  gates?: { default_finish?: string };
+  gates?: { pickup?: string; default_finish?: string };
   harness?: { cli?: string; cli_version?: string };
 };
 
@@ -621,11 +621,114 @@ async function cmdCancel(args: string[]): Promise<number> {
   return EXIT_OK;
 }
 
+// ---------- doctor ----------
+
+/** Known script interpreters: the first non-interpreter, non-flag token in a pickup command is the script file. */
+const INTERPRETERS = new Set(['node', 'bash', 'sh', 'python', 'python3', 'ruby', 'perl']);
+
+/**
+ * Extract the script file path from a pickup command like "node .fleet/gate.mjs".
+ * Skips the token following -c/--command (it is a shell snippet, not a file).
+ * Returns undefined when no file can be identified (e.g. "sh -c '...'").
+ */
+function gateScriptFile(pickup: string): string | undefined {
+  const tokens = pickup.trim().split(/\s+/);
+  let skipNext = false;
+  for (const token of tokens) {
+    if (skipNext) { skipNext = false; continue; }
+    if (token === '-c' || token === '--command') { skipNext = true; continue; }
+    if (token.startsWith('-') || INTERPRETERS.has(token)) continue;
+    return token;
+  }
+  return undefined;
+}
+
 function cmdDoctor(args: string[]): number {
-  parseCommand(args, {}, 0, 0);
-  console.error('doctor: NOT IMPLEMENTED — Phase 1 stub.');
-  console.error('Planned checks: docker CLI, aws CLI, daemon socket reachability, FLEET_HOME layout.');
-  console.error('Until then: `fleet lint` validates your manifest and `fleet status` proves the daemon is up.');
+  const { values } = parseCommand(args, { manifest: { type: 'string' } }, 0, 0);
+  const manifestPath =
+    typeof values.manifest === 'string' ? values.manifest : path.join('.fleet', 'manifest.json');
+
+  let rawManifest: unknown;
+  try {
+    rawManifest = readJsonFile(manifestPath, 'manifest');
+  } catch (err) {
+    if (err instanceof CliError) {
+      console.error(`doctor: ${err.message}`);
+      return EXIT_FAILURE;
+    }
+    throw err;
+  }
+  const manifestCheck = validateManifest(rawManifest);
+  if (!manifestCheck.ok) {
+    for (const line of formatFindings(manifestPath, manifestCheck.errors)) console.error(line);
+    return EXIT_FAILURE;
+  }
+  // Safe: validated against manifest.schema.json just above.
+  const manifest = rawManifest as Manifest;
+
+  const findings: string[] = [];
+
+  // 1. Required tools
+  for (const tool of ['git', 'gh']) {
+    const res = spawnSync(tool, ['--version'], { encoding: 'utf8' });
+    if (res.error !== undefined || res.status !== 0) {
+      findings.push(`tool not found: ${tool}`);
+    }
+  }
+
+  // 2. Sync files
+  for (const rel of manifest.workspace?.sync ?? []) {
+    if (!fs.existsSync(rel)) {
+      findings.push(`missing sync file: ${rel}`);
+    }
+  }
+
+  // 3. Env vars
+  for (const name of manifest.env?.vars ?? []) {
+    if (process.env[name] === undefined) {
+      findings.push(`unset env var: ${name}`);
+    }
+  }
+
+  // 4. Gate script: present and runnable
+  const pickup = manifest.gates?.pickup;
+  if (pickup !== undefined) {
+    const scriptFile = gateScriptFile(pickup);
+    if (scriptFile !== undefined && !fs.existsSync(scriptFile)) {
+      findings.push(`gate script missing: ${scriptFile}`);
+    } else {
+      const tokens = pickup.trim().split(/\s+/);
+      const gateRes = spawnSync(tokens[0], tokens.slice(1), { encoding: 'utf8' });
+      const code = gateRes.error !== undefined ? -1 : (gateRes.status ?? -1);
+      // Exit 2 = "cannot evaluate" (no target) — expected without a dispatch target; not a defect.
+      if (code !== 0 && code !== 2) {
+        findings.push(`gate script failed: ${pickup} (exit ${code})`);
+      }
+    }
+  }
+
+  // 5. Harness CLI version (skipped when cli_version is not pinned in the manifest)
+  const cliVersion = manifest.harness?.cli_version;
+  if (cliVersion !== undefined) {
+    const cli = manifest.harness?.cli ?? 'claude-code';
+    const cliBinary: Record<string, string> = { 'claude-code': 'claude', codex: 'codex', opencode: 'opencode' };
+    const binary = cliBinary[cli] ?? cli;
+    const cliRes = spawnSync(binary, ['--version'], { encoding: 'utf8' });
+    if (cliRes.error !== undefined || cliRes.status !== 0) {
+      findings.push(`harness CLI not found: ${binary} (manifest expects ${cliVersion})`);
+    } else {
+      const installed = cliRes.stdout.trim();
+      if (installed !== cliVersion) {
+        findings.push(`harness CLI version mismatch: installed ${installed}, manifest ${cliVersion}`);
+      }
+    }
+  }
+
+  if (findings.length === 0) {
+    console.log('doctor: clean');
+    return EXIT_OK;
+  }
+  for (const finding of findings) console.error(finding);
   return EXIT_FAILURE;
 }
 
