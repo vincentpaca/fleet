@@ -28,6 +28,13 @@ test('override wins verbatim, no notes, no derivation', () => {
   assert.deepStrictEqual(plan, { cmd: 'node fake-harness.mjs', notes: [] });
 });
 
+test('claude-code adapter ships its dialect env default; overrides carry none', () => {
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  assert.equal(plan?.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '64000');
+  const override = buildHarnessCommand({ manifest, target: 'APP-14', override: 'node fake.mjs' });
+  assert.equal(override?.env, undefined);
+});
+
 test('version violations become notes, not failures', () => {
   const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.0.9' });
   assert.ok(plan);
