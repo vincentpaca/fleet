@@ -4,13 +4,14 @@
 import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { validateManifest, validateWorkOrder, validateEvent } from "../validate.mjs";
 import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
-import { socketPath } from "../shared/home.ts";
+import { socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
@@ -203,9 +204,16 @@ export class FleetDaemon {
       if (parts.length === 3 && parts[2] === "cancel" && method === "POST") {
         return this.#cancel(job, res);
       }
+      // Artifact lane (issue #18): list and fetch delivered artifacts.
+      if (parts[2] === "artifacts" && method === "GET") {
+        if (parts.length === 3) return this.#listArtifacts(job, res);
+        const artPath = parts.slice(3).map(decodeURIComponent).join("/");
+        return this.#getArtifact(job, artPath, res);
+      }
     }
 
     // Runner: POST /internal/jobs/:id/events | GET /internal/jobs/:id/answer
+    //         POST /internal/jobs/:id/artifacts
     if (parts[0] === "internal" && parts[1] === "jobs" && parts.length === 4) {
       const job = this.registry.getJob(parts[2]);
       if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[2]}` });
@@ -214,6 +222,7 @@ export class FleetDaemon {
       }
       if (parts[3] === "events" && method === "POST") return this.#intakeEvents(job, req, res);
       if (parts[3] === "answer" && method === "GET") return this.#answerPoll(job, url, res);
+      if (parts[3] === "artifacts" && method === "POST") return this.#receiveArtifact(job, req, res);
     }
 
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
@@ -783,5 +792,156 @@ export class FleetDaemon {
       }
       await this.registry.waitForEvent(job.id, remaining);
     }
+  }
+
+  // ---- Artifact lane (issue #18) ----
+
+  /**
+   * Reject artifact paths that could escape outside the artifact directory.
+   * Returns the path as-is if safe, or null if unsafe.
+   */
+  static #safeArtifactPath(relPath: string): string | null {
+    if (!relPath || relPath.startsWith("/") || relPath.startsWith("\\")) return null;
+    const parts = relPath.split(/[/\\]/);
+    for (const part of parts) {
+      if (part === "" || part === "." || part === "..") return null;
+    }
+    return relPath;
+  }
+
+  /** Compute total bytes stored under an artifact directory. */
+  static #artifactDirSize(dir: string): number {
+    if (!existsSync(dir)) return 0;
+    let total = 0;
+    const stack = [dir];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const full = join(current, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else total += statSync(full).size;
+      }
+    }
+    return total;
+  }
+
+  /**
+   * POST /internal/jobs/:id/artifacts
+   * Runner uploads one artifact at a time. Body: JSON {path, content (base64), sha256?, bytes}.
+   * Enforces per-file and total caps; path-escape-guarded. Runner-token auth.
+   */
+  async #receiveArtifact(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: unknown;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      return sendJson(res, 400, { error: "invalid JSON body" });
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return sendJson(res, 400, { error: "body must be a JSON object" });
+    }
+    const raw = body as Record<string, unknown>;
+    const relPath = raw.path;
+    const contentB64 = raw.content;
+    const declaredBytes = raw.bytes;
+    const declaredSha256 = raw.sha256;
+
+    if (typeof relPath !== "string" || !relPath) {
+      return sendJson(res, 400, { error: "path (string) required" });
+    }
+    if (typeof contentB64 !== "string") {
+      return sendJson(res, 400, { error: "content (base64 string) required" });
+    }
+    if (typeof declaredBytes !== "number" || declaredBytes < 0) {
+      return sendJson(res, 400, { error: "bytes (non-negative number) required" });
+    }
+
+    const safePath = FleetDaemon.#safeArtifactPath(relPath);
+    if (!safePath) {
+      return sendJson(res, 400, { error: `invalid artifact path: ${relPath}` });
+    }
+
+    // Per-file cap: checked against declared bytes before decoding.
+    if (declaredBytes > ARTIFACT_PER_FILE_CAP) {
+      return sendJson(res, 413, {
+        error: `artifact ${relPath} (${declaredBytes} bytes) exceeds per-file cap of ${ARTIFACT_PER_FILE_CAP} bytes`,
+      });
+    }
+
+    // Decode and verify integrity.
+    const decoded = Buffer.from(contentB64, "base64");
+    if (decoded.length !== declaredBytes) {
+      return sendJson(res, 422, {
+        error: `bytes mismatch: declared ${declaredBytes}, actual ${decoded.length}`,
+      });
+    }
+    if (typeof declaredSha256 === "string") {
+      const actualSha256 = createHash("sha256").update(decoded).digest("hex");
+      if (actualSha256 !== declaredSha256) {
+        return sendJson(res, 422, { error: `sha256 mismatch for ${relPath}` });
+      }
+    }
+
+    // Total cap: compute current on-disk total before writing.
+    const artDir = artifactDir(this.#options.home, job.id);
+    const currentTotal = FleetDaemon.#artifactDirSize(artDir);
+    if (currentTotal + declaredBytes > ARTIFACT_TOTAL_CAP) {
+      return sendJson(res, 413, {
+        error: `total artifact cap (${ARTIFACT_TOTAL_CAP} bytes) would be exceeded`,
+      });
+    }
+
+    const targetPath = join(artDir, safePath);
+    mkdirSync(dirname(targetPath), { recursive: true });
+    writeFileSync(targetPath, decoded);
+
+    return sendJson(res, 200, { stored: true, path: relPath, bytes: declaredBytes });
+  }
+
+  /** GET /jobs/:id/artifacts — list artifacts stored for the job. */
+  async #listArtifacts(job: JobRecord, res: ServerResponse): Promise<void> {
+    const artDir = artifactDir(this.#options.home, job.id);
+    const artifacts: { path: string; bytes: number }[] = [];
+    if (existsSync(artDir)) {
+      const stack = [artDir];
+      while (stack.length > 0) {
+        const current = stack.pop()!;
+        for (const entry of readdirSync(current, { withFileTypes: true })) {
+          const full = join(current, entry.name);
+          if (entry.isDirectory()) stack.push(full);
+          else {
+            const relPath = relative(artDir, full).replace(/\\/g, "/");
+            artifacts.push({ path: relPath, bytes: statSync(full).size });
+          }
+        }
+      }
+      artifacts.sort((a, b) => a.path.localeCompare(b.path));
+    }
+    return sendJson(res, 200, { artifacts });
+  }
+
+  /**
+   * GET /jobs/:id/artifacts/<path> — fetch a single artifact.
+   * Returns JSON {path, content (base64), bytes, sha256} so the CLI can write
+   * it without binary-encoding issues in the HTTP client.
+   */
+  async #getArtifact(job: JobRecord, relPath: string, res: ServerResponse): Promise<void> {
+    const safePath = FleetDaemon.#safeArtifactPath(relPath);
+    if (!safePath) {
+      return sendJson(res, 400, { error: `invalid artifact path: ${relPath}` });
+    }
+    const artDir = artifactDir(this.#options.home, job.id);
+    const fullPath = join(artDir, safePath);
+    if (!existsSync(fullPath)) {
+      return sendJson(res, 404, { error: `artifact not found: ${relPath}` });
+    }
+    const content = readFileSync(fullPath);
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    return sendJson(res, 200, {
+      path: relPath,
+      content: content.toString("base64"),
+      bytes: content.length,
+      sha256,
+    });
   }
 }

@@ -21,6 +21,7 @@ import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { WallClockTimer } from './wall-clock.ts';
 import { composeSettle } from './settle.ts';
+import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
@@ -362,11 +363,25 @@ async function main(): Promise<void> {
     }
   }
 
+  // Artifact delivery (issue #18): upload files from .fleet/out/artifacts/
+  // before composing the settle so produced[] can list them. Over-cap files
+  // are noted and skipped; the settle always proceeds.
+  const { produced: artifactProduced, notes: artifactNotes } = await collectArtifacts({
+    workspace,
+    jobId,
+    daemonUrl,
+    token,
+  });
+  for (const note of artifactNotes) {
+    await sink.emit({ type: 'log', text: note, who: 'runner' });
+  }
+
   const { body, notes } = composeSettle({
     jobId,
     startedAt,
     decisions: watcher.count,
     workspace,
+    produced: artifactProduced,
     ...(settleRung !== undefined ? { rung: settleRung } : {}),
     prUrl,
   });

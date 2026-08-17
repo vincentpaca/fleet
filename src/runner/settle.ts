@@ -27,6 +27,12 @@ export function composeSettle(opts: {
   report?: EventBody;
   /** PR URL from authority.publish — merged into report.pr (issue #3). */
   prUrl?: string;
+  /**
+   * Pre-collected artifact produced[] entries (issue #18). Populated by
+   * collectArtifacts() in main.ts before composeSettle is called; the
+   * daemon has already received the artifact files by this point.
+   */
+  produced?: Array<Record<string, unknown>>;
 }): SettleComposition {
   const notes: string[] = [];
   const minutes = Math.max(
@@ -36,7 +42,7 @@ export function composeSettle(opts: {
   const body: EventBody = {
     type: 'settle',
     minutes,
-    outcome: { produced: [], findings: 0, decisions: opts.decisions },
+    outcome: { produced: opts.produced ?? [], findings: 0, decisions: opts.decisions },
   };
   if (opts.rung !== undefined) body.rung = opts.rung;
 

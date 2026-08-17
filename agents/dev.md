@@ -19,6 +19,14 @@ Implement the given GitHub issue on this repository.
 
 Two materially different implementations both plausible, an acceptance criterion ambiguous, or a rule conflict: write `.fleet/out/decision.json` (see AGENTS.md — question, ≥2 options with stable ids, exactly one recommended), then poll for `.fleet/out/answer-d<n>.json` and proceed with the answer. Never guess through a real fork; never answer your own question.
 
+## Delivery lanes
+
+Every job delivers its transcript plus whatever lane its mode uses. Lanes stack on top of the evidence floor, never replace it.
+
+1. **Repo lane** — the job branch and optional draft PR. Used by `implement`/`followthrough`; also for docs and ADRs that should be versioned.
+2. **Artifact lane** — files the job writes to `.fleet/out/artifacts/`. The runner collects them at settle, uploads to the daemon, and lists them in `produced[]` with sha256 and bytes. Retrieve with `fleet artifacts <jobId> [list | get <path>]`. Used by `assess`/`investigate`/`review`/`compare` — the settle report itself becomes a downloadable artifact, not just transcript lines. Write artifacts to `.fleet/out/artifacts/`; files outside that path are not collected.
+3. **External lane** — jobs that mutate external systems (wiki pages, tracker tickets) MUST record references in `produced[]` as `{id: <url>, type: "<system>", title: "..."}` and verify by read-back in `report.verification`. Fleet evidences, never proxies.
+
 ## Never
 
 - Never merge anything or touch deployment.
