@@ -11,6 +11,7 @@ import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
 import { socketPath } from "../shared/home.ts";
+import { parseDurationMs } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
@@ -41,6 +42,18 @@ export type DaemonOptions = {
    * `fleet status` (blocked-first) — the pull loop needs no channel at all.
    */
   notifyWebhooks?: string[];
+  /**
+   * Extra ms the daemon adds to the wall_clock limit before triggering its
+   * backstop (terminate + synthesise events). Default: 90_000 (90s). Must be
+   * large enough for the runner to SIGTERM + grace + settle before the daemon
+   * fires. Set smaller in tests.
+   */
+  wallClockBackstopMarginMs?: number;
+  /**
+   * How often (ms) the daemon scans for wall-clock-overdue jobs. Default: 10_000.
+   * Set smaller in tests.
+   */
+  wallClockSweepIntervalMs?: number;
 };
 
 type IntakeError = { status: number; errors: unknown[] };
@@ -91,6 +104,7 @@ export class FleetDaemon {
   #unixServer: Server | null = null;
   #tcpServer: Server | null = null;
   #port: number | null = null;
+  #sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: DaemonOptions) {
     this.#options = options;
@@ -131,10 +145,20 @@ export class FleetDaemon {
       const address = this.#tcpServer.address();
       this.#port = typeof address === "object" && address !== null ? address.port : null;
     }
+
+    // Wall-clock backstop sweep: checks for overdue jobs and terminates them.
+    const sweepMs = this.#options.wallClockSweepIntervalMs ?? 10_000;
+    this.#sweepTimer = setInterval(() => { this.#wallClockSweep(); }, sweepMs);
+    this.#sweepTimer.unref(); // don't prevent process exit
+
     return { socketPath: this.#sockPath, port: this.#port };
   }
 
   async stop(): Promise<void> {
+    if (this.#sweepTimer !== null) {
+      clearInterval(this.#sweepTimer);
+      this.#sweepTimer = null;
+    }
     const servers = [this.#unixServer, this.#tcpServer].filter((server) => server !== null);
     await Promise.all(
       servers.map((server) => {
@@ -267,6 +291,18 @@ export class FleetDaemon {
       },
     });
 
+    // Initialise wall-clock backstop tracking when the manifest sets a limit.
+    const manifestLimits = (manifest as Record<string, unknown>).limits;
+    if (manifestLimits && typeof manifestLimits === "object") {
+      const wallClockStr = (manifestLimits as Record<string, unknown>).wall_clock;
+      if (typeof wallClockStr === "string") {
+        const limitMs = parseDurationMs(wallClockStr);
+        if (limitMs !== undefined) {
+          this.registry.initWallClock(id, limitMs);
+        }
+      }
+    }
+
     try {
       const { handle } = await this.#options.provider.launch({
         jobId: id,
@@ -363,6 +399,8 @@ export class FleetDaemon {
     this.registry.setOpenDecision(job.id, null);
     this.registry.clearMarker(job.id);
     const updated = this.registry.updateJob(job.id, { state: "running" });
+    // Job is active again; resume the daemon-side wall-clock meter.
+    this.registry.wallClockBecameActive(job.id);
     return sendJson(res, 200, { job: publicJob(updated) });
   }
 
@@ -477,6 +515,12 @@ export class FleetDaemon {
         this.registry.clearMarker(job.id);
         this.registry.updateJob(job.id, { state: nextState });
       }
+      // Wall-clock tracking: running = active, blocked/terminal = inactive.
+      if (nextState === "running") {
+        this.registry.wallClockBecameActive(job.id);
+      } else if (nextState === "blocked" || isTerminal(nextState)) {
+        this.registry.wallClockBecameInactive(job.id);
+      }
       if (isTerminal(nextState)) {
         // Settle rides ahead of the terminal state event; verify the target
         // rung — locally for lower rungs, via gh for upper rungs.
@@ -496,6 +540,9 @@ export class FleetDaemon {
         optionIds: decision.options.map((option) => option.id),
       });
       this.registry.updateJob(job.id, { state: "blocked" });
+      // The job is now waiting for an operator answer — operator wait time is
+      // excluded from the wall-clock budget, same as the runner-side behaviour.
+      this.registry.wallClockBecameInactive(job.id);
       this.#notify(job.id, decision.question);
       return;
     }
@@ -506,6 +553,83 @@ export class FleetDaemon {
       if (event.report !== undefined) settle.report = event.report;
       this.registry.updateJob(job.id, { settle });
     }
+  }
+
+  /**
+   * Periodic sweep: terminate and cancel any job whose active runtime has
+   * exceeded its wall_clock limit by more than the backstop margin.
+   *
+   * The runner is the primary enforcer; the daemon fires only when the runner
+   * is wedged (not posting events). The backstop margin must be large enough
+   * for the runner to SIGTERM + grace + settle before the daemon fires.
+   */
+  #wallClockSweep(): void {
+    const now = Date.now();
+    const margin = this.#options.wallClockBackstopMarginMs ?? 90_000;
+    for (const job of this.registry.listJobs()) {
+      if (job.state !== "running" && job.state !== "blocked") continue;
+      const limitMs = this.registry.wallClockLimitMs(job.id);
+      if (limitMs === null) continue;
+      const activeMs = this.registry.wallClockActiveMs(job.id, now);
+      if (activeMs === null) continue;
+      if (activeMs >= limitMs + margin) {
+        // Fire asynchronously; errors are logged to the job's event stream.
+        this.#wallClockBackstop(job).catch(() => {});
+      }
+    }
+  }
+
+  /** Daemon-side wall-clock backstop: terminate container, synthesise events. */
+  async #wallClockBackstop(job: JobRecord): Promise<void> {
+    // Re-fetch to guard against a race where the runner already settled.
+    const current = this.registry.getJob(job.id);
+    if (!current || isTerminal(current.state)) return;
+
+    if (current.handle) {
+      try {
+        await this.#options.provider.terminate(current.handle);
+      } catch (error) {
+        this.registry.appendEvent(job.id, {
+          type: "log",
+          text: `wall-clock backstop: terminate failed: ${String(error)}`,
+          who: "daemon",
+        });
+      }
+    }
+
+    // Re-check after async terminate; runner may have settled in the meantime.
+    const afterTerminate = this.registry.getJob(job.id);
+    if (!afterTerminate || isTerminal(afterTerminate.state)) return;
+
+    // Synthesise settle (if none yet) then the terminal state event.
+    if (!afterTerminate.settle) {
+      const settlePayload = {
+        type: "settle",
+        outcome: { produced: [], findings: 0, decisions: 0 },
+        report: {
+          status: "PARTIAL",
+          next_action: "job cancelled: wall-clock limit reached (daemon backstop)",
+        },
+      };
+      this.registry.appendEvent(job.id, settlePayload);
+      this.registry.updateJob(job.id, {
+        settle: {
+          outcome: settlePayload.outcome,
+          report: settlePayload.report,
+        },
+      });
+    }
+
+    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "wall-clock" });
+    this.registry.setOpenDecision(job.id, null);
+    this.registry.clearMarker(job.id);
+    this.registry.wallClockBecameInactive(job.id);
+    const updated = this.registry.updateJob(job.id, { state: "cancelled" });
+
+    // Verify target rung (will show not-reached for a cancelled job).
+    const target = targetRung(updated.workOrder);
+    const doneCheck = verifyRung(updated.settle, target, { ghRunner: defaultGhRunner() });
+    this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
   }
 
   #notify(jobId: string, question: string): void {

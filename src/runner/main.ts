@@ -15,13 +15,16 @@ import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
 import { EventSink } from './events.ts';
 import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
+import { WallClockTimer } from './wall-clock.ts';
 import { composeSettle } from './settle.ts';
 import { setupWorkspace, pushWork, getHeadSha, createDraftPr } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
+import { parseDurationMs } from '../shared/time.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -115,8 +118,6 @@ async function main(): Promise<void> {
   // clone (committed by accident upstream) must never speak for this job.
   rmSync(join(workspace, '.fleet', 'out'), { recursive: true, force: true });
   mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
-  const watcher = new DecisionWatcher({ workspace, sink });
-  watcher.start();
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
@@ -130,7 +131,6 @@ async function main(): Promise<void> {
     actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
   });
   if (!plan) {
-    await watcher.stop();
     await settleBlocked(sink, `no harness command derivable for cli "${cli}" — set harness.commands or FLEET_HARNESS_CMD`);
     await sink.emit({ type: 'state', state: 'cancelled', reason: 'harness-cmd' });
     process.exit(1);
@@ -141,6 +141,17 @@ async function main(): Promise<void> {
   const cmd = plan.cmd;
 
   const startedAt = Date.now();
+
+  // Parse wall-clock limit; build timer so the decision watcher can pause it
+  // while the job is blocked (blocked time doesn't count against the budget).
+  const limits = (manifest.limits ?? {}) as Record<string, unknown>;
+  const wallClockStr = typeof limits.wall_clock === 'string' ? limits.wall_clock : undefined;
+  const wallClockLimitMs = wallClockStr !== undefined ? parseDurationMs(wallClockStr) : undefined;
+  const wallClock = wallClockLimitMs !== undefined ? new WallClockTimer(wallClockLimitMs, startedAt) : undefined;
+
+  const watcher = new DecisionWatcher({ workspace, sink, wallClock });
+  watcher.start();
+
   // The harness child gets NO runner-scoped FLEET_* env: nested fleet
   // processes inside the workspace (the delegated agent running this repo's
   // own tests, a nested CLI call) must never inherit this job's identity,
@@ -181,7 +192,51 @@ async function main(): Promise<void> {
   child.on('close', (code) => exit.resolve(code ?? 1));
   const linesDone = Promise.withResolvers<void>();
   lines.once('close', () => linesDone.resolve());
-  const exitCode = await exit.promise;
+
+  // --- Wall-clock enforcement ---
+  // Poll active time every 250ms; on expiry send SIGTERM, then wait grace
+  // period before SIGKILL so the harness can flush/settle gracefully.
+  let wallClockFired = false;
+  let exitCode: number;
+
+  if (wallClock !== undefined) {
+    const graceMs =
+      parseInt(process.env.FLEET_WALL_CLOCK_GRACE_MS ?? '', 10) || 30_000;
+
+    // Promise that resolves once active time >= limit.
+    const wallClockExpired = (async () => {
+      while (!wallClock.expired()) {
+        await delay(Math.min(250, Math.max(1, wallClock.remainingMs())));
+      }
+    })();
+
+    const result = await Promise.race([
+      exit.promise.then((code) => ({ kind: 'exit' as const, code })),
+      wallClockExpired.then(() => ({ kind: 'wall-clock' as const })),
+    ]);
+
+    if (result.kind === 'wall-clock') {
+      wallClockFired = true;
+      await sink.emit({
+        type: 'log',
+        text: `wall-clock limit (${wallClockStr}) reached; sending SIGTERM`,
+        who: 'runner',
+      });
+      child.kill('SIGTERM');
+      // Grace period: let the harness shut down cleanly before SIGKILL.
+      await Promise.race([exit.promise, delay(graceMs)]);
+      if (!child.killed) child.kill('SIGKILL');
+      await exit.promise;
+      // Wall-clock cancellation always fails the job regardless of how the
+      // harness exited (it may exit 0 if it handles SIGTERM gracefully).
+      exitCode = 1;
+    } else {
+      exitCode = result.code;
+    }
+  } else {
+    exitCode = await exit.promise;
+  }
+
   await linesDone.promise;
   await Promise.all(emits);
   await watcher.stop();
@@ -246,11 +301,18 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'log', text: note, who: 'runner' });
   }
   if (!ok && body.report === undefined) {
-    const hint = stderrTail.join('').trim().split('\n').at(-1) ?? '';
-    body.report = {
-      status: 'PARTIAL',
-      next_action: `inspect harness exit ${exitCode}${hint ? `: ${hint.slice(0, 200)}` : ''}`,
-    };
+    if (wallClockFired) {
+      body.report = {
+        status: 'PARTIAL',
+        next_action: `job cancelled: wall-clock limit (${wallClockStr ?? 'unknown'}) reached`,
+      };
+    } else {
+      const hint = stderrTail.join('').trim().split('\n').at(-1) ?? '';
+      body.report = {
+        status: 'PARTIAL',
+        next_action: `inspect harness exit ${exitCode}${hint ? `: ${hint.slice(0, 200)}` : ''}`,
+      };
+    }
   }
   await sink.emit(body);
 
@@ -258,7 +320,8 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'done' });
     process.exit(0);
   } else {
-    await sink.emit({ type: 'state', state: 'cancelled', reason: 'harness-exit' });
+    const reason = wallClockFired ? 'wall-clock' : 'harness-exit';
+    await sink.emit({ type: 'state', state: 'cancelled', reason });
     process.exit(1);
   }
 }

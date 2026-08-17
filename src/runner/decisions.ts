@@ -13,6 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 // @ts-ignore -- plain-JS module, no type declarations
 import { validateDecisionFile } from '../validate.mjs';
 import type { EventSink } from './events.ts';
+import type { WallClockTimer } from './wall-clock.ts';
 
 export type Answer = { option?: string; text?: string };
 
@@ -27,12 +28,15 @@ export class DecisionWatcher {
   private loop: Promise<void> = Promise.resolve();
   /** Raw content seen failing JSON.parse last tick — tolerates one mid-write read. */
   private pendingRaw: string | null = null;
+  /** Optional wall-clock timer: paused while awaiting answers. */
+  private readonly wallClock?: WallClockTimer;
 
-  constructor(opts: { workspace: string; sink: EventSink; intervalMs?: number }) {
+  constructor(opts: { workspace: string; sink: EventSink; intervalMs?: number; wallClock?: WallClockTimer }) {
     this.sink = opts.sink;
     this.outDir = join(opts.workspace, '.fleet', 'out');
     this.decisionPath = join(this.outDir, 'decision.json');
     this.intervalMs = opts.intervalMs ?? 500;
+    this.wallClock = opts.wallClock;
   }
 
   start(): void {
@@ -117,25 +121,32 @@ export class DecisionWatcher {
 
   /** Long-poll the daemon until the operator answers this decision. */
   private async awaitAnswer(id: string): Promise<Answer | null> {
+    // Pause the wall-clock meter: blocked time doesn't count against the budget.
+    this.wallClock?.block();
     const url =
       `${this.sink.daemonUrl}/internal/jobs/${encodeURIComponent(this.sink.jobId)}` +
       `/answer?decision=${encodeURIComponent(id)}`;
-    while (!this.stopped) {
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          headers: { 'x-fleet-runner-token': this.sink.token },
-        });
-      } catch {
-        await delay(this.intervalMs);
-        continue;
+    try {
+      while (!this.stopped) {
+        let response: Response;
+        try {
+          response = await fetch(url, {
+            headers: { 'x-fleet-runner-token': this.sink.token },
+          });
+        } catch {
+          await delay(this.intervalMs);
+          continue;
+        }
+        if (response.ok && response.status !== 204) {
+          return (await response.json()) as Answer;
+        }
+        await response.arrayBuffer().catch(() => {});
+        // 204 / timeout cycle from the daemon: poll again.
       }
-      if (response.ok && response.status !== 204) {
-        return (await response.json()) as Answer;
-      }
-      await response.arrayBuffer().catch(() => {});
-      // 204 / timeout cycle from the daemon: poll again.
+      return null;
+    } finally {
+      // Resume the meter whether an answer was received or the watcher was stopped.
+      this.wallClock?.resume();
     }
-    return null;
   }
 }
