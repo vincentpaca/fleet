@@ -50,11 +50,16 @@ output "connect_hint" {
       --output text)
 
     # 3. Open the SSM port-forward session. The daemon HTTP API is then
-    #    reachable at http://localhost:${var.daemon_tcp_port} on your machine.
+    #    reachable at http://localhost:1${var.daemon_tcp_port} on your machine.
+    #    The SSM target is underscore-separated (its API regex rejects commas).
+    #    localPortNumber is deliberately NOT ${var.daemon_tcp_port}: local
+    #    agents commonly squat low ports and accept connections silently —
+    #    pick any free local port and point fleet-config.json's daemon_url
+    #    at it.
     aws ssm start-session \
-      --target "ecs:${aws_ecs_cluster.this.name},$${TASK##*/},$RUNTIME_ID" \
+      --target "ecs:${aws_ecs_cluster.this.name}_$${TASK##*/}_$RUNTIME_ID" \
       --document-name AWS-StartPortForwardingSessionToRemoteHost \
-      --parameters '{"host":["localhost"],"portNumber":["${var.daemon_tcp_port}"],"localPortNumber":["${var.daemon_tcp_port}"]}'
+      --parameters '{"host":["localhost"],"portNumber":["${var.daemon_tcp_port}"],"localPortNumber":["1${var.daemon_tcp_port}"]}'
   EOT
 }
 

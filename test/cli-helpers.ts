@@ -17,7 +17,12 @@ export function runCli(
   const { promise, resolve, reject } = Promise.withResolvers<CliResult>();
   const env: Record<string, string | undefined> = { ...process.env, FLEET_DAEMON_URL: undefined, ...opts.env };
   const child = spawn(process.execPath, [CLI, ...args], {
-    cwd: opts.cwd ?? process.cwd(),
+    // Never inherit the checkout as cwd: daemon resolution scans
+    // .fleet/infra/*/fleet-config.json under cwd (#15), so a test run from a
+    // checkout with a live deployment would silently query — or dispatch to —
+    // production. Same isolation the FLEET_DAEMON_URL scrub above provides
+    // for resolution step 1.
+    cwd: opts.cwd ?? makeTempDir('fleet-cli-cwd-'),
     env: Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined)) as Record<string, string>,
     stdio: ['ignore', 'pipe', 'pipe'],
   });

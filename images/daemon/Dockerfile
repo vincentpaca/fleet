@@ -16,8 +16,10 @@
 FROM node:24-slim
 
 # AWS CLI v2 (used by EcsProvider to call ssm get-parameter and ecs run-task).
+# ca-certificates is explicit: --no-install-recommends drops it, and without
+# it the https download below fails (curl exit 77).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl unzip \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
