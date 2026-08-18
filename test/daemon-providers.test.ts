@@ -586,3 +586,134 @@ test("EcsProvider.checkResources delegates to checkResourceFit with the config t
   // Exceeds capacity: throws.
   assert.throws(() => provider.checkResources({ cpu: 4096, memory: 3584 }), /exceeds offered capacity/);
 });
+
+// --- Defect #34 fixes: capacity-provider strategy + non-loopback daemon URL ---
+
+test("EcsProvider.buildRunTaskArgs uses --capacity-provider-strategy when capacityProvider is set", () => {
+  // This is the defect #34 fix: run-task must use capacity-provider strategy so
+  // ECS managed scaling fires; --launch-type EC2 bypasses it entirely.
+  const provider = new EcsProvider({
+    cluster: "fleet-cluster",
+    taskDefinition: "fleet-runner:3",
+    containerName: "runner",
+    subnets: [],
+    securityGroups: [],
+    launchType: "EC2",
+    assignPublicIp: "DISABLED",
+    capacityTiers: [],
+    capacityProvider: "fleet-ec2",
+  });
+  const args = provider.buildRunTaskArgs(SPEC);
+
+  // Must use --capacity-provider-strategy, not --launch-type.
+  assert.ok(args.includes("--capacity-provider-strategy"), "must include --capacity-provider-strategy");
+  assert.ok(!args.includes("--launch-type"), "must not include --launch-type when capacityProvider is set");
+
+  // The strategy value must name the provider with weight and base.
+  const strategyIdx = args.indexOf("--capacity-provider-strategy");
+  const strategyVal = args[strategyIdx + 1];
+  assert.ok(strategyVal.includes("fleet-ec2"), `strategy must name the capacity provider; got: ${strategyVal}`);
+  assert.ok(strategyVal.includes("weight=1"), `strategy must include weight; got: ${strategyVal}`);
+  assert.ok(strategyVal.includes("base=0"), `strategy must include base; got: ${strategyVal}`);
+});
+
+test("EcsProvider.buildRunTaskArgs uses --launch-type when no capacityProvider is set", () => {
+  // Backwards-compat path: env-var configs and legacy SSM configs without
+  // capacity_provider fall back to the original --launch-type flag.
+  const provider = new EcsProvider({
+    cluster: "c", taskDefinition: "t", containerName: "runner",
+    subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
+    capacityTiers: [],
+    // no capacityProvider
+  });
+  const args = provider.buildRunTaskArgs(SPEC);
+  assert.ok(!args.includes("--capacity-provider-strategy"), "must not include strategy when capacityProvider absent");
+  assert.ok(args.includes("--launch-type"), "must fall back to --launch-type");
+  assert.equal(args[args.indexOf("--launch-type") + 1], "EC2");
+});
+
+test("ecsConfigFromFleetConfig reads capacity_provider field", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet-cluster",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    capacity_provider: "fleet-ec2",
+    // launch_type intentionally omitted — capacity_provider is now preferred
+  });
+  assert.equal(config.capacityProvider, "fleet-ec2");
+  // launchType falls back to "EC2" when absent.
+  assert.equal(config.launchType, "EC2");
+});
+
+test("ecsConfigFromFleetConfig leaves capacityProvider undefined when absent", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "c",
+    runner_task_definition: "t",
+    runner_container_name: "runner",
+    launch_type: "EC2",
+  });
+  assert.equal(config.capacityProvider, undefined);
+  assert.equal(config.launchType, "EC2");
+});
+
+test("ecsConfigFromFleetConfig makes launch_type optional (defaults to EC2)", () => {
+  // New fleet_config SSM parameters omit launch_type in favour of capacity_provider.
+  // Old code must not throw on the absence of launch_type.
+  assert.doesNotThrow(() =>
+    ecsConfigFromFleetConfig({
+      provider: "ecs",
+      cluster: "c",
+      runner_task_definition: "t",
+      runner_container_name: "runner",
+      capacity_provider: "fleet-ec2",
+      // no launch_type
+    }),
+  );
+});
+
+test("FleetDaemon.daemonUrl returns non-loopback TCP URL when tcpHost is a private IP", async (t) => {
+  // Defect #34: runner tasks in ECS cannot reach 127.0.0.1. When tcpHost is set
+  // to the daemon's VPC private IP, daemonUrl must advertise that address.
+  // bindHost stays 127.0.0.1 (the test host's loopback) so the TCP server actually
+  // starts — we are verifying URL construction, not actual VPC reachability.
+  const home = tempHome();
+  const provider = new ProcessProvider();
+  const daemon = new FleetDaemon({ home, provider, port: 0, bindHost: "127.0.0.1", tcpHost: "10.0.1.55" });
+  const { port } = await daemon.start();
+  t.after(() => daemon.stop());
+  assert.ok(port !== null && port > 0, "ephemeral port must be assigned");
+  assert.equal(daemon.daemonUrl, `http://10.0.1.55:${port}`, "daemonUrl must use the configured tcpHost");
+});
+
+test("FleetDaemon.daemonUrl defaults to 127.0.0.1 when tcpHost is not set", async (t) => {
+  const home = tempHome();
+  const provider = new ProcessProvider();
+  const daemon = new FleetDaemon({ home, provider, port: 0 });
+  const { port } = await daemon.start();
+  t.after(() => daemon.stop());
+  assert.equal(daemon.daemonUrl, `http://127.0.0.1:${port}`);
+});
+
+test("GET /health returns {ok: true} with status 200", async (t) => {
+  // The daemon Dockerfile HEALTHCHECK and the ECS service health check both
+  // hit /health.  It must answer without any state, auth, or provider calls.
+  const home = tempHome();
+  const provider = new ProcessProvider();
+  const daemon = new FleetDaemon({ home, provider, port: 0, longPollMs: 400 });
+  const { socketPath: sock, port } = await daemon.start();
+  t.after(() => daemon.stop());
+  assert.ok(port !== null);
+
+  // Hit /health via TCP (the path operators and ECS health checks use).
+  const res = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(res.status, 200);
+  const body = await res.json() as Record<string, unknown>;
+  assert.equal(body.ok, true);
+
+  // Also verify via the unix socket (the operator CLI path).
+  const sockResult = await op(sock, "GET", "/health");
+  assert.equal(sockResult.status, 200);
+  assert.equal((sockResult.json as { ok: boolean }).ok, true);
+});
