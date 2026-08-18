@@ -8,6 +8,11 @@
   "additionalProperties": false,
   "properties": {
     "mode": { "$ref": "#/$defs/mode" },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable title for the target (e.g. from a GitHub issue). Stamped once at dispatch; viewers never fetch."
+    },
     "target": {
       "type": "string",
       "minLength": 1,

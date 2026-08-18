@@ -435,6 +435,8 @@ test("registry survives a daemon restart over the same FLEET_HOME", async (t) =>
   const blocked = await createJob(first);
   await runnerPost(first.sock, blocked.id, blocked.token, event(blocked.id, 0, { type: "state", state: "running" }));
   await runnerPost(first.sock, blocked.id, blocked.token, event(blocked.id, 1, DECISION));
+  // Add a think event after the decision so lastActivity is stamped before the restart.
+  await runnerPost(first.sock, blocked.id, blocked.token, event(blocked.id, 2, { type: "think", text: "before restart" }));
 
   const finished = await createJob(first);
   await runnerPost(first.sock, finished.id, finished.token, event(finished.id, 0, { type: "state", state: "running" }));
@@ -450,7 +452,12 @@ test("registry survives a daemon restart over the same FLEET_HOME", async (t) =>
   const reloaded = jobOf((await op(second.sock, "GET", `/jobs/${blocked.id}`)).json);
   assert.equal(reloaded.state, "blocked");
   const events = parseNdjson((await op(second.sock, "GET", `/jobs/${blocked.id}/events`)).body) as unknown[];
-  assert.equal(events.length, 3); // queued + running + decision
+  assert.equal(events.length, 4); // queued + running + decision + think
+
+  // lastActivity persists across a daemon restart — stored in job.json, not recomputed from the log.
+  const laAfterRestart = reloaded.lastActivity as { text: string; at: string } | undefined;
+  assert.ok(laAfterRestart, "lastActivity must survive a daemon restart (persisted in job.json)");
+  assert.equal(laAfterRestart!.text, "before restart", "lastActivity.text matches the pre-restart think event");
 
   const doneJob = jobOf((await op(second.sock, "GET", `/jobs/${finished.id}`)).json);
   assert.equal(doneJob.state, "done");
@@ -464,7 +471,7 @@ test("registry survives a daemon restart over the same FLEET_HOME", async (t) =>
   assert.equal(jobOf(answered.json).state, "running");
 
   // Runner seq continuity survives the restart too.
-  const next = await runnerPost(second.sock, blocked.id, blocked.token, event(blocked.id, 2, { type: "think", text: "resuming" }));
+  const next = await runnerPost(second.sock, blocked.id, blocked.token, event(blocked.id, 3, { type: "think", text: "resuming" }));
   assert.equal(next.status, 200, next.body);
   const stale = await runnerPost(second.sock, blocked.id, blocked.token, event(blocked.id, 1, { type: "think", text: "replay" }));
   assert.equal(stale.status, 422);
@@ -843,4 +850,42 @@ test("re-launch failure after answer cancels the job — not stuck in blocked", 
   // No open decision remains (job is terminal, second answer attempt returns 409).
   const second = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
   assert.equal(second.status, 409);
+});
+
+test("lastActivity: present after think/log event; absent for queued-never-ran job; no log scan at list time", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  // Create two jobs: one that gets a think event, one that never runs.
+  const { id: runId, token } = await createJob(ctx);
+  const { id: queuedId } = await createJob(ctx);
+
+  // Verify the queued job has no lastActivity.
+  const queuedRes = await op(ctx.sock, "GET", `/jobs/${queuedId}`);
+  const queuedJob = jobOf(queuedRes.json) as Record<string, unknown>;
+  assert.equal(queuedJob.lastActivity, undefined, "queued-never-ran job must have no lastActivity");
+
+  // Transition the run job to running, then emit a think event.
+  await runnerPost(ctx.sock, runId, token, event(runId, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, runId, token, event(runId, 1, { type: "think", text: "analysing the codebase" }));
+
+  const runRes = await op(ctx.sock, "GET", `/jobs/${runId}`);
+  const runJob = jobOf(runRes.json) as Record<string, unknown>;
+  const lastActivity = runJob.lastActivity as { text: string; at: string } | undefined;
+  assert.ok(lastActivity, "running job with think event must have lastActivity");
+  assert.equal(lastActivity.text, "analysing the codebase", "lastActivity.text matches think event");
+  assert.ok(typeof lastActivity.at === "string" && lastActivity.at.length > 0, "lastActivity.at is a timestamp string");
+
+  // Verify lastActivity appears on the jobs listing (no log-file scan needed).
+  const listRes = await op(ctx.sock, "GET", "/jobs");
+  const jobs = (listRes.json as { jobs: Array<Record<string, unknown>> }).jobs;
+  const runInList = jobs.find((j) => j.id === runId);
+  assert.ok(runInList, "running job in listing");
+  assert.ok(runInList!.lastActivity, "lastActivity present in jobs listing without log scan");
+
+  // A subsequent log event updates lastActivity.
+  await runnerPost(ctx.sock, runId, token, event(runId, 2, { type: "log", text: "ran npm test" }));
+  const updated = jobOf((await op(ctx.sock, "GET", `/jobs/${runId}`)).json) as Record<string, unknown>;
+  const updatedActivity = updated.lastActivity as { text: string } | undefined;
+  assert.equal(updatedActivity?.text, "ran npm test", "lastActivity updates to latest log event");
 });

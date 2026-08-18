@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
-import { formatEvent, logsNoColor, type FleetEvent } from './format.ts';
+import { formatEvent, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -41,7 +41,10 @@ Commands:
                                            Build the per-repo job image (two-layer model).
                                            Skips the build when the computed tag already exists.
   status [jobId]                           List jobs (blocked first) or show one job
-  logs <jobId> [--after seq] [--full]       Dump job events (--full: raw JSON per line)
+  logs <jobId> [--after seq] [--tools] [--full]
+                                           Dump job events (default: narrative spine — state, phase,
+                                           thinks, decisions, settle; --tools adds tool_use/tool_result;
+                                           --full: raw JSON per line)
   attach <jobId> [--answer]                Follow job events until done/cancelled
                                            (--answer: respond to decisions from stdin)
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
@@ -258,13 +261,29 @@ async function cmdDelegate(args: string[]): Promise<number> {
   if (!preset) fail(`unknown mode "${modeName}" — available: ${Object.keys(modes).join(', ')}`);
 
   const flagFinish = typeof values.finish === 'string' ? values.finish : undefined;
-  const workOrder = {
+
+  // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
+  let issueTitle: string | undefined;
+  if (/^\d+$/.test(target)) {
+    try {
+      const raw = spawnSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
+        encoding: 'utf8',
+      });
+      if (raw.status === 0) {
+        const t = raw.stdout.trim();
+        if (t) issueTitle = t;
+      }
+    } catch { /* gh unavailable or not a real issue — proceed without title */ }
+  }
+
+  const workOrder: Record<string, unknown> = {
     mode: preset.mode,
     target,
     finish: flagFinish ?? preset.finish ?? manifest.gates?.default_finish ?? 'merge-ready',
     authority: preset.authority,
     report: preset.report ?? 'status-first',
   };
+  if (issueTitle !== undefined) workOrder.title = issueTitle;
   const orderCheck = validateWorkOrder(workOrder);
   if (!orderCheck.ok) {
     for (const line of formatFindings('work order', orderCheck.errors)) console.error(line);
@@ -445,14 +464,18 @@ type Job = {
   id: string;
   state: string;
   marker?: string;
-  workOrder?: { mode?: string; target?: string };
+  workOrder?: { mode?: string; target?: string; title?: string };
   updatedAt?: string;
 };
 
 function formatJob(job: Job): string {
   const state = typeof job.marker === 'string' ? `${job.state}(${job.marker})` : job.state;
   const mode = job.workOrder?.mode ?? '?';
-  const target = job.workOrder?.target ?? '?';
+  const rawTarget = job.workOrder?.target ?? '?';
+  const title = job.workOrder?.title;
+  // Prefer "#<n> <title>" when both an issue number and title are present.
+  const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
+  const target = title ? `${ref} ${title}`.slice(0, 60) : rawTarget;
   const updated = typeof job.updatedAt === 'string' ? `  updated=${job.updatedAt}` : '';
   return `${job.id}  ${state}  mode=${mode}  target=${target}${updated}`;
 }
@@ -483,19 +506,30 @@ async function cmdStatus(args: string[]): Promise<number> {
 async function cmdLogs(args: string[]): Promise<number> {
   const { values, positionals } = parseCommand(
     args,
-    { after: { type: 'string' }, full: { type: 'boolean' } },
+    { after: { type: 'string' }, tools: { type: 'boolean' }, full: { type: 'boolean' } },
     1,
     1,
   );
   const jobId = positionals[0];
   const after = typeof values.after === 'string' ? values.after : undefined;
+  const tools = values.tools === true;
   const full = values.full === true;
   if (after !== undefined && !/^-?\d+$/.test(after)) throw new UsageError('--after takes an integer sequence number');
   const query = after === undefined ? '' : `?after=${after}`;
   const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY ?? false);
   const onLine = full
     ? (line: string) => { console.log(line); }
-    : (line: string) => { printEventLine(line, noColor); };
+    : (line: string) => {
+        try {
+          const event: FleetEvent = JSON.parse(line);
+          // Narrative mode (default): omit progress/pair/agent and tool_use/tool_result log lines.
+          // --tools: include tool lines too. --full: already handled above.
+          if (!isNarrativeEvent(event, tools)) return;
+          console.log(formatEvent(event, noColor));
+        } catch {
+          console.log(line); // never crash on a malformed daemon line
+        }
+      };
   const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, onLine);
   if (res.status !== 200) return daemonFailure(res, 'logs');
   return EXIT_OK;

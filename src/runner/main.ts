@@ -11,7 +11,7 @@
  * state cancelled reason "harness-exit" on nonzero harness exit).
  */
 
-import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -77,10 +77,12 @@ async function main(): Promise<void> {
 
   // Work-order target: names the job branch and rides into the harness prompt.
   let target = 'work';
+  let orderTitle: string | undefined;
   let authorityPublish = false;
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
+    if (typeof order.title === 'string' && order.title) orderTitle = order.title;
     authorityPublish = order?.authority?.publish === true;
   } catch {
     // No staged order (direct runner invocation): branch/prompt fall back.
@@ -354,12 +356,8 @@ async function main(): Promise<void> {
         try {
           report = JSON.parse(readFileSync(join(workspace, '.fleet', 'out', 'report.json'), 'utf8'));
         } catch { /* thin PR text is the honest fallback */ }
-        let issueTitle: string | undefined;
-        try {
-          issueTitle = execFileSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'],
-            { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || undefined;
-        } catch { /* non-issue targets or offline: title degrades to job id */ }
-        const pr = composeDraftPrText({ target, issueTitle, jobId, report });
+        // Title stamped at dispatch (in order.json); never re-fetched from gh.
+        const pr = composeDraftPrText({ target, issueTitle: orderTitle, jobId, report });
         prUrl = createDraftPr(workspace, { base, branch, title: pr.title, body: pr.body });
         const headSha = getHeadSha(workspace);
         await sink.emit({ type: 'log', text: `draft PR opened: ${prUrl} (head ${headSha})`, who: 'runner' });

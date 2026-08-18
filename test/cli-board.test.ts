@@ -179,6 +179,92 @@ test('renderFrame: NO_COLOR output is stable (snapshot)', () => {
   assert.equal(frame, expected);
 });
 
+test('renderFrame: title in workOrder shows as #<n> <title> in TARGET column (clipped to column)', () => {
+  const jobs: BoardJob[] = [
+    {
+      id: 'job-run',
+      state: 'running',
+      workOrder: { mode: 'implement', target: '42', title: 'Fix login' },
+    },
+  ];
+  // Use wide enough frame so "Fix login" fits in 17-char TARGET column (#42 Fix login = 13 chars).
+  const frame = renderFrame(jobs, -1, 120, { noColor: true, now: 0 });
+  assert.match(frame, /#42 Fix login/, 'title shown as #<n> <title> in TARGET column');
+  // Without title: numeric target renders without # prefix.
+  const noTitle: BoardJob[] = [
+    { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: '42' } },
+  ];
+  const noTitleFrame = renderFrame(noTitle, -1, 120, { noColor: true, now: 0 });
+  assert.doesNotMatch(noTitleFrame, /#42/, 'bare numeric target has no # prefix without title');
+});
+
+test('renderFrame: now-line from lastActivity appears under all running/queued jobs', () => {
+  // now=10000ms; at = new Date(10000 - 3000).toISOString() ≈ 3s ago
+  const AT = new Date(10000 - 3000).toISOString();
+  const jobs: BoardJob[] = [
+    {
+      id: 'job-run1',
+      state: 'running',
+      workOrder: { mode: 'implement', target: 'app' },
+      lastActivity: { text: 'reading the codebase', at: AT },
+    },
+    {
+      id: 'job-run2',
+      state: 'running',
+      workOrder: { mode: 'assess', target: 'docs' },
+      lastActivity: { text: 'running tests', at: AT },
+    },
+    {
+      id: 'job-no-activity',
+      state: 'running',
+      workOrder: { mode: 'review', target: 'pr' },
+      // no lastActivity
+    },
+  ];
+  const frame = renderFrame(jobs, -1, 120, { noColor: true, now: 10000 });
+  assert.match(frame, /now: reading the codebase/, 'now-line for job-run1');
+  assert.match(frame, /now: running tests/, 'now-line for job-run2');
+  assert.match(frame, /\(3s\)/, 'age shown in now-line');
+  // Job with no lastActivity has no now-line.
+  const lines = frame.split('\n');
+  const noActLines = lines.filter((l) => l.includes('job-no-activity'));
+  // The job-no-activity row is present but has no "now:" below it.
+  assert.ok(noActLines.length > 0, 'no-activity job rendered');
+  assert.doesNotMatch(noActLines.join('\n'), /now:/, 'no now-line without lastActivity');
+});
+
+test('renderFrame: now-line snapshot (noColor)', () => {
+  const AT = new Date(0).toISOString(); // epoch — 5s before now=5000
+  const jobs: BoardJob[] = [
+    {
+      id: 'job-run',
+      state: 'running',
+      workOrder: { mode: 'implement', target: 'app' },
+      lastActivity: { text: 'writing tests', at: AT },
+    },
+  ];
+  const frame = renderFrame(jobs, -1, 80, { noColor: true, now: 5000 });
+  const lines = frame.split('\n');
+  // Find the now-line (should be immediately after the job row).
+  const jobRowIdx = lines.findIndex((l) => l.includes('job-run'));
+  assert.ok(jobRowIdx !== -1, 'job row found');
+  const nowLine = lines[jobRowIdx + 1];
+  assert.match(nowLine ?? '', /now: writing tests \(5s\)/, 'now-line shows text and age');
+});
+
+test('renderDetailFrame: title shown in full in detail header', () => {
+  const job: BoardJob = {
+    id: 'job-x',
+    state: 'running',
+    workOrder: { mode: 'implement', target: '99', title: 'Migrate to PostgreSQL' },
+  };
+  const frame = renderDetailFrame(job, [], 0, true, 120, 24, { noColor: true, now: 0 });
+  const lines = frame.split('\n');
+  // Context strip middle line has the job line with full title.
+  const jobLine = lines[1];
+  assert.match(jobLine, /#99: Migrate to PostgreSQL/, 'full title in detail header');
+});
+
 test('renderFrame: selection indicator appears on the correct sorted row', () => {
   // sorted order: blocked (index 0), running (index 1)
   const jobs: BoardJob[] = [
