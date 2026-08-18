@@ -3,8 +3,11 @@
 Provisions everything Fleet needs to run coding-agent jobs in containers on your own AWS
 account: an ECS cluster backed by an EC2 auto scaling group that scales to zero, the
 Fleet daemon as an always-on Fargate service with durable `FLEET_HOME` state on EFS,
-ECR repositories for the runner and project images, CloudWatch log groups, and a monthly
-cost budget with email alerts.
+ECR repositories for the runner and project images, and CloudWatch log groups.
+
+Spend is bounded structurally — the ASG floors at zero and caps at `max_instances`,
+and core bounds each job's wall-clock. The unit provisions no billing products:
+budget alarms are your account's own concern (`docs/decisions.md#d12`).
 
 **Two-substrate design.** The daemon runs on Fargate (always-on, no EC2 pinned) while
 worker jobs run on the EC2 capacity provider with managed ASG scaling — the ASG can
@@ -45,8 +48,6 @@ Then push a daemon image to the runner repository with the `daemon` tag (or set
 | `daemon_tcp_port` | `number` | `9000` | TCP port the daemon binds inside its container; operators reach it via SSM port-forward. |
 | `fleet_home_path` | `string` | `"/var/lib/fleet"` | Container path for `FLEET_HOME` (EFS-backed). |
 | `log_retention_days` | `number` | `30` | CloudWatch log retention. |
-| `monthly_budget_usd` | `number` | `200` | Monthly cost budget in USD. |
-| `budget_email` | `string` | `"ops@example.com"` | Recipient for budget notifications (80% actual, 100% forecasted). |
 
 ## Outputs
 

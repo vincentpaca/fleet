@@ -699,31 +699,8 @@ resource "aws_ecs_service" "daemon" {
   tags = local.tags
 }
 
-# --- Budget ---------------------------------------------------------------------
-
-resource "aws_budgets_budget" "monthly" {
-  name        = "${var.name}-monthly"
-  budget_type = "COST"
-  time_unit   = "MONTHLY"
-
-  limit_amount = tostring(var.monthly_budget_usd)
-  limit_unit   = "USD"
-
-  notification {
-    comparison_operator        = "GREATER_THAN"
-    notification_type          = "ACTUAL"
-    threshold                  = 80
-    threshold_type             = "PERCENTAGE"
-    subscriber_email_addresses = [var.budget_email]
-  }
-
-  notification {
-    comparison_operator        = "GREATER_THAN"
-    notification_type          = "FORECASTED"
-    threshold                  = 100
-    threshold_type             = "PERCENTAGE"
-    subscriber_email_addresses = [var.budget_email]
-  }
-
-  tags = local.tags
-}
+# Deliberately no billing/budget resources: Fleet bounds spend structurally
+# (ASG min 0 / max_instances cap here; per-job wall-clock in core). Billing
+# alarms are the operator's own — a budget provisioned by the unit meters the
+# whole account unless cost-allocation tags are activated, and either way it
+# is monitoring, not control. See docs/decisions.md#d12 (amended 2026-08-19).
