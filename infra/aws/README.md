@@ -48,10 +48,17 @@ That builds the runner base and the daemon image for **this deployment's**
 architecture (`linux/amd64`; pass `--platform` to change it), tags them `:runner`
 and `:daemon` — the tags this unit's task definitions pin — pushes both to the ECR
 repository from `fleet_config`, and forces a new deployment of the daemon service so
-it starts from the image just pushed. On an arm64 workstation the build is emulated;
-you never set `DOCKER_DEFAULT_PLATFORM`, `docker tag`, or `aws ecs update-service`
-by hand. Add `daemon_url` to `fleet-config.json` (see `connect_hint` for the
-port-forward) and the CLI talks to it.
+it starts from the image just pushed. You never set `DOCKER_DEFAULT_PLATFORM`,
+`docker tag`, or `aws ecs update-service` by hand. Add `daemon_url` to
+`fleet-config.json` (see `connect_hint` for the port-forward) and the CLI talks to it.
+
+On an arm64 workstation the build is emulated, which needs binfmt registered.
+Docker Desktop ships it; a plain arm64 Linux engine (a Graviton dev box) does not,
+and without it the first `RUN` fails with `exec format error`. Register it once:
+
+```sh
+docker run --privileged --rm tonistiigi/binfmt --install amd64
+```
 
 `daemon_image` is still available if you would rather point the service at an image
 you publish elsewhere.

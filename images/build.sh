@@ -32,7 +32,10 @@
 # Platform defaults to linux/amd64: the architecture infra/aws runs today (its
 # Fargate daemon task and its default t3 container instances are both x86_64).
 # On an arm64 workstation that means an emulated build — the deployment's
-# architecture is what matters, not the builder's.
+# architecture is what matters, not the builder's. Emulation needs binfmt
+# registered: Docker Desktop ships it, a plain arm64 Linux engine does not, and
+# without it the first RUN dies with "exec format error". Register it once with
+#   docker run --privileged --rm tonistiigi/binfmt --install amd64
 #
 # --redeploy-daemon restarts FLEET'S OWN daemon service with the image just
 # pushed. It deploys no user application, and no job or runner code path can
@@ -51,7 +54,8 @@ usage() {
 usage: images/build.sh [flags]
 
   --runner | --daemon    build only that image (default: both)
-  --platform PLATFORM    target architecture (default: linux/amd64)
+  --platform PLATFORM    architecture to build for (default: linux/amd64, what
+                         infra/aws runs; --redeploy-daemon accepts no other)
   --cli HARNESS_CLI      harness CLI baked into the runner base (default: claude-code)
   --version VERSION      harness CLI version (default: latest)
   --push                 push to the deployment's ECR as :runner / :daemon
@@ -89,16 +93,27 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --runner)          BUILD_RUNNER=1; shift ;;
     --daemon)          BUILD_DAEMON=1; shift ;;
-    --platform)        PLATFORM="$2"; shift 2 ;;
-    --cli)             HARNESS_CLI="$2"; shift 2 ;;
-    --version)         HARNESS_VERSION="$2"; shift 2 ;;
     --push)            PUSH=1; shift ;;
     --redeploy-daemon) REDEPLOY=1; PUSH=1; shift ;;
-    --config)          CONFIG="$2"; shift 2 ;;
-    --repository)      REPOSITORY="$2"; shift 2 ;;
-    --region)          REGION_FLAG="$2"; shift 2 ;;
-    --cluster)         CLUSTER="$2"; shift 2 ;;
-    --service)         SERVICE="$2"; shift 2 ;;
+    # Every value-taking flag routes through one arity check: reading "$2"
+    # directly makes a forgotten value exit with bash's "$2: unbound variable"
+    # instead of saying which flag is short.
+    --platform|--cli|--version|--config|--repository|--region|--cluster|--service)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 needs a value" >&2
+        exit 1
+      fi
+      case "$1" in
+        --platform)   PLATFORM="$2" ;;
+        --cli)        HARNESS_CLI="$2" ;;
+        --version)    HARNESS_VERSION="$2" ;;
+        --config)     CONFIG="$2" ;;
+        --repository) REPOSITORY="$2" ;;
+        --region)     REGION_FLAG="$2" ;;
+        --cluster)    CLUSTER="$2" ;;
+        --service)    SERVICE="$2" ;;
+      esac
+      shift 2 ;;
     --registry)
       # Was a registry HOST; the tags now live in the deployment's own repository.
       echo "error: --registry is gone — pass --repository <ECR repository URL>, the full .../<name>-runner path that holds the :runner and :daemon tags" >&2
@@ -116,6 +131,15 @@ fi
 
 if [[ $REDEPLOY -eq 1 && $BUILD_DAEMON -eq 0 ]]; then
   echo "error: --redeploy-daemon rolls the daemon service onto a freshly pushed :daemon image — drop --runner so the daemon image is built too" >&2
+  exit 1
+fi
+
+# Rolling the service onto an image its platform cannot execute takes the daemon
+# down: the ECS daemon task is X86_64 (infra/aws sets no runtime_platform, and
+# Fargate defaults to it). Publish whatever you like, but do not roll onto it.
+if [[ $REDEPLOY -eq 1 && "$PLATFORM" != "linux/amd64" ]]; then
+  echo "error: the daemon service runs linux/amd64 images — a ${PLATFORM} :daemon tag would fail to start and leave the daemon down" >&2
+  echo "  push it without rolling (--push), or drop --platform to build what this deployment runs" >&2
   exit 1
 fi
 
@@ -147,9 +171,11 @@ find_config() {
 }
 
 capture_hint() {
+  # The terraform unit lives in this checkout; discovery reads the project you
+  # ran from. The <> placeholder keeps the two straight.
   echo "  capture the deployment's own values once after terraform apply:" >&2
   echo "    mkdir -p .fleet/infra/aws" >&2
-  echo "    terraform -chdir=infra/aws/examples/basic output -json fleet_config > .fleet/infra/aws/fleet-config.json" >&2
+  echo "    terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config > .fleet/infra/aws/fleet-config.json" >&2
 }
 
 if [[ $PUSH -eq 1 ]]; then
@@ -161,6 +187,15 @@ if [[ $PUSH -eq 1 ]]; then
   fi
   if [[ -n "$CONFIG" ]]; then
     echo "reading deployment from ${CONFIG}"
+    # This script speaks ECR and ECS. A config for another cloud would survive
+    # discovery — its repository URL is non-empty too — and only fail at docker
+    # login, after both images are built.
+    CONFIG_PROVIDER="$(config_field "$CONFIG" provider)"
+    if [[ -n "$CONFIG_PROVIDER" && "$CONFIG_PROVIDER" != "ecs" ]]; then
+      echo "error: ${CONFIG} describes a ${CONFIG_PROVIDER} deployment; this script publishes to ECR and rolls an ECS service" >&2
+      echo "  point --config at the ecs deployment, or pass --repository/--cluster/--service yourself" >&2
+      exit 1
+    fi
     [[ -n "$REPOSITORY" ]] || REPOSITORY="$(config_field "$CONFIG" runner_repository_url)"
     [[ -n "$CLUSTER" ]] || CLUSTER="$(config_field "$CONFIG" cluster)"
     [[ -n "$SERVICE" ]] || SERVICE="$(config_field "$CONFIG" daemon_service)"

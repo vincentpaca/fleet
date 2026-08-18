@@ -79,7 +79,9 @@ function runBuild(args: string[], opts: { cwd?: string; config?: unknown; env?: 
     HARNESS_VERSION: undefined,
     ...opts.env,
   };
-  const res = spawnSync('bash', [SCRIPT, ...args], { cwd, encoding: 'utf8', env });
+  // Invoked directly, not via `bash <script>`: the runbook says ./images/build.sh,
+  // so the shebang and the exec bit are part of what is under test.
+  const res = spawnSync(SCRIPT, args, { cwd, encoding: 'utf8', env });
   const log = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
   return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '', log };
 }
@@ -90,6 +92,19 @@ const only = (log: string[], needle: string): string => {
   assert.equal(hits.length, 1, `expected exactly one ${needle} call, got:\n${log.join('\n')}`);
   return hits[0];
 };
+
+// ---------- the script itself ----------
+
+test('build.sh is executable — the runbook tells operators to run it directly', () => {
+  assert.ok(fs.statSync(SCRIPT).mode & 0o111, `${SCRIPT} lost its exec bit`);
+});
+
+test('a forgotten flag value names the flag instead of dying inside bash', () => {
+  const res = runBuild(['--platform']);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /--platform needs a value/);
+  assert.ok(!res.stderr.includes('unbound variable'), `bash internals leaked: ${res.stderr}`);
+});
 
 // ---------- build ----------
 
@@ -212,6 +227,28 @@ describe('push', () => {
     assert.deepEqual(res.log, [], 'must not spend a build it cannot publish');
   });
 
+  test('a namespaced repository keeps its whole path and logs in to the host only', () => {
+    // host/ns/name is where `${REPOSITORY%/*}` and `${REPOSITORY%%/*}` diverge:
+    // the single-% form would try to log in to <host>/platform.
+    const nested = '123456789012.dkr.ecr.us-west-2.amazonaws.com/platform/fleet-runner';
+    const res = runBuild(['--push', '--repository', nested]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(only(res.log, 'docker login'), `docker login --username AWS --password-stdin ${ECR_HOST}`);
+    assert.deepEqual(find(res.log, 'docker tag'), [
+      `docker tag fleet-runner:claude-code-latest ${nested}:runner`,
+      `docker tag fleet-daemon:local ${nested}:daemon`,
+    ]);
+  });
+
+  test('a config for another cloud is refused before any build', () => {
+    const res = runBuild(['--push'], {
+      config: { ...FLEET_CONFIG, provider: 'gke', runner_repository_url: 'gcr.io/somewhere/fleet-runner' },
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /describes a gke deployment/);
+    assert.deepEqual(res.log, [], 'must not build for a deployment it cannot publish to');
+  });
+
   test('a registry host passed as --repository is rejected, not pushed to', () => {
     // <host> alone would make the push target <host>:runner — a tag on a
     // repository that does not exist, which is how the hand-run push failed.
@@ -273,6 +310,44 @@ describe('--redeploy-daemon', () => {
     assert.match(res.stderr, /--redeploy-daemon/);
     assert.deepEqual(res.log, []);
   });
+
+  test('refuses a foreign --platform rather than rolling the daemon onto an image it cannot run', () => {
+    // The ECS daemon task is X86_64; an arm64 :daemon tag starts nothing and the
+    // operator's daemon stays down. Publishing it is still allowed.
+    const rolled = runBuild(['--platform', 'linux/arm64', '--redeploy-daemon'], { config: FLEET_CONFIG });
+    assert.equal(rolled.code, 1);
+    assert.match(rolled.stderr, /linux\/amd64/);
+    assert.deepEqual(rolled.log, []);
+
+    const pushed = runBuild(['--platform', 'linux/arm64', '--push'], { config: FLEET_CONFIG });
+    assert.equal(pushed.code, 0, pushed.stderr);
+    assert.equal(find(pushed.log, 'docker push').length, 2);
+  });
+});
+
+// ---------- the rule the roll depends on ----------
+
+test('no shipped code path can roll a service — only the operator-run script', () => {
+  // docs/decisions.md#d5: deploy is never grantable. images/build.sh is reached
+  // by an operator typing it, never by the daemon or a job's runner, and the
+  // runner task role carries no ecs:UpdateService. This is the checkpoint for
+  // that claim: a deploy call appearing under src/ is the regression.
+  const srcDir = path.join(REPO_ROOT, 'src');
+  const offenders: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.(ts|mjs)$/.test(entry.name)) {
+        const text = fs.readFileSync(full, 'utf8');
+        for (const forbidden of ['update-service', 'force-new-deployment']) {
+          if (text.includes(forbidden)) offenders.push(`${path.relative(REPO_ROOT, full)}: ${forbidden}`);
+        }
+      }
+    }
+  };
+  walk(srcDir);
+  assert.deepEqual(offenders, [], `deploy call in shipped code:\n${offenders.join('\n')}`);
 });
 
 // The other half of the contract — that every infra unit's fleet_config names
