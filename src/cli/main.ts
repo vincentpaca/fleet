@@ -40,6 +40,10 @@ Commands:
   image build [--manifest path] [--push] [--registry ECR_URI] [--region AWS_REGION]
                                            Build the per-repo job image (two-layer model).
                                            Skips the build when the computed tag already exists.
+  resume [--answer]                        Show live state of jobs delegated from this checkout.
+                                           Reads .fleet/dispatched.jsonl; blocked jobs appear first
+                                           with their open decision rendered.
+                                           (--answer: answer the first blocked job interactively)
   status [jobId]                           List jobs (blocked first) or show one job
   logs <jobId> [--after seq] [--tools] [--full]
                                            Dump job events (default: narrative spine — state, phase,
@@ -58,7 +62,7 @@ Commands:
 Flags:
   --version                                Print version and exit
 
-Daemon address: FLEET_DAEMON_URL, or unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).`;
+Daemon address: FLEET_DAEMON_URL env → .fleet/infra/<provider>/fleet-config.json (daemon_url) → unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).`;
 
 class UsageError extends Error {}
 class CliError extends Error {}
@@ -127,9 +131,11 @@ function initManifest(): unknown {
 // Runtime and per-deployment artifacts never belong in the user's repo:
 // out/ is the job's decision/answer/report channel; infra/ holds generated
 // terraform + local state + the per-deployment fleet-config.json (two people
-// on the same repo can point at different infra).
+// on the same repo can point at different infra). dispatched.jsonl is a
+// local pointer ledger — per-checkout, never shared.
 const FLEET_GITIGNORE = `out/
 infra/
+dispatched.jsonl
 `;
 
 function cmdInit(args: string[]): number {
@@ -345,6 +351,25 @@ async function cmdDelegate(args: string[]): Promise<number> {
   // Daemon API contract: POST /jobs → 201 {job}.
   const created = res.json as { job: { id: string; state: string } };
   console.log(`${created.job.id} ${created.job.state}`);
+
+  // Append a pointer entry to the local dispatch ledger (gitignored).
+  // Pointer only: no status fields — remote is truth.
+  const ledgerEntry: Record<string, string> = {
+    jobId: created.job.id,
+    target,
+    mode: preset.mode,
+    daemonUrl: describeTarget(),
+    at: new Date().toISOString(),
+  };
+  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
+  try {
+    fs.mkdirSync(path.join('.fleet'), { recursive: true });
+    fs.appendFileSync(ledgerPath, `${JSON.stringify(ledgerEntry)}\n`);
+  } catch {
+    // Non-fatal: the job was created; a ledger write failure only affects fleet resume.
+    console.error('fleet: warning: could not write to .fleet/dispatched.jsonl');
+  }
+
   if (values.watch === true) return followJob(created.job.id, true);
   return EXIT_OK;
 }
@@ -792,6 +817,179 @@ function cmdDoctor(args: string[]): number {
   return EXIT_FAILURE;
 }
 
+// ---------- resume ----------
+
+type LedgerEntry = {
+  jobId: string;
+  target: string;
+  mode: string;
+  daemonUrl: string;
+  at: string;
+};
+
+type ResumeDecision = {
+  id: string;
+  question: string;
+  options: Array<{ id: string; label?: string; recommended?: boolean }>;
+};
+
+/** Fetch the pending decision for a blocked job, or undefined if none. */
+async function fetchResumeDecision(jobId: string): Promise<ResumeDecision | undefined> {
+  let decision: ResumeDecision | undefined;
+  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events`, undefined, (line) => {
+    try {
+      const ev = JSON.parse(line) as { type: string; id?: string; question?: string; options?: Array<{ id: string; label?: string; recommended?: boolean }> };
+      if (ev.type === 'decision' && ev.id && ev.question && ev.options) {
+        decision = { id: ev.id, question: ev.question, options: ev.options };
+      }
+      if (ev.type === 'answer') decision = undefined; // answered elsewhere
+    } catch {
+      // ignore malformed event lines
+    }
+  });
+  if (res.status !== 200) {
+    console.error(`${jobId}: warning: events fetch returned HTTP ${res.status} — decision may not be shown`);
+    return undefined;
+  }
+  return decision;
+}
+
+/**
+ * Read the local dispatch ledger, fetch live state for every entry, and print
+ * a reconnect-oriented summary: blocked/stale first with open decisions, then
+ * active, then a tail of recent terminal jobs.
+ */
+async function cmdResume(args: string[]): Promise<number> {
+  const { values } = parseCommand(args, { answer: { type: 'boolean' } }, 0, 0);
+  const answerMode = values.answer === true;
+
+  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
+  if (!fs.existsSync(ledgerPath)) {
+    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
+    return EXIT_OK;
+  }
+
+  const rawLedger = fs.readFileSync(ledgerPath, 'utf8').trim();
+  if (!rawLedger) {
+    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
+    return EXIT_OK;
+  }
+
+  const entries: LedgerEntry[] = [];
+  for (const line of rawLedger.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      entries.push(JSON.parse(trimmed) as LedgerEntry);
+    } catch {
+      // ignore malformed ledger lines
+    }
+  }
+
+  if (entries.length === 0) {
+    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
+    return EXIT_OK;
+  }
+
+  // Fetch live state for each entry. daemonCall fails fast (exit 1) on network
+  // errors — never report stale data. 404 = daemon doesn't know this job.
+  type ResumeResult = {
+    entry: LedgerEntry;
+    job?: Job;
+    decision?: ResumeDecision;
+    unknown?: boolean;   // true: 404 or non-200 from daemon
+    fetchError?: string; // set when unknown=true and the cause was a non-404 error
+  };
+
+  const results: ResumeResult[] = [];
+  for (const entry of entries) {
+    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(entry.jobId)}`);
+    if (res.status === 404) {
+      results.push({ entry, unknown: true });
+    } else if (res.status !== 200) {
+      // Surface other daemon errors; include the job in the output as unknown so
+      // it is never silently dropped from the summary table.
+      const errBody = res.json as { error?: string } | undefined;
+      const msg = errBody?.error ?? `HTTP ${res.status}`;
+      results.push({ entry, unknown: true, fetchError: msg });
+    } else {
+      const body = res.json as { job: Job };
+      const rr: ResumeResult = { entry, job: body.job };
+      if (body.job.state === 'blocked') {
+        rr.decision = await fetchResumeDecision(entry.jobId);
+      }
+      results.push(rr);
+    }
+  }
+
+  // Sort priority: stale-blocked → blocked → running/queued → terminal → unknown.
+  const sortKey = (rr: ResumeResult): number => {
+    if (rr.unknown) return 100;
+    if (!rr.job) return 90;
+    const { state, marker } = rr.job;
+    if (state === 'blocked' && marker === 'stale') return 0;
+    if (state === 'blocked') return 1;
+    if (state === 'running' || state === 'queued') return 2;
+    return 10; // terminal
+  };
+  results.sort((a, b) => sortKey(a) - sortKey(b));
+
+  const ACTIVE_STATES = new Set(['blocked', 'running', 'queued']);
+  const active = results.filter((rr) => !rr.unknown && rr.job && ACTIVE_STATES.has(rr.job.state));
+  const terminal = results.filter((rr) => !rr.unknown && rr.job && !ACTIVE_STATES.has(rr.job.state));
+  const unknown = results.filter((rr) => rr.unknown);
+
+  let firstBlocked: ResumeResult | undefined;
+
+  // Active jobs (blocked first, then running/queued).
+  for (const rr of active) {
+    const job = rr.job!;
+    console.log(formatJob(job));
+    if (rr.decision) {
+      if (!firstBlocked) firstBlocked = rr;
+      const dec = rr.decision;
+      console.log(`  ? ${dec.question}`);
+      for (const opt of dec.options) {
+        const rec = opt.recommended ? ' (recommended)' : '';
+        const label = opt.label ? `: ${opt.label}` : '';
+        console.log(`    - ${opt.id}${rec}${label}`);
+      }
+      console.log(`  run: fleet answer ${job.id} --option <id>  |  fleet resume --answer`);
+    } else if (job.state === 'blocked' && !firstBlocked) {
+      firstBlocked = rr;
+    }
+  }
+
+  // Recent terminal tail (last 5, oldest first within the tail).
+  const recentTerminal = terminal.slice(-5);
+  for (const rr of recentTerminal) {
+    console.log(formatJob(rr.job!));
+  }
+
+  // Unknown-to-daemon entries (404 or daemon error). Include daemonUrl so the
+  // user knows which daemon was queried and where the job may actually live.
+  for (const rr of unknown) {
+    const reason = rr.fetchError ? `error: ${rr.fetchError}` : 'unknown to daemon';
+    console.log(`${rr.entry.jobId}  ${reason}  target=${rr.entry.target}  daemon=${describeTarget()}  delegated=${rr.entry.at}`);
+  }
+
+  if (active.length === 0 && terminal.length === 0 && unknown.length === 0) {
+    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
+    return EXIT_OK;
+  }
+
+  // --answer: drop into interactive answer loop on the first blocked job.
+  if (answerMode) {
+    if (!firstBlocked || !firstBlocked.job) {
+      console.log('no blocked jobs to answer');
+      return EXIT_OK;
+    }
+    return followJob(firstBlocked.job.id, true);
+  }
+
+  return EXIT_OK;
+}
+
 // ---------- router ----------
 
 function parseCommand(
@@ -839,6 +1037,8 @@ export async function main(argv: string[]): Promise<number> {
         return cmdLint(rest);
       case 'delegate':
         return await cmdDelegate(rest);
+      case 'resume':
+        return await cmdResume(rest);
       case 'status':
         return await cmdStatus(rest);
       case 'logs':
