@@ -235,9 +235,11 @@ data "aws_iam_policy_document" "ec2_assume" {
   }
 }
 
-# Task role: deliberately minimal. The only permissions are the SSM messaging
-# channels required for `aws ecs execute-command` (the SSM-only access path),
-# plus GetParameter on the fleet-config SSM parameter the daemon reads at boot.
+# Runner task role: deliberately minimal — only the SSM messaging channels
+# required for `aws ecs execute-command` (the SSM-only access path). Dispatch
+# powers live on the daemon role below and must never appear here: a job
+# container able to run or stop tasks defeats the sandbox the same way an
+# agent answering its own decision would.
 resource "aws_iam_role" "task" {
   name               = "${var.name}-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
@@ -265,9 +267,39 @@ resource "aws_iam_role_policy" "task_ecs_exec" {
   })
 }
 
-resource "aws_iam_role_policy" "task_ssm_config" {
+# Daemon role: the coordinator's own identity, separate from the runner task
+# role above. It reads the fleet-config parameter at boot and dispatches
+# runner tasks; scoped to this cluster and the runner task definition only.
+resource "aws_iam_role" "daemon" {
+  name               = "${var.name}-daemon"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  tags               = local.tags
+}
+
+resource "aws_iam_role_policy" "daemon_ecs_exec" {
+  name = "ecs-exec-ssm-channel"
+  role = aws_iam_role.daemon.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "daemon_ssm_config" {
   name = "ssm-fleet-config-read"
-  role = aws_iam_role.task.id
+  role = aws_iam_role.daemon.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -276,6 +308,37 @@ resource "aws_iam_role_policy" "task_ssm_config" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
         Resource = aws_ssm_parameter.fleet_config.arn
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "daemon_dispatch" {
+  name = "ecs-dispatch"
+  role = aws_iam_role.daemon.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Action    = ["ecs:RunTask"]
+        Resource  = "${aws_ecs_task_definition.runner.arn_without_revision}:*"
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.this.arn } }
+      },
+      {
+        Effect    = "Allow"
+        Action    = ["ecs:StopTask"]
+        Resource  = "*"
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.this.arn } }
+      },
+      {
+        # run-task hands the runner its task and execution roles; the daemon
+        # may pass exactly those two, to ECS tasks only.
+        Effect    = "Allow"
+        Action    = ["iam:PassRole"]
+        Resource  = [aws_iam_role.task.arn, aws_iam_role.task_execution.arn]
+        Condition = { StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" } }
       },
     ]
   })
@@ -544,7 +607,7 @@ resource "aws_ecs_task_definition" "daemon" {
   # Fargate requires cpu and memory at the task level (as strings).
   cpu                = tostring(var.daemon_cpu)
   memory             = tostring(var.daemon_memory)
-  task_role_arn      = aws_iam_role.task.arn
+  task_role_arn      = aws_iam_role.daemon.arn
   execution_role_arn = aws_iam_role.task_execution.arn
 
   volume {
