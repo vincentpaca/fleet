@@ -8,7 +8,9 @@
 # -e flags and live only in the process environment — never in ARG, ENV, or
 # any image layer. Asserted by: docker history --no-trunc | grep -i key.
 #
-# Usage:
+# Usage: images/build.sh --runner --cli claude-code --version 1.2.3
+#   (it targets the deployment's architecture and owns the :runner tag; build by
+#   hand only when you are debugging this file)
 #   docker build --build-arg HARNESS_CLI=claude-code --build-arg HARNESS_VERSION=1.2.3 \
 #     -t fleet-runner:claude-code-1.2.3 -f images/runner/Dockerfile .
 

@@ -6,7 +6,9 @@
 # Secrets NEVER enter this image. Credentials arrive at container start via
 # ECS task roles (IMDS) or -e flags — never in ARG, ENV, or any image layer.
 #
-# Usage (build):
+# Usage (build): images/build.sh --daemon
+#   (it targets the deployment's architecture and owns the :daemon tag; build by
+#   hand only when you are debugging this file)
 #   docker build -t fleet-daemon:local -f images/daemon/Dockerfile .
 #
 # Usage (run locally for health-check testing):

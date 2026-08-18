@@ -19,14 +19,49 @@ output for the exact command). Intra-VPC ingress rules:
 - Runner tasks (instances SG) → daemon TCP port
 - Daemon + instances → EFS NFS port (2049)
 
-## One-command apply
+## Bring-up
+
+**1. Apply.**
 
 ```sh
 cd examples/basic && terraform init && terraform apply
 ```
 
-Then push a daemon image to the runner repository with the `daemon` tag (or set
-`daemon_image`), and the service starts it automatically.
+**2. Capture the deployment's own description.** Every value the image build and the
+CLI need is in the `fleet_config` output; keep it beside the project that dispatches
+jobs (`.fleet/infra/` is gitignored — two people on one repo can point at different
+deployments). Steps 2 and 3 run from that project directory, not from this unit:
+
+```sh
+mkdir -p .fleet/infra/aws
+terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config \
+  > .fleet/infra/aws/fleet-config.json
+```
+
+**3. Publish both images and start the daemon on them — one command.**
+
+```sh
+<fleet-checkout>/images/build.sh --redeploy-daemon
+```
+
+That builds the runner base and the daemon image for **this deployment's**
+architecture (`linux/amd64`; pass `--platform` to change it), tags them `:runner`
+and `:daemon` — the tags this unit's task definitions pin — pushes both to the ECR
+repository from `fleet_config`, and forces a new deployment of the daemon service so
+it starts from the image just pushed. You never set `DOCKER_DEFAULT_PLATFORM`,
+`docker tag`, or `aws ecs update-service` by hand. Add `daemon_url` to
+`fleet-config.json` (see `connect_hint` for the port-forward) and the CLI talks to it.
+
+On an arm64 workstation the build is emulated, which needs binfmt registered.
+Docker Desktop ships it; a plain arm64 Linux engine (a Graviton dev box) does not,
+and without it the first `RUN` fails with `exec format error`. Register it once:
+
+```sh
+docker run --privileged --rm tonistiigi/binfmt --install amd64
+```
+
+`daemon_image` is still available if you would rather point the service at an image
+you publish elsewhere.
 
 ## Inputs
 
@@ -60,6 +95,7 @@ Then push a daemon image to the runner repository with the `daemon` tag (or set
 | `efs_file_system_id` | EFS file system backing `FLEET_HOME`. |
 | `vpc_id` | VPC deployed into (created or reused). |
 | `connect_hint` | SSM port-forward commands (copy-paste) to tunnel the daemon HTTP port to localhost. |
+| `fleet_config` | The unit's self-description: what the daemon reads at boot and what `images/build.sh` publishes to (`runner_repository_url`, `cluster`, `daemon_service`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
 
 ## Notes
 

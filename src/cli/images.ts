@@ -17,9 +17,16 @@
 // Delegated jobs bill via API key; interactive OAuth/subscription login does
 // not transfer to headless containers.
 //
-// ECR push: a separate build.sh covers the runner base layer. Per-repo images
-// are pushed here when --registry is configured (Phase 1: doc + path; live
-// exercise against real ECR belongs to #9 once the ECS substrate is up).
+// ECR push: images/build.sh covers the runner base and daemon layers — it
+// builds for the deployment's architecture, tags them :runner / :daemon, pushes
+// to the repository its fleet_config names, and rolls the daemon service.
+// Per-repo images are pushed here when --registry is configured (Phase 1: doc +
+// path; live exercise against real ECR belongs to #9 once the ECS substrate is up).
+// Region precedence differs from that script and predates it: pushToEcr below
+// composes the ECR host from a flag/AWS_REGION region, while build.sh reads the
+// region out of the repository URL (a login token is region-scoped, so the URL
+// is the authority). Reconciling them belongs with the layer-2 ECR push work,
+// not here — until then AWS_REGION must match the registry for this path.
 
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";

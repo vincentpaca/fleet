@@ -51,18 +51,37 @@ test('each infra unit self-describes its shape via fleet_config', () => {
   // The output is the contract between an infra unit and its runtime
   // provider: Fleet predicts the infrastructure it created, never discovers it.
   // Add new required keys here when the EcsConfig (or equivalent) gains a field
-  // that the provider cannot derive from any other source.
+  // that the provider cannot derive from any other source — or when operator
+  // tooling has to address the unit's own infrastructure: images/build.sh
+  // publishes to runner_repository_url and rolls cluster + daemon_service.
   const infra = join(src, '..', 'infra');
   for (const unit of readdirSync(infra)) {
     if (!statSync(join(infra, unit)).isDirectory()) continue;
     const outputs = readFileSync(join(infra, unit, 'outputs.tf'), 'utf8');
-    for (const required of [
-      'output "fleet_config"',
-      'output "connect_hint"',
-      'provider ',
-      'runner_task_definition',
-    ]) {
+    for (const required of ['output "fleet_config"', 'output "connect_hint"']) {
       assert.ok(outputs.includes(required), `infra/${unit}/outputs.tf missing ${required}`);
+    }
+    // Keys are required INSIDE the fleet_config block, as assignments. A
+    // whole-file substring scan cannot fail: a prose comment mentioning the key,
+    // or a same-named standalone output (daemon_service_name,
+    // runner_repository_url both exist), satisfies it while the map itself has
+    // been trimmed — and trimming it silently breaks every consumer.
+    const start = outputs.indexOf('output "fleet_config"');
+    const next = outputs.indexOf('\noutput "', start + 1);
+    const block = next === -1 ? outputs.slice(start) : outputs.slice(start, next);
+    for (const key of [
+      'provider',
+      'cluster',
+      'runner_task_definition',
+      'runner_container_name',
+      'runner_repository_url',
+      'daemon_service',
+    ]) {
+      assert.match(
+        block,
+        new RegExp(`^\\s*${key}\\s*=`, 'm'),
+        `infra/${unit}/outputs.tf: fleet_config must set ${key}`,
+      );
     }
   }
 });
