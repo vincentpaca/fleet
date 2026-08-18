@@ -53,7 +53,7 @@ fleet answer <jobId> --text "free text answer"
 
 ## When the job settles
 
-Report the settle event's status-first report to the human, leading with its `status` line, the rung reached vs the target, and its one `next_action` — verbatim, not paraphrased. If the job cancelled (gate failure, wall-clock), say so plainly and quote the reason.
+Report the settle event's status-first report to the human, leading with its `status` line, the rung reached vs the target, and its one `next_action` — verbatim, not paraphrased. If the job cancelled (gate failure, wall-clock, stall), say so plainly and quote the reason.
 
 If the settle's `produced[]` contains entries with `type: "file"`, the job delivered artifacts. List them to the human and offer to fetch them:
 

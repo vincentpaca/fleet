@@ -69,6 +69,20 @@ test('renderFrame: blocked jobs sort before running and terminal jobs', () => {
   assert.ok(runIdx < donIdx, 'running comes before done');
 });
 
+test('renderFrame/renderDetailFrame: a cancelled job shows its reason — cancelled(stall)', () => {
+  const stalled: BoardJob = {
+    id: 'job-stall', state: 'cancelled', reason: 'stall',
+    workOrder: { mode: 'implement', target: '39' },
+    createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:25:00Z',
+  };
+  const budget: BoardJob = { ...stalled, id: 'job-budget', reason: 'wall-clock' };
+  const frame = renderFrame([stalled, budget], -1, 100, { noColor: true, now: 0 });
+  assert.match(frame, /job-stall\s+cancelled\(stall\)/);
+  assert.match(frame, /job-budget\s+cancelled\(wall-clock\)/, 'the two cancellations must not look alike');
+  const detail = renderDetailFrame(stalled, [], 0, true, 100, 20, { noColor: true, now: 0 });
+  assert.match(detail, /cancelled\(stall\)/, 'detail header carries the reason too');
+});
+
 test('renderFrame: decision options rendered verbatim; recommended marked; non-recommended not marked', () => {
   const jobs: BoardJob[] = [
     {

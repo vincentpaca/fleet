@@ -3,7 +3,7 @@
 import { parseArgs } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { request, describeTarget } from './client.ts';
-import { formatLogText } from './format.ts';
+import { formatJobState, formatLogText } from './format.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,8 @@ export type BoardJob = {
   id: string;
   state: string;
   marker?: string;
+  /** Cancellation reason (stall, wall-clock, ...) — rendered as cancelled(<reason>). */
+  reason?: string;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -440,7 +442,7 @@ export function renderDetailFrame(
   // the detail line is a full contextual header; the roster is compact tabular data.
   const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
   const targetFull = title ? `${ref}: ${title}` : rawTarget;
-  const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
+  const stateDisplay = formatJobState(job);
   const stateColor = job.state === 'blocked' ? 33 : job.state === 'running' ? 32 : 90;
   const jobLineContent = [
     col(job.id, 1),
@@ -567,7 +569,7 @@ export function renderFrame(
     // Prefer "#<n> <title>" when both are present.
     const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
     const targetDisplay = title ? `${ref} ${title}` : rawTarget;
-    const stateDisplay = job.marker ? `${job.state}(${job.marker})` : job.state;
+    const stateDisplay = formatJobState(job);
 
     if (job.state === 'blocked') {
       // Urgency marker pulses on a ~600ms cycle.
@@ -619,6 +621,7 @@ type RawJob = {
   id: string;
   state: string;
   marker?: string;
+  reason?: string;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -679,6 +682,7 @@ export async function fetchBoardJobs(
       id: r.id,
       state: r.state,
       marker: r.marker,
+      reason: r.reason,
       workOrder: r.workOrder,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,

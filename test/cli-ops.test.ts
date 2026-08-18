@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
-import { formatEvent, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
+import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
 
 const RUNNING_JOB = {
   id: 'job-1',
@@ -90,6 +90,37 @@ test('formatEvent: log compacts tool_use and tool_result', () => {
   assert.match(formatEvent(toolUse, true), /tool_use Bash command=npm test/);
   assert.match(formatEvent(toolResult, true), /tool_result toolu_01 \(\d+ bytes\)/);
   assert.match(formatEvent(plainLog, true), /ran the tests successfully/);
+});
+
+test('formatJobState: cancellations name their kind; blocked keeps its marker', () => {
+  // The whole point of #39: a silent job and an over-budget job look different.
+  assert.equal(formatJobState({ state: 'cancelled', reason: 'stall' }), 'cancelled(stall)');
+  assert.equal(formatJobState({ state: 'cancelled', reason: 'wall-clock' }), 'cancelled(wall-clock)');
+  assert.equal(formatJobState({ state: 'cancelled' }), 'cancelled', 'no reason → plain state');
+  assert.equal(formatJobState({ state: 'blocked', marker: 'parked' }), 'blocked(parked)');
+  // A reason left over from an earlier event never decorates a live state.
+  assert.equal(formatJobState({ state: 'running', reason: 'stall' }), 'running');
+  assert.equal(formatJobState({ state: 'done' }), 'done');
+});
+
+test('status shows cancelled(stall) distinctly from cancelled(wall-clock)', async (t) => {
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => {
+      sendJson(res, 200, {
+        jobs: [
+          { id: 'job-s', state: 'cancelled', reason: 'stall', workOrder: { mode: 'implement', target: '39' } },
+          { id: 'job-w', state: 'cancelled', reason: 'wall-clock', workOrder: { mode: 'implement', target: '7' } },
+        ],
+      });
+    },
+  });
+  t.after(daemon.close);
+
+  const list = await runCli(['status'], { env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(list.code, 0, list.stderr);
+  const lines = list.stdout.trim().split('\n');
+  assert.match(lines[0], /job-s\s+cancelled\(stall\)\s+mode=implement/);
+  assert.match(lines[1], /job-w\s+cancelled\(wall-clock\)\s+mode=implement/);
 });
 
 test('status lists jobs and shows a single job', async (t) => {

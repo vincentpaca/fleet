@@ -107,6 +107,17 @@ export function isNarrativeEvent(event: FleetEvent, tools: boolean): boolean {
   return true;
 }
 
+/**
+ * State with its qualifier for job listings: the marker on blocked
+ * (parked/stale), the cancellation reason on cancelled — `cancelled(stall)`
+ * reads differently from `cancelled(wall-clock)`, and that difference is the
+ * whole diagnosis. Shared by `fleet status` and the board.
+ */
+export function formatJobState(job: { state: string; marker?: string; reason?: string }): string {
+  const qualifier = job.marker ?? (job.state === 'cancelled' ? job.reason : undefined);
+  return typeof qualifier === 'string' && qualifier !== '' ? `${job.state}(${qualifier})` : job.state;
+}
+
 /** Format one persisted Fleet event for human display. Never throws. */
 export function formatEvent(event: FleetEvent, noColor: boolean): string {
   const col = makeStyledText(noColor);

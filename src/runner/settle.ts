@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 // @ts-ignore -- plain-JS module, no type declarations
 import { validateEvent } from '../validate.mjs';
+import { toMinutes } from '../shared/time.ts';
 import type { EventBody } from './events.ts';
 
 export type SettleComposition = {
@@ -50,10 +51,7 @@ export function composeSettle(opts: {
       `retry the push with: fleet resume-push ${opts.jobId}`,
     );
   }
-  const minutes = Math.max(
-    0,
-    Math.round(((Date.now() - opts.startedAt) / 60000) * 100) / 100,
-  );
+  const minutes = toMinutes(Date.now() - opts.startedAt);
   const body: EventBody = {
     type: 'settle',
     minutes,

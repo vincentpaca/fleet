@@ -553,6 +553,94 @@ test("wall-clock backstop terminates and cancels wedged job via daemon sweep", a
   assert.equal((cancelledEvent as Record<string, unknown>).reason, "wall-clock");
 });
 
+test("stall backstop cancels a running job whose events dried up (reason stall)", async (t) => {
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    // Fire 300ms past the 1s idle threshold; sweep fast so the test is quick.
+    idleBackstopMarginMs: 300,
+    wallClockSweepIntervalMs: 50,
+  });
+  const { socketPath } = await daemon.start();
+  t.after(() => daemon.stop());
+  const ctx: Ctx = { daemon, sock: socketPath, provider, home };
+
+  // idle only: no wall_clock, so nothing but the stall sweep can end this job.
+  const manifest = { ...MANIFEST, limits: { idle: "1s" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest });
+  assert.equal(res.status, 201, res.body);
+  const job = (res.json as { job: { id: string; handle?: string } }).job;
+  const launch = provider.launches.find((l) => l.jobId === job.id);
+  assert.ok(launch, "provider.launch must be called");
+
+  await runnerPost(ctx.sock, job.id, launch.runnerToken, event(job.id, 0, { type: "state", state: "running" }));
+
+  // The runner is dead: no further events. Limit (1s) + margin (300ms) + sweeps.
+  await sleep(1_600);
+
+  const cancelled = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
+  assert.equal(cancelled.state, "cancelled");
+  assert.equal(cancelled.reason, "stall", "the record carries the reason so status/board can show cancelled(stall)");
+  assert.ok(
+    provider.terminated.includes(job.handle ?? `stub:${job.id}`),
+    `expected the handle to be terminated; got ${JSON.stringify(provider.terminated)}`,
+  );
+
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${job.id}/events`)).body) as Record<string, unknown>[];
+  const settleEvent = events.find((e) => e.type === "settle");
+  assert.ok(settleEvent, "settle event must be synthesised");
+  const report = settleEvent.report as Record<string, unknown>;
+  assert.equal(report.status, "PARTIAL");
+  assert.match(String(report.next_action), /no events for \d+(\.\d+)?m \(idle limit \d+(\.\d+)?m, daemon backstop\)/);
+  const cancelEvent = events.find((e) => e.type === "state" && e.state === "cancelled");
+  assert.ok(cancelEvent);
+  assert.equal(cancelEvent.reason, "stall");
+});
+
+test("stall backstop leaves a blocked job alone however long it waits", async (t) => {
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    idleBackstopMarginMs: 300,
+    wallClockSweepIntervalMs: 50,
+  });
+  const { socketPath } = await daemon.start();
+  t.after(() => daemon.stop());
+  const ctx: Ctx = { daemon, sock: socketPath, provider, home };
+
+  const manifest = { ...MANIFEST, limits: { idle: "1s" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest });
+  assert.equal(res.status, 201, res.body);
+  const job = (res.json as { job: { id: string } }).job;
+  const launch = provider.launches.find((l) => l.jobId === job.id);
+  assert.ok(launch);
+
+  await runnerPost(ctx.sock, job.id, launch.runnerToken, event(job.id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, job.id, launch.runnerToken, event(job.id, 1, DECISION));
+
+  // Silent well past idle + margin: waiting on a human is not a stall.
+  await sleep(1_600);
+
+  const still = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
+  assert.equal(still.state, "blocked", "a blocked job must never be cancelled by the stall sweep");
+  assert.deepEqual(provider.terminated, [], "nothing may be terminated");
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${job.id}/events`)).body) as Record<string, unknown>[];
+  assert.ok(
+    !events.some((e) => e.type === "state" && e.state === "cancelled"),
+    "no cancellation event may be synthesised",
+  );
+
+  // Still answerable afterwards: the wait was untouched, not merely un-cancelled.
+  const answered = await op(ctx.sock, "POST", `/jobs/${job.id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+});
+
 test("notify webhook fires on decision when configured", async (t) => {
   const home = tempHome();
   const posts: unknown[] = [];

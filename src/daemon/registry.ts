@@ -39,6 +39,12 @@ export type JobRecord = {
   id: string;
   state: JobState;
   marker?: Marker;
+  /**
+   * Why a job cancelled ("wall-clock", "stall", "pickup-gate", ...), carried
+   * from the state event so `fleet status` and the board can say which kind of
+   * cancellation this was without replaying the event log.
+   */
+  reason?: string;
   workOrder: unknown;
   createdAt: string;
   updatedAt: string;
@@ -63,6 +69,11 @@ type JobInternal = {
   wallClockActiveMs: number;
   /** Timestamp (ms) when the job last became active; null when not currently active. */
   wallClockActiveSince: number | null;
+  // Stall backstop tracking (issue #39).
+  /** Idle (silence) threshold in ms; null = not initialised (pre-#39 records). */
+  idleMs: number | null;
+  /** Daemon-clock ms when the last event landed; null until the first event. */
+  lastEventAt: number | null;
   // Decision-timeout tracking (issue #6).
   /** Total decision timeout in ms (from first block to stale); null = no limit. */
   decisionTimeoutMs: number | null;
@@ -103,6 +114,7 @@ export class Registry extends EventEmitter {
       const {
         lastRunnerSeq, openDecision,
         wallClockMs, wallClockActiveMs, wallClockActiveSince,
+        idleMs, lastEventAt,
         decisionTimeoutMs, decisionBlockedAt,
         launchManifest, launchEnv, launchSync, launchImage,
         ...record
@@ -120,6 +132,8 @@ export class Registry extends EventEmitter {
           wallClockMs: wallClockMs ?? null,
           wallClockActiveMs: wallClockActiveMs ?? 0,
           wallClockActiveSince: wallClockActiveSince ?? null,
+          idleMs: idleMs ?? null,
+          lastEventAt: lastEventAt ?? null,
           decisionTimeoutMs: decisionTimeoutMs ?? null,
           decisionBlockedAt: decisionBlockedAt ?? null,
           launchManifest: launchManifest ?? null,
@@ -152,6 +166,8 @@ export class Registry extends EventEmitter {
         wallClockMs: null,
         wallClockActiveMs: 0,
         wallClockActiveSince: null,
+        idleMs: null,
+        lastEventAt: null,
         decisionTimeoutMs: null,
         decisionBlockedAt: null,
         launchManifest: null,
@@ -233,12 +249,16 @@ export class Registry extends EventEmitter {
     appendFileSync(join(dir, "events.jsonl"), `${JSON.stringify(stored)}\n`);
     entry.events.push(stored);
     entry.lastSeq = stored.seq;
+    // Liveness for the stall backstop (issue #39): the daemon's own clock, not
+    // the event's `at` — that one is stamped by the runner, whose container
+    // clock may be skewed against the daemon's.
+    entry.internal.lastEventAt = Date.now();
     // Update lastActivity for think/log events — intake-computed so listJobs()
     // never has to scan event files (O(1) per job at list time).
     if ((stored.type === "think" || stored.type === "log") && typeof stored.text === "string" && stored.text) {
       entry.record.lastActivity = { text: stored.text, at: stored.at as string };
-      this.#persist(entry);
     }
+    this.#persist(entry);
     this.emit("event", id, stored);
     return stored;
   }
@@ -302,6 +322,25 @@ export class Registry extends EventEmitter {
   /** Wall-clock limit in ms for the job; null if none. */
   wallClockLimitMs(id: string): number | null {
     return this.#entry(id).internal.wallClockMs;
+  }
+
+  // --- Stall backstop tracking (issue #39) ---
+
+  /** Set the idle (silence) threshold for a job (called when the job is created). */
+  initIdle(id: string, limitMs: number): void {
+    const entry = this.#entry(id);
+    entry.internal.idleMs = limitMs;
+    this.#persist(entry);
+  }
+
+  /** Idle threshold in ms; null for records created before the limit existed. */
+  idleLimitMs(id: string): number | null {
+    return this.#entry(id).internal.idleMs;
+  }
+
+  /** Daemon-clock ms when this job's last event landed; null if it has none. */
+  lastEventAtMs(id: string): number | null {
+    return this.#entry(id).internal.lastEventAt;
   }
 
   // --- Decision-timeout tracking (issue #6) ---
