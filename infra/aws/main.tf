@@ -153,7 +153,9 @@ resource "aws_security_group" "daemon" {
   vpc_id      = local.vpc_id
 
   ingress {
-    description     = "Runner tasks → daemon HTTP (private VPC only)"
+    # ASCII only: AWS restricts SG rule descriptions to a charset that
+    # excludes unicode arrows; the API rejects them at apply time.
+    description     = "Runner tasks -> daemon HTTP (private VPC only)"
     from_port       = var.daemon_tcp_port
     to_port         = var.daemon_tcp_port
     protocol        = "tcp"
