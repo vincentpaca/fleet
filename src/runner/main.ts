@@ -22,7 +22,7 @@ import { DecisionWatcher } from './decisions.ts';
 import { WallClockTimer } from './wall-clock.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
-import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs } from '../shared/time.ts';
@@ -88,6 +88,14 @@ async function main(): Promise<void> {
   } catch {
     // No staged order (direct runner invocation): branch/prompt fall back.
   }
+
+  // --- Git credentials, ambient for the whole job tree. ---
+  // The workspace lifecycle, the pickup gate, and the repo's own harness all
+  // spawn git/gh themselves; wiring gh as the credential helper only inside
+  // git.ts left the gate's ls-remote unauthenticated (#9's first cloud job
+  // died there). Applies only when the job env ships a GitHub token; adds
+  // process env for children, never touches git config on the host.
+  Object.assign(process.env, gitCredentialEnv());
 
   // --- Workspace git lifecycle (#2): branch pushed at creation. ---
   // Activated by FLEET_GIT_URL, resolved by the CLI at dispatch; providers

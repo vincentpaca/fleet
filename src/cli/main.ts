@@ -16,6 +16,7 @@ import {
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
+import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
 import { formatEvent, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
 import {
@@ -398,7 +399,13 @@ async function cmdDelegate(args: string[]): Promise<number> {
     const name = gitValue(['config', 'user.name']);
     const email = gitValue(['config', 'user.email']);
     if (!name || !email) fail('git identity missing: set git config user.name and user.email — job commits are authored as you');
-    env.FLEET_GIT_URL = resolved;
+    // Containers hold no SSH keys. When the job ships a GitHub token, rewrite
+    // an ssh github.com remote to https so that token is the credential the
+    // runner's git actually uses (gitCredentialEnv in src/runner/git.ts).
+    // Without a token, keep the URL as-is: ssh-agent still covers the
+    // process provider, and rewriting would strand it.
+    const hasGithubToken = env.GH_TOKEN !== undefined || env.GITHUB_TOKEN !== undefined;
+    env.FLEET_GIT_URL = hasGithubToken ? toHttpsGitUrl(resolved) : resolved;
     env.FLEET_GIT_NAME = name;
     env.FLEET_GIT_EMAIL = email;
   }

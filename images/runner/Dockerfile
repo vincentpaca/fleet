@@ -24,8 +24,11 @@ ARG HARNESS_VERSION
 # System tools:
 #   git — workspace clone and branch management
 #   curl — needed by the gh install step
+#   ca-certificates — explicit: --no-install-recommends drops it, and only
+#   git's dependency chain happens to pull it in today (the daemon image
+#   without git shipped broken https for exactly this reason)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git curl \
+    && apt-get install -y --no-install-recommends git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI (gh) — rung verification calls gh to check PR/CI state.

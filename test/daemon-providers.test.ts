@@ -179,6 +179,10 @@ test("EcsProvider builds an aws ecs run-task command with env overrides", () => 
   assert.equal(envByName.FLEET_DAEMON_URL, SPEC.daemonUrl);
   assert.equal(envByName.EXAMPLE_TOKEN, "abc");
   assert.ok(envByName.FLEET_MANIFEST_JSON);
+  // The materialisation payload must be provider-complete: the ECS path once
+  // omitted the work order and the runner died at the pickup gate with no
+  // target (first real cloud job, #9).
+  assert.ok(envByName.FLEET_WORK_ORDER_JSON, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
 
   const network = JSON.parse(args[args.indexOf("--network-configuration") + 1]) as {
     awsvpcConfiguration: { subnets: string[]; securityGroups: string[]; assignPublicIp: string };

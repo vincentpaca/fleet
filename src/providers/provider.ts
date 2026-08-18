@@ -58,3 +58,22 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
       : {}),
   };
 }
+
+/**
+ * Workspace materialisation payload (#5): manifest, work order, and sync
+ * files travel as base64 env vars; the runner writes them into
+ * FLEET_WORKSPACE before any file reads. One builder for every container
+ * provider — the Docker/ECS paths once assembled this by hand and diverged:
+ * the ECS copy omitted the work order, and #9's first real cloud job died
+ * at the pickup gate with no target.
+ */
+export function materializationEnv(spec: LaunchSpec): Record<string, string> {
+  const env: Record<string, string> = {
+    FLEET_MANIFEST_JSON: Buffer.from(JSON.stringify(spec.manifest)).toString('base64'),
+    FLEET_WORK_ORDER_JSON: Buffer.from(JSON.stringify(spec.workOrder)).toString('base64'),
+  };
+  if (Object.keys(spec.sync).length > 0) {
+    env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString('base64');
+  }
+  return env;
+}

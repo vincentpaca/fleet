@@ -11,7 +11,8 @@
   },
   "env": {
     "vars": [
-      "ANTHROPIC_API_KEY"
+      "ANTHROPIC_API_KEY",
+      "GH_TOKEN"
     ]
   },
   "services": [
