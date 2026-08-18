@@ -146,14 +146,3 @@ variable "log_retention_days" {
   default     = 30
 }
 
-variable "monthly_budget_usd" {
-  description = "Monthly AWS cost budget in USD; notifications fire at 80% actual and 100% forecasted spend."
-  type        = number
-  default     = 200
-}
-
-variable "budget_email" {
-  description = "Email address subscribed to budget notifications."
-  type        = string
-  default     = "ops@example.com"
-}

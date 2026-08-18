@@ -22,7 +22,6 @@ provider "aws" {
 module "fleet" {
   source = "../.."
 
-  budget_email  = "ops@example.com"
   project_repos = ["acme-app"]
 }
 
