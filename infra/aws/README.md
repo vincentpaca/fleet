@@ -71,6 +71,11 @@ Then push a daemon image to the runner repository with the `daemon` tag (or set
   worker ASG can reach zero while the daemon stays up. Runner tasks reach the daemon on
   `daemon_tcp_port` (default 9000) through the daemon security group; no inbound rule
   opens a path from outside the VPC.
+- The daemon logs four `fleet daemon: ` lines at boot to its log group — `FLEET_HOME`,
+  provider, config source (the fleet-config SSM parameter name, never its contents), and
+  the listen address. The last line is the one that says it is up: a task stream with the
+  first three and no `listening on` is stuck before bind, so read the stream before
+  reaching for `ecs execute-command`.
 - The daemon discovers its own private IP from the ECS container metadata endpoint at
   startup and advertises it in the `FLEET_DAEMON_URL` it passes to runner tasks — no
   static IP or service-discovery registration needed.
