@@ -97,7 +97,39 @@ test('delegate fails loudly on a missing env var, before any POST', async (t) =>
   });
   assert.equal(res.code, 1);
   assert.match(res.stderr, /missing env var: ACME_API_TOKEN/);
+  assert.match(res.stderr, /\.fleet\/\.env/, 'error names the file as a fallback source');
   assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
+test('delegate: var present only in .fleet/.env is injected into the job', async (t) => {
+  const cwd = scaffold();
+  // Write .fleet/.env with the var; remove it from the shell env.
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'ACME_API_TOKEN=from-dotenv\n');
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: undefined },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(body.env.ACME_API_TOKEN, 'from-dotenv', 'dotenv value injected when shell var absent');
+});
+
+test('delegate: shell env wins over .fleet/.env when var is in both', async (t) => {
+  const cwd = scaffold();
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'ACME_API_TOKEN=from-dotenv\n');
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'from-shell' },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(body.env.ACME_API_TOKEN, 'from-shell', 'shell value takes precedence over .fleet/.env');
 });
 
 test('delegate fails loudly on a missing sync file, before any POST', async (t) => {

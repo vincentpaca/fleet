@@ -127,9 +127,18 @@ function initManifest(): unknown {
 // Runtime and per-deployment artifacts never belong in the user's repo:
 // out/ is the job's decision/answer/report channel; infra/ holds generated
 // terraform + local state + the per-deployment fleet-config.json (two people
-// on the same repo can point at different infra).
+// on the same repo can point at different infra). .env holds secrets — only
+// .env.example (the key template) belongs in git.
 const FLEET_GITIGNORE = `out/
 infra/
+.env
+`;
+
+// Template only — the operator fills in real values in .fleet/.env (gitignored).
+const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in real values.
+# .env is gitignored; this file is the template that lives in the repo.
+# Declare the same keys in manifest.json env.vars so Fleet picks them up.
+# EXAMPLE_VAR=replace-with-real-value
 `;
 
 function cmdInit(args: string[]): number {
@@ -152,8 +161,24 @@ function cmdInit(args: string[]): number {
   fs.writeFileSync(manifestPath, `${JSON.stringify(initManifest(), null, 2)}\n`);
   if (!setupExists) fs.writeFileSync(setupPath, SETUP_STUB, { mode: 0o755 });
   if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
+
+  // .gitignore: create with defaults when absent; ensure .env is covered when
+  // the file already exists (e.g. an older init omitted it).
   const gitignorePath = path.join(fleetDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
+  if (!fs.existsSync(gitignorePath)) {
+    fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
+  } else {
+    const currentIgnore = fs.readFileSync(gitignorePath, 'utf8');
+    const lines = currentIgnore.split('\n').map((l) => l.trim());
+    // Accept both '.env' and the root-anchored form '/.env'.
+    if (!lines.includes('.env') && !lines.includes('/.env')) {
+      fs.appendFileSync(gitignorePath, currentIgnore.endsWith('\n') ? '.env\n' : '\n.env\n');
+    }
+  }
+
+  // .env.example: template for the gitignored .fleet/.env; never clobber.
+  const dotEnvExamplePath = path.join(fleetDir, '.env.example');
+  if (!fs.existsSync(dotEnvExamplePath)) fs.writeFileSync(dotEnvExamplePath, DOT_ENV_EXAMPLE);
 
   console.log(`wrote ${manifestPath}`);
   if (setupExists) console.log(`kept existing ${setupPath}`);
@@ -199,6 +224,13 @@ function cmdLint(args: string[]): number {
     }
   }
 
+  // Git tracking check: .fleet/.env must never be committed (it holds secrets).
+  const dotEnvRelPath = path.join('.fleet', '.env');
+  const lsResult = spawnSync('git', ['ls-files', dotEnvRelPath], { encoding: 'utf8' });
+  if (lsResult.status === 0 && lsResult.stdout.trim() !== '') {
+    findings.push(`.fleet/.env is tracked by git — add '.env' to .fleet/.gitignore to keep secrets out of the repo`);
+  }
+
   for (const line of findings) console.error(line);
   if (findings.length > 0) return EXIT_FAILURE;
   console.log(`lint ok: ${checked} file(s) valid`);
@@ -213,6 +245,38 @@ type Manifest = {
   gates?: { pickup?: string; default_finish?: string };
   harness?: { cli?: string; cli_version?: string };
 };
+
+// ---------- .fleet/.env ----------
+
+/**
+ * Parse a .fleet/.env file: KEY=VALUE per line.
+ * Rules: # starts a comment; blank lines ignored; everything after the first
+ * '=' is the value (trimmed); no interpolation; no quoting beyond trim.
+ * Empty values (KEY=) are accepted — they satisfy the "var is set" check.
+ */
+function parseDotEnv(content: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 1) continue; // no key before '='
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (key) result[key] = value;
+  }
+  return result;
+}
+
+/** Load .fleet/.env from the given .fleet directory. Returns {} when the file is absent (ENOENT). */
+function loadDotEnv(fleetDir: string): Record<string, string> {
+  try {
+    return parseDotEnv(fs.readFileSync(path.join(fleetDir, '.env'), 'utf8'));
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw err;
+  }
+}
 
 /** git stdout in cwd, or undefined on any failure. */
 function gitValue(args: string[]): string | undefined {
@@ -297,10 +361,12 @@ async function cmdDelegate(args: string[]): Promise<number> {
     sync[rel] = fs.readFileSync(file).toString('base64');
   }
 
+  // Process env takes precedence over .fleet/.env (per-invocation override, CI-friendly).
+  const dotEnv = loadDotEnv(path.join('.fleet'));
   const env: Record<string, string> = {};
   for (const name of manifest.env?.vars ?? []) {
-    const value = process.env[name];
-    if (value === undefined) fail(`missing env var: ${name} (listed in manifest env.vars, not set in this shell)`);
+    const value = process.env[name] ?? dotEnv[name];
+    if (value === undefined) fail(`missing env var: ${name} (not in environment or .fleet/.env)`);
     env[name] = value;
   }
 
@@ -743,9 +809,10 @@ function cmdDoctor(args: string[]): number {
     }
   }
 
-  // 3. Env vars
+  // 3. Env vars — process env first, then .fleet/.env fallback
+  const dotEnv = loadDotEnv(path.join('.fleet'));
   for (const name of manifest.env?.vars ?? []) {
-    if (process.env[name] === undefined) {
+    if (process.env[name] === undefined && dotEnv[name] === undefined) {
       findings.push(`unset env var: ${name}`);
     }
   }

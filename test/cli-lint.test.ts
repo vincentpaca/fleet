@@ -84,3 +84,20 @@ test('lint fails readably on a missing or unparsable manifest', async () => {
   assert.equal(unparsable.code, 1);
   assert.match(unparsable.stderr, /not valid JSON/);
 });
+
+test('lint fails when .fleet/.env is tracked by git', async () => {
+  const cwd = makeTempDir('fleet-cli-lint-gitenv-');
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), JSON.stringify(VALID_MANIFEST, null, 2));
+
+  // Initialise a bare git repo, add .fleet/.env so git ls-files reports it tracked.
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('git', ['init', '-q', '-b', 'main', cwd]);
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'SECRET=value\n');
+  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=t@test.local',
+    'add', '.fleet/.env'], { cwd });
+
+  const res = await runCli(['lint'], { cwd });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /\.fleet\/\.env.*tracked by git/i, 'names the file in the finding');
+});
