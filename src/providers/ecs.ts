@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { LaunchSpec, Provider, ResourceRequest } from "./provider.ts";
-import { runnerEnv } from "./provider.ts";
+import { runnerEnv, materializationEnv } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -183,11 +183,8 @@ export class EcsProvider implements Provider {
   buildRunTaskArgs(spec: LaunchSpec): string[] {
     const env: Record<string, string> = {
       ...runnerEnv(spec, CONTAINER_WORKSPACE),
-      FLEET_MANIFEST_JSON: Buffer.from(JSON.stringify(spec.manifest)).toString("base64"),
+      ...materializationEnv(spec),
     };
-    if (Object.keys(spec.sync).length > 0) {
-      env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString("base64");
-    }
     const overrides: Record<string, unknown> = {
       containerOverrides: [
         {

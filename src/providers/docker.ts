@@ -4,7 +4,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { LaunchSpec, Provider } from "./provider.ts";
-import { runnerEnv } from "./provider.ts";
+import { runnerEnv, materializationEnv } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -33,15 +33,8 @@ export class DockerProvider implements Provider {
   buildRunArgs(spec: LaunchSpec): string[] {
     const env: Record<string, string> = {
       ...runnerEnv(spec, CONTAINER_WORKSPACE),
-      // Workspace materialisation (#5): manifest, work order, and sync files
-      // travel as base64 env vars; the runner writes them to FLEET_WORKSPACE
-      // before reading any files (Docker provider path; no-op for ProcessProvider).
-      FLEET_MANIFEST_JSON: Buffer.from(JSON.stringify(spec.manifest)).toString("base64"),
-      FLEET_WORK_ORDER_JSON: Buffer.from(JSON.stringify(spec.workOrder)).toString("base64"),
+      ...materializationEnv(spec),
     };
-    if (Object.keys(spec.sync).length > 0) {
-      env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString("base64");
-    }
     const args = ["run", "-d", "--name", `fleet-${spec.jobId}`, "--label", `fleet.job=${spec.jobId}`];
     // Resource constraints from manifest limits.resources.
     // cpu is in ECS units (1024 = 1 vCPU); --cpus takes fractional cores.
