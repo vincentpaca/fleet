@@ -323,9 +323,11 @@ async function main(): Promise<void> {
   let workPushed = false;
   if (gitUrl && branch) {
     try {
-      const outcome = pushWork(workspace, target, jobId, exitCode === 0);
-      workPushed = outcome === 'pushed';
-      pushNote = workPushed ? `work pushed to ${branch}` : `workspace clean; nothing beyond ${branch} creation`;
+      const outcome = pushWork(workspace, target, jobId, exitCode === 0, base);
+      workPushed = outcome === 'pushed' || outcome === 'delivered';
+      pushNote = outcome === 'pushed' ? `work pushed to ${branch}`
+        : outcome === 'delivered' ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`
+        : `workspace clean; nothing beyond ${branch} creation`;
     } catch (err) {
       pushNote = `WORK PUSH FAILED: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
     }

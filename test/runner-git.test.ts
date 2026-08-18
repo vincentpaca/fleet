@@ -242,3 +242,19 @@ test('pushWork delivers commits the agent made itself (not just uncommitted chan
   const remoteLog = run(remote, ['log', '--oneline', branch]);
   assert.match(remoteLog, /agent commits its own work/);
 });
+
+test('pushWork reports delivered when the agent pushed itself, even after a post-push amend', () => {
+  // #34's third run: agent committed, pushed, then amended - runner push was
+  // rejected and the job was mislabeled "clean" despite the delivery existing.
+  const remote = makeRemote();
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-ws-'));
+  const { branch, base } = setupWorkspace(workspace, { url: remote, target: 'APP-8', jobId: 'job-amend', name: 'Operator One', email: 'op@example.com' });
+  writeFileSync(join(workspace, 'work.txt'), 'agent work\n');
+  run(workspace, ['add', '-A']);
+  run(workspace, ['commit', '-q', '-m', 'agent work']);
+  run(workspace, ['push', '-q']);
+  run(workspace, ['commit', '--amend', '-q', '--no-edit']); // diverge from remote
+  assert.equal(pushWork(workspace, 'APP-8', 'job-amend', true, base), 'delivered');
+  const remoteLog = run(remote, ['log', '--oneline', branch]);
+  assert.match(remoteLog, /agent work/);
+});

@@ -133,24 +133,49 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
 }
 
 /**
- * Commit everything and push. 'clean' means nothing to deliver: no uncommitted
- * changes AND no local commits ahead of the remote. An agent that commits its
- * own work must still get pushed — conflating "nothing dirty" with "nothing to
- * push" silently dropped a whole job's delivery (#34's second run).
+ * Commit everything and push. Outcomes:
+ * - 'pushed': this call moved the remote.
+ * - 'delivered': the remote branch already carries work beyond base (the agent
+ *   pushed itself; possibly our push then failed on a post-push amend). The
+ *   delivery exists regardless of who pushed it — #34/#37 attempt runs were
+ *   mislabeled "clean" for exactly this.
+ * - 'clean': nothing committed anywhere; there is no deliverable.
  */
-function commitAndPush(workspace: string, message: string): 'pushed' | 'clean' {
+function commitAndPush(workspace: string, message: string, base?: string): 'pushed' | 'delivered' | 'clean' {
   git(workspace, ['add', '-A']);
   const staged = git(workspace, ['status', '--porcelain']).trim();
   if (staged !== '') git(workspace, ['commit', '-q', '-m', message]);
   const ahead = git(workspace, ['rev-list', '--count', '@{upstream}..HEAD']).trim();
-  if (staged === '' && ahead === '0') return 'clean';
-  git(workspace, ['push', '-q']);
-  return 'pushed';
+  if (staged !== '' || ahead !== '0') {
+    try {
+      git(workspace, ['push', '-q']);
+      return 'pushed';
+    } catch (err) {
+      // Push rejected (e.g. the agent amended after its own push). Fall through:
+      // judge delivery by what the remote actually has.
+      if (remoteAheadOfBase(workspace, base)) return 'delivered';
+      throw err;
+    }
+  }
+  return remoteAheadOfBase(workspace, base) ? 'delivered' : 'clean';
+}
+
+/** Does the remote branch carry commits beyond the base branch? */
+function remoteAheadOfBase(workspace: string, base?: string): boolean {
+  if (!base) return false;
+  try {
+    git(workspace, ['fetch', '-q', 'origin']);
+    const branch = git(workspace, ['branch', '--show-current']).trim();
+    const count = git(workspace, ['rev-list', '--count', `origin/${base}..origin/${branch}`]).trim();
+    return count !== '0';
+  } catch {
+    return false;
+  }
 }
 
 /** The work commit at settle. Pushes partial work too — evidence over tidiness. */
-export function pushWork(workspace: string, target: string, jobId: string, ok: boolean): 'pushed' | 'clean' {
-  return commitAndPush(workspace, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`);
+export function pushWork(workspace: string, target: string, jobId: string, ok: boolean, base?: string): 'pushed' | 'delivered' | 'clean' {
+  return commitAndPush(workspace, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`, base);
 }
 
 /** The WIP commit when a blocked job parks (#6 calls this). */
