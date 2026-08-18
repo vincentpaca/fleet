@@ -5,6 +5,9 @@
 //   ECS_CONTAINER_METADATA_URI_V4 is present),
 // FLEET_PROVIDER (process | docker | ecs; default process), FLEET_NOTIFY_WEBHOOK
 // (optional, comma-separated URLs; {text} payload per decision).
+// Logs four terse `fleet daemon: ` lines at boot (home, provider, config source,
+// listen address; a fifth when it discovers its IP from ECS metadata) and nothing
+// per-request — see test/daemon-boot-log.test.ts.
 import { mkdirSync } from "node:fs";
 import { fleetHome } from "../shared/home.ts";
 import { FleetDaemon } from "./server.ts";
@@ -13,29 +16,56 @@ import { DockerProvider } from "../providers/docker.ts";
 import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm } from "../providers/ecs.ts";
 import type { Provider } from "../providers/provider.ts";
 
-async function pickProvider(name: string, home: string): Promise<Provider> {
-  switch (name) {
+/**
+ * Which provider to build and where its configuration comes from. Decided in
+ * one place so the boot log (below) states the same source the provider reads
+ * — a boot line derived from a second copy of this branch could lie (#53).
+ * `ssmPath` carries the decision; `configSource` is only the log label. It is a
+ * parameter *name* or the literal `env`/`none`, never a configuration value:
+ * boot evidence must be safe to ship to a log group.
+ */
+type ProviderChoice = { name: string; configSource: string; ssmPath?: string };
+
+function providerChoice(): ProviderChoice {
+  const name = process.env.FLEET_PROVIDER ?? "process";
+  // Only ecs reads configuration from outside the process env.
+  if (name !== "ecs") return { name, configSource: "none" };
+  // FLEET_ECS_CLUSTER being set signals an explicit env override (tests,
+  // manual deployments).  Otherwise read the SSM parameter that the infra
+  // unit wrote at apply time so no FLEET_ECS_* vars need to be hand-set.
+  const ssmPath = process.env.FLEET_ECS_CONFIG_SSM_PATH;
+  if (ssmPath && !process.env.FLEET_ECS_CLUSTER) {
+    return { name, configSource: `ssm:${ssmPath}`, ssmPath };
+  }
+  return { name, configSource: "env" };
+}
+
+async function buildProvider(choice: ProviderChoice, home: string): Promise<Provider> {
+  switch (choice.name) {
     case "process":
       // home: where a workspace retained after a failed push is registered (#38).
       return new ProcessProvider({ home });
     case "docker":
       return new DockerProvider();
-    case "ecs": {
-      // FLEET_ECS_CLUSTER being set signals an explicit env override (tests,
-      // manual deployments).  Otherwise read the SSM parameter that the infra
-      // unit wrote at apply time so no FLEET_ECS_* vars need to be hand-set.
-      const ssmPath = process.env.FLEET_ECS_CONFIG_SSM_PATH;
-      if (ssmPath && !process.env.FLEET_ECS_CLUSTER) {
-        return new EcsProvider(await ecsConfigFromSsm(ssmPath));
-      }
-      return new EcsProvider(ecsConfigFromEnv());
-    }
+    case "ecs":
+      return new EcsProvider(
+        choice.ssmPath !== undefined ? await ecsConfigFromSsm(choice.ssmPath) : ecsConfigFromEnv(),
+      );
     default:
-      throw new Error(`unknown FLEET_PROVIDER: ${name} (expected process | docker | ecs)`);
+      throw new Error(`unknown FLEET_PROVIDER: ${choice.name} (expected process | docker | ecs)`);
   }
 }
 
+// Boot evidence, emitted before anything that can hang or fail — creating home
+// (an NFS mount in ECS), the SSM read, the bind. A task that logged these three
+// lines and nothing else is stuck before bind, which is exactly what #9's
+// bring-up could not tell without ECS exec.
 const home = fleetHome();
+const choice = providerChoice();
+console.log(`fleet daemon: home ${home}`);
+console.log(`fleet daemon: provider ${choice.name}`);
+console.log(`fleet daemon: config source ${choice.configSource}`);
+
 mkdirSync(home, { recursive: true });
 
 const portEnv = process.env.FLEET_PORT;
@@ -80,14 +110,16 @@ if (!tcpHost) tcpHost = "127.0.0.1";
 
 const daemon = new FleetDaemon({
   home,
-  provider: await pickProvider(process.env.FLEET_PROVIDER ?? "process", home),
+  provider: await buildProvider(choice, home),
   port,
   bindHost,
   tcpHost,
 });
 
 const { socketPath: sock, port: boundPort } = await daemon.start();
-console.log(`fleet daemon listening on ${sock}${boundPort !== null ? ` and ${bindHost}:${boundPort} (advertising ${tcpHost})` : ""}`);
+// Same `fleet daemon: ` prefix as the lines above: one filter on a log stream
+// must not drop the line that says the daemon is up.
+console.log(`fleet daemon: listening on ${sock}${boundPort !== null ? ` and ${bindHost}:${boundPort} (advertising ${tcpHost})` : ""}`);
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
