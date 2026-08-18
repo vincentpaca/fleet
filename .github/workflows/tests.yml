@@ -1,0 +1,43 @@
+# CI for every PR and for main. Two jobs:
+#   test      — the full node --test suite, including the sanitized, packaging,
+#               harness-mirrors, and cloud-agnostic gates.
+#   terraform — fmt + validate on the infra unit (the first slice of #48;
+#               plan-level checks need credentials and live there).
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The e2e tests commit in scratch repos and fall back to the global git
+      # identity; Actions runners ship none.
+      - run: |
+          git config --global user.name fleet-ci
+          git config --global user.email ci@example.com
+      - run: npm test
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive infra/
+      - run: terraform -chdir=infra/aws/examples/basic init -backend=false -input=false
+      - run: terraform -chdir=infra/aws/examples/basic validate -no-color
