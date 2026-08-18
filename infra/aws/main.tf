@@ -20,7 +20,10 @@ locals {
   # Fargate daemon: assign a public IP when subnets are public (no NAT gateway)
   # so the task can pull its image from ECR and write logs to CloudWatch.
   # With a NAT gateway (private subnets) a public IP is not needed.
-  daemon_assign_public_ip = local.create_vpc ? (var.enable_nat_gateway ? "DISABLED" : "ENABLED") : "ENABLED"
+  # Bool, not the run-task CLI's ENABLED/DISABLED strings: aws_ecs_service's
+  # network_configuration takes a bool, and validate cannot catch the mismatch
+  # (the local's value only meets the provider schema at plan time).
+  daemon_assign_public_ip = local.create_vpc ? (var.enable_nat_gateway ? false : true) : true
 
   tags = merge(var.tags, { "fleet:module" = var.name })
 }
