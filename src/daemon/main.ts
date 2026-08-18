@@ -13,10 +13,11 @@ import { DockerProvider } from "../providers/docker.ts";
 import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm } from "../providers/ecs.ts";
 import type { Provider } from "../providers/provider.ts";
 
-async function pickProvider(name: string): Promise<Provider> {
+async function pickProvider(name: string, home: string): Promise<Provider> {
   switch (name) {
     case "process":
-      return new ProcessProvider();
+      // home: where a workspace retained after a failed push is registered (#38).
+      return new ProcessProvider({ home });
     case "docker":
       return new DockerProvider();
     case "ecs": {
@@ -79,7 +80,7 @@ if (!tcpHost) tcpHost = "127.0.0.1";
 
 const daemon = new FleetDaemon({
   home,
-  provider: await pickProvider(process.env.FLEET_PROVIDER ?? "process"),
+  provider: await pickProvider(process.env.FLEET_PROVIDER ?? "process", home),
   port,
   bindHost,
   tcpHost,
