@@ -30,13 +30,15 @@ Layer 1 — runner base (Fleet publishes)
   fleet-runner:<harness-cli>-<cli_version>
   FROM node:22  +  harness CLI installed globally  +  Fleet runner source
   Built once per CLI release by Fleet maintainers; pushed to the operator's ECR.
-  Dockerfile: images/runner/Dockerfile   Build script: images/runner/build.sh
+  Dockerfile: images/runner/Dockerfile   Build script: images/build.sh
 
 Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
   fleet-job:<hash>  (hash = sha256(base-tag + \0 + setup-inputs)[:16])
   FROM fleet-runner:<cli>-<version>  +  repo setup layer (optional)
   Rebuilt only when the base tag or setup inputs change.
 ```
+
+**Publishing both images to a deployment:** `images/build.sh --redeploy-daemon` builds the runner base *and* the daemon image for the deployment's architecture (`--platform`, default `linux/amd64` — what `infra/aws` runs), tags them `:runner` and `:daemon` (the tags the infra unit's task definitions pin), pushes them to the ECR repository named by that deployment's `fleet_config`, and forces the daemon service to start from the new image. The deployment is read from `.fleet/infra/<provider>/fleet-config.json` — the same file the CLI resolves `daemon_url` from — so no repository URL, cluster, or service name is typed by hand. See `infra/aws/README.md` for the bring-up sequence.
 
 **Activation:** only when `manifest.harness.cli_version` is set. Without it the daemon launches whatever `manifest.setup.image` names — existing manifests and simple setups are unaffected.
 

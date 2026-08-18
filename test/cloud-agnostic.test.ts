@@ -51,7 +51,11 @@ test('each infra unit self-describes its shape via fleet_config', () => {
   // The output is the contract between an infra unit and its runtime
   // provider: Fleet predicts the infrastructure it created, never discovers it.
   // Add new required keys here when the EcsConfig (or equivalent) gains a field
-  // that the provider cannot derive from any other source.
+  // that the provider cannot derive from any other source — or when operator
+  // tooling has to address the unit's own infrastructure: images/build.sh
+  // publishes to runner_repository_url and rolls cluster + daemon_service.
+  // Trailing space on daemon_service: the separate daemon_service_name output
+  // must not satisfy the fleet_config requirement.
   const infra = join(src, '..', 'infra');
   for (const unit of readdirSync(infra)) {
     if (!statSync(join(infra, unit)).isDirectory()) continue;
@@ -61,6 +65,8 @@ test('each infra unit self-describes its shape via fleet_config', () => {
       'output "connect_hint"',
       'provider ',
       'runner_task_definition',
+      'runner_repository_url',
+      'daemon_service ',
     ]) {
       assert.ok(outputs.includes(required), `infra/${unit}/outputs.tf missing ${required}`);
     }

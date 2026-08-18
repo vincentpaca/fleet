@@ -70,7 +70,11 @@ output "fleet_config" {
     cluster  = aws_ecs_cluster.this.name
     # capacity_provider drives --capacity-provider-strategy in run-task so managed
     # ASG scaling fires for every worker job.
-    capacity_provider      = aws_ecs_capacity_provider.ec2.name
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    # daemon_service names the service that runs the :daemon tag, so publishing a
+    # new image can roll it (images/build.sh --redeploy-daemon) without the
+    # operator naming infrastructure Fleet already created.
+    daemon_service         = aws_ecs_service.daemon.name
     runner_repository_url  = aws_ecr_repository.runner.repository_url
     runner_task_definition = aws_ecs_task_definition.runner.family
     runner_container_name  = local.runner_container_name
