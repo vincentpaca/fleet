@@ -47,8 +47,31 @@ export type GitSetupOptions = {
 
 const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
 
+/**
+ * Credential wiring for https remotes. When the job env carries a GitHub
+ * token (GH_TOKEN or GITHUB_TOKEN — both spellings reach gh), expose gh as
+ * git's credential helper for github.com through GIT_CONFIG_* env vars.
+ * Env-scoped on purpose: the process provider runs on the operator's own
+ * machine, and nothing here may touch their git config. Containers have no
+ * other helper, so this is the one that answers; on an operator machine it
+ * appends to their existing helpers, which keep working.
+ */
+export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  if (!env.GH_TOKEN && !env.GITHUB_TOKEN) return {};
+  return {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'credential.https://github.com.helper',
+    GIT_CONFIG_VALUE_0: '!gh auth git-credential',
+  };
+}
+
 function git(workspace: string, args: string[]): string {
-  return execFileSync('git', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return execFileSync('git', args, {
+    cwd: workspace,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...gitCredentialEnv() },
+  });
 }
 
 /** fleet/<target>-<jobId>, target sanitized to git-ref-safe characters. */

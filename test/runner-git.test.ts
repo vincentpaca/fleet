@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr, composeDraftPrText } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -100,6 +100,23 @@ test('partial work is pushed with a partial marker — evidence over tidiness', 
 test('jobBranch sanitizes hostile targets', () => {
   assert.equal(jobBranch('QA symptom: 403 on upload!', 'j9'), 'fleet/QA-symptom-403-on-upload-j9');
   assert.equal(jobBranch('...', 'j9'), 'fleet/work-j9');
+});
+
+test('gitCredentialEnv wires gh as the github.com helper only when a token exists', () => {
+  assert.deepEqual(gitCredentialEnv({}), {}, 'no token, no injection — ssh-agent flows stay untouched');
+  const injected = gitCredentialEnv({ GH_TOKEN: 't' });
+  assert.equal(injected.GIT_CONFIG_COUNT, '1');
+  assert.equal(injected.GIT_CONFIG_KEY_0, 'credential.https://github.com.helper');
+  assert.equal(injected.GIT_CONFIG_VALUE_0, '!gh auth git-credential');
+  assert.deepEqual(gitCredentialEnv({ GITHUB_TOKEN: 't' }), injected, 'both token spellings gh honors');
+});
+
+test('git accepts the injected credential config — key names are real, not typos', () => {
+  const out = execFileSync('git', ['config', '--get', 'credential.https://github.com.helper'], {
+    encoding: 'utf8',
+    env: { ...process.env, ...gitCredentialEnv({ GH_TOKEN: 't' }) },
+  }).trim();
+  assert.equal(out, '!gh auth git-credential');
 });
 
 test('setup fails loudly on an unreachable remote', () => {

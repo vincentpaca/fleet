@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { validateWorkOrder } from '../src/validate.mjs';
 import { runCli, makeTempDir, startMockDaemon, sendJson, type MockRequest } from './cli-helpers.ts';
+import { toHttpsGitUrl } from '../src/shared/giturl.ts';
 
 const MANIFEST = {
   version: 1,
@@ -229,4 +230,48 @@ test('delegate: numeric target stamps workOrder.title when gh succeeds, skips gr
   // In either case, the work order must validate against the schema.
   const { ok, errors } = validateWorkOrder(body.workOrder);
   assert.ok(ok, `work order with numeric target must validate: ${JSON.stringify(errors)}`);
+});
+
+test('delegate rewrites an ssh github remote to https when the job ships a GitHub token', async (t) => {
+  const cwd = scaffold({ ...MANIFEST, env: { vars: ['ACME_API_TOKEN', 'GH_TOKEN'] } });
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', GH_TOKEN: 'gh-token' },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(
+    body.env.FLEET_GIT_URL,
+    'https://github.com/acme/example-app.git',
+    'ssh remote becomes https — containers hold no SSH keys, only the token',
+  );
+});
+
+test('delegate keeps the ssh remote verbatim when no GitHub token ships', async (t) => {
+  const cwd = scaffold();
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value' },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(
+    body.env.FLEET_GIT_URL,
+    'git@github.com:acme/example-app.git',
+    'without a token the URL is untouched — ssh-agent still covers the process provider',
+  );
+});
+
+test('toHttpsGitUrl: github ssh forms rewrite, everything else passes through', () => {
+  assert.equal(toHttpsGitUrl('git@github.com:acme/example-app.git'), 'https://github.com/acme/example-app.git');
+  assert.equal(toHttpsGitUrl('ssh://git@github.com/acme/example-app.git'), 'https://github.com/acme/example-app.git');
+  assert.equal(toHttpsGitUrl('https://github.com/acme/example-app.git'), 'https://github.com/acme/example-app.git');
+  assert.equal(toHttpsGitUrl('git@git.example.com:acme/tools.git'), 'git@git.example.com:acme/tools.git', 'non-github hosts untouched — no credential can serve them yet');
+  assert.equal(toHttpsGitUrl('/tmp/local/bare.git'), '/tmp/local/bare.git', 'local paths untouched');
 });
