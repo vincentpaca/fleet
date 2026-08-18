@@ -30,23 +30,23 @@ cd examples/basic && terraform init && terraform apply
 **2. Capture the deployment's own description.** Every value the image build and the
 CLI need is in the `fleet_config` output; keep it beside the project that dispatches
 jobs (`.fleet/infra/` is gitignored — two people on one repo can point at different
-deployments):
+deployments). Steps 2 and 3 run from that project directory, not from this unit:
 
 ```sh
 mkdir -p .fleet/infra/aws
-terraform -chdir=<path>/infra/aws/examples/basic output -json fleet_config \
+terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config \
   > .fleet/infra/aws/fleet-config.json
 ```
 
 **3. Publish both images and start the daemon on them — one command.**
 
 ```sh
-<path-to-fleet-checkout>/images/build.sh --redeploy-daemon
+<fleet-checkout>/images/build.sh --redeploy-daemon
 ```
 
 That builds the runner base and the daemon image for **this deployment's**
 architecture (`linux/amd64`; pass `--platform` to change it), tags them `:runner`
-and `:daemon` — the tags the task definitions above pin — pushes both to the ECR
+and `:daemon` — the tags this unit's task definitions pin — pushes both to the ECR
 repository from `fleet_config`, and forces a new deployment of the daemon service so
 it starts from the image just pushed. On an arm64 workstation the build is emulated;
 you never set `DOCKER_DEFAULT_PLATFORM`, `docker tag`, or `aws ecs update-service`
