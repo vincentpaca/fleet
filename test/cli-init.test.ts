@@ -70,3 +70,59 @@ test('init --existing still refuses to overwrite an existing manifest', async ()
   assert.equal(rerun.code, 1);
   assert.match(rerun.stderr, /refusing to overwrite/);
 });
+
+test('init scaffolds .env.example and covers .env in .gitignore', async () => {
+  const cwd = makeTempDir('fleet-cli-init-dotenv-');
+  const res = await runCli(['init'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+
+  const examplePath = path.join(cwd, '.fleet', '.env.example');
+  assert.ok(fs.existsSync(examplePath), '.env.example written');
+  const exampleContent = fs.readFileSync(examplePath, 'utf8');
+  assert.ok(exampleContent.includes('EXAMPLE_VAR'), '.env.example has placeholder key');
+
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  assert.match(gitignore, /^\.env$/m, '.fleet/.gitignore covers .env');
+});
+
+test('init: .env appended to an existing .fleet/.gitignore that lacks it', async () => {
+  // Simulate an older init that wrote out/ and infra/ but not .env.
+  const cwd = makeTempDir('fleet-cli-init-dotenv3-');
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.fleet', '.gitignore'), 'out/\ninfra/\n');
+  const res = await runCli(['init'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  assert.match(gitignore, /^out\/$/m, 'existing out/ entry preserved');
+  assert.match(gitignore, /^infra\/$/m, 'existing infra/ entry preserved');
+  assert.match(gitignore, /^\.env$/m, '.env appended without replacing existing content');
+  // No double-blank between entries.
+  assert.doesNotMatch(gitignore, /\n\n\n/, 'no triple newline (no spurious blank lines)');
+});
+
+test('init: .env not appended when /.env already present in .gitignore', async () => {
+  const cwd = makeTempDir('fleet-cli-init-dotenv4-');
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.fleet', '.gitignore'), 'out/\ninfra/\n/.env\n');
+  const res = await runCli(['init'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  // The root-anchored form already covers .env — don't add a bare .env too.
+  assert.equal(gitignore, 'out/\ninfra/\n/.env\n', 'gitignore unchanged when /.env already present');
+});
+
+test('init: .env.example not clobbered on reinit (manifest check fires first)', async () => {
+  // fleet init already refuses on an existing manifest.json, so .env.example is safe.
+  // But if someone pre-creates .env.example before any init, it must survive.
+  const cwd = makeTempDir('fleet-cli-init-dotenv2-');
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  const customExample = '# custom example\nMY_KEY=placeholder\n';
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env.example'), customExample);
+  const res = await runCli(['init'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(
+    fs.readFileSync(path.join(cwd, '.fleet', '.env.example'), 'utf8'),
+    customExample,
+    'pre-existing .env.example untouched',
+  );
+});

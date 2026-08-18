@@ -158,6 +158,16 @@ test('doctor: reports harness CLI not found when cli_version is set but binary i
   assert.match(lines[0], /claude/);
 });
 
+test('doctor: var in .fleet/.env satisfies the env check (no finding)', async () => {
+  const manifest = { ...BASE_MANIFEST, env: { vars: ['FLEET_TEST_DOTENV_VAR_XYZ'] } };
+  const cwd = setupDir(manifest, 'process.exit(0);\n');
+  // Write the var to .fleet/.env; leave it absent from the shell env.
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'FLEET_TEST_DOTENV_VAR_XYZ=from-dotenv\n');
+  const res = await runCli(['doctor'], { cwd, env: { FLEET_TEST_DOTENV_VAR_XYZ: undefined } });
+  assert.equal(res.code, 0, `expected clean but got stderr: ${res.stderr}`);
+  assert.match(res.stdout, /doctor: clean/);
+});
+
 test('doctor: --manifest flag points at an explicit path', async () => {
   const cwd = makeTempDir('fleet-doctor-mflag-');
   fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
