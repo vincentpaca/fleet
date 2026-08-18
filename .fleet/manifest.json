@@ -10,7 +10,9 @@
     "sync": []
   },
   "env": {
-    "vars": []
+    "vars": [
+      "ANTHROPIC_API_KEY"
+    ]
   },
   "services": [
     {
@@ -36,7 +38,7 @@
   },
   "gates": {
     "pickup": "node .fleet/gate.mjs",
-    "default_finish": "implemented"
+    "default_finish": "pr-open"
   },
   "limits": {
     "wall_clock": "2h",

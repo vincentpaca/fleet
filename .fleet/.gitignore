@@ -1,3 +1,4 @@
 out/
 infra/
 dispatched.jsonl
+.env
