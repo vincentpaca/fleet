@@ -51,10 +51,13 @@ const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
  * Credential wiring for https remotes. When the job env carries a GitHub
  * token (GH_TOKEN or GITHUB_TOKEN — both spellings reach gh), expose gh as
  * git's credential helper for github.com through GIT_CONFIG_* env vars.
- * Env-scoped on purpose: the process provider runs on the operator's own
- * machine, and nothing here may touch their git config. Containers have no
- * other helper, so this is the one that answers; on an operator machine it
- * appends to their existing helpers, which keep working.
+ * The runner's main applies this to its own process.env once, before the
+ * gate: everything a job spawns (this module's git calls, the pickup gate,
+ * the repo's harness and its agent) inherits it. Env-scoped on purpose: the
+ * process provider runs on the operator's own machine, and nothing here may
+ * touch their git config. Containers have no other helper, so this is the
+ * one that answers; on an operator machine it appends to their existing
+ * helpers, which keep working.
  */
 export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   if (!env.GH_TOKEN && !env.GITHUB_TOKEN) return {};
@@ -66,12 +69,7 @@ export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<s
 }
 
 function git(workspace: string, args: string[]): string {
-  return execFileSync('git', args, {
-    cwd: workspace,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ...gitCredentialEnv() },
-  });
+  return execFileSync('git', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 /** fleet/<target>-<jobId>, target sanitized to git-ref-safe characters. */

@@ -128,3 +128,59 @@ test('delegate -> blocked -> answer -> done, over the real wire', async (t) => {
   assert.ok(raw.length >= 6, `expected a full event log, got ${raw.length} lines`);
   for (const lineText of raw) JSON.parse(lineText);
 });
+
+test('job children inherit the git credential helper env when a token ships', async (t) => {
+  // The pickup gate, the harness, and the agent all spawn their own git; the
+  // runner must make gh-as-credential-helper ambient before the gate runs.
+  // This gate exits 0 only if it sees the injected config — on a runner that
+  // scopes credentials to its own git calls it fails, and the job dies at
+  // pickup (exactly how #9's first cloud job died).
+  const home = mkdtempSync(join(tmpdir(), 'fleet-e2e-home-'));
+  const project = mkdtempSync(join(tmpdir(), 'fleet-e2e-proj-'));
+  const remote = makeRemote(mkdtempSync(join(tmpdir(), 'fleet-e2e-git-')));
+  mkdirSync(join(project, '.fleet'), { recursive: true });
+  const m = manifest(remote);
+  m.env.vars = ['FLEET_HARNESS_CMD', 'GH_TOKEN'];
+  m.gates.pickup =
+    'node -e "process.exit(process.env.GIT_CONFIG_VALUE_0 === \'!gh auth git-credential\' ? 0 : 1)"';
+  writeFileSync(join(project, '.fleet', 'manifest.json'), JSON.stringify(m, null, 2));
+  writeFileSync(join(project, '.env.fleet'), 'EXAMPLE=1\n');
+
+  const daemon = new FleetDaemon({ home, provider: new ProcessProvider(), port: 0, longPollMs: 1_000 });
+  const { port } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const env = {
+    ...process.env,
+    FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
+    FLEET_HARNESS_CMD: `node ${harness}`,
+    GH_TOKEN: 'e2e-fake-token',
+  };
+  const fleet = (args: string[], cwd: string = project) => run('node', [cli, ...args], { cwd, env });
+
+  const delegated = await fleet(['delegate', 'APP-124', '--mode', 'implement', '--finish', 'implemented']);
+  const jobId = delegated.stdout.trim().split(/\s+/).find((w) => w.startsWith('job-'));
+  assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
+
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const { stdout } = await fleet(['status', jobId]);
+    assert.ok(
+      !/cancelled/i.test(stdout),
+      `gate did not see the credential env — job cancelled at pickup:\n${stdout}`,
+    );
+    if (/blocked/i.test(stdout)) break;
+    assert.ok(Date.now() < deadline, `timed out waiting for blocked; last status:\n${stdout}`);
+    await delay(250);
+  }
+
+  // Let the job finish cleanly so nothing lingers past daemon.stop().
+  await fleet(['answer', jobId, '--option', 'rebase']);
+  const doneBy = Date.now() + 30_000;
+  for (;;) {
+    const { stdout } = await fleet(['status', jobId]);
+    if (/\bdone\b/i.test(stdout)) break;
+    assert.ok(Date.now() < doneBy, `timed out waiting for done; last status:\n${stdout}`);
+    await delay(250);
+  }
+});
