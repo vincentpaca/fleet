@@ -13,6 +13,11 @@
  * The CLI resolves the manifest's workspace.repo at dispatch (including the
  * "origin" sentinel) and ships it as env; providers stay git-agnostic.
  *
+ * Called from inside the sandbox, with one host-side exception: `fleet
+ * resume-push` (#38) reuses pushWork/remoteHasHead/getHeadSha against a
+ * workspace the runner left behind, so these three must stay pure functions of
+ * a workspace path — no runner env, no daemon.
+ *
  * The provider stages the dispatch payload (.fleet/manifest.json, order.json,
  * sync files) into the workspace BEFORE the clone. Those must survive the
  * checkout and must never be committed: staged files are captured in memory,
@@ -186,6 +191,23 @@ export function pushWip(workspace: string, reason: string): 'pushed' | 'clean' {
 /** HEAD SHA after all commits; used for settle reporting. */
 export function getHeadSha(workspace: string): string {
   return git(workspace, ['rev-parse', 'HEAD']).trim();
+}
+
+/**
+ * Does origin/<branch> contain this workspace's HEAD? The delivery test for a
+ * late push (#38): 'delivered' only says the remote branch is ahead of base —
+ * it can be ahead with somebody else's commit while this HEAD exists nowhere
+ * but here. `fleet resume-push` deletes the workspace on this answer alone.
+ */
+export function remoteHasHead(workspace: string, branch: string): boolean {
+  try {
+    git(workspace, ['fetch', '-q', 'origin', branch]);
+    git(workspace, ['merge-base', '--is-ancestor', 'HEAD', 'FETCH_HEAD']);
+    return true;
+  } catch {
+    // Unreachable remote, missing branch, or HEAD not an ancestor — all "no".
+    return false;
+  }
 }
 
 /**

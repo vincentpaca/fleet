@@ -14,7 +14,10 @@ import type { EventBody } from './events.ts';
 
 export type SettleComposition = {
   body: EventBody;
-  /** Human-readable problems encountered (e.g. invalid report.json). */
+  /**
+   * Human-readable problems encountered (e.g. invalid report.json, a workspace
+   * retained after a failed push). The caller emits each as a log event.
+   */
   notes: string[];
 };
 
@@ -33,8 +36,20 @@ export function composeSettle(opts: {
    * daemon has already received the artifact files by this point.
    */
   produced?: Array<Record<string, unknown>>;
+  /**
+   * Workspace kept because the work push failed (issue #38). Its path is the
+   * only address the work has until the late push succeeds, so it rides out as
+   * a settle note — and therefore into the event log.
+   */
+  retainedWorkspace?: string;
 }): SettleComposition {
   const notes: string[] = [];
+  if (opts.retainedWorkspace !== undefined) {
+    notes.push(
+      `workspace retained at ${opts.retainedWorkspace} (work push failed) — ` +
+      `retry the push with: fleet resume-push ${opts.jobId}`,
+    );
+  }
   const minutes = Math.max(
     0,
     Math.round(((Date.now() - opts.startedAt) / 60000) * 100) / 100,

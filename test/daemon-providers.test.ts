@@ -432,6 +432,108 @@ test("ProcessProvider.terminate kills the child and is idempotent", async () => 
   await provider.terminate(handle);
 });
 
+// --- Retained workspaces after a failed push (#38) ----------------------------
+
+// Fake runner that leaves a retain request behind, as the real one does when
+// its work push fails. The reason line is what the operator later reads back.
+const RETAIN_RUNNER = `
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+writeFileSync(join(process.env.FLEET_WORKSPACE, '.fleet', 'out', 'retain-workspace.json'), JSON.stringify({
+  jobId: process.env.FLEET_JOB_ID,
+  target: 'APP-123',
+  branch: 'fleet/APP-123-' + process.env.FLEET_JOB_ID,
+  base: 'main',
+  ok: true,
+  reason: 'fatal: could not read from remote repository',
+  at: '2026-08-17T10:00:00.000Z',
+}));
+`;
+
+test("ProcessProvider keeps and registers a workspace the runner asked to retain", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "retain-runner.mjs");
+  writeFileSync(runnerPath, RETAIN_RUNNER);
+  const home = tempHome();
+
+  const provider = new ProcessProvider({ runnerPath, workspaceRoot, home });
+  await provider.launch(SPEC);
+
+  const recordPath = join(home, "retained", `${SPEC.jobId}.json`);
+  await until(() => existsSync(recordPath), 10_000);
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+
+  // The kept directory is still there, and the record points at it.
+  const kept = readdirSync(workspaceRoot).filter((name) => name.startsWith(`fleet-${SPEC.jobId}-`));
+  assert.equal(kept.length, 1, "the workspace must survive: it is the only copy of the work");
+  assert.equal(record.workspace, join(workspaceRoot, kept[0]));
+  assert.equal(record.jobId, SPEC.jobId);
+  assert.equal(record.branch, `fleet/APP-123-${SPEC.jobId}`);
+  assert.match(String(record.reason), /could not read from remote/);
+});
+
+test("ProcessProvider keeps an unparseable retain request's workspace and records what it can", async () => {
+  // A half-written request file must not read as "no retention requested" —
+  // that would delete the only copy of the work on a parse error.
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "torn-runner.mjs");
+  writeFileSync(
+    runnerPath,
+    `import { writeFileSync } from 'node:fs';\n` +
+      `import { join } from 'node:path';\n` +
+      `writeFileSync(join(process.env.FLEET_WORKSPACE, '.fleet', 'out', 'retain-workspace.json'), '{"jobId":"job-');\n`,
+  );
+  const home = tempHome();
+
+  const provider = new ProcessProvider({ runnerPath, workspaceRoot, home });
+  await provider.launch(SPEC);
+
+  const recordPath = join(home, "retained", `${SPEC.jobId}.json`);
+  await until(() => existsSync(recordPath), 10_000);
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+  assert.equal(record.jobId, SPEC.jobId);
+  assert.match(String(record.reason), /unreadable/);
+  assert.equal(record.branch, undefined, "nothing is invented for a record we could not read");
+  const kept = readdirSync(workspaceRoot).filter((name) => name.startsWith(`fleet-${SPEC.jobId}-`));
+  assert.equal(kept.length, 1, "an unreadable request still keeps the workspace");
+});
+
+test("ProcessProvider registers a failed push even under FLEET_KEEP_WORKSPACE", async () => {
+  // The debug flag keeps directories; it must not hide a lost delivery from
+  // doctor and resume-push.
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "retain-runner.mjs");
+  writeFileSync(runnerPath, RETAIN_RUNNER);
+  const home = tempHome();
+  const previous = process.env.FLEET_KEEP_WORKSPACE;
+  process.env.FLEET_KEEP_WORKSPACE = "1";
+
+  try {
+    const provider = new ProcessProvider({ runnerPath, workspaceRoot, home });
+    await provider.launch(SPEC);
+    await until(() => existsSync(join(home, "retained", `${SPEC.jobId}.json`)), 10_000);
+  } finally {
+    if (previous === undefined) delete process.env.FLEET_KEEP_WORKSPACE;
+    else process.env.FLEET_KEEP_WORKSPACE = previous;
+  }
+});
+
+test("ProcessProvider deletes the workspace and registers nothing without a retain request", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "quiet-runner.mjs");
+  writeFileSync(runnerPath, "process.exit(0);\n");
+  const home = tempHome();
+
+  const provider = new ProcessProvider({ runnerPath, workspaceRoot, home });
+  await provider.launch(SPEC);
+
+  await until(
+    () => readdirSync(workspaceRoot).every((name) => !name.startsWith(`fleet-${SPEC.jobId}-`)),
+    10_000,
+  );
+  assert.ok(!existsSync(join(home, "retained")), "a delivered job leaves no retained record");
+});
+
 // --- Resource request / capacity-fit tests ------------------------------------
 
 test("DockerProvider adds --cpus and --memory when resources are specified", () => {

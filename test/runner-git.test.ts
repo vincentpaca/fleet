@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, createDraftPr, composeDraftPrText } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, createDraftPr, composeDraftPrText } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -257,4 +257,31 @@ test('pushWork reports delivered when the agent pushed itself, even after a post
   assert.equal(pushWork(workspace, 'APP-8', 'job-amend', true, base), 'delivered');
   const remoteLog = run(remote, ['log', '--oneline', branch]);
   assert.match(remoteLog, /agent work/);
+});
+
+test('remoteHasHead answers only for this HEAD, not for "the branch moved"', () => {
+  // #38: `fleet resume-push` deletes a retained workspace on this answer, so a
+  // branch that is ahead with somebody else's commit must read as false.
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const { branch } = setupWorkspace(workspace, opts(remote));
+  writeFileSync(join(workspace, 'work.txt'), 'the only copy\n');
+  run(workspace, ['add', '-A']);
+  run(workspace, ['commit', '-q', '-m', 'work']);
+  assert.equal(remoteHasHead(workspace, branch), false, 'unpushed commit is not on the remote');
+
+  assert.equal(pushWork(workspace, 'APP-7', 'job-1', true), 'pushed');
+  assert.equal(remoteHasHead(workspace, branch), true, 'pushed commit is on the remote');
+
+  // Local history rewritten after the push: the remote has a commit, but not
+  // this one — the retained work would be lost if this returned true.
+  writeFileSync(join(workspace, 'work.txt'), 'rewritten\n');
+  run(workspace, ['add', '-A']);
+  run(workspace, ['commit', '--amend', '-q', '-m', 'work (amended)']);
+  assert.equal(remoteHasHead(workspace, branch), false, 'an amended HEAD is not on the remote');
+
+  // An unreachable remote is a "no", never a throw.
+  const gone = mkdtempSync(join(tmpdir(), 'fleet-git-gone-'));
+  run(workspace, ['remote', 'set-url', 'origin', join(gone, 'nope.git')]);
+  assert.equal(remoteHasHead(workspace, branch), false);
 });

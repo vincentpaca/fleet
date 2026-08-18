@@ -7,6 +7,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
+import { fleetHome } from '../shared/home.ts';
+import {
+  clearRetainedRecord,
+  listRetainedRecords,
+  readRetainedRecord,
+  retainedDir,
+} from '../shared/retained.ts';
+import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
 import { formatEvent, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
@@ -44,6 +52,9 @@ Commands:
                                            Reads .fleet/dispatched.jsonl; blocked jobs appear first
                                            with their open decision rendered.
                                            (--answer: answer the first blocked job interactively)
+  resume-push <jobId>                      Retry the work push from a workspace retained because the
+                                           job's push failed. Removes the workspace once the remote
+                                           has the work; leaves it in place if the push fails again.
   status [jobId]                           List jobs (blocked first) or show one job
   logs <jobId> [--after seq] [--tools] [--full]
                                            Dump job events (default: narrative spine — state, phase,
@@ -56,7 +67,8 @@ Commands:
   board [--once]                           Full-screen live view (--once or non-TTY: static render)
   artifacts <jobId> [list]                 List artifacts delivered by a job
   artifacts <jobId> get <path> [--out dir] Download an artifact (writes to dir/<filename>, or stdout)
-  doctor [--manifest path]                 Check local environment against the manifest
+  doctor [--manifest path]                 Check local environment against the manifest, and list
+                                           workspaces retained after a failed push
   version                                  Print version and exit
 
 Flags:
@@ -876,12 +888,91 @@ function cmdDoctor(args: string[]): number {
     }
   }
 
+  // 6. Retained workspaces (#38): a workspace kept because its work push failed
+  //    holds the only copy of that job's work. It is a finding until recovered —
+  //    silence here is exactly how hours of agent time disappear.
+  for (const record of listRetainedRecords(fleetHome())) {
+    const missing = fs.existsSync(record.workspace) ? '' : ' (directory missing)';
+    findings.push(
+      `retained workspace: ${record.workspace}${missing} (job ${record.jobId}, push failed ${record.at}) — retry with: fleet resume-push ${record.jobId}`,
+    );
+  }
+
   if (findings.length === 0) {
     console.log('doctor: clean');
     return EXIT_OK;
   }
   for (const finding of findings) console.error(finding);
   return EXIT_FAILURE;
+}
+
+// ---------- resume-push ----------
+
+/**
+ * Retry the work push from a workspace the runner kept because its push failed
+ * (#38). Reuses the runner's pushWork so the retry commits, pushes, and judges
+ * delivery exactly as the original attempt did — no second push path.
+ *
+ * The workspace is removed only once the remote branch provably contains this
+ * HEAD; every other path leaves the directory and the record exactly as they
+ * were. Cleanup is never inferred from a push outcome alone.
+ */
+function cmdResumePush(args: string[]): number {
+  const { positionals } = parseCommand(args, {}, 1, 1);
+  const jobId = positionals[0];
+  const home = fleetHome();
+  const record = readRetainedRecord(home, jobId);
+  if (record === undefined) {
+    console.error(`no retained workspace for job ${jobId} (looked in ${retainedDir(home)})`);
+    console.error('container jobs keep their workspace inside the stopped task, not on this host');
+    return EXIT_FAILURE;
+  }
+  if (!fs.existsSync(record.workspace)) {
+    clearRetainedRecord(home, jobId);
+    console.error(`retained workspace is gone: ${record.workspace}`);
+    console.error('record dropped; nothing is recoverable from this host');
+    return EXIT_FAILURE;
+  }
+  const { target, branch } = record;
+  if (!target || !branch) {
+    // The request file existed but did not parse: the workspace was kept on
+    // purpose, and guessing a branch or a commit message would be worse.
+    console.error(`retained record for ${jobId} is incomplete: ${record.reason ?? 'unknown reason'}`);
+    console.error(`the work is at ${record.workspace} — recover it by hand (git -C <path> log/push)`);
+    return EXIT_FAILURE;
+  }
+
+  let outcome: 'pushed' | 'delivered' | 'clean';
+  try {
+    outcome = pushWork(record.workspace, target, record.jobId, record.ok !== false, record.base);
+  } catch (err) {
+    console.error(`push still failing: ${errorMessage(err).split('\n')[0]}`);
+    console.error(`workspace kept at ${record.workspace} — retry when the remote is reachable`);
+    return EXIT_FAILURE;
+  }
+  if (outcome === 'clean') {
+    console.error(`nothing to push from ${record.workspace} — no commits beyond ${branch}`);
+    console.error('workspace kept — inspect it before dropping the record');
+    return EXIT_FAILURE;
+  }
+  // 'delivered' only means the remote branch is ahead of base — it can be ahead
+  // with a different commit while this HEAD lives nowhere else. Prove it.
+  const head = getHeadSha(record.workspace);
+  if (!remoteHasHead(record.workspace, branch)) {
+    console.error(`origin/${branch} does not contain ${head} (push outcome: ${outcome})`);
+    console.error(`workspace kept at ${record.workspace} — reconcile the branch by hand`);
+    return EXIT_FAILURE;
+  }
+
+  console.log(
+    outcome === 'pushed'
+      ? `pushed ${branch} from ${record.workspace} (${head})`
+      : `${branch} already carries ${head} on the remote`,
+  );
+  fs.rmSync(record.workspace, { recursive: true, force: true });
+  clearRetainedRecord(home, jobId);
+  console.log(`workspace removed: ${record.workspace}`);
+  return EXIT_OK;
 }
 
 // ---------- resume ----------
@@ -1106,6 +1197,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdDelegate(rest);
       case 'resume':
         return await cmdResume(rest);
+      case 'resume-push':
+        return cmdResumePush(rest);
       case 'status':
         return await cmdStatus(rest);
       case 'logs':

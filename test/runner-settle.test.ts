@@ -158,3 +158,38 @@ test('prUrl creates a minimal report when no report.json exists', () => {
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+test('a retained workspace rides out as a settle note carrying the path and the recovery command', () => {
+  // #38: after a failed push the directory is the only address the work has.
+  // The note is what the caller turns into a log event, so this is also what
+  // puts the path in the persisted transcript.
+  const workspace = makeWorkspace();
+  try {
+    const { body, notes } = composeSettle({
+      jobId: 'job-s7',
+      startedAt: Date.now(),
+      decisions: 0,
+      workspace,
+      retainedWorkspace: workspace,
+    });
+    assert.equal(notes.length, 1, `expected exactly the retention note, got: ${JSON.stringify(notes)}`);
+    assert.match(notes[0], /retained/);
+    assert.ok(notes[0].includes(workspace), 'the note must carry the retained path verbatim');
+    assert.match(notes[0], /fleet resume-push job-s7/);
+    // The settle event itself stays inside the schema — no new field.
+    const { ok } = validateEvent({ job: 'job-s7', seq: 0, ...body });
+    assert.ok(ok, 'settle with a retention note validates');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('no retained workspace, no note', () => {
+  const workspace = makeWorkspace();
+  try {
+    const { notes } = composeSettle({ jobId: 'job-s8', startedAt: Date.now(), decisions: 0, workspace });
+    assert.deepEqual(notes, []);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

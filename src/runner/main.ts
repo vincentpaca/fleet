@@ -26,6 +26,7 @@ import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDr
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs } from '../shared/time.ts';
+import { writeRetainRequest } from '../shared/retained.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -321,6 +322,10 @@ async function main(): Promise<void> {
   // partial work included; evidence over tidiness.
   let pushNote: string | undefined;
   let workPushed = false;
+  // Set when the push failed and the workspace is the only copy of the work
+  // (#38): the provider keeps the directory instead of deleting it, and the
+  // path rides out in a settle note.
+  let retainedWorkspace: string | undefined;
   if (gitUrl && branch) {
     try {
       const outcome = pushWork(workspace, target, jobId, exitCode === 0, base);
@@ -329,7 +334,22 @@ async function main(): Promise<void> {
         : outcome === 'delivered' ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`
         : `workspace clean; nothing beyond ${branch} creation`;
     } catch (err) {
-      pushNote = `WORK PUSH FAILED: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
+      const reason = String(err instanceof Error ? err.message : err).split('\n')[0];
+      pushNote = `WORK PUSH FAILED: ${reason}`;
+      try {
+        writeRetainRequest(workspace, {
+          jobId,
+          target,
+          branch,
+          ...(base !== undefined ? { base } : {}),
+          ok: exitCode === 0,
+          reason,
+          at: new Date().toISOString(),
+        });
+        retainedWorkspace = workspace;
+      } catch (markErr) {
+        pushNote += ` (workspace NOT retained: ${String(markErr instanceof Error ? markErr.message : markErr).split('\n')[0]})`;
+      }
     }
     await sink.emit({ type: 'log', text: pushNote, who: 'runner' });
   }
@@ -398,6 +418,7 @@ async function main(): Promise<void> {
     workspace,
     produced: artifactProduced,
     ...(settleRung !== undefined ? { rung: settleRung } : {}),
+    ...(retainedWorkspace !== undefined ? { retainedWorkspace } : {}),
     prUrl,
   });
   for (const note of notes) {
