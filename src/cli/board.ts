@@ -267,15 +267,18 @@ export function renderContextStrip(
   if (ctx?.harnessCli) parts.push(col(ctx.harnessCli, 90));
   if (ctx?.tunnel) parts.push(col(ctx.tunnel, 90));
 
-  const leftContent = ` ${parts.join('  ')} `;
-  const leftVLen = visualLength(leftContent);
-
   // Right-side: semantic count labels.
   const bLabel = blockedCount > 0 ? col(`blk:${blockedCount}`, 33) : col(`blk:0`, 90);
   const rLabel = runningCount > 0 ? col(`run:${runningCount}`, 32) : col(`run:0`, 90);
   const dLabel = col(`done:${doneCount}`, 90);
   const countsStr = `${bLabel} ${rLabel} ${dLabel}`;
   const countsVLen = visualLength(countsStr);
+
+  // The counts are the smallest and most useful thing on this line, so the
+  // context yields to them: a long repo/branch used to push them off the end
+  // entirely, which is how "how many jobs want me" disappears on a narrow term.
+  const leftContent = visualClip(` ${parts.join('  ')} `, Math.max(8, inner - countsVLen - 2));
+  const leftVLen = visualLength(leftContent);
 
   // Fill gap between left and right with dashes.
   const dashCount = Math.max(1, inner - leftVLen - countsVLen - 1);

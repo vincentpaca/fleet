@@ -429,3 +429,23 @@ test('a settled job never shows a now-line, whatever activity it reported last',
   assert.equal(rows[0].lines.length, 1);
   assert.doesNotMatch(rows[0].lines.join('\n'), /now:/);
 });
+
+test('renderContextStrip: the counts survive a long repo, branch and endpoint', () => {
+  // How many jobs want a human is the smallest and most useful thing on this
+  // line. A long left side used to push it off the end, at exactly the width
+  // where an operator most needs it.
+  const strip = renderContextStrip(2, 3, 4, 80, {
+    noColor: true,
+    endpoint: 'http://127.0.0.1:19000',
+    context: {
+      repo: 'a-long-organisation/a-long-repository-name',
+      branch: 'fleet/1234-job-abcdefgh-01234567',
+      provider: 'ecs',
+      tunnel: 'tunnel:ours:19000',
+    },
+  });
+  const top = strip.split('\n')[0];
+  assert.match(top, /blk:2 run:3 done:4/, 'the counts are still there');
+  assert.ok(top.length <= 80, `the line still fits: ${top.length}`);
+  assert.match(top, /FLEET/, 'and the identity survives at the other end');
+});
