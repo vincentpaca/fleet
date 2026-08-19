@@ -14,8 +14,8 @@ worker jobs run on the EC2 capacity provider with managed ASG scaling — the AS
 reach zero instances when the cluster is idle, and scale back out when a new job arrives.
 
 **Access model: SSM only.** No security group accepts inbound traffic from the public
-internet. Operators reach the daemon HTTP API via SSM port-forward (see the `connect_hint`
-output for the exact command). Intra-VPC ingress rules:
+internet. Operators reach the daemon HTTP API via an SSM port-forward, which `fleet connect`
+opens and holds (the `connect_hint` output is the same thing by hand). Intra-VPC ingress rules:
 - Runner tasks (instances SG) → daemon TCP port
 - Daemon + instances → EFS NFS port (2049)
 
@@ -49,8 +49,20 @@ architecture (`linux/amd64`; pass `--platform` to change it), tags them `:runner
 and `:daemon` — the tags this unit's task definitions pin — pushes both to the ECR
 repository from `fleet_config`, and forces a new deployment of the daemon service so
 it starts from the image just pushed. You never set `DOCKER_DEFAULT_PLATFORM`,
-`docker tag`, or `aws ecs update-service` by hand. Add `daemon_url` to
-`fleet-config.json` (see `connect_hint` for the port-forward) and the CLI talks to it.
+`docker tag`, or `aws ecs update-service` by hand.
+
+**4. Open the tunnel.** Add `"daemon_url": "http://127.0.0.1:19000"` to
+`fleet-config.json` (any free local port; `1` + `daemon_tcp_port` is the convention),
+then from that project directory:
+
+```sh
+fleet connect          # foreground; --detach to supervise in the background
+```
+
+It resolves the deployment from `fleet_config`, forwards `daemon_port` to the port
+`daemon_url` names, verifies `/health`, and reopens the session when it dies —
+re-resolving the daemon task, which a `force-new-deployment` replaces. `fleet doctor`
+reports the tunnel's state; `connect_hint` is the same sequence to run by hand.
 
 On an arm64 workstation the build is emulated, which needs binfmt registered.
 Docker Desktop ships it; a plain arm64 Linux engine (a Graviton dev box) does not,
@@ -94,8 +106,8 @@ you publish elsewhere.
 | `project_repository_urls` | Map of project repo name → ECR URL. |
 | `efs_file_system_id` | EFS file system backing `FLEET_HOME`. |
 | `vpc_id` | VPC deployed into (created or reused). |
-| `connect_hint` | SSM port-forward commands (copy-paste) to tunnel the daemon HTTP port to localhost. |
-| `fleet_config` | The unit's self-description: what the daemon reads at boot and what `images/build.sh` publishes to (`runner_repository_url`, `cluster`, `daemon_service`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
+| `connect_hint` | The SSM port-forward commands `fleet connect` runs, for when you want the tunnel by hand. |
+| `fleet_config` | The unit's self-description: what the daemon reads at boot, what `images/build.sh` publishes to (`runner_repository_url`, `cluster`, `daemon_service`), and what `fleet connect` tunnels into (`daemon_container_name`, `daemon_port`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
 
 ## Notes
 

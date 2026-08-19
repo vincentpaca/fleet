@@ -34,8 +34,12 @@ output "vpc_id" {
 }
 
 output "connect_hint" {
-  description = "SSM port-forward command to tunnel the daemon HTTP port to localhost. No security-group rule opens an inbound path from the internet; access is via SSM only. Run each line in order."
+  description = "Manual SSM port-forward commands, the documented fallback for `fleet connect` (which does all of this and reopens the session when it dies). No security-group rule opens an inbound path from the internet; access is via SSM only. Run each line in order."
   value       = <<-EOT
+    # `fleet connect` does all of this from fleet_config and holds the session
+    # open across SSM timeouts and service deployments. These steps are the
+    # fallback for when you want the tunnel without the CLI.
+
     # 1. Find the running daemon task ARN.
     TASK=$(aws ecs list-tasks \
       --cluster ${aws_ecs_cluster.this.name} \
@@ -46,7 +50,7 @@ output "connect_hint" {
     RUNTIME_ID=$(aws ecs describe-tasks \
       --cluster ${aws_ecs_cluster.this.name} \
       --tasks "$TASK" \
-      --query "tasks[0].containers[?name=='${var.name}-daemon'].runtimeId" \
+      --query "tasks[0].containers[?name=='${local.daemon_container_name}'].runtimeId" \
       --output text)
 
     # 3. Open the SSM port-forward session. The daemon HTTP API is then
@@ -64,32 +68,6 @@ output "connect_hint" {
 }
 
 output "fleet_config" {
-  description = "The unit's shape, self-described for Fleet's runtime provider. Every infra unit must expose this output (test/cloud-agnostic.test.ts): it is the contract that lets Fleet predict the infrastructure it created instead of discovering it."
-  value = {
-    provider = "ecs"
-    cluster  = aws_ecs_cluster.this.name
-    # capacity_provider drives --capacity-provider-strategy in run-task so managed
-    # ASG scaling fires for every worker job.
-    capacity_provider = aws_ecs_capacity_provider.ec2.name
-    # daemon_service names the service that runs the :daemon tag, so publishing a
-    # new image can roll it (images/build.sh --redeploy-daemon) without the
-    # operator naming infrastructure Fleet already created.
-    daemon_service         = aws_ecs_service.daemon.name
-    runner_repository_url  = aws_ecr_repository.runner.repository_url
-    runner_task_definition = aws_ecs_task_definition.runner.family
-    runner_container_name  = local.runner_container_name
-    runner_log_group       = aws_cloudwatch_log_group.runner.name
-    # Runner tasks use bridge networking on EC2; ecs run-task must not receive
-    # --network-configuration for bridge-mode tasks.  Subnets and security groups
-    # are intentionally empty in both this output and the SSM fleet-config parameter
-    # so the values remain consistent and consumers do not pass them to run-task.
-    subnets         = []
-    security_groups = []
-    ssm_config_path = aws_ssm_parameter.fleet_config.name
-    # Offered capacity tiers: the daemon rejects manifests whose limits.resources
-    # exceed every tier here at dispatch time.  Operators set offered_cpu_units /
-    # offered_memory_mib to match their actual instance type; the defaults match
-    # a t3.medium leaving ~512 MiB for the ECS agent and OS.
-    capacity_tiers = [{ cpu = var.offered_cpu_units, memory = var.offered_memory_mib }]
-  }
+  description = "The unit's shape, self-described for Fleet's runtime provider. Every infra unit must expose this output (test/cloud-agnostic.test.ts): it is the contract that lets Fleet predict the infrastructure it created instead of discovering it. Defined once as local.fleet_config in main.tf and published both here and as the SSM parameter the daemon reads at boot — same bytes, never two copies."
+  value       = local.fleet_config
 }

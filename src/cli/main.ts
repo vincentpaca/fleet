@@ -15,7 +15,9 @@ import {
   retainedDir,
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
-import { request, describeTarget, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
+import { runConnect, resolveDeployment, tunnelReport, chooseLocalPort } from './connect.ts';
+import { tunnelOpenerFor } from './tunnel-openers.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
@@ -68,8 +70,14 @@ Commands:
   board [--once]                           Full-screen live view (--once or non-TTY: static render)
   artifacts <jobId> [list]                 List artifacts delivered by a job
   artifacts <jobId> get <path> [--out dir] Download an artifact (writes to dir/<filename>, or stdout)
-  doctor [--manifest path]                 Check local environment against the manifest, and list
-                                           workspaces retained after a failed push
+  connect [--port N] [--detach]            Open and hold the tunnel to a cloud daemon: resolve the
+                                           deployment, forward its daemon port to localhost, verify
+                                           /health, and reopen on session death (re-resolving the
+                                           daemon task, which changes on every service deployment).
+                                           Foreground by default; --detach supervises in background.
+  doctor [--manifest path]                 Check local environment against the manifest, report
+                                           tunnel state, and list workspaces retained after a
+                                           failed push
   version                                  Print version and exit
 
 Flags:
@@ -552,7 +560,13 @@ async function daemonCall(
   try {
     return await request(method, reqPath, body, { onLine });
   } catch (err) {
-    fail(`cannot reach daemon at ${describeTarget()}: ${errorMessage(err)}`);
+    // A TCP address means a port-forward is carrying this call, and a dead
+    // session is the likeliest cause (#57) — say where to look, not just what broke.
+    const hint =
+      daemonTarget().kind === 'tcp'
+        ? '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state'
+        : '';
+    fail(`cannot reach daemon at ${describeTarget()}: ${errorMessage(err)}${hint}`);
   }
 }
 
@@ -792,6 +806,36 @@ async function cmdArtifacts(args: string[]): Promise<number> {
   return EXIT_USAGE;
 }
 
+// ---------- connect ----------
+
+/**
+ * Own the daemon tunnel (#57). Everything but argument parsing lives in
+ * ./connect.ts; the provider dispatch it uses is ./tunnel-openers.ts, the CLI's
+ * one composition root for operator access.
+ */
+async function cmdConnect(args: string[]): Promise<number> {
+  const { values } = parseCommand(args, { port: { type: 'string' }, detach: { type: 'boolean' } }, 0, 0);
+  let port: number | undefined;
+  if (typeof values.port === 'string') {
+    if (!/^\d+$/.test(values.port)) throw new UsageError('--port takes a port number');
+    port = Number(values.port);
+    if (port < 1 || port > 65535) throw new UsageError('--port takes a port number');
+  }
+  try {
+    return await runConnect({
+      cwd: process.cwd(),
+      home: fleetHome(),
+      port,
+      detach: values.detach === true,
+      selfPath: fileURLToPath(new URL('./main.ts', import.meta.url)),
+      log: (line) => console.log(line),
+      warn: (line) => console.error(`fleet connect: ${line}`),
+    });
+  } catch (err) {
+    fail(`fleet connect: ${errorMessage(err)}`);
+  }
+}
+
 // ---------- doctor ----------
 
 /** Known script interpreters: the first non-interpreter, non-flag token in a pickup command is the script file. */
@@ -814,7 +858,37 @@ function gateScriptFile(pickup: string): string | undefined {
   return undefined;
 }
 
-function cmdDoctor(args: string[]): number {
+/**
+ * Tunnel state for doctor (#57): a TCP daemon address means a port-forward is
+ * carrying every command, and its death is the single most common cause of
+ * "cannot reach daemon". Answer the three questions an ECONNREFUSED does not:
+ * is the port open, does /health answer, is the endpoint still the current one.
+ * A unix-socket daemon has no tunnel and gets no section.
+ */
+async function doctorTunnel(home: string): Promise<{ notes: string[]; findings: string[] }> {
+  const target = daemonTarget();
+  if (target.kind !== 'tcp') return { notes: [], findings: [] };
+  // Resolving the live endpoint costs cloud API calls; tunnelReport spends them
+  // only once the tunnel has already failed a /health check. Each call is
+  // bounded by the cloud runner itself (ecs.ts AWS_CLI_TIMEOUT_MS), which kills
+  // the child rather than only abandoning the promise — doctor is a diagnostic,
+  // and a hung diagnostic is worse than a slow one. A failure here is a note,
+  // never a finding: not knowing is not a defect.
+  const resolveEndpoint = async (): Promise<string> => {
+    const deployment = await resolveDeployment(process.cwd());
+    const { open, remotePort } = tunnelOpenerFor(deployment);
+    return (await open(chooseLocalPort(undefined, deployment.daemonUrl, remotePort))).id;
+  };
+  return await tunnelReport({
+    host: target.host,
+    port: target.port,
+    url: describeTarget(),
+    home,
+    resolveEndpoint,
+  });
+}
+
+async function cmdDoctor(args: string[]): Promise<number> {
   const { values } = parseCommand(args, { manifest: { type: 'string' } }, 0, 0);
   const manifestPath =
     typeof values.manifest === 'string' ? values.manifest : path.join('.fleet', 'manifest.json');
@@ -896,7 +970,13 @@ function cmdDoctor(args: string[]): number {
     }
   }
 
-  // 6. Retained workspaces (#38): a workspace kept because its work push failed
+  // 6. Tunnel (#57): when the daemon lives behind a port-forward, say what the
+  //    tunnel is doing rather than letting every command report ECONNREFUSED.
+  const tunnel = await doctorTunnel(fleetHome());
+  for (const note of tunnel.notes) console.log(note);
+  findings.push(...tunnel.findings);
+
+  // 7. Retained workspaces (#38): a workspace kept because its work push failed
   //    holds the only copy of that job's work. It is a finding until recovered —
   //    silence here is exactly how hours of agent time disappear.
   for (const record of listRetainedRecords(fleetHome())) {
@@ -1223,8 +1303,10 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdImage(rest);
       case 'artifacts':
         return await cmdArtifacts(rest);
+      case 'connect':
+        return await cmdConnect(rest);
       case 'doctor':
-        return cmdDoctor(rest);
+        return await cmdDoctor(rest);
       default:
         console.error(`unknown command: ${command}\n\n${HELP}`);
         return EXIT_USAGE;

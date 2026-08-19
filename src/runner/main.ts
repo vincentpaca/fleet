@@ -28,6 +28,7 @@ import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs, idleLimitMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
+import { killTree } from '../shared/process.ts';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -561,25 +562,6 @@ async function main(): Promise<void> {
     const reason = timeout?.reason ?? 'harness-exit';
     await sink.emit({ type: 'state', state: 'cancelled', reason });
     process.exit(1);
-  }
-}
-
-/**
- * Signal the harness's whole process group. The child is a shell (`shell: true`)
- * spawned `detached`, so its pid is a group leader: the negated pid reaches the
- * shell and every descendant it forked. Falls back to the child alone if the
- * group is already gone.
- */
-function killTree(child: { pid?: number; kill(signal: NodeJS.Signals): boolean }, signal: NodeJS.Signals): void {
-  try {
-    if (child.pid === undefined) return;
-    process.kill(-child.pid, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      // Already reaped; nothing left to signal.
-    }
   }
 }
 

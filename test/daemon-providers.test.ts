@@ -4,7 +4,19 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, exist
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
-import { EcsProvider, ecsConfigFromEnv, ecsConfigFromFleetConfig, parseFleetConfigSsmResponse, checkResourceFit } from "../src/providers/ecs.ts";
+import {
+  EcsProvider,
+  ecsConfigFromEnv,
+  ecsConfigFromFleetConfig,
+  parseFleetConfigSsmResponse,
+  checkResourceFit,
+  ecsDaemonAccessFromFleetConfig,
+  parseDaemonTaskArn,
+  parseDaemonRuntimeId,
+  ssmSessionTarget,
+  buildPortForwardArgs,
+  ecsTunnelOpener,
+} from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { LaunchSpec } from "../src/providers/provider.ts";
@@ -822,4 +834,161 @@ test("GET /health returns {ok: true} with status 200", async (t) => {
   const sockResult = await op(sock, "GET", "/health");
   assert.equal(sockResult.status, 200);
   assert.equal((sockResult.json as { ok: boolean }).ok, true);
+});
+
+// ---------- operator access: SSM port-forward primitives (#57) ----------
+// `fleet connect` builds its whole command from these. Every test below fails
+// on a mistake that would produce a plausible-looking but unusable tunnel.
+
+const DAEMON_ACCESS = {
+  cluster: "fleet",
+  service: "fleet-daemon",
+  containerName: "fleet-daemon",
+  port: 9000,
+};
+
+test("ecsDaemonAccessFromFleetConfig reads the daemon access fields", () => {
+  const access = ecsDaemonAccessFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    daemon_service: "fleet-daemon",
+    daemon_container_name: "fleet-daemon",
+    daemon_port: 9000,
+  });
+  assert.deepEqual(access, DAEMON_ACCESS);
+});
+
+test("ecsDaemonAccessFromFleetConfig names the missing daemon access field", () => {
+  const base = {
+    provider: "ecs",
+    cluster: "fleet",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    daemon_service: "fleet-daemon",
+    daemon_container_name: "fleet-daemon",
+    daemon_port: 9000,
+  };
+  assert.throws(
+    () => ecsDaemonAccessFromFleetConfig({ ...base, daemon_service: undefined }),
+    /daemon_service/,
+  );
+  assert.throws(
+    () => ecsDaemonAccessFromFleetConfig({ ...base, daemon_container_name: undefined }),
+    /daemon_container_name/,
+  );
+  // A config captured before the unit described its port must not silently
+  // forward to port 0 (or to NaN, which aws would accept as a string).
+  assert.throws(() => ecsDaemonAccessFromFleetConfig({ ...base, daemon_port: undefined }), /daemon_port/);
+});
+
+test("parseDaemonTaskArn takes the first running task and names the service when there is none", () => {
+  const arn = "arn:aws:ecs:us-east-1:111122223333:task/fleet/0af1b2c3d4e5";
+  assert.equal(parseDaemonTaskArn(JSON.stringify({ taskArns: [arn] }), DAEMON_ACCESS), arn);
+  assert.throws(
+    () => parseDaemonTaskArn(JSON.stringify({ taskArns: [] }), DAEMON_ACCESS),
+    /fleet-daemon.*fleet|no running task/,
+  );
+});
+
+test("parseDaemonRuntimeId picks the daemon container by name, not by position", () => {
+  // A task with a sidecar listed first: taking containers[0] would forward to
+  // the wrong process and produce a tunnel that connects to nothing.
+  const describe = JSON.stringify({
+    tasks: [
+      {
+        lastStatus: "RUNNING",
+        containers: [
+          { name: "log-router", runtimeId: "aaaa-1111" },
+          { name: "fleet-daemon", runtimeId: "bbbb-2222" },
+        ],
+      },
+    ],
+  });
+  assert.equal(parseDaemonRuntimeId(describe, "fleet-daemon"), "bbbb-2222");
+});
+
+test("parseDaemonRuntimeId refuses a task that is not running or has no runtime id yet", () => {
+  const pending = JSON.stringify({
+    tasks: [{ lastStatus: "PENDING", containers: [{ name: "fleet-daemon" }] }],
+  });
+  assert.throws(() => parseDaemonRuntimeId(pending, "fleet-daemon"), /PENDING/);
+
+  const noRuntime = JSON.stringify({
+    tasks: [{ lastStatus: "RUNNING", containers: [{ name: "fleet-daemon" }] }],
+  });
+  assert.throws(() => parseDaemonRuntimeId(noRuntime, "fleet-daemon"), /runtimeId/);
+
+  const wrongName = JSON.stringify({
+    tasks: [{ lastStatus: "RUNNING", containers: [{ name: "other", runtimeId: "x" }] }],
+  });
+  assert.throws(() => parseDaemonRuntimeId(wrongName, "fleet-daemon"), /no container named fleet-daemon/);
+
+  assert.throws(() => parseDaemonRuntimeId(JSON.stringify({ tasks: [] }), "fleet-daemon"), /no task/);
+});
+
+test("ssmSessionTarget uses the task id and underscores, never the ARN or commas", () => {
+  const target = ssmSessionTarget(
+    "fleet",
+    "arn:aws:ecs:us-east-1:111122223333:task/fleet/0af1b2c3d4e5",
+    "bbbb-2222",
+  );
+  // The SSM API's target regex rejects both the slashes in an ARN and the
+  // comma form used by ecs execute-command — either would fail at session start.
+  assert.equal(target, "ecs:fleet_0af1b2c3d4e5_bbbb-2222");
+  assert.ok(!target.includes(","));
+  assert.ok(!target.includes("/"));
+});
+
+test("buildPortForwardArgs forwards the daemon port to the chosen local port", () => {
+  const args = buildPortForwardArgs("ecs:fleet_task_rt", 9000, 19000);
+  assert.deepEqual(args.slice(0, 5), [
+    "ssm",
+    "start-session",
+    "--target",
+    "ecs:fleet_task_rt",
+    "--document-name",
+  ]);
+  assert.equal(args[5], "AWS-StartPortForwardingSessionToRemoteHost");
+  assert.equal(args[6], "--parameters");
+  // Ports are strings inside arrays — the SSM document rejects bare numbers,
+  // and swapping the two ports produces a tunnel to the wrong end.
+  assert.deepEqual(JSON.parse(args[7]), {
+    host: ["localhost"],
+    portNumber: ["9000"],
+    localPortNumber: ["19000"],
+  });
+});
+
+test("ecsTunnelOpener resolves the current task on every call", async () => {
+  // The daemon task id changes on every service deployment. An opener that
+  // cached its first answer would reopen forever against a dead container.
+  const runtimeIds = ["rt-one", "rt-two"];
+  const taskArns = [
+    "arn:aws:ecs:us-east-1:111122223333:task/fleet/task-one",
+    "arn:aws:ecs:us-east-1:111122223333:task/fleet/task-two",
+  ];
+  let round = 0;
+  const calls: string[][] = [];
+  const opener = ecsTunnelOpener(DAEMON_ACCESS, async (args) => {
+    calls.push(args);
+    if (args[1] === "list-tasks") return JSON.stringify({ taskArns: [taskArns[round]] });
+    return JSON.stringify({
+      tasks: [
+        { lastStatus: "RUNNING", containers: [{ name: "fleet-daemon", runtimeId: runtimeIds[round++] }] },
+      ],
+    });
+  });
+
+  const first = await opener(19000);
+  assert.equal(first.id, "ecs:fleet_task-one_rt-one");
+  assert.deepEqual(first.argv.slice(0, 4), ["aws", "ssm", "start-session", "--target"]);
+  assert.equal(first.argv[4], "ecs:fleet_task-one_rt-one");
+
+  const second = await opener(19000);
+  assert.equal(second.id, "ecs:fleet_task-two_rt-two");
+  assert.equal(calls.length, 4, "each open re-lists and re-describes");
+  // describe-tasks must ask about the task list-tasks just returned.
+  assert.equal(calls[3][calls[3].indexOf("--tasks") + 1], taskArns[1]);
 });

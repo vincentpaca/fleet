@@ -16,6 +16,15 @@ locals {
 
   daemon_image          = var.daemon_image != "" ? var.daemon_image : "${aws_ecr_repository.runner.repository_url}:daemon"
   runner_container_name = "${var.name}-runner"
+  # Named once: `fleet connect` builds its SSM target from this container's
+  # runtime id and resolves it through this service, so the resources and
+  # fleet_config can never disagree about either name. Plain expressions, not
+  # resource attributes: local.fleet_config is published as the SSM parameter
+  # the daemon service reads at boot, and referencing the service from it would
+  # be a dependency cycle.
+  daemon_container_name = "${var.name}-daemon"
+  daemon_service_name   = "${var.name}-daemon"
+  fleet_config_ssm_path = "/${var.name}/fleet-config"
 
   # Fargate daemon: assign a public IP when subnets are public (no NAT gateway)
   # so the task can pull its image from ECR and write logs to CloudWatch.
@@ -566,15 +575,32 @@ resource "aws_ecs_task_definition" "runner" {
 # omitted: the runner task uses bridge networking and must not pass
 # --network-configuration to ecs run-task.
 
-resource "aws_ssm_parameter" "fleet_config" {
-  name = "/${var.name}/fleet-config"
-  type = "String"
-  value = jsonencode({
+# This deployment's self-description, written once and published twice: as the
+# SSM parameter the daemon reads at boot, and as the fleet_config output
+# operators capture beside their project. Terraform cannot reference an output,
+# so the map has to live in a local — and it has to be ONE local. It was two
+# hand-kept copies until #57, by which time the parameter had silently missed
+# daemon_service, runner_repository_url, and ssm_config_path: the copy nobody
+# reads at apply time is the copy that rots. test/cloud-agnostic.test.ts fails a
+# unit that writes the map more than once.
+locals {
+  fleet_config = {
     provider = "ecs"
     cluster  = aws_ecs_cluster.this.name
     # capacity_provider replaces launch_type: run-task uses --capacity-provider-strategy
     # so ECS managed scaling fires and the ASG scales out for each job.
-    capacity_provider      = aws_ecs_capacity_provider.ec2.name
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    # daemon_service names the service that runs the :daemon tag, so publishing a
+    # new image can roll it (images/build.sh --redeploy-daemon) without the
+    # operator naming infrastructure Fleet already created.
+    daemon_service = local.daemon_service_name
+    # Operator access (D12): `fleet connect` resolves the service's running task,
+    # takes this container's runtime id for the SSM target, and forwards
+    # daemon_port to localhost. Without both, reaching the daemon is back to
+    # hand-run aws commands — see the connect_hint output.
+    daemon_container_name  = local.daemon_container_name
+    daemon_port            = var.daemon_tcp_port
+    runner_repository_url  = aws_ecr_repository.runner.repository_url
     runner_task_definition = aws_ecs_task_definition.runner.family
     runner_container_name  = local.runner_container_name
     runner_log_group       = aws_cloudwatch_log_group.runner.name
@@ -582,11 +608,18 @@ resource "aws_ssm_parameter" "fleet_config" {
     # --network-configuration for bridge-mode tasks.
     subnets         = []
     security_groups = []
+    ssm_config_path = local.fleet_config_ssm_path
     # Offered capacity: the daemon rejects manifests whose limits.resources
     # exceed every tier here, surfacing the mismatch at dispatch rather than
     # letting the job queue forever against capacity it can never obtain.
     capacity_tiers = [{ cpu = var.offered_cpu_units, memory = var.offered_memory_mib }]
-  })
+  }
+}
+
+resource "aws_ssm_parameter" "fleet_config" {
+  name  = local.fleet_config_ssm_path
+  type  = "String"
+  value = jsonencode(local.fleet_config)
 
   tags = local.tags
 }
@@ -621,7 +654,7 @@ resource "aws_ecs_task_definition" "daemon" {
 
   container_definitions = jsonencode([
     {
-      name      = "${var.name}-daemon"
+      name      = local.daemon_container_name
       image     = local.daemon_image
       essential = true
       cpu       = var.daemon_cpu
@@ -675,7 +708,7 @@ resource "aws_ecs_task_definition" "daemon" {
 }
 
 resource "aws_ecs_service" "daemon" {
-  name                    = "${var.name}-daemon"
+  name                    = local.daemon_service_name
   cluster                 = aws_ecs_cluster.this.id
   task_definition         = aws_ecs_task_definition.daemon.arn
   desired_count           = 1

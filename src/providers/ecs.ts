@@ -6,7 +6,7 @@
 // is the unit-tested surface.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { LaunchSpec, Provider, ResourceRequest } from "./provider.ts";
+import type { CloudCliRunner, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
 import { runnerEnv, materializationEnv } from "./provider.ts";
 
 const run = promisify(execFile);
@@ -60,6 +60,12 @@ export type FleetConfig = {
   runner_task_definition: string;
   runner_container_name: string;
   runner_log_group?: string;
+  /** ECS service running the daemon — what `fleet connect` resolves a task from. */
+  daemon_service?: string;
+  /** Container name inside the daemon task; the SSM target needs its runtime id. */
+  daemon_container_name?: string;
+  /** Port the daemon binds inside that container; the far end of the forward. */
+  daemon_port?: number;
   /** Fallback when capacity_provider is absent. Default "EC2". */
   launch_type?: string;
   subnets?: string[];
@@ -166,6 +172,155 @@ export function ecsConfigFromEnv(env: Record<string, string | undefined> = proce
     launchType: env.FLEET_ECS_LAUNCH_TYPE ?? "EC2",
     assignPublicIp: env.FLEET_ECS_ASSIGN_PUBLIC_IP ?? "DISABLED",
     capacityTiers: [],
+  };
+}
+
+// ---------- operator access: SSM port-forward to the daemon ----------
+// The AWS unit's answer to D12's "give the operator access without public
+// ingress". Everything below is command construction and response parsing —
+// pure, unit-tested without AWS — plus one thin opener that shells out.
+
+/** What `fleet connect` needs to address this deployment's daemon container. */
+export type EcsDaemonAccess = {
+  cluster: string;
+  /** ECS service holding the daemon task. Re-queried every session: task ids change. */
+  service: string;
+  /** Container name inside the daemon task definition. */
+  containerName: string;
+  /** Port the daemon binds inside the container. */
+  port: number;
+};
+
+/** Build an EcsDaemonAccess from a parsed fleet_config, naming any missing field. */
+export function ecsDaemonAccessFromFleetConfig(config: FleetConfig): EcsDaemonAccess {
+  const required = (key: string, val: string | undefined): string => {
+    if (!val) throw new Error(`fleet_config missing required field: ${key}`);
+    return val;
+  };
+  const port = config.daemon_port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
+    throw new Error("fleet_config missing required field: daemon_port");
+  }
+  return {
+    cluster: required("cluster", config.cluster),
+    service: required("daemon_service", config.daemon_service),
+    containerName: required("daemon_container_name", config.daemon_container_name),
+    port,
+  };
+}
+
+/** argv after `aws` for listing the daemon service's running tasks. */
+export function buildListDaemonTasksArgs(access: EcsDaemonAccess): string[] {
+  return [
+    "ecs",
+    "list-tasks",
+    "--cluster",
+    access.cluster,
+    "--service-name",
+    access.service,
+    "--desired-status",
+    "RUNNING",
+    "--output",
+    "json",
+  ];
+}
+
+/** argv after `aws` for describing one task. */
+export function buildDescribeDaemonTaskArgs(access: EcsDaemonAccess, taskArn: string): string[] {
+  return ["ecs", "describe-tasks", "--cluster", access.cluster, "--tasks", taskArn, "--output", "json"];
+}
+
+/** First task ARN from an `ecs list-tasks --output json` response. Throws when the service has none. */
+export function parseDaemonTaskArn(listJson: string, access: EcsDaemonAccess): string {
+  const parsed = JSON.parse(listJson) as { taskArns?: string[] };
+  const arn = parsed.taskArns?.[0];
+  if (!arn) {
+    throw new Error(
+      `no running task for service ${access.service} on cluster ${access.cluster} — the daemon service is not up`,
+    );
+  }
+  return arn;
+}
+
+/**
+ * Runtime id of the daemon container in an `ecs describe-tasks --output json`
+ * response. Selected by container name, not position: a task with a sidecar
+ * would otherwise forward to whichever container ECS happened to list first.
+ * A task still starting has no runtime id — that is a wait, not a target.
+ */
+export function parseDaemonRuntimeId(describeJson: string, containerName: string): string {
+  const parsed = JSON.parse(describeJson) as {
+    tasks?: { lastStatus?: string; containers?: { name?: string; runtimeId?: string }[] }[];
+  };
+  const task = parsed.tasks?.[0];
+  if (!task) throw new Error("ecs describe-tasks returned no task for the daemon service");
+  if (task.lastStatus !== "RUNNING") {
+    throw new Error(`daemon task is ${task.lastStatus ?? "in an unknown state"}, not RUNNING`);
+  }
+  const container = task.containers?.find((c) => c.name === containerName);
+  if (!container) {
+    const names = (task.containers ?? []).map((c) => c.name ?? "?").join(", ") || "none";
+    throw new Error(`daemon task has no container named ${containerName} (containers: ${names})`);
+  }
+  if (!container.runtimeId) throw new Error(`container ${containerName} has no runtimeId yet — the task is still starting`);
+  return container.runtimeId;
+}
+
+/**
+ * SSM session target for one ECS container: `ecs:<cluster>_<taskId>_<runtimeId>`.
+ * Underscore-separated and taking the task *id* (the ARN's last segment), because
+ * the SSM API's target regex rejects both commas and slashes.
+ */
+export function ssmSessionTarget(cluster: string, taskArn: string, runtimeId: string): string {
+  const taskId = taskArn.slice(taskArn.lastIndexOf("/") + 1);
+  return `ecs:${cluster}_${taskId}_${runtimeId}`;
+}
+
+/** argv after `aws` for the port-forward session that holds the tunnel open. */
+export function buildPortForwardArgs(target: string, remotePort: number, localPort: number): string[] {
+  return [
+    "ssm",
+    "start-session",
+    "--target",
+    target,
+    "--document-name",
+    "AWS-StartPortForwardingSessionToRemoteHost",
+    "--parameters",
+    JSON.stringify({
+      host: ["localhost"],
+      portNumber: [String(remotePort)],
+      localPortNumber: [String(localPort)],
+    }),
+  ];
+}
+
+/**
+ * How long one `aws` read may take before its process is killed. These are
+ * single describe-style calls; the AWS CLI's own retry budget on a bad network
+ * is minutes, and an unkilled child keeps the CLI's event loop alive long after
+ * the caller has given up on the promise.
+ */
+export const AWS_CLI_TIMEOUT_MS = 10_000;
+
+/** Shell out to `aws` and return stdout. Injectable so the opener is testable without AWS. */
+export const awsCli: CloudCliRunner = async (args) =>
+  (await run("aws", args, { timeout: AWS_CLI_TIMEOUT_MS })).stdout;
+
+/**
+ * Tunnel opener for an ECS deployment: list the service's running task, read the
+ * daemon container's runtime id, and hand back the `aws ssm start-session` argv
+ * plus the target it resolved to. Resolution happens on every call — a service
+ * deployment replaces the task id, and a reopened session must find the new one.
+ */
+export function ecsTunnelOpener(access: EcsDaemonAccess, aws: CloudCliRunner = awsCli): TunnelOpener {
+  return async (localPort: number): Promise<TunnelEndpoint> => {
+    const taskArn = parseDaemonTaskArn(await aws(buildListDaemonTasksArgs(access)), access);
+    const runtimeId = parseDaemonRuntimeId(
+      await aws(buildDescribeDaemonTaskArgs(access, taskArn)),
+      access.containerName,
+    );
+    const target = ssmSessionTarget(access.cluster, taskArn, runtimeId);
+    return { argv: ["aws", ...buildPortForwardArgs(target, access.port, localPort)], id: target };
   };
 }
 

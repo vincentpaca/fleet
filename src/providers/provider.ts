@@ -44,6 +44,37 @@ export interface Provider {
   checkResources?(resources: ResourceRequest): void;
 }
 
+/**
+ * Operator access to the daemon without public ingress (`docs/decisions.md#d12`).
+ * Every cloud unit owes the operator a way in and satisfies it its own way; core
+ * only knows how to hold one open and how to notice it died.
+ */
+export type TunnelEndpoint = {
+  /** argv (program + args) of a command that holds the forward open in the foreground. */
+  argv: string[];
+  /**
+   * What the forward currently points at, in whatever form the cloud addresses
+   * it. It changes whenever the deployment replaces the daemon's container —
+   * which is exactly when a dead session must not be reopened at the old
+   * address. Core compares this string; it never parses it.
+   */
+  id: string;
+};
+
+/**
+ * Resolve the deployment's daemon endpoint *now* and build the command that
+ * forwards it to localPort. Called once per session, never cached: re-resolving
+ * is what survives a service deployment.
+ */
+export type TunnelOpener = (localPort: number) => Promise<TunnelEndpoint>;
+
+/**
+ * Shells out to a cloud's own CLI and returns stdout. Every provider that talks
+ * to its cloud by shelling out takes one of these, so tests can drive the real
+ * command construction without the cloud.
+ */
+export type CloudCliRunner = (args: string[]) => Promise<string>;
+
 /** FLEET_* env every provider injects into the sandbox. */
 export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, string> {
   return {

@@ -1,8 +1,12 @@
 // Clouds are self-contained units: cloud-specific code lives in its unit
 // (src/providers/<name>.ts + infra/<cloud>/), and core never imports it.
-// The one exception is the composition root, src/daemon/main.ts, which maps
-// FLEET_PROVIDER to an implementation. Everything else depends only on the
-// Provider interface (src/providers/provider.ts).
+// The exceptions are the two composition roots — src/daemon/main.ts maps
+// FLEET_PROVIDER to a launch implementation, src/cli/tunnel-openers.ts maps a
+// captured deployment's `provider` to a tunnel implementation. Everything else
+// depends only on the Provider interface (src/providers/provider.ts). Adding a
+// root here is a real widening: keep the list to files whose entire job is the
+// map, so a cloud detail can never accumulate beside general code under the
+// exemption.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -10,7 +14,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const src = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
-const COMPOSITION_ROOT = join('daemon', 'main.ts');
+const COMPOSITION_ROOTS = [join('daemon', 'main.ts'), join('cli', 'tunnel-openers.ts')];
 
 function* files(dir: string): Generator<string> {
   for (const name of readdirSync(dir)) {
@@ -24,7 +28,7 @@ test('core never imports a concrete cloud provider', () => {
   const offenders: string[] = [];
   for (const file of files(src)) {
     const rel = file.slice(src.length + 1);
-    if (rel.startsWith('providers/') || rel === COMPOSITION_ROOT) continue;
+    if (rel.startsWith('providers/') || COMPOSITION_ROOTS.includes(rel)) continue;
     const text = readFileSync(file, 'utf8');
     // provider.ts (the interface) is fine; concrete impls are not.
     const match = text.match(/from\s+["'][^"']*providers\/(?!provider\.ts)[^"']+["']/);
@@ -47,28 +51,83 @@ test('each infra unit is self-contained (module + README + example)', () => {
   }
 });
 
+/** The `{ ... }` block starting at `open` (the index of its `{`). */
+function braceBlock(text: string, open: number): string {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth += 1;
+    else if (text[i] === '}' && --depth === 0) return text.slice(open, i + 1);
+  }
+  throw new Error('unterminated block');
+}
+
 test('each infra unit self-describes its shape via fleet_config', () => {
-  // The output is the contract between an infra unit and its runtime
+  // fleet_config is the contract between an infra unit and its runtime
   // provider: Fleet predicts the infrastructure it created, never discovers it.
   // Add new required keys here when the EcsConfig (or equivalent) gains a field
   // that the provider cannot derive from any other source — or when operator
   // tooling has to address the unit's own infrastructure: images/build.sh
-  // publishes to runner_repository_url and rolls cluster + daemon_service.
+  // publishes to runner_repository_url and rolls cluster + daemon_service, and
+  // `fleet connect` forwards to daemon_container_name on daemon_port (#57).
+  //
+  // The map must be written EXACTLY ONCE, as a `fleet_config = { ... }` local,
+  // and referenced everywhere it is published. A unit publishes it in more than
+  // one place — the output operators capture, and (for AWS) the parameter the
+  // daemon reads at boot — and Terraform cannot reference an output, so the
+  // second copy is always hand-kept. It drifted exactly that way before #57:
+  // the SSM parameter never learned daemon_service, and nothing noticed because
+  // the copy an operator reads is not the copy the daemon reads.
   const infra = join(src, '..', 'infra');
   for (const unit of readdirSync(infra)) {
-    if (!statSync(join(infra, unit)).isDirectory()) continue;
-    const outputs = readFileSync(join(infra, unit, 'outputs.tf'), 'utf8');
+    const unitDir = join(infra, unit);
+    if (!statSync(unitDir).isDirectory()) continue;
+    const outputs = readFileSync(join(unitDir, 'outputs.tf'), 'utf8');
     for (const required of ['output "fleet_config"', 'output "connect_hint"']) {
       assert.ok(outputs.includes(required), `infra/${unit}/outputs.tf missing ${required}`);
     }
-    // Keys are required INSIDE the fleet_config block, as assignments. A
-    // whole-file substring scan cannot fail: a prose comment mentioning the key,
-    // or a same-named standalone output (daemon_service_name,
-    // runner_repository_url both exist), satisfies it while the map itself has
-    // been trimmed — and trimming it silently breaks every consumer.
-    const start = outputs.indexOf('output "fleet_config"');
-    const next = outputs.indexOf('\noutput "', start + 1);
-    const block = next === -1 ? outputs.slice(start) : outputs.slice(start, next);
+
+    // The example root has to re-export it. Module outputs are not addressable
+    // from a root module, so `terraform -chdir=<unit>/examples/basic output
+    // -json fleet_config` — the first command of every bring-up, and what the
+    // CLI, images/build.sh, and `fleet connect` all read afterwards — fails
+    // outright without this passthrough.
+    const example = readFileSync(join(unitDir, 'examples', 'basic', 'main.tf'), 'utf8');
+    assert.match(
+      example,
+      /output "fleet_config"/,
+      `infra/${unit}/examples/basic/main.tf must re-export fleet_config — the documented capture command reads it from the example root`,
+    );
+
+    const blocks: string[] = [];
+    let unitText = '';
+    for (const name of readdirSync(unitDir)) {
+      if (!name.endsWith('.tf')) continue;
+      const text = readFileSync(join(unitDir, name), 'utf8');
+      unitText += `${text}\n`;
+      for (const match of text.matchAll(/^[ \t]*fleet_config\s*=\s*\{/gm)) {
+        blocks.push(braceBlock(text, text.indexOf('{', match.index)));
+      }
+    }
+    assert.equal(
+      blocks.length,
+      1,
+      `infra/${unit}: fleet_config must be written once as a local and referenced wherever it is published (found ${blocks.length} definitions)`,
+    );
+    // Counting definitions only catches a copy that is also *named* fleet_config.
+    // A second copy inlined into a jsonencode() would slip past it, so count a
+    // key the map alone carries: one assignment across the whole unit, or
+    // somebody is writing the description twice again.
+    assert.equal(
+      [...unitText.matchAll(/^\s*daemon_port\s*=/gm)].length,
+      1,
+      `infra/${unit}: daemon_port is assigned more than once — reference local.fleet_config where it is published instead of re-listing its keys (a hoisting local counts as an assignment too)`,
+    );
+
+    // Keys are required INSIDE that block, as assignments. A whole-file
+    // substring scan cannot fail: a prose comment mentioning the key, or a
+    // same-named standalone output (daemon_service_name, runner_repository_url
+    // both exist), satisfies it while the map itself has been trimmed — and
+    // trimming it silently breaks every consumer.
     for (const key of [
       'provider',
       'cluster',
@@ -76,11 +135,13 @@ test('each infra unit self-describes its shape via fleet_config', () => {
       'runner_container_name',
       'runner_repository_url',
       'daemon_service',
+      'daemon_container_name',
+      'daemon_port',
     ]) {
       assert.match(
-        block,
+        blocks[0],
         new RegExp(`^\\s*${key}\\s*=`, 'm'),
-        `infra/${unit}/outputs.tf: fleet_config must set ${key}`,
+        `infra/${unit}: fleet_config must set ${key}`,
       );
     }
   }
