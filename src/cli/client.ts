@@ -22,9 +22,59 @@ export type RequestOptions = {
   cwd?: string;
 };
 
-type Target =
+export type Target =
   | { kind: 'socket'; socketPath: string }
   | { kind: 'tcp'; host: string; port: number; basePath: string };
+
+/** One captured deployment description: the file it came from, and its contents. */
+export type FleetConfigFile = { path: string; config: Record<string, unknown> };
+
+/**
+ * Every parseable `.fleet/infra/<provider>/fleet-config.json` under cwd, in
+ * directory order. One reader for both consumers — `daemonTarget` takes the
+ * first config carrying a usable daemon_url, `fleet connect` prefers that same
+ * one — so neither can drift on where a deployment description lives.
+ * Unreadable and malformed files are skipped, never fatal: a half-captured
+ * config for one provider must not hide a good one for another.
+ */
+export function* fleetConfigFiles(cwd: string = process.cwd()): Generator<FleetConfigFile> {
+  const infraDir = path.join(cwd, '.fleet', 'infra');
+  let providers: string[];
+  try {
+    providers = fs.readdirSync(infraDir);
+  } catch {
+    return; // .fleet/infra/ does not exist
+  }
+  for (const provider of providers) {
+    if (!fs.statSync(path.join(infraDir, provider), { throwIfNoEntry: false })?.isDirectory()) continue;
+    const configPath = path.join(infraDir, provider, 'fleet-config.json');
+    let config: unknown;
+    try {
+      config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch {
+      continue; // missing or malformed — try the next provider
+    }
+    if (typeof config === 'object' && config !== null && !Array.isArray(config)) {
+      yield { path: configPath, config: config as Record<string, unknown> };
+    }
+  }
+}
+
+/**
+ * The usable `daemon_url` in a captured config, or undefined. One predicate, so
+ * `fleet connect` cannot tunnel for the capture in one provider directory while
+ * every other command talks to another's daemon — an empty string or a
+ * non-URL has to disqualify a file for both of them identically.
+ */
+export function configDaemonUrl(config: Record<string, unknown>): URL | undefined {
+  const value = config.daemon_url;
+  if (typeof value !== 'string' || value === '') return undefined;
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Resolve the daemon address from (highest priority first):
@@ -50,29 +100,15 @@ export function daemonTarget(
 
   // 2. Per-deployment fleet-config.json (written by `fleet setup infra` (#13) or by hand).
   //    Scan .fleet/infra/<provider>/fleet-config.json for a daemon_url field; first wins.
-  const cwd = opts.cwd ?? process.cwd();
-  const infraDir = path.join(cwd, '.fleet', 'infra');
-  try {
-    for (const provider of fs.readdirSync(infraDir)) {
-      if (!fs.statSync(path.join(infraDir, provider), { throwIfNoEntry: false })?.isDirectory()) continue;
-      const configPath = path.join(infraDir, provider, 'fleet-config.json');
-      try {
-        const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { daemon_url?: string };
-        if (typeof cfg.daemon_url === 'string' && cfg.daemon_url) {
-          const u = new URL(cfg.daemon_url);
-          return {
-            kind: 'tcp',
-            host: u.hostname,
-            port: u.port ? Number(u.port) : 80,
-            basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
-          };
-        }
-      } catch {
-        // Missing or malformed fleet-config.json — try the next provider.
-      }
-    }
-  } catch {
-    // .fleet/infra/ does not exist — fall through to socket.
+  for (const { config } of fleetConfigFiles(opts.cwd ?? process.cwd())) {
+    const u = configDaemonUrl(config);
+    if (!u) continue;
+    return {
+      kind: 'tcp',
+      host: u.hostname,
+      port: u.port ? Number(u.port) : 80,
+      basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
+    };
   }
 
   // 3. Unix socket at $FLEET_HOME.

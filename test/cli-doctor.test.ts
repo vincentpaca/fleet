@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runCli, makeTempDir } from './cli-helpers.ts';
+import { runCli, makeTempDir, startMockDaemon } from './cli-helpers.ts';
 
 // Minimal valid-for-doctor manifest; sync/env.vars empty so no base findings.
 const BASE_MANIFEST = {
@@ -257,4 +257,46 @@ test('doctor: a malformed retained record is ignored, not a crash', async () => 
   const res = await runDoctor(['doctor'], { cwd, env: { FLEET_HOME: home } });
   assert.equal(res.code, 0, `expected clean but got stderr: ${res.stderr}`);
   assert.match(res.stdout, /doctor: clean/);
+});
+
+// ── Tunnel state (#57) ───────────────────────────────────────────────────────
+// A TCP daemon address means a port-forward carries every command. doctor has
+// to say what the tunnel is doing; "cannot reach daemon: ECONNREFUSED" from the
+// next delegate does not.
+
+test('doctor: reports a dead tunnel instead of leaving it to the next command', async () => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  // A port the OS just handed back and nothing is on.
+  const probe = await startMockDaemon({});
+  const port = Number(new URL(probe.url).port);
+  await probe.close();
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: `http://127.0.0.1:${port}` } });
+  assert.equal(res.code, 1, `expected a finding but got: ${res.stdout}`);
+  assert.equal(stderrLines(res.stderr).length, 1, `exactly one finding: ${res.stderr}`);
+  assert.match(res.stderr, new RegExp(`nothing is listening on http://127\\.0\\.0\\.1:${port}`));
+  assert.match(res.stderr, /fleet connect/);
+});
+
+test('doctor: a serving tunnel is a note, not a finding', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.match(res.stdout, /tunnel: daemon \/health ok/);
+  assert.match(res.stdout, /doctor: clean/);
+});
+
+test('doctor: a unix-socket daemon has no tunnel and gets no tunnel section', async () => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const res = await runDoctor(['doctor'], { cwd });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.ok(!res.stdout.includes('tunnel:'), `no tunnel section: ${res.stdout}`);
 });

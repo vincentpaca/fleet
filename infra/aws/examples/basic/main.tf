@@ -36,3 +36,12 @@ output "runner_repository_url" {
 output "connect_hint" {
   value = module.fleet.connect_hint
 }
+
+# The capture every bring-up step starts from:
+#   terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config \
+#     > .fleet/infra/aws/fleet-config.json
+# Module outputs are not addressable from a root module, so this passthrough is
+# what makes that command work at all. test/cloud-agnostic.test.ts requires it.
+output "fleet_config" {
+  value = module.fleet.fleet_config
+}

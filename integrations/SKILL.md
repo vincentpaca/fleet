@@ -11,7 +11,7 @@ Fleet runs this repo's own harness commands in a remote container and reports ba
 
 1. `.fleet/manifest.json` exists (if not: run `fleet init`, then help the human fill in the placeholders — the setup script and pickup gate are theirs to own).
 2. `fleet lint` passes.
-3. The daemon is reachable (`fleet status` responds). If not, stop and tell the human; do not try to stand up infrastructure unasked.
+3. The daemon is reachable (`fleet status` responds). If it is not, run `fleet doctor` and relay what it says about the tunnel: a cloud daemon is reached through a port-forward, and a dead session is the usual cause. Reopening it is `fleet connect` (foreground) or `fleet connect --detach` — offer that to the human rather than running it unasked, and never try to stand up infrastructure.
 
 ## Dispatch
 
