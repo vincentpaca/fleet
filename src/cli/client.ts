@@ -20,6 +20,13 @@ export type RequestOptions = {
   timeoutMs?: number;
   /** Working directory for fleet-config.json lookup; defaults to process.cwd(). */
   cwd?: string;
+  /**
+   * Abort the call, closing the socket. A follow read is held open by the daemon
+   * for its whole long-poll window, so a caller that stops caring — a cockpit
+   * whose selection moved, or one that is closing — has to be able to hang up:
+   * otherwise the socket outlives the reason for it.
+   */
+  signal?: AbortSignal;
 };
 
 export type Target =
@@ -124,6 +131,25 @@ export function describeTarget(
   return target.kind === 'tcp' ? `http://${target.host}:${target.port}${target.basePath}` : target.socketPath;
 }
 
+/**
+ * Does the daemon answer at the address this checkout resolves — socket, port,
+ * base path and all? `probeDaemonHealth` in ./connect.ts asks a narrower
+ * question (is a forward on this local port serving), and both are needed: one
+ * is about a tunnel, this one is about the daemon every command talks to.
+ */
+export async function daemonHealthy(
+  env: Record<string, string | undefined> = process.env,
+  cwd?: string,
+  timeoutMs = 3_000,
+): Promise<boolean> {
+  try {
+    const res = await request('GET', '/health', undefined, { env, cwd, timeoutMs });
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
 export function request(
   method: string,
   reqPath: string,
@@ -138,6 +164,7 @@ export function request(
     headers: payload === undefined
       ? { accept: 'application/json' }
       : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+    signal: opts.signal,
   };
   if (target.kind === 'tcp') {
     requestOptions.host = target.host;

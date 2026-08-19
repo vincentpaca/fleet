@@ -1,5 +1,5 @@
 // Shared helpers for CLI tests (not a test file itself: no .test suffix).
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -107,4 +107,77 @@ export function sendJson(res: http.ServerResponse, status: number, payload: unkn
 export function sendNdjson(res: http.ServerResponse, events: unknown[]): void {
   res.writeHead(200, { 'content-type': 'application/x-ndjson' });
   res.end(events.map((e) => `${JSON.stringify(e)}\n`).join(''));
+}
+
+// ---------- waiting on live processes ----------
+
+/** Poll a predicate to true, or fail with what it was waiting for. */
+export async function until(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+/** Resolve once the collected output contains `needle`, or reject when the process dies first. */
+export function waitForLine(
+  chunks: () => string,
+  child: ChildProcess,
+  needle: string,
+  label: string,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const timer = setInterval(() => {
+    if (chunks().includes(needle)) {
+      clearInterval(timer);
+      resolve();
+    }
+  }, 25);
+  const deadline = setTimeout(() => {
+    clearInterval(timer);
+    reject(new Error(`timed out waiting for ${label}; output so far:\n${chunks()}`));
+  }, timeoutMs);
+  void promise.finally(() => {
+    clearInterval(timer);
+    clearTimeout(deadline);
+  });
+  child.on('close', () => {
+    clearInterval(timer);
+    if (!chunks().includes(needle)) reject(new Error(`the process exited before ${label}:\n${chunks()}`));
+  });
+  return promise;
+}
+
+// ---------- tunnel fixtures (shared by connect and cockpit tests) ----------
+
+/** A port nothing is listening on: bind one, then let it go. */
+export async function closedPort(): Promise<number> {
+  const daemon = await startMockDaemon({});
+  const port = Number(new URL(daemon.url).port);
+  await daemon.close();
+  return port;
+}
+
+/** A project dir with .fleet/infra/<provider>/fleet-config.json. */
+export function projectWithConfig(config: unknown, provider = 'aws'): string {
+  const cwd = makeTempDir('fleet-deployment-');
+  const dir = path.join(cwd, '.fleet', 'infra', provider);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'fleet-config.json'), JSON.stringify(config, null, 2));
+  return cwd;
+}
+
+/** A directory holding an `aws` that routes to fixtures/fake-aws.mjs. */
+export function fakeAwsBin(stateDir: string): string {
+  const bin = makeTempDir('fleet-fake-aws-');
+  const fixture = fileURLToPath(new URL('../fixtures/fake-aws.mjs', import.meta.url));
+  // exec, so SIGTERM from the supervisor reaches node rather than the shell.
+  fs.writeFileSync(path.join(bin, 'aws'), `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`, {
+    mode: 0o755,
+  });
+  fs.mkdirSync(stateDir, { recursive: true });
+  return bin;
 }
