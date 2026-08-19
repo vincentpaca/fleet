@@ -113,6 +113,7 @@
       "additionalProperties": false,
       "properties": {
         "wall_clock": { "type": "string", "pattern": "^[0-9]+(s|m|h)$", "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained. Supports s/m/h units." },
+        "idle": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "default": "20m", "description": "Liveness check, not a cost bound: no harness output for this long (blocked time excluded) → SIGTERM + grace, partial work pushed, settle with the idle duration, state cancelled reason stall. Supports s/m/h units; zero is not a value — stall detection cannot be switched off, only widened. Must exceed the pickup gate's runtime: the daemon's mirror of this limit measures silence on the event stream, which the gate does not feed." },
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "30m", "description": "How long a blocked container stays hot before parking (WIP committed, task exits)." },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "default": "24h", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered." },
         "model_spend": { "type": "string", "description": "OPEN — unenforced until the Phase 2 metering spike; the Terraform budget alarm is the interim backstop." },

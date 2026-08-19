@@ -19,8 +19,16 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { validateDecisionFile } from '../validate.mjs';
 import type { EventSink } from './events.ts';
 import type { WallClockTimer } from './wall-clock.ts';
+import type { IdleTimer } from './idle.ts';
 
 export type Answer = { option?: string; text?: string };
+
+/**
+ * A meter that must not run while the job waits on an operator: the wall-clock
+ * budget (blocked time is not billed) and the idle timer (a harness polling for
+ * an answer is silent on purpose, not stalled).
+ */
+type PausableMeter = { block(now?: number): void; resume(now?: number): void };
 
 export class DecisionWatcher {
   /** Number of decisions raised so far (valid ones only). */
@@ -33,8 +41,8 @@ export class DecisionWatcher {
   private loop: Promise<void> = Promise.resolve();
   /** Raw content seen failing JSON.parse last tick — tolerates one mid-write read. */
   private pendingRaw: string | null = null;
-  /** Optional wall-clock timer: paused while awaiting answers. */
-  private readonly wallClock?: WallClockTimer;
+  /** Meters paused while awaiting an answer (wall-clock budget, idle timer). */
+  private readonly meters: PausableMeter[];
   /** Optional block_hot limit in ms: fires when the hot window expires. */
   private readonly blockHotMs: number | undefined;
   /** Resolves with the decision id when block_hot fires (never resolves if unset). */
@@ -46,13 +54,16 @@ export class DecisionWatcher {
     sink: EventSink;
     intervalMs?: number;
     wallClock?: WallClockTimer;
+    idle?: IdleTimer;
     blockHotMs?: number;
   }) {
     this.sink = opts.sink;
     this.outDir = join(opts.workspace, '.fleet', 'out');
     this.decisionPath = join(this.outDir, 'decision.json');
     this.intervalMs = opts.intervalMs ?? 500;
-    this.wallClock = opts.wallClock;
+    this.meters = [opts.wallClock, opts.idle].filter(
+      (meter): meter is PausableMeter => meter !== undefined,
+    );
     this.blockHotMs = opts.blockHotMs;
     let resolve!: (id: string) => void;
     this.parked = new Promise<string>((r) => { resolve = r; });
@@ -142,8 +153,9 @@ export class DecisionWatcher {
   /** Long-poll the daemon until the operator answers this decision.
    *  Returns null when stopped or when the block_hot timer fires (parking). */
   private async awaitAnswer(id: string): Promise<Answer | null> {
-    // Pause the wall-clock meter: blocked time doesn't count against the budget.
-    this.wallClock?.block();
+    // Pause the meters: blocked time counts against neither the wall-clock
+    // budget nor the stall threshold.
+    for (const meter of this.meters) meter.block();
     const url =
       `${this.sink.daemonUrl}/internal/jobs/${encodeURIComponent(this.sink.jobId)}` +
       `/answer?decision=${encodeURIComponent(id)}`;
@@ -177,9 +189,9 @@ export class DecisionWatcher {
       return null;
     } finally {
       if (parkTimer !== null) clearTimeout(parkTimer);
-      // Resume the meter whether an answer was received, the watcher was stopped,
-      // or the block_hot timer fired.
-      this.wallClock?.resume();
+      // Resume the meters whether an answer was received, the watcher was
+      // stopped, or the block_hot timer fired.
+      for (const meter of this.meters) meter.resume();
     }
   }
 }

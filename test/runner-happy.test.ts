@@ -82,6 +82,8 @@ test('full happy path: running → gate ok → harness replay → settle → don
     const types = daemon.events.map((event) => event.type);
     assert.deepEqual(types, [
       'state', // running
+      'log', // pickup gate announced (#39: the gate emits nothing itself)
+      'log', // gate passed, harness command
       'log', // system init line
       'think', // planning text
       'log', // tool_use Read
@@ -138,9 +140,9 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.deepEqual(daemon.rejected, []);
 
     const types = daemon.events.map((event) => event.type);
-    assert.deepEqual(types, ['state', 'think', 'settle', 'state']);
+    assert.deepEqual(types, ['state', 'log', 'log', 'think', 'settle', 'state']);
 
-    const settle = daemon.events[2];
+    const settle = daemon.events[4];
     assert.equal(settle.rung, undefined, 'no rung claimed on failure');
     assert.deepEqual(settle.outcome, { produced: [], findings: 0, decisions: 0 });
     const report = settle.report;
@@ -149,7 +151,7 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.ok('next_action' in report);
     assert.match(String(report.next_action), /harness exit 2/);
 
-    const cancelled = daemon.events[3];
+    const cancelled = daemon.events[5];
     assert.equal(cancelled.state, 'cancelled');
     assert.equal(cancelled.reason, 'harness-exit');
   } finally {

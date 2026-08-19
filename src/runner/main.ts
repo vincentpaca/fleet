@@ -20,12 +20,13 @@ import { EventSink } from './events.ts';
 import { translateLine } from './translate.ts';
 import { DecisionWatcher } from './decisions.ts';
 import { WallClockTimer } from './wall-clock.ts';
+import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
-import { parseDurationMs } from '../shared/time.ts';
+import { parseDurationMs, idleLimitMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 
 function requireEnv(name: string): string {
@@ -128,6 +129,10 @@ async function main(): Promise<void> {
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
   const gates = (manifest.gates ?? {}) as Record<string, unknown>;
   const pickup = typeof gates.pickup === 'string' ? gates.pickup : '';
+  // Bracket the gate with events. It is a blocking spawnSync that emits
+  // nothing, and the daemon's stall backstop (#39) reads silence on the event
+  // stream: an unannounced gate looks exactly like a wedged runner.
+  await sink.emit({ type: 'log', text: `pickup gate: ${pickup || '(none)'}`, who: 'runner' });
   const gate = spawnSync(pickup, {
     shell: true,
     cwd: workspace,
@@ -179,6 +184,10 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'log', text: note, who: 'runner' });
   }
   const cmd = plan.cmd;
+  // Last event before the harness owns the stream: it dates the silence the
+  // stall detectors measure, and it is the line an operator reads to see which
+  // command the job actually launched.
+  await sink.emit({ type: 'log', text: `pickup gate passed; starting harness: ${cmd}`, who: 'runner' });
 
   const startedAt = Date.now();
 
@@ -192,7 +201,14 @@ async function main(): Promise<void> {
   const blockHotStr = typeof limits.block_hot === 'string' ? limits.block_hot : undefined;
   const blockHotMs = blockHotStr !== undefined ? parseDurationMs(blockHotStr) : undefined;
 
-  const watcher = new DecisionWatcher({ workspace, sink, wallClock, blockHotMs });
+  // Stall detection (#39): unlike wall_clock this is always armed — a running
+  // job that emits nothing is never in an intended state. The threshold defaults
+  // when limits.idle is absent, so the label falls back to the same number.
+  const idleMs = idleLimitMs(limits);
+  const idleLabel = typeof limits.idle === 'string' ? limits.idle : `${toMinutes(idleMs)}m`;
+  const idle = new IdleTimer(idleMs, startedAt);
+
+  const watcher = new DecisionWatcher({ workspace, sink, wallClock, idle, blockHotMs });
   watcher.start();
 
   // The harness child gets NO runner-scoped FLEET_* env: nested fleet
@@ -213,7 +229,21 @@ async function main(): Promise<void> {
     cwd: workspace,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
+    // Own process group, so a timeout can take the whole harness tree down —
+    // see killTree: signalling the shell alone is not enough.
+    detached: true,
   });
+
+  // The harness is in its own process group now, so a signal aimed at the
+  // runner (provider terminate, an operator's Ctrl-C on a process-provider
+  // daemon) no longer reaches it by inheritance. Forward it, or cancelling a
+  // job leaves a live harness burning tokens with nowhere to report.
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.once(signal, () => {
+      killTree(child, 'SIGTERM');
+      process.exit(1);
+    });
+  }
 
   const stderrTail: string[] = [];
   child.stderr.setEncoding('utf8');
@@ -225,6 +255,9 @@ async function main(): Promise<void> {
   const emits: Promise<unknown>[] = [];
   const lines = createInterface({ input: child.stdout });
   lines.on('line', (line) => {
+    // Any output line is proof of life, translatable or not: the stall clock
+    // measures silence on the harness's own stream, not event throughput.
+    idle.touch();
     if (capture) appendFileSync(capture, line + '\n');
     const translated = translateLine(line);
     const bodies = translated.filter((item) => item.type !== 'result');
@@ -235,17 +268,70 @@ async function main(): Promise<void> {
   });
 
   const exit = Promise.withResolvers<number>();
-  child.on('close', (code) => exit.resolve(code ?? 1));
+  /** True once 'close' has fired: the tree is gone AND the pipes are released. */
+  let harnessClosed = false;
+  child.on('close', (code) => {
+    harnessClosed = true;
+    exit.resolve(code ?? 1);
+  });
   const linesDone = Promise.withResolvers<void>();
   lines.once('close', () => linesDone.resolve());
 
-  // --- Harness exit race: wall-clock, block_hot (park), or normal exit ---
-  // All three are armed regardless; whichever fires first wins.
+  // --- Harness exit race: wall-clock, stall, block_hot (park), or normal exit ---
+  // All four are armed regardless; whichever fires first wins.
   const graceMs =
     parseInt(process.env.FLEET_WALL_CLOCK_GRACE_MS ?? '', 10) || 30_000;
 
-  let wallClockFired = false;
+  /** Set when a timer, not the harness, ended the run: drives reason + report. */
+  let timeout: { reason: 'wall-clock' | 'stall'; nextAction: string } | undefined;
   let exitCode: number;
+
+  /**
+   * End the harness: SIGTERM the tree, grace, then SIGKILL it. Always returns.
+   *
+   * Two traps live here, both of which cost a job. `child.killed` only records
+   * that a signal was *sent*, so guarding the escalation on it (as this code
+   * once did) means SIGKILL never arrives. And `shell: true` makes the child a
+   * shell that may fork rather than exec, so signalling its pid alone leaves the
+   * real harness alive holding the stdout pipe — 'close' never fires and the
+   * runner waits forever instead of settling. A stalled harness is precisely the
+   * process that will not exit on its own (#39), so the kill, not the harness,
+   * has to be what ends the run.
+   */
+  const endHarness = async (): Promise<void> => {
+    killTree(child, 'SIGTERM');
+    await Promise.race([exit.promise, delay(graceMs)]);
+    // Escalate unless 'close' already fired. Not `child.exitCode` — the shell can
+    // be dead while the harness it forked lives on holding the pipe, which is
+    // the case this escalation exists for. 'close' is the honest signal that
+    // nothing is left to kill, and skipping the signal then also avoids aiming
+    // -pid at a group id the kernel may since have recycled.
+    if (!harnessClosed) {
+      killTree(child, 'SIGKILL');
+      await Promise.race([exit.promise, delay(graceMs)]);
+    }
+  };
+
+  /**
+   * Wait for the stdout reader to finish, but never unboundedly: 'close' needs
+   * EOF on the pipe, and a survivor that escaped the group kill (a harness that
+   * setsid()s itself) holds the write end open. Settling late beats not
+   * settling, so past the grace window the runner takes the stream down itself.
+   */
+  const drainOutput = async (): Promise<void> => {
+    const drained = await Promise.race([
+      linesDone.promise.then(() => true),
+      delay(graceMs).then(() => false),
+    ]);
+    if (drained) return;
+    lines.close();
+    child.stdout.destroy();
+    await sink.emit({
+      type: 'log',
+      text: 'harness stdout still open after the kill; settling without it',
+      who: 'runner',
+    });
+  };
 
   // Park signal: resolves with the decision id when block_hot fires.
   // Silently never resolves if blockHotMs is not set.
@@ -262,20 +348,26 @@ async function main(): Promise<void> {
       })()
     : new Promise<void>(() => {}); // never
 
+  // Stall: resolves when the harness has been silent (and unblocked) for the
+  // idle threshold. Always armed — see idleLimitMs's default.
+  const idleExpired: Promise<void> = (async () => {
+    while (!idle.expired()) {
+      await delay(Math.min(250, Math.max(1, idle.remainingMs())));
+    }
+  })();
+
   const result = await Promise.race([
     exit.promise.then((code) => ({ kind: 'exit' as const, code })),
     wallClockExpired.then(() => ({ kind: 'wall-clock' as const })),
+    idleExpired.then(() => ({ kind: 'stall' as const })),
     parkPromise,
   ]);
 
   if (result.kind === 'parked') {
     // block_hot expired: commit WIP, emit blocked/parked, exit 0.
     // The harness is still running (waiting for its answer); terminate it now.
-    child.kill('SIGTERM');
-    await Promise.race([exit.promise, delay(graceMs)]);
-    if (!child.killed) child.kill('SIGKILL');
-    await exit.promise;
-    await linesDone.promise;
+    await endHarness();
+    await drainOutput();
     await Promise.all(emits);
     await watcher.stop(); // already stopped internally; awaits the loop wind-down
 
@@ -302,27 +394,37 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (result.kind === 'wall-clock') {
-    wallClockFired = true;
+  if (result.kind === 'wall-clock' || result.kind === 'stall') {
+    // The idle duration is the diagnosis, so it rides both the live log line
+    // and the settle report — the transcript must say why the job died.
+    const silentFor = `no harness output for ${toMinutes(idle.idleMs())}m (idle limit ${idleLabel})`;
+    timeout = result.kind === 'wall-clock'
+      ? {
+          reason: 'wall-clock',
+          nextAction: `job cancelled: wall-clock limit (${wallClockStr ?? 'unknown'}) reached`,
+        }
+      : {
+          reason: 'stall',
+          nextAction: `job cancelled: ${silentFor} — inspect the last events for where it went silent`,
+        };
     await sink.emit({
       type: 'log',
-      text: `wall-clock limit (${wallClockStr}) reached; sending SIGTERM`,
+      text: result.kind === 'wall-clock'
+        ? `wall-clock limit (${wallClockStr}) reached; sending SIGTERM`
+        : `stalled: ${silentFor}; sending SIGTERM`,
       who: 'runner',
     });
-    child.kill('SIGTERM');
-    // Grace period: let the harness shut down cleanly before SIGKILL.
-    await Promise.race([exit.promise, delay(graceMs)]);
-    if (!child.killed) child.kill('SIGKILL');
-    await exit.promise;
-    // Wall-clock cancellation always fails the job regardless of how the
-    // harness exited (it may exit 0 if it handles SIGTERM gracefully).
+    // Grace period inside endHarness: clean shutdown first, SIGKILL after.
+    await endHarness();
+    // Timer cancellation always fails the job regardless of how the harness
+    // exited (it may exit 0 if it handles SIGTERM gracefully).
     exitCode = 1;
   } else {
     // result.kind === 'exit'
     exitCode = result.code;
   }
 
-  await linesDone.promise;
+  await drainOutput();
   await Promise.all(emits);
   await watcher.stop();
 
@@ -433,11 +535,8 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'log', text: note, who: 'runner' });
   }
   if (!ok && body.report === undefined) {
-    if (wallClockFired) {
-      body.report = {
-        status: 'PARTIAL',
-        next_action: `job cancelled: wall-clock limit (${wallClockStr ?? 'unknown'}) reached`,
-      };
+    if (timeout !== undefined) {
+      body.report = { status: 'PARTIAL', next_action: timeout.nextAction };
     } else {
       const hint = stderrTail.join('').trim().split('\n').at(-1) ?? '';
       body.report = {
@@ -445,6 +544,13 @@ async function main(): Promise<void> {
         next_action: `inspect harness exit ${exitCode}${hint ? `: ${hint.slice(0, 200)}` : ''}`,
       };
     }
+  } else if (timeout !== undefined && body.report !== undefined) {
+    // A harness that was killed mid-run may still have left a report behind; it
+    // cannot know it was cancelled. Record why in not_done rather than letting
+    // its own account be the settle's last word.
+    const report = body.report as Record<string, unknown>;
+    const notDone = Array.isArray(report.not_done) ? report.not_done as unknown[] : [];
+    body.report = { ...report, not_done: [...notDone, timeout.nextAction] };
   }
   await sink.emit(body);
 
@@ -452,9 +558,28 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'done' });
     process.exit(0);
   } else {
-    const reason = wallClockFired ? 'wall-clock' : 'harness-exit';
+    const reason = timeout?.reason ?? 'harness-exit';
     await sink.emit({ type: 'state', state: 'cancelled', reason });
     process.exit(1);
+  }
+}
+
+/**
+ * Signal the harness's whole process group. The child is a shell (`shell: true`)
+ * spawned `detached`, so its pid is a group leader: the negated pid reaches the
+ * shell and every descendant it forked. Falls back to the child alone if the
+ * group is already gone.
+ */
+function killTree(child: { pid?: number; kill(signal: NodeJS.Signals): boolean }, signal: NodeJS.Signals): void {
+  try {
+    if (child.pid === undefined) return;
+    process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // Already reaped; nothing left to signal.
+    }
   }
 }
 

@@ -12,7 +12,7 @@ import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
 import { socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
-import { parseDurationMs } from "../shared/time.ts";
+import { parseDurationMs, idleLimitMs, toMinutes } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
@@ -66,10 +66,16 @@ export type DaemonOptions = {
    */
   wallClockBackstopMarginMs?: number;
   /**
-   * How often (ms) the daemon scans for wall-clock-overdue jobs. Default: 10_000.
-   * Set smaller in tests.
+   * How often (ms) the daemon scans for overdue jobs (wall-clock, stall,
+   * decision-timeout). Default: 10_000. Set smaller in tests.
    */
   wallClockSweepIntervalMs?: number;
+  /**
+   * Extra ms the daemon adds to the idle threshold before triggering the stall
+   * backstop (issue #39). Default: 90_000 (90s) — the runner is the primary
+   * enforcer, and this margin must leave it room to SIGTERM, push, and settle.
+   */
+  idleBackstopMarginMs?: number;
 };
 
 type IntakeError = { status: number; errors: unknown[] };
@@ -125,6 +131,13 @@ export class FleetDaemon {
   #tcpServer: Server | null = null;
   #port: number | null = null;
   #sweepTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Jobs with a backstop cancellation in flight. Two sweeps run per tick and
+   * `provider.terminate` is awaited, so without this the same job can be
+   * cancelled twice — two settles and a cancelled → cancelled pair in the log,
+   * which appendEvent has no state machine to refuse.
+   */
+  readonly #backstopping = new Set<string>();
 
   constructor(options: DaemonOptions) {
     this.#options = options;
@@ -169,10 +182,11 @@ export class FleetDaemon {
       this.#port = typeof address === "object" && address !== null ? address.port : null;
     }
 
-    // Combined sweep: wall-clock backstop and decision-timeout (stale) marking.
+    // Combined sweep: wall-clock and stall backstops, decision-timeout (stale) marking.
     const sweepMs = this.#options.wallClockSweepIntervalMs ?? 10_000;
     this.#sweepTimer = setInterval(() => {
       this.#wallClockSweep();
+      this.#idleSweep();
       this.#decisionTimeoutSweep();
     }, sweepMs);
     this.#sweepTimer.unref(); // don't prevent process exit
@@ -344,8 +358,11 @@ export class FleetDaemon {
       },
     });
 
-    // Initialise wall-clock and decision-timeout backstop tracking.
+    // Initialise wall-clock, stall, and decision-timeout backstop tracking.
     const manifestLimits = (manifest as Record<string, unknown>).limits;
+    // Stall detection is always armed — idleLimitMs supplies the default when
+    // the manifest declares no limits block at all.
+    this.registry.initIdle(id, idleLimitMs(manifestLimits));
     if (manifestLimits && typeof manifestLimits === "object") {
       const limits = manifestLimits as Record<string, unknown>;
       const wallClockStr = limits.wall_clock;
@@ -384,7 +401,7 @@ export class FleetDaemon {
       return sendJson(res, 201, { job: publicJob(updated) });
     } catch (error) {
       this.registry.appendEvent(id, { type: "state", state: "cancelled", reason: "launch-failed" });
-      const updated = this.registry.updateJob(id, { state: "cancelled" });
+      const updated = this.registry.updateJob(id, { state: "cancelled", reason: "launch-failed" });
       return sendJson(res, 500, { error: `launch failed: ${String(error)}`, job: publicJob(updated) });
     }
   }
@@ -507,7 +524,7 @@ export class FleetDaemon {
           who: "daemon",
         });
         this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-failed" });
-        this.registry.updateJob(job.id, { state: "cancelled" });
+        this.registry.updateJob(job.id, { state: "cancelled", reason: "launch-failed" });
         return sendJson(res, 500, { error: `re-launch failed: ${String(error)}` });
       }
     }
@@ -540,7 +557,7 @@ export class FleetDaemon {
     this.registry.setOpenDecision(job.id, null);
     this.registry.setDecisionBlockedAt(job.id, null);
     this.registry.clearMarker(job.id);
-    const updated = this.registry.updateJob(job.id, { state: "cancelled" });
+    const updated = this.registry.updateJob(job.id, { state: "cancelled", reason: "operator-cancel" });
     return sendJson(res, 200, { job: publicJob(updated) });
   }
 
@@ -633,11 +650,14 @@ export class FleetDaemon {
       // Schema-validated at intake.
       const nextState = event.state as JobState;
       const marker = event.marker as Marker | undefined;
+      // Cancellation reason (wall-clock, stall, pickup-gate, ...) is part of the
+      // record so status/board can distinguish kinds of cancellation.
+      const reason = typeof event.reason === "string" ? { reason: event.reason } : {};
       if (marker !== undefined) {
-        this.registry.updateJob(job.id, { state: nextState, marker });
+        this.registry.updateJob(job.id, { state: nextState, marker, ...reason });
       } else {
         this.registry.clearMarker(job.id);
-        this.registry.updateJob(job.id, { state: nextState });
+        this.registry.updateJob(job.id, { state: nextState, ...reason });
       }
       // Wall-clock tracking: running = active, blocked/terminal = inactive.
       if (nextState === "running") {
@@ -701,24 +721,77 @@ export class FleetDaemon {
       if (activeMs === null) continue;
       if (activeMs >= limitMs + margin) {
         // Fire asynchronously; errors are logged to the job's event stream.
-        this.#wallClockBackstop(job).catch(() => {});
+        this.#timeoutBackstop(job, {
+          reason: "wall-clock",
+          nextAction: "job cancelled: wall-clock limit reached (daemon backstop)",
+        }).catch(() => {});
       }
     }
   }
 
-  /** Daemon-side wall-clock backstop: terminate container, synthesise events. */
-  async #wallClockBackstop(job: JobRecord): Promise<void> {
+  /**
+   * Periodic sweep: terminate and cancel any running job that has posted no
+   * event for longer than its idle threshold plus the backstop margin (#39).
+   *
+   * The runner is the primary enforcer; this covers the case it cannot report
+   * on itself (dead or wedged runner). Blocked jobs are exempt — waiting on a
+   * human is not a stall, and the park/stale lifecycle already owns that wait.
+   *
+   * It is a backstop, not a mirror: the runner measures silence on the harness's
+   * stdout, the daemon measures silence on the event stream, and the two differ
+   * (the pickup gate feeds neither; some stream lines translate to no event).
+   * Hence the margin, and hence `limits.idle` must exceed the gate's runtime —
+   * this path terminates the container, so unlike the runner's own stall path it
+   * cannot push the partial work first.
+   */
+  #idleSweep(): void {
+    const now = Date.now();
+    const margin = this.#options.idleBackstopMarginMs ?? 90_000;
+    for (const job of this.registry.listJobs()) {
+      if (job.state !== "running") continue;
+      const limitMs = this.registry.idleLimitMs(job.id);
+      if (limitMs === null) continue;
+      const lastEventAt = this.registry.lastEventAtMs(job.id);
+      if (lastEventAt === null) continue;
+      const idleMs = now - lastEventAt;
+      if (idleMs >= limitMs + margin) {
+        this.#timeoutBackstop(job, {
+          reason: "stall",
+          nextAction:
+            `job cancelled: no events for ${toMinutes(idleMs)}m ` +
+            `(idle limit ${toMinutes(limitMs)}m, daemon backstop)`,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Daemon-side timeout backstop: terminate the container, synthesise the
+   * settle and the cancelled state event. Shared by the wall-clock (cost) and
+   * stall (liveness) sweeps — only the reason and the note differ.
+   */
+  async #timeoutBackstop(job: JobRecord, cause: { reason: string; nextAction: string }): Promise<void> {
     // Re-fetch to guard against a race where the runner already settled.
     const current = this.registry.getJob(job.id);
     if (!current || isTerminal(current.state)) return;
+    if (this.#backstopping.has(job.id)) return;
+    this.#backstopping.add(job.id);
+    try {
+      await this.#cancelFromBackstop(current, cause);
+    } finally {
+      this.#backstopping.delete(job.id);
+    }
+  }
 
-    if (current.handle) {
+  /** The backstop's actual work; guarded by #timeoutBackstop against re-entry. */
+  async #cancelFromBackstop(job: JobRecord, cause: { reason: string; nextAction: string }): Promise<void> {
+    if (job.handle) {
       try {
-        await this.#options.provider.terminate(current.handle);
+        await this.#options.provider.terminate(job.handle);
       } catch (error) {
         this.registry.appendEvent(job.id, {
           type: "log",
-          text: `wall-clock backstop: terminate failed: ${String(error)}`,
+          text: `${cause.reason} backstop: terminate failed: ${String(error)}`,
           who: "daemon",
         });
       }
@@ -735,7 +808,7 @@ export class FleetDaemon {
         outcome: { produced: [], findings: 0, decisions: 0 },
         report: {
           status: "PARTIAL",
-          next_action: "job cancelled: wall-clock limit reached (daemon backstop)",
+          next_action: cause.nextAction,
         },
       };
       this.registry.appendEvent(job.id, settlePayload);
@@ -747,12 +820,12 @@ export class FleetDaemon {
       });
     }
 
-    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "wall-clock" });
+    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: cause.reason });
     this.registry.setOpenDecision(job.id, null);
     this.registry.setDecisionBlockedAt(job.id, null);
     this.registry.clearMarker(job.id);
     this.registry.wallClockBecameInactive(job.id);
-    const updated = this.registry.updateJob(job.id, { state: "cancelled" });
+    const updated = this.registry.updateJob(job.id, { state: "cancelled", reason: cause.reason });
 
     // Verify target rung (will show not-reached for a cancelled job).
     const target = targetRung(updated.workOrder);

@@ -18,7 +18,7 @@ import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, type DaemonResponse } from './client.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
-import { formatEvent, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
+import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -574,12 +574,13 @@ type Job = {
   id: string;
   state: string;
   marker?: string;
+  reason?: string;
   workOrder?: { mode?: string; target?: string; title?: string };
   updatedAt?: string;
 };
 
 function formatJob(job: Job): string {
-  const state = typeof job.marker === 'string' ? `${job.state}(${job.marker})` : job.state;
+  const state = formatJobState(job);
   const mode = job.workOrder?.mode ?? '?';
   const rawTarget = job.workOrder?.target ?? '?';
   const title = job.workOrder?.title;

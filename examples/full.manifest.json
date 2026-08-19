@@ -32,6 +32,7 @@
   },
   "limits": {
     "wall_clock": "4h",
+    "idle": "20m",
     "block_hot": "30m",
     "decision_timeout": "24h",
     "egress": ["github.com", "api.anthropic.com", "your-tracker.example.com"]
