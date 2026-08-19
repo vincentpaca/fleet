@@ -16,10 +16,10 @@ import {
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
-import { runConnect, resolveDeployment, tunnelReport, chooseLocalPort } from './connect.ts';
-import { tunnelOpenerFor } from './tunnel-openers.ts';
+import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
-import { cmdBoard, renderBanner, detectColorLevel } from './board.ts';
+import { parseAnswerLine, renderBanner, detectColorLevel } from './board.ts';
+import { runCockpit } from './cockpit.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
 import {
   twoLayerEnabled,
@@ -38,7 +38,11 @@ const EXIT_USAGE = 2;
 
 const HELP = `fleet — run coding-agent jobs in containers in your own cloud
 
-Usage: fleet <command> [options]
+Usage: fleet [command] [options]
+
+With no command on a terminal, fleet opens the cockpit: the live board, the
+selected job's tail, and a command line to dispatch and answer from. It adopts a
+healthy daemon tunnel or opens its own, and closing it leaves running jobs alone.
 
 Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/)
@@ -67,7 +71,6 @@ Commands:
                                            (--answer: respond to decisions from stdin)
   answer <jobId> [--option id] [--text s]  Answer a blocked job's decision
   cancel <jobId>                           Cancel a job
-  board [--once]                           Full-screen live view (--once or non-TTY: static render)
   artifacts <jobId> [list]                 List artifacts delivered by a job
   artifacts <jobId> get <path> [--out dir] Download an artifact (writes to dir/<filename>, or stdout)
   connect [--port N] [--detach]            Open and hold the tunnel to a cloud daemon: resolve the
@@ -327,31 +330,40 @@ function loadPresets(): Record<string, ModePreset> {
   return presets.modes;
 }
 
-async function cmdDelegate(args: string[]): Promise<number> {
-  const { values, positionals } = parseCommand(
-    args,
-    { mode: { type: 'string' }, finish: { type: 'string' }, manifest: { type: 'string' }, watch: { type: 'boolean' } },
-    1,
-    1,
-  );
-  const target = positionals[0];
-  const manifestPath = typeof values.manifest === 'string' ? values.manifest : path.join('.fleet', 'manifest.json');
+/** A dispatch as asked for, with somewhere to put its progress. */
+type DelegateRequest = {
+  target: string;
+  mode?: string;
+  finish?: string;
+  manifestPath?: string;
+  log: (line: string) => void;
+  warn: (line: string) => void;
+};
+
+/**
+ * One dispatch, however it was asked for. `fleet delegate` parses flags and
+ * prints; the cockpit's command line calls this same function (#61) — a second
+ * path would mean two sets of rules about manifests, env, images and the ledger.
+ * Progress goes to `log`/`warn` rather than the console, because one of the two
+ * callers owns the whole screen. Refusals throw, so both surfaces report the
+ * same words for the same problem.
+ */
+async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; state: string }> {
+  const target = req.target;
+  const manifestPath = req.manifestPath ?? path.join('.fleet', 'manifest.json');
 
   const rawManifest = readJsonFile(manifestPath, 'manifest');
   const manifestCheck = validateManifest(rawManifest);
-  if (!manifestCheck.ok) {
-    for (const line of formatFindings(manifestPath, manifestCheck.errors)) console.error(line);
-    return EXIT_FAILURE;
-  }
+  if (!manifestCheck.ok) fail(formatFindings(manifestPath, manifestCheck.errors).join('\n'));
   // Safe: validated against manifest.schema.json just above.
   const manifest = rawManifest as Manifest;
 
   const modes = loadPresets();
-  const modeName = typeof values.mode === 'string' ? values.mode : 'implement';
+  const modeName = req.mode ?? 'implement';
   const preset = modes[modeName];
   if (!preset) fail(`unknown mode "${modeName}" — available: ${Object.keys(modes).join(', ')}`);
 
-  const flagFinish = typeof values.finish === 'string' ? values.finish : undefined;
+  const flagFinish = req.finish;
 
   // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
   let issueTitle: string | undefined;
@@ -376,10 +388,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   };
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   const orderCheck = validateWorkOrder(workOrder);
-  if (!orderCheck.ok) {
-    for (const line of formatFindings('work order', orderCheck.errors)) console.error(line);
-    return EXIT_FAILURE;
-  }
+  if (!orderCheck.ok) fail(formatFindings('work order', orderCheck.errors).join('\n'));
 
   const sync: Record<string, string> = {};
   for (const rel of manifest.workspace?.sync ?? []) {
@@ -427,11 +436,11 @@ async function cmdDelegate(args: string[]): Promise<number> {
     const tag = jobImageTag(hash);
     const base = runnerBaseTag(rawManifest as ImageManifest);
     if (!imageExistsLocally(tag)) {
-      console.log(`fleet: building job image ${tag} from ${base} ...`);
+      req.log(`fleet: building job image ${tag} from ${base} ...`);
       buildJobImage({ tag, baseTag: base, manifest: rawManifest as ImageManifest });
-      console.log(`fleet: job image ready: ${tag}`);
+      req.log(`fleet: job image ready: ${tag}`);
     } else {
-      console.log(`fleet: job image exists (${tag}), skipping build`);
+      req.log(`fleet: job image exists (${tag}), skipping build`);
     }
     imageOverride = tag;
   }
@@ -440,10 +449,9 @@ async function cmdDelegate(args: string[]): Promise<number> {
   if (imageOverride !== undefined) body.image = imageOverride;
 
   const res = await daemonCall('POST', '/jobs', body);
-  if (res.status !== 201) return daemonFailure(res, 'delegate');
+  if (res.status !== 201) fail(daemonFailureMessage(res, 'delegate'));
   // Daemon API contract: POST /jobs → 201 {job}.
   const created = res.json as { job: { id: string; state: string } };
-  console.log(`${created.job.id} ${created.job.state}`);
 
   // Append a pointer entry to the local dispatch ledger (gitignored).
   // Pointer only: no status fields — remote is truth.
@@ -460,10 +468,29 @@ async function cmdDelegate(args: string[]): Promise<number> {
     fs.appendFileSync(ledgerPath, `${JSON.stringify(ledgerEntry)}\n`);
   } catch {
     // Non-fatal: the job was created; a ledger write failure only affects fleet resume.
-    console.error('fleet: warning: could not write to .fleet/dispatched.jsonl');
+    req.warn('fleet: warning: could not write to .fleet/dispatched.jsonl');
   }
 
-  if (values.watch === true) return followJob(created.job.id, true);
+  return { jobId: created.job.id, state: created.job.state };
+}
+
+async function cmdDelegate(args: string[]): Promise<number> {
+  const { values, positionals } = parseCommand(
+    args,
+    { mode: { type: 'string' }, finish: { type: 'string' }, manifest: { type: 'string' }, watch: { type: 'boolean' } },
+    1,
+    1,
+  );
+  const created = await dispatchDelegate({
+    target: positionals[0],
+    mode: typeof values.mode === 'string' ? values.mode : undefined,
+    finish: typeof values.finish === 'string' ? values.finish : undefined,
+    manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,
+    log: (line) => console.log(line),
+    warn: (line) => console.error(line),
+  });
+  console.log(`${created.jobId} ${created.state}`);
+  if (values.watch === true) return followJob(created.jobId, true);
   return EXIT_OK;
 }
 
@@ -570,17 +597,18 @@ async function daemonCall(
   }
 }
 
-function daemonFailure(res: DaemonResponse, what: string): number {
+/** What a rejected daemon call says, as lines. Shared so every surface says it identically. */
+function daemonFailureMessage(res: DaemonResponse, what: string): string {
   // Daemon API contract: schema failures return {errors: [...ajv error objects]};
   // non-schema failures (409 not-blocked, 422 bad option) return {error: string}.
   const body = res.json as { errors?: AjvError[]; error?: string } | undefined;
-  if (body && Array.isArray(body.errors)) {
-    for (const line of formatFindings(what, body.errors)) console.error(line);
-  } else if (body && typeof body.error === 'string') {
-    console.error(`${what} failed: ${body.error}`);
-  } else {
-    console.error(`${what} failed: daemon returned ${res.status}${res.body ? ` ${res.body.trim()}` : ''}`);
-  }
+  if (body && Array.isArray(body.errors)) return formatFindings(what, body.errors).join('\n');
+  if (body && typeof body.error === 'string') return `${what} failed: ${body.error}`;
+  return `${what} failed: daemon returned ${res.status}${res.body ? ` ${res.body.trim()}` : ''}`;
+}
+
+function daemonFailure(res: DaemonResponse, what: string): number {
+  console.error(daemonFailureMessage(res, what));
   return EXIT_FAILURE;
 }
 
@@ -668,12 +696,7 @@ async function readAnswerLine(prompt: string): Promise<{ option?: string; text?:
   const readline = await import('node:readline/promises'); // lazy: only in interactive watch mode
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   try {
-    const line = (await rl.question(prompt)).trim();
-    if (line === '') return undefined;
-    if (line.startsWith('text:')) return { text: line.slice('text:'.length).trim() };
-    const [option, ...restWords] = line.split(/\s+/);
-    const text = restWords.join(' ');
-    return text ? { option, text } : { option };
+    return parseAnswerLine(await rl.question(prompt));
   } finally {
     rl.close();
   }
@@ -836,6 +859,23 @@ async function cmdConnect(args: string[]): Promise<number> {
   }
 }
 
+// ---------- cockpit ----------
+
+/**
+ * Bare `fleet` on a terminal (#61). The cockpit is a view over the same event
+ * stream and answer API as every other command; the only thing wired in here is
+ * dispatch, so the CLI keeps owning the one path a work order travels.
+ */
+async function cmdCockpit(): Promise<number> {
+  return await runCockpit({
+    cwd: process.cwd(),
+    home: fleetHome(),
+    env: process.env as Record<string, string | undefined>,
+    delegate: (req) =>
+      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn }),
+  });
+}
+
 // ---------- doctor ----------
 
 /** Known script interpreters: the first non-interpreter, non-flag token in a pickup command is the script file. */
@@ -875,9 +915,8 @@ async function doctorTunnel(home: string): Promise<{ notes: string[]; findings: 
   // and a hung diagnostic is worse than a slow one. A failure here is a note,
   // never a finding: not knowing is not a defect.
   const resolveEndpoint = async (): Promise<string> => {
-    const deployment = await resolveDeployment(process.cwd());
-    const { open, remotePort } = tunnelOpenerFor(deployment);
-    return (await open(chooseLocalPort(undefined, deployment.daemonUrl, remotePort))).id;
+    const tunnel = await resolveTunnel(process.cwd());
+    return (await tunnel.open(tunnel.localPort)).id;
   };
   return await tunnelReport({
     host: target.host,
@@ -1257,17 +1296,37 @@ function parseCommand(
   return parsed;
 }
 
+function printHelp(): void {
+  console.log(renderBanner(80, !process.stdout.isTTY || 'NO_COLOR' in process.env, detectColorLevel(process.env)) + '\n');
+  console.log(HELP);
+}
+
+/**
+ * Is there a terminal to draw a full-screen view on? A cockpit piped into a file
+ * or a CI log is nobody's intent, so bare `fleet` prints help instead.
+ * FLEET_FORCE_TTY drives the loop without one, which is how it is tested end to
+ * end — an env var rather than a flag, so the command surface stays honest.
+ */
+function terminalAvailable(): boolean {
+  if (process.env.FLEET_FORCE_TTY === '1') return true;
+  return (process.stdout.isTTY ?? false) && (process.stdin.isTTY ?? false);
+}
+
 export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   try {
+    // Bare `fleet` is the cockpit (#61), where there is a terminal for it.
+    if (command === undefined) {
+      if (terminalAvailable()) return await cmdCockpit();
+      printHelp();
+      return EXIT_USAGE;
+    }
     switch (command) {
-      case undefined:
       case 'help':
       case '--help':
       case '-h':
-        console.log(renderBanner(80, !process.stdout.isTTY || 'NO_COLOR' in process.env, detectColorLevel(process.env)) + '\n');
-        console.log(HELP);
-        return command === undefined ? EXIT_USAGE : EXIT_OK;
+        printHelp();
+        return EXIT_OK;
       case 'version':
       case '--version': {
         const pkg = readJsonFile(
@@ -1297,8 +1356,6 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdAnswer(rest);
       case 'cancel':
         return await cmdCancel(rest);
-      case 'board':
-        return await cmdBoard(rest);
       case 'image':
         return await cmdImage(rest);
       case 'artifacts':

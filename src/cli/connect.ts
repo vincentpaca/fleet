@@ -290,6 +290,12 @@ export async function superviseTunnel(localPort: number, deps: SuperviseDeps): P
       continue;
     }
 
+    // Resolving an endpoint is seconds of cloud calls, and the owner may have
+    // quit during them. Spawning now would write a session record over the one
+    // the stop just cleared, leave a detached forward holding the local port,
+    // and then block on a handle nobody is left to kill.
+    if (deps.stopped()) return;
+
     deps.log(`forwarding http://127.0.0.1:${localPort} → ${endpoint.id}`);
     deps.onSession?.(endpoint);
     const startedAt = deps.now();
@@ -384,11 +390,130 @@ export function portAccepts(host: string, port: number, timeoutMs = 2_000): Prom
   return promise;
 }
 
-/** Not unref'd on purpose: a backoff wait is the only thing keeping the supervisor alive. */
-export function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
+// ---------- holding a tunnel, for whoever needs one ----------
+
+/** A deployment resolved to the one thing a supervisor needs: how to open a forward, and where. */
+export type ResolvedTunnel = {
+  /** Re-resolves the endpoint and builds the forward command; called once per session. */
+  open: TunnelOpener;
+  /** The local port the forward binds — the one every other command must talk to. */
+  localPort: number;
+  /** Where the deployment description was read from, for messages and the record. */
+  source: string;
+};
+
+/**
+ * Resolve the deployment and decide which local port to forward. Split out
+ * because two surfaces need it and neither may resolve twice: `fleet connect`
+ * warns and refuses before binding, and the cockpit holds a tunnel for as long
+ * as its view is open (#61). Resolution can cost cloud calls, so it happens once.
+ */
+export async function resolveTunnel(cwd: string, port?: number): Promise<ResolvedTunnel> {
+  const deployment = await resolveDeployment(cwd);
+  const { open, remotePort } = tunnelOpenerFor(deployment);
+  return { open, localPort: chooseLocalPort(port, deployment.daemonUrl, remotePort), source: deployment.source };
+}
+
+/** A supervised tunnel someone else owns the lifetime of. */
+export type HeldTunnel = {
+  port: number;
+  /** Resolves when supervision ends: the Error it died of, or undefined if it was stopped. */
+  ended: Promise<Error | undefined>;
+  /**
+   * Close the forward and drop the record, then wait for the child to actually
+   * die. Idempotent, and safe to await more than once.
+   */
+  stop: () => Promise<void>;
+};
+
+/**
+ * Hold a tunnel open without owning the process. The caller decides when it
+ * ends — a signal for `fleet connect`, a closed view for the cockpit — which is
+ * the whole difference between the two: the supervision, the tunnel record, and
+ * the guarantee that the forward dies with its owner are identical, and live here.
+ */
+export function holdTunnel(
+  tunnel: ResolvedTunnel,
+  home: string,
+  log: (line: string) => void,
+): HeldTunnel {
+  const localPort = tunnel.localPort;
+  let stopping = false;
+  let current: ForwardHandle | undefined;
+
+  // The supervisor spends most of its life asleep in a backoff, and that timer
+  // is deliberately not unref'd — for `fleet connect` it is the only thing
+  // keeping the process alive. So stopping has to wake it: an owner that quits
+  // during a 30s backoff would otherwise sit there until the timer fired.
+  const waking = new Map<NodeJS.Timeout, () => void>();
+  const wakeableSleep = (ms: number): Promise<void> => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const timer = setTimeout(() => {
+      waking.delete(timer);
+      resolve();
+    }, ms);
+    waking.set(timer, resolve);
+    return promise;
+  };
+  const wakeAll = (): void => {
+    for (const [timer, resolve] of waking) {
+      clearTimeout(timer);
+      resolve();
+    }
+    waking.clear();
+  };
+
+  const ended = superviseTunnel(localPort, {
+    open: tunnel.open,
+    spawnForward: (argv) => {
+      current = spawnForward(argv);
+      return current;
+    },
+    probeHealth: () => probeDaemonHealth('127.0.0.1', localPort),
+    sleep: wakeableSleep,
+    now: () => Date.now(),
+    log,
+    stopped: () => stopping,
+    onSession: (endpoint) =>
+      writeTunnelRecord(home, {
+        port: localPort,
+        pid: process.pid,
+        endpointId: endpoint.id,
+        source: tunnel.source,
+        at: new Date().toISOString(),
+      }),
+  }).then(
+    () => undefined,
+    (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
+  ).finally(() => {
+    // Whatever ended it, the forward is a child process and the record claims a
+    // live session: leaving either behind is what makes the next attempt look
+    // like it worked while forwarding into nothing.
+    current?.stop();
+    clearTunnelRecord(home, localPort);
+  });
+
+  let stopped: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    stopped ??= (async () => {
+      stopping = true;
+      wakeAll();
+      const handle = current;
+      handle?.stop();
+      clearTunnelRecord(home, localPort);
+      // Exiting before the forward dies orphans it, and an orphan is exactly
+      // the thing that keeps the local port bound. Give it a bounded moment —
+      // and drop the grace timer once it is done, so the wait cannot be the
+      // slowest part of closing a view.
+      if (handle) {
+        await Promise.race([handle.exited, wakeableSleep(FORWARD_SHUTDOWN_MS)]);
+        wakeAll();
+      }
+    })();
+    return stopped;
+  };
+
+  return { port: localPort, ended, stop };
 }
 
 // ---------- the command ----------
@@ -412,9 +537,8 @@ export type ConnectOptions = {
  * background so a shell can be closed without taking the tunnel with it.
  */
 export async function runConnect(opts: ConnectOptions): Promise<number> {
-  const deployment = await resolveDeployment(opts.cwd);
-  const { open, remotePort } = tunnelOpenerFor(deployment);
-  const localPort = chooseLocalPort(opts.port, deployment.daemonUrl, remotePort);
+  const tunnel = await resolveTunnel(opts.cwd, opts.port);
+  const localPort = tunnel.localPort;
 
   // Forwarding somewhere other than where the rest of the CLI looks is a
   // legitimate thing to ask for and a silent way to strand every other command.
@@ -424,7 +548,7 @@ export async function runConnect(opts: ConnectOptions): Promise<number> {
   const target = daemonTarget(process.env, { cwd: opts.cwd });
   if (target.kind !== 'tcp') {
     opts.warn(
-      `note: other fleet commands resolve the daemon at ${describeTarget(process.env, { cwd: opts.cwd })} — add "daemon_url": "http://127.0.0.1:${localPort}" to ${deployment.source} so they use this tunnel`,
+      `note: other fleet commands resolve the daemon at ${describeTarget(process.env, { cwd: opts.cwd })} — add "daemon_url": "http://127.0.0.1:${localPort}" to ${tunnel.source} so they use this tunnel`,
     );
   } else if (target.port !== localPort) {
     opts.warn(
@@ -466,22 +590,15 @@ export async function runConnect(opts: ConnectOptions): Promise<number> {
     return 0;
   }
 
-  opts.log(`fleet connect: deployment from ${deployment.source}`);
-  let stopping = false;
-  let current: ForwardHandle | undefined;
+  opts.log(`fleet connect: deployment from ${tunnel.source}`);
+  const held = holdTunnel(tunnel, opts.home, (line) => opts.log(`fleet connect: ${line}`));
+
+  let closing = false;
   const stop = (): void => {
-    if (stopping) process.exit(0); // a second interrupt means now, not politely
-    stopping = true;
+    if (closing) process.exit(0); // a second interrupt means now, not politely
+    closing = true;
     opts.log('fleet connect: closing the tunnel');
-    // The forward is a child process: leaving it running would hold the local
-    // port and make the next `fleet connect` look like it worked. Wait for it
-    // to actually die — exiting first orphans it, and an orphan is exactly the
-    // thing that keeps the port bound.
-    const handle = current;
-    handle?.stop();
-    clearTunnelRecord(opts.home, localPort);
-    const settled = handle ? Promise.race([handle.exited, sleep(FORWARD_SHUTDOWN_MS)]) : Promise.resolve();
-    void settled.then(() => process.exit(0));
+    void held.stop().then(() => process.exit(0));
   };
   // SIGHUP matters for --detach: a closed terminal is how that supervisor most
   // often dies, and it must take its forward with it.
@@ -489,31 +606,10 @@ export async function runConnect(opts: ConnectOptions): Promise<number> {
   process.on('SIGTERM', stop);
   process.on('SIGHUP', stop);
 
-  try {
-    await superviseTunnel(localPort, {
-      open,
-      spawnForward: (argv) => {
-        current = spawnForward(argv);
-        return current;
-      },
-      probeHealth: () => probeDaemonHealth('127.0.0.1', localPort),
-      sleep,
-      now: () => Date.now(),
-      log: (line) => opts.log(`fleet connect: ${line}`),
-      stopped: () => stopping,
-      onSession: (endpoint) =>
-        writeTunnelRecord(opts.home, {
-          port: localPort,
-          pid: process.pid,
-          endpointId: endpoint.id,
-          source: deployment.source,
-          at: new Date().toISOString(),
-        }),
-    });
-  } finally {
-    current?.stop();
-    clearTunnelRecord(opts.home, localPort);
-  }
+  // Waiting cannot install a missing binary: superviseTunnel gives up on a
+  // forward command that never ran, and this is the process that reports it.
+  const failure = await held.ended;
+  if (failure) throw failure;
   return 0;
 }
 

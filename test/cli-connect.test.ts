@@ -10,8 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, type ChildProcess } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import type { TunnelEndpoint } from '../src/providers/provider.ts';
 import {
   RECONNECT_BACKOFF_MS,
@@ -31,7 +30,17 @@ import {
   type SuperviseDeps,
 } from '../src/cli/connect.ts';
 import { tunnelOpenerFor } from '../src/cli/tunnel-openers.ts';
-import { CLI, makeTempDir, runCli, startMockDaemon } from './cli-helpers.ts';
+import {
+  CLI,
+  closedPort,
+  fakeAwsBin,
+  makeTempDir,
+  projectWithConfig as projectWith,
+  runCli,
+  startMockDaemon,
+  until,
+  waitForLine,
+} from './cli-helpers.ts';
 
 // ---------- fixtures ----------
 
@@ -45,15 +54,6 @@ const FULL_CONFIG = {
   runner_container_name: 'fleet-runner',
   ssm_config_path: '/fleet/fleet-config',
 };
-
-/** A project dir with .fleet/infra/<provider>/fleet-config.json. */
-function projectWith(config: unknown, provider = 'aws'): string {
-  const cwd = makeTempDir('fleet-connect-');
-  const dir = path.join(cwd, '.fleet', 'infra', provider);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'fleet-config.json'), JSON.stringify(config, null, 2));
-  return cwd;
-}
 
 // ---------- deployment resolution ----------
 
@@ -267,6 +267,37 @@ test('a dead forward is reopened against a freshly resolved endpoint', async () 
   );
 });
 
+test('a stop during endpoint resolution spawns nothing and records nothing', async () => {
+  // Resolving costs seconds of cloud calls, and an owner can quit inside them:
+  // the cockpit closing, or `fleet connect` taking a SIGINT. Spawning anyway
+  // leaves a detached forward holding the local port with nobody left to kill
+  // it, over a session record the stop had already cleared — and the supervisor
+  // then blocks forever on that handle, so its owner never exits either.
+  let stopped = false;
+  const spawned: string[][] = [];
+  const sessions: string[] = [];
+  await superviseTunnel(19000, {
+    open: async (localPort) => {
+      stopped = true; // the operator quit while we were resolving
+      return { argv: ['aws', 'ssm', 'start-session', String(localPort)], id: 'ecs:fleet_task-1_rt-1' };
+    },
+    spawnForward: (argv) => {
+      spawned.push(argv);
+      // Resolves, so a regression fails on the assertions below instead of
+      // hanging the suite the way the real forward hangs the real supervisor.
+      return { exited: Promise.resolve({ how: 'exit 0' }), stop: () => {} };
+    },
+    probeHealth: async () => true,
+    sleep: async () => {},
+    now: () => 0,
+    log: () => {},
+    stopped: () => stopped,
+    onSession: (endpoint) => sessions.push(endpoint.id),
+  });
+  assert.deepEqual(spawned, [], 'nothing was forwarded after the stop');
+  assert.deepEqual(sessions, [], 'and nothing claimed to be a live session');
+});
+
 test('backoff grows across consecutive short sessions', async () => {
   const h = harness([
     { lastsMs: 10, healthy: false },
@@ -328,14 +359,6 @@ test('a forward that never serves /health is reported but still supervised', asy
 });
 
 // ---------- doctor: tunnel state ----------
-
-/** A port with nothing on it: take one the OS just handed back. */
-async function closedPort(): Promise<number> {
-  const daemon = await startMockDaemon({});
-  const port = Number(new URL(daemon.url).port);
-  await daemon.close();
-  return port;
-}
 
 test('tunnelReport says the tunnel is fine when /health answers', async (t) => {
   const daemon = await startMockDaemon({
@@ -431,52 +454,6 @@ test('tunnelReport treats an unanswerable currency check as a note, not a findin
 });
 
 // ---------- end to end: the real CLI, a fake aws, a real local port ----------
-
-/** A directory holding an `aws` that routes to fixtures/fake-aws.mjs. */
-function fakeAwsBin(stateDir: string): string {
-  const bin = makeTempDir('fleet-connect-bin-');
-  const fixture = fileURLToPath(new URL('../fixtures/fake-aws.mjs', import.meta.url));
-  // exec, so SIGTERM from the supervisor reaches node rather than the shell.
-  fs.writeFileSync(path.join(bin, 'aws'), `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`, {
-    mode: 0o755,
-  });
-  fs.mkdirSync(stateDir, { recursive: true });
-  return bin;
-}
-
-/** Poll a predicate to true, or fail with what it was waiting for. */
-async function until(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new Error(`timed out waiting for ${label}`);
-}
-
-/** Resolve once stdout contains `needle`, or reject when the process dies first. */
-function waitForLine(chunks: () => string, child: ChildProcess, needle: string, label: string): Promise<void> {
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  const timer = setInterval(() => {
-    if (chunks().includes(needle)) {
-      clearInterval(timer);
-      resolve();
-    }
-  }, 25);
-  const deadline = setTimeout(() => {
-    clearInterval(timer);
-    reject(new Error(`timed out waiting for ${label}; output so far:\n${chunks()}`));
-  }, 20_000);
-  void promise.finally(() => {
-    clearInterval(timer);
-    clearTimeout(deadline);
-  });
-  child.on('close', () => {
-    clearInterval(timer);
-    if (!chunks().includes(needle)) reject(new Error(`fleet connect exited before ${label}:\n${chunks()}`));
-  });
-  return promise;
-}
 
 test('fleet connect opens the tunnel, verifies /health, and re-establishes on session death', async (t) => {
   // The two acceptance cases in one run: /health green with zero hand-run aws
