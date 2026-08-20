@@ -119,100 +119,83 @@ test('a frame is exactly the terminal it was given, at every size', () => {
   for (const h of [1, 4, 24]) assert.match(frame(model(), 80, h).at(-1) ?? '', /^› _/);
 });
 
-test('a shrinking terminal drops chrome from the outside in, keeping the panes', () => {
+test('a shrinking terminal drops chrome from the outside in, keeping the board', () => {
   const has = (h: number, needle: string): boolean => frame(model(), 80, h).some((l) => l.includes(needle));
   // 24 rows: everything.
-  assert.ok(has(24, 'F L E E T') && has(24, 'JOB ') && has(24, 'tail:') && has(24, '↑↓ select'));
-  // The banner goes first, then the table header, then the tail divider, then the
-  // context strip — the board and the command line are the last things standing.
+  assert.ok(has(24, 'F L E E T') && has(24, 'JOB ') && has(24, '↑↓ select'));
+  // The banner goes first, then the table header, then the context strip — the
+  // board and the command line are the last things standing.
   assert.ok(!has(21, 'F L E E T'), 'the banner is the first thing dropped');
-  assert.ok(has(21, 'JOB ') && has(21, 'tail:'));
+  assert.ok(has(21, 'JOB '));
   assert.ok(!has(8, 'JOB '), 'the table header goes next');
-  assert.ok(has(8, 'tail:'));
-  assert.ok(!has(7, 'tail:'), 'then the tail, so the board keeps its rows');
-  assert.ok(has(7, 'job-blk'), 'the board survives');
+  assert.ok(has(8, 'job-blk'), 'the board survives');
   assert.ok(!has(5, 'FLEET  http'), 'the context strip goes last');
   assert.ok(has(5, 'job-blk') && has(2, '↑↓ select'));
 });
 
-test('the panes are stacked in one order: board, tail, hints, input line', () => {
+test('the board view stacks banner, strip, header, board, hints, input — and never a tail', () => {
   const lines = frame(model());
   const index = (needle: string) => lines.findIndex((l) => l.includes(needle));
   assert.ok(index('F L E E T') >= 0, 'the banner is the top of the frame');
   assert.ok(index('FLEET  http://127.0.0.1:19000') > index('F L E E T'), 'then the context strip');
   assert.ok(index('JOB ') > index('FLEET  http'), 'then the table header');
   assert.ok(index('job-blk') > index('JOB '), 'then the board');
-  assert.ok(index('tail: job-blk') > index('job-blk'), 'then the tail divider');
-  assert.ok(index('[1] reading the schema') > index('tail: job-blk'), 'then the tail itself');
   assert.equal(lines.length - 2, index('↑↓ select'), 'the key hints sit above the input line');
   assert.match(lines.at(-1) ?? '', /^› _/, 'the input line is the last line, with the caret');
+  // Logs never stream onto the board: no tail divider, no event lines. The tail
+  // exists only in the drill-down the operator opens on purpose (operator
+  // feedback from the first live run: an uninvited tail floods the surface).
+  assert.equal(index('tail:'), -1, 'no tail divider on the board');
+  assert.equal(index('[1] reading the schema'), -1, 'no event lines on the board');
 });
 
-test('blocked jobs come first on the board, and the tail follows the selection', () => {
+test('blocked jobs come first on the board, and their decision card is on the board', () => {
   const lines = frame(model());
   const blk = lines.findIndex((l) => l.includes('job-blk'));
   const run = lines.findIndex((l) => l.includes('job-run'));
   assert.ok(blk >= 0 && run > blk, 'blocked above running');
   assert.ok(lines[blk].includes('▶'), 'selection starts on the job that wants a human');
-  // Selecting the second job moves the tail to it.
-  assert.ok(frame(model({ selection: 1 })).some((l) => l.includes('tail: job-run')));
+  // The board itself advertises what the blocked job wants — the roster card,
+  // not a tail pane, is where the question and options live.
+  const board = lines.join('\n');
+  assert.match(board, /Rename the endpoint\?/);
+  assert.match(board, /\[keep\] Keep \/api\/v1 ★/);
+  assert.match(board, /\[rename\] Rename to \/api\/v2/);
 });
 
-test("a blocked selection advertises the answer it wants, on the divider", () => {
-  const divider = frame(model()).find((l) => l.includes('tail: job-blk')) ?? '';
-  assert.match(divider, /blocked, answer \[keep\|rename\]/, 'the option ids are on the divider');
-  // A running selection has nothing to answer and says nothing about answering.
-  assert.doesNotMatch(frame(model({ selection: 1 })).find((l) => l.includes('tail:')) ?? '', /answer/);
-});
-
-test('a decision renders in the tail as its own question and options, verbatim', () => {
-  // The tail's copy is the event log's, seq and all — the roster card above it
-  // comes from the job listing. Both render the decision; neither summarises it.
-  const lines = frame(model());
-  const tailAt = lines.findIndex((l) => l.includes('tail:'));
-  const tail = lines.slice(tailAt).join('\n');
+test('the tail renders only in the drill-down, verbatim, windowed to its end', () => {
+  // The drill-down's copy is the event log's, seq and all.
+  const lines = frame(model({ view: 'job' }));
+  const tail = lines.join('\n');
   assert.match(tail, /\[2\] \? Rename the endpoint\?/);
   assert.match(tail, /\[keep\] Keep \/api\/v1 ★/);
   assert.match(tail, /\[rename\] Rename to \/api\/v2/);
-});
-
-test('the tail is windowed, not re-rendered whole: a long history still shows its end', () => {
+  // Windowed, not re-rendered whole: a long history still shows its end.
   const long: BoardEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
-  const lines = frame(model({ tail: long }));
-  assert.match(lines.join('\n'), /line 4999/, 'the newest event is on screen');
-  assert.doesNotMatch(lines.join('\n'), /line 0\b/, 'the oldest is not');
+  const drilled = frame(model({ view: 'job', tail: long }));
+  assert.match(drilled.join('\n'), /line 4999/, 'the newest event is on screen');
+  assert.doesNotMatch(drilled.join('\n'), /line 0\b/, 'the oldest is not');
   // Scrolled back, the window moves with the scroll rather than clamping to the
   // slice that happened to be rendered.
-  assert.match(frame(model({ tail: long, tailScroll: 100 })).join('\n'), /line 489\d/);
+  assert.match(frame(model({ view: 'job', tail: long, tailScroll: 100 })).join('\n'), /line 489\d/);
 });
 
-test('the banner yields to the panes on a short terminal', () => {
+test('the banner yields to the board on a short terminal', () => {
   assert.ok(frame(model(), 80, BANNER_MIN_ROWS).some((l) => l.includes('F L E E T')));
   assert.ok(!frame(model(), 80, BANNER_MIN_ROWS - 1).some((l) => l.includes('F L E E T')));
-  // What the banner cost goes to the tail, not to nothing.
-  const tallTail = frame(model(), 80, BANNER_MIN_ROWS - 1).filter((l) => l.trim() !== '').length;
-  assert.ok(tallTail > 6, 'a short frame is still populated');
+  // What the banner cost goes to the board, not to nothing.
+  const populated = frame(model(), 80, BANNER_MIN_ROWS - 1).filter((l) => l.trim() !== '').length;
+  assert.ok(populated > 6, 'a short frame is still populated');
 });
 
-test('the board takes what it needs and the tail takes the rest', () => {
-  // The tail pane: everything between the divider and the footer/input pair.
-  const panes = (m: CockpitModel, h: number): { roster: number; tail: number } => {
-    const lines = frame(m, 80, h);
-    const header = lines.findIndex((l) => l.includes('JOB '));
-    const divider = lines.findIndex((l) => l.includes('tail'));
-    return { roster: divider - header - 2, tail: lines.length - divider - 3 };
-  };
-  // Two jobs on a tall terminal: the board takes its seven rows, the tail the rest.
-  const few = panes(model(), 30);
-  assert.equal(few.roster, 7, 'the board takes exactly what its jobs need');
-  assert.ok(few.tail >= 10, `a small fleet reads as a transcript, got ${few.tail} tail rows`);
-  // Twenty jobs: the board grows, but never past half the space.
-  const many = panes(
-    model({ jobs: sortJobs(Array.from({ length: 20 }, (_, i) => ({ id: `job-${i}`, state: 'running' }))) }),
-    30,
-  );
-  assert.ok(many.roster <= 10, `the board must not swallow the tail, got ${many.roster} rows`);
-  assert.ok(many.tail >= 8, `the tail keeps a usable window, got ${many.tail}`);
+test('the board owns the whole body: many jobs use the rows the tail no longer takes', () => {
+  const jobs = sortJobs(Array.from({ length: 20 }, (_, i) => ({ id: `job-${i}`, state: 'running' as const })));
+  const lines = frame(model({ jobs }), 80, 30);
+  const shown = lines.filter((l) => /job-\d/.test(l)).length;
+  // Under the old split layout the board was capped at half the space (~10 rows
+  // at this height). With the tail gone it runs to the footer.
+  assert.ok(shown >= 15, `the board should fill the body, got ${shown} job rows`);
+  assert.equal(lines.length, 30, 'the frame is still exactly the terminal');
 });
 
 test('an empty fleet says how to start one, from the line below', () => {
@@ -739,9 +722,9 @@ test("a blocked job's decision is answered from the cockpit, and never by the co
   const cockpit = startCockpit({ cwd: makeTempDir('fleet-cockpit-'), env: { FLEET_DAEMON_URL: daemon.url } });
   t.after(() => cockpit.child.kill('SIGKILL'));
 
-  // The card renders with the schema's own options, and the divider says how to answer.
+  // The card renders on the board itself with the schema's own options — no
+  // tail pane needed to see what a blocked job wants.
   await shows(cockpit, 'Rename the endpoint?', 'the decision card');
-  await shows(cockpit, 'blocked, answer [keep|rename]', 'how to answer it');
   assert.match(cockpit.output(), /\[keep\] Keep \/api\/v1/, 'options verbatim');
   // A whole render cycle has passed with an open question and nothing answered:
   // an agent answering its own question is the bug this design exists to prevent.
@@ -790,10 +773,11 @@ test('cancelling from the cockpit asks first, and only y goes through', async (t
   assert.equal(await cockpit.quit(), 0);
 });
 
-test('the tail follows the selection: live events, from the selected job only', async (t) => {
-  // The middle pane is the acceptance criterion the roster's decision card can
-  // impersonate — both render a decision. These events exist only in the event
-  // stream, so nothing but a live follow can put them on screen.
+test('the drill-down tails the selected job only; the board never tails anything', async (t) => {
+  // These events exist only in the event stream, so nothing but a live follow
+  // can put them on screen — and the only place a follow may render is the
+  // drill-down the operator opened. A board that streams logs uninvited is the
+  // firehose the first live run was rolled back for.
   const daemon = await startMockDaemon({
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
@@ -812,28 +796,27 @@ test('the tail follows the selection: live events, from the selected job only', 
   const cockpit = startCockpit({ cwd: makeTempDir('fleet-cockpit-'), env: { FLEET_DAEMON_URL: daemon.url } });
   t.after(() => cockpit.child.kill('SIGKILL'));
 
-  await nowShows(cockpit, 'tail: job-alpha', "the first job's tail");
-  await nowShows(cockpit, '[0] alpha is reading the schema', "alpha's own events");
-  assert.ok(!cockpit.frame().includes('beta is running'), "beta's events are not in alpha's tail");
+  // The board renders both jobs and no events from either.
+  await shows(cockpit, 'job-alpha', 'the board');
+  await shows(cockpit, 'job-beta');
+  assert.ok(!cockpit.frame().includes('alpha is reading'), 'no event lines on the board');
+  assert.ok(!cockpit.frame().includes('beta is running'), 'from any job');
 
-  // j moves the selection; the tail must move with it and stop showing alpha.
-  cockpit.type('j');
-  await nowShows(cockpit, 'tail: job-beta', "the second job's tail");
-  await nowShows(cockpit, '[0] beta is running the suite', "beta's own events");
-  await noLongerShows(cockpit, 'alpha is reading');
-
-  // Back again: a follow that was replaced must not write into the new tail.
-  cockpit.type('k');
-  await nowShows(cockpit, '[0] alpha is reading the schema');
-  await noLongerShows(cockpit, 'beta is running');
-
-  // Enter drills into it, Esc comes back — the same tail, one pane bigger.
+  // Enter opens the selected job: its events, nobody else's, roster gone.
   cockpit.type('\r');
   await nowShows(cockpit, 'job-alpha  running  implement  alpha', 'the drill-down header');
+  await nowShows(cockpit, '[0] alpha is reading the schema', "alpha's own events");
   assert.ok(!cockpit.frame().includes('JOB '), 'the roster is gone in the drill-down');
-  assert.ok(cockpit.frame().includes('[0] alpha is reading the schema'), 'the tail is still the point');
+  assert.ok(!cockpit.frame().includes('beta is running'), "beta's events are not in alpha's tail");
+
+  // Esc back, j to the second job, Enter: the follow moves with the selection,
+  // and a follow that was replaced must not write into the new tail.
   cockpit.type('\x1b');
   await nowShows(cockpit, 'JOB ', 'the board again');
+  cockpit.type('j');
+  cockpit.type('\r');
+  await nowShows(cockpit, '[0] beta is running the suite', "beta's own events");
+  await noLongerShows(cockpit, 'alpha is reading');
   assert.equal(await cockpit.quit(), 0);
 });
 
