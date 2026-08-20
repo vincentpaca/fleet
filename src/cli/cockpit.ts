@@ -3,9 +3,13 @@
  *
  * Operating Fleet used to be three windows: a shell to dispatch from, a board to
  * watch, and a hand-rebuilt port-forward whose death showed up as ECONNREFUSED
- * at the next dispatch. This is one resident surface instead: the live board on
- * top, the selected job's tail in the middle, a command line at the bottom, and
- * the tunnel held for as long as the view is open.
+ * at the next dispatch. This is one resident surface instead: the live board
+ * with a command line under it, and the tunnel held for as long as the view is
+ * open. Logs are never on the board — a tail pane that streams uninvited turns
+ * the operating surface into a firehose (operator feedback, first live run).
+ * Events appear only in the drill-down the operator enters on purpose (Enter),
+ * where the board is deliberately replaced and the tail is windowed to the
+ * screen.
  *
  * What it is not, deliberately:
  *   - Not a harness (D8). No model call, no conversation, no agent loop. A
@@ -167,20 +171,6 @@ export function windowTail(lines: string[], scroll: number, budget: number): str
   return exactly(lines.slice(Math.max(0, end - budget), end), budget);
 }
 
-/** The divider between the board and the tail: whose tail it is, and what it wants. */
-function renderDivider(m: CockpitModel, w: number, noColor: boolean): string {
-  const col = makeCol(noColor);
-  const job = selectedJob(m);
-  const ids = openOptionIds(m);
-  const label = job === undefined
-    ? ' tail '
-    : ids.length > 0
-      ? ` tail: ${job.id} — blocked, answer [${ids.join('|')}] `
-      : ` tail: ${job.id} `;
-  const dashes = Math.max(0, w - 2 - visualLength(label));
-  return visualClip(`${col('──', 90)}${col(label, 36)}${col('─'.repeat(dashes), 90)}`, w);
-}
-
 /** The bottom line: a pending confirmation, or the command prompt with its cursor. */
 function renderInputLine(m: CockpitModel, w: number, noColor: boolean): string {
   const col = makeCol(noColor);
@@ -253,33 +243,21 @@ export function renderCockpit(
   }
 
   // Board view, outermost chrome first: each piece appears only once there is
-  // room for it and for a pane to sit under it.
+  // room for it and for a pane to sit under it. No tail here, ever — logs
+  // stream only in the drill-down the operator opens on purpose; the board is
+  // the thing being operated, and it owns the whole body.
   const banner = h >= BANNER_MIN_ROWS ? renderBanner(w, noColor, opts.colorLevel ?? '256').split('\n') : [];
   const strip = h >= 6 ? renderContextStrip(counts.blocked, counts.running, counts.done, w, opts).split('\n') : [];
   const tableHeader = h >= 9 ? renderTableHeader(w, noColor).split('\n') : [];
   const head = [...banner, ...strip, ...tableHeader];
-  const divider = h >= 8 ? [renderDivider(m, w, noColor)] : [];
 
-  const avail = h - head.length - divider.length - foot.length;
+  const avail = h - head.length - foot.length;
   const rows = renderRosterRows(m.jobs, m.selection, w, opts);
-  const rosterLines = rows.reduce((n, r) => n + r.lines.length, 0);
-  // The board gets what it needs, up to half the space; the tail gets the rest,
-  // so a two-job fleet reads as a transcript and a twenty-job one as a list.
-  // With no room for both, the board wins: it is the thing being operated.
-  const rosterBudget = divider.length === 0
-    ? avail
-    : Math.max(1, Math.min(rosterLines || 1, Math.max(1, Math.min(avail - 1, Math.ceil(avail / 2)))));
   const roster = m.jobs.length === 0
-    ? exactly([col('  no jobs — dispatch one from the line below: delegate <target>', 90)], rosterBudget)
-    : exactly(windowRosterRows(rows, m.selection, rosterBudget), rosterBudget);
+    ? exactly([col('  no jobs — dispatch one from the line below: delegate <target>', 90)], avail)
+    : exactly(windowRosterRows(rows, m.selection, avail), avail);
 
-  return [
-    ...head,
-    ...roster,
-    ...divider,
-    ...renderTailPane(m, w, noColor, avail - rosterBudget),
-    ...foot,
-  ].join('\n');
+  return [...head, ...roster, ...foot].join('\n');
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────────────
@@ -984,6 +962,9 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
         dirty = true;
         break;
       case 'scroll': {
+        // Only the drill-down has a tail to move; on the board the keys are
+        // inert rather than building up scroll debt against an invisible pane.
+        if (model.view !== 'job') break;
         // Clamped to the tail it is scrolling, so PgUp past the top does not
         // build up a debt that PgDn has to spend before anything moves.
         const room = Math.max(0, renderEventLines(model.tail, width(), noColor).length - 1);
