@@ -161,6 +161,9 @@ test('blocked jobs come first on the board, and their decision card is on the bo
   assert.match(board, /Rename the endpoint\?/);
   assert.match(board, /\[keep\] Keep \/api\/v1 ★/);
   assert.match(board, /\[rename\] Rename to \/api\/v2/);
+  // And the card says how to act on it — an option id with no visible way to
+  // send it reads as a dead end.
+  assert.match(board, /answer: type an option id below — keep \| rename/);
 });
 
 test('the tail renders only in the drill-down, verbatim, windowed to its end', () => {
@@ -170,6 +173,7 @@ test('the tail renders only in the drill-down, verbatim, windowed to its end', (
   assert.match(tail, /\[2\] \? Rename the endpoint\?/);
   assert.match(tail, /\[keep\] Keep \/api\/v1 ★/);
   assert.match(tail, /\[rename\] Rename to \/api\/v2/);
+  assert.match(tail, /answer: type an option id below — keep \| rename/, 'the tail card says how to answer too');
   // Windowed, not re-rendered whole: a long history still shows its end.
   const long: BoardEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
   const drilled = frame(model({ view: 'job', tail: long }));
@@ -252,10 +256,11 @@ test('windowRosterRows never splits a job from its own decision card', () => {
     { id: 'job-blk', state: 'blocked', decision: { id: 'd1', question: 'Q?', options: [{ id: 'x' }, { id: 'y' }] } },
   ];
   const rows = renderRosterRows(sortJobs(jobs), 0, 80, { noColor: true });
-  // The blocked group is 5 lines; a 5-line budget must show it whole.
-  const window = windowRosterRows(rows, 0, 5);
-  assert.equal(window.length, 5);
-  assert.match(window.join('\n'), /Q\?[\s\S]*\[x\][\s\S]*\[y\]/);
+  // The blocked group is 6 lines (row, question, two options, the answer
+  // hint, a blank); a 6-line budget must show it whole.
+  const window = windowRosterRows(rows, 0, 6);
+  assert.equal(window.length, 6);
+  assert.match(window.join('\n'), /Q\?[\s\S]*\[x\][\s\S]*\[y\][\s\S]*answer: type an option id/);
 });
 
 test('windowTail follows the end by default and clamps a scroll past the top', () => {

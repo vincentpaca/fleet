@@ -341,6 +341,12 @@ export function renderEventLines(events: BoardEvent[], w: number, noColor: boole
             const rec = opt.recommended ? col(' ★', 33) : '';
             lines.push(visualClip(`     ${col(`[${opt.id}]`, 33)} ${opt.label ?? opt.id}${rec}`, w));
           }
+          // Same rule as the roster card: a question on screen states how to
+          // answer it, in place.
+          lines.push(visualClip(
+            `     ${col(`answer: type an option id below — ${(ev.options ?? []).map((o) => o.id).join(' | ')}`, 33)}`,
+            w,
+          ));
         }
         break;
       case 'answer': {
@@ -508,6 +514,13 @@ export function renderRosterRows(
         const rec = opt.recommended ? col(' ★', 33) : '';
         lines.push(visualClip(`     [${opt.id}] ${opt.label ?? opt.id}${rec}`, w));
       }
+      // The card must say how to act on it: the divider that used to carry
+      // this hint is gone (#68), and an option id with no visible way to send
+      // it reads as a dead end (operator feedback, first parked decision).
+      lines.push(visualClip(
+        `     ${col(`answer: type an option id below — ${job.decision.options.map((o) => o.id).join(' | ')}`, 33)}`,
+        w,
+      ));
       lines.push('');
     } else if ((job.state === 'running' || job.state === 'queued') && job.lastActivity) {
       // The daemon reports the latest activity for every live job, so this line
