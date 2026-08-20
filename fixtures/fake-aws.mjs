@@ -41,6 +41,18 @@ if (args[0] === '--hold') {
   server.listen(localPort, '127.0.0.1');
   // No signal handlers on purpose: this process dies only when the whole
   // process group is signalled, exactly like the real plugin.
+} else if (args[0] === 'sts' && args[1] === 'get-caller-identity') {
+  // The credential preflight `fleet setup infra` runs before its first prompt
+  // (#13). Stateless, so it needs no FAKE_AWS_DIR: FAKE_AWS_DENY_STS is how a
+  // test says "this shell has no usable credentials".
+  if (process.env.FAKE_AWS_DENY_STS) {
+    process.stderr.write('Unable to locate credentials. You can configure credentials by running "aws configure".\n');
+    process.exit(255);
+  }
+  process.stdout.write(
+    JSON.stringify({ UserId: 'AIDAFAKE', Account: '111122223333', Arn: 'arn:aws:iam::111122223333:user/fake' }),
+  );
+  process.exit(0);
 } else {
   const dir = process.env.FAKE_AWS_DIR;
   if (!dir) {

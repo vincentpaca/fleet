@@ -12,7 +12,7 @@ export type CliResult = { code: number; stdout: string; stderr: string };
 
 export function runCli(
   args: string[],
-  opts: { cwd?: string; env?: Record<string, string | undefined> } = {},
+  opts: { cwd?: string; env?: Record<string, string | undefined>; stdin?: string } = {},
 ): Promise<CliResult> {
   const { promise, resolve, reject } = Promise.withResolvers<CliResult>();
   const env: Record<string, string | undefined> = { ...process.env, FLEET_DAEMON_URL: undefined, ...opts.env };
@@ -24,8 +24,11 @@ export function runCli(
     // for resolution step 1.
     cwd: opts.cwd ?? makeTempDir('fleet-cli-cwd-'),
     env: Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined)) as Record<string, string>,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // Piped stdin is how the interactive wizards are driven headlessly (#13);
+    // without it, stdin stays closed, which is what a real non-terminal run has.
+    stdio: [opts.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
+  if (opts.stdin !== undefined) child.stdin!.end(opts.stdin);
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8');
@@ -173,11 +176,29 @@ export function projectWithConfig(config: unknown, provider = 'aws'): string {
 /** A directory holding an `aws` that routes to fixtures/fake-aws.mjs. */
 export function fakeAwsBin(stateDir: string): string {
   const bin = makeTempDir('fleet-fake-aws-');
-  const fixture = fileURLToPath(new URL('../fixtures/fake-aws.mjs', import.meta.url));
-  // exec, so SIGTERM from the supervisor reaches node rather than the shell.
-  fs.writeFileSync(path.join(bin, 'aws'), `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`, {
-    mode: 0o755,
-  });
+  fakeBin(bin, 'aws', 'fake-aws.mjs');
   fs.mkdirSync(stateDir, { recursive: true });
   return bin;
+}
+
+/**
+ * A directory holding a `terraform` (and an `aws` for the credential preflight)
+ * that route to the fixtures. `fleet setup infra` shells out to both, and a
+ * test that let either real binary run would be testing HashiCorp and AWS.
+ */
+export function fakeCloudBin(stateDir: string): string {
+  const bin = makeTempDir('fleet-fake-cloud-');
+  fakeBin(bin, 'terraform', 'fake-terraform.mjs');
+  fakeBin(bin, 'aws', 'fake-aws.mjs');
+  fs.mkdirSync(stateDir, { recursive: true });
+  return bin;
+}
+
+/** Write a shim that execs a fixture under a binary's name. */
+function fakeBin(bin: string, name: string, fixtureFile: string): void {
+  const fixture = fileURLToPath(new URL(`../fixtures/${fixtureFile}`, import.meta.url));
+  // exec, so a signal reaches node rather than the shell.
+  fs.writeFileSync(path.join(bin, name), `#!/bin/sh\nexec "${process.execPath}" "${fixture}" "$@"\n`, {
+    mode: 0o755,
+  });
 }
