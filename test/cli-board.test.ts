@@ -111,8 +111,8 @@ test('rows keep a job with its own detail: one group per job', () => {
   ];
   const rows = renderRosterRows(sortJobs(jobs), 0, 100, { noColor: true, now: 5_000 });
   assert.equal(rows.length, 2, 'one group per job');
-  // Blocked: row + question + two options + a blank separator.
-  assert.equal(rows[0].lines.length, 5);
+  // Blocked: row + question + two options + the answer hint + a blank separator.
+  assert.equal(rows[0].lines.length, 6);
   assert.equal(rows[0].jobIndex, 0);
   // Running: row + its now-line.
   assert.equal(rows[1].lines.length, 2);
@@ -182,6 +182,7 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
     '     Deploy now?',
     '     [go] Deploy now ★',
     '     [wait] Wait for review',
+    '     answer: type an option id below — go | wait',
     '',
     '  ●  job-run                 running    implement   app                ',
   ].join('\n'));
