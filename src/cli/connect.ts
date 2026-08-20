@@ -9,9 +9,10 @@
  * crash — and every death resurfaces as `ECONNREFUSED` at the next dispatch.
  *
  * So Fleet owns the tunnel: resolve the deployment, open the forward, verify
- * /health, and reopen on exit with backoff — re-resolving the task every time,
- * because a service deployment replaces it. `connect_hint` stays in the infra
- * unit as the documented manual fallback.
+ * /health, keep polling it while the session lives so the far end never reaps
+ * it for silence, and reopen on exit with backoff — re-resolving the task every
+ * time, because a service deployment replaces it. `connect_hint` stays in the
+ * infra unit as the documented manual fallback.
  *
  * Nothing here is cloud-specific: the provider dispatch lives next door in
  * ./tunnel-openers.ts, the composition root core's cloud-agnostic gate exempts.
@@ -39,6 +40,28 @@ export const HEALTH_TIMEOUT_MS = 20_000;
 
 /** Poll interval while waiting for /health. */
 export const HEALTH_INTERVAL_MS = 500;
+
+/**
+ * How long SSM Session Manager leaves an idle session open before killing it
+ * ("Your session timed out due to inactivity"). 20 minutes is the default; the
+ * account preference that sets it is not something we can read, so it is here
+ * as the documented motivation for the keepalive, never as a target to tune to.
+ */
+export const IDLE_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * How often to poll /health through a live forward. Well inside the shortest
+ * idle window we know of, so a tunnel nobody types a command through still
+ * carries traffic and is never reaped for silence.
+ */
+export const KEEPALIVE_INTERVAL_MS = 120_000;
+
+/**
+ * Consecutive keepalive polls that must miss before a still-running forward is
+ * treated as dead. One miss is a daemon restart or a slow answer; reopening
+ * costs cloud calls and a new session, so it takes two.
+ */
+export const KEEPALIVE_MISSES = 2;
 
 /** How long an interrupted connect waits for its forward to die before leaving anyway. */
 export const FORWARD_SHUTDOWN_MS = 3_000;
@@ -242,22 +265,94 @@ function seconds(ms: number): string {
 }
 
 /**
+ * Latch a forward's exit, so every wait can ask synchronously whether it is
+ * still running instead of each installing its own listener.
+ */
+function watchExit(handle: ForwardHandle): () => ForwardExit | undefined {
+  let exit: ForwardExit | undefined;
+  const seen = (how: ForwardExit): void => {
+    exit = how;
+  };
+  void handle.exited.then(seen, (err: unknown) => seen({ how: String(err) }));
+  return () => exit;
+}
+
+/**
  * Poll /health until it answers, the forward dies, or the deadline passes.
  * The three outcomes are different things to say: `gone` means the forward
  * never got going, `silent` means it is up but nothing is serving behind it.
  */
-async function waitForHealth(deps: SuperviseDeps, handle: ForwardHandle): Promise<'ok' | 'silent' | 'gone'> {
-  let dead = false;
-  const died = (): void => {
-    dead = true;
-  };
-  void handle.exited.then(died, died);
+async function waitForHealth(
+  deps: SuperviseDeps,
+  exited: () => ForwardExit | undefined,
+): Promise<'ok' | 'silent' | 'gone'> {
   const deadline = deps.now() + HEALTH_TIMEOUT_MS;
-  while (!dead && !deps.stopped() && deps.now() < deadline) {
+  while (!exited() && !deps.stopped() && deps.now() < deadline) {
     if (await deps.probeHealth()) return 'ok';
     await deps.sleep(HEALTH_INTERVAL_MS);
   }
-  return dead ? 'gone' : 'silent';
+  return exited() ? 'gone' : 'silent';
+}
+
+/**
+ * Hold a live session, polling /health through the forward until it exits.
+ *
+ * The poll is the point. SSM Session Manager terminates a session that carries
+ * no traffic, and a supervisor that only waits for process exit sends none: a
+ * quiet daemon tunnel is killed every idle window and reopened, and a delegate
+ * typed inside the reopen gap still gets ECONNREFUSED. A request every
+ * KEEPALIVE_INTERVAL_MS is traffic, so the timeout never fires. Nothing is
+ * logged while it answers — this runs forever, and a healthy tunnel has
+ * nothing to say.
+ *
+ * The answer is a second signal for free. A forward can outlive what it points
+ * at — the task is replaced, the daemon dies — and it goes on holding the local
+ * port while answering nothing, which is invisible until someone tries to use
+ * it. Consecutive misses end the session here, and the ordinary reopen path
+ * (fresh endpoint, backoff) takes it from there, rather than waiting for a
+ * process exit that may never come.
+ *
+ * `proven` is why a silent session is not killed by this: `waitForHealth`
+ * already chose to hold it open, and killing it two minutes later on the same
+ * symptom would just churn the deployment. Once a poll does answer, the session
+ * has proven it can, and from then on missing is evidence.
+ *
+ * Returns the keepalive's own verdict when it ended the session, and undefined
+ * when the forward ended it — the caller tells the two apart.
+ */
+async function keepAlive(
+  deps: SuperviseDeps,
+  handle: ForwardHandle,
+  exited: () => ForwardExit | undefined,
+  proven: boolean,
+): Promise<ForwardExit | undefined> {
+  let misses = 0;
+  while (!exited() && !deps.stopped()) {
+    // Whichever comes first: the forward's own death is still the ordinary way
+    // a session ends, and must not wait out an interval to be noticed.
+    await Promise.race([handle.exited, deps.sleep(KEEPALIVE_INTERVAL_MS)]);
+    if (exited() || deps.stopped()) return undefined;
+    if (await deps.probeHealth()) {
+      proven = true;
+      misses = 0;
+      continue;
+    }
+    // A probe takes seconds, and the forward can die inside one. Its own exit
+    // is the truer story, and claiming to close what is already closed is not.
+    if (exited()) return undefined;
+    if (!proven) continue;
+    misses += 1;
+    if (misses < KEEPALIVE_MISSES) continue;
+    deps.log('daemon /health stopped answering through the forward — closing the session');
+    handle.stop();
+    // Closing it was a verdict on a process that had stopped being a signal, so
+    // waiting on that same process unbounded is how the supervisor would strand
+    // itself on exactly the wedged forward this branch exists for. Same grace
+    // the shutdown path gives, then reopen either way.
+    await Promise.race([handle.exited, deps.sleep(FORWARD_SHUTDOWN_MS)]);
+    return exited() ?? { how: `no /health for ${KEEPALIVE_MISSES} polls, and no exit after SIGTERM` };
+  }
+  return undefined;
 }
 
 /**
@@ -269,6 +364,9 @@ async function waitForHealth(deps: SuperviseDeps, handle: ForwardHandle): Promis
  * longer exists. Backoff grows across consecutive failures and resets after a
  * session that stayed up, so a rolling deployment recovers on its own while a
  * genuinely broken deployment is not hammered.
+ *
+ * A session is not just waited on: `keepAlive` polls /health through it, which
+ * is what stops the far end from reaping it for silence.
  */
 export async function superviseTunnel(localPort: number, deps: SuperviseDeps): Promise<void> {
   // Consecutive attempts that failed or died young. A session that stayed up
@@ -300,22 +398,27 @@ export async function superviseTunnel(localPort: number, deps: SuperviseDeps): P
     deps.onSession?.(endpoint);
     const startedAt = deps.now();
     const handle = deps.spawnForward(endpoint.argv);
-    const health = await waitForHealth(deps, handle);
+    const exited = watchExit(handle);
+    const health = await waitForHealth(deps, exited);
     if (health === 'ok') {
       deps.log(`daemon /health ok on http://127.0.0.1:${localPort}`);
     } else if (health === 'silent' && !deps.stopped()) {
       deps.log(`warning: /health did not answer within ${seconds(HEALTH_TIMEOUT_MS)} — holding the session open anyway`);
     }
 
-    const exit = await handle.exited;
+    const closed = await keepAlive(deps, handle, exited, health === 'ok');
+    const exit = closed ?? (await handle.exited);
     if (deps.stopped()) return;
     // Waiting cannot install a missing binary. Retrying to the 30s ceiling
     // forever would look like a flaky tunnel instead of a missing tool.
     if (exit.startFailed) throw new Error(exit.how);
     const lasted = deps.now() - startedAt;
     // A session that ran long enough to be useful is not evidence of a broken
-    // deployment: only consecutive short-lived ones escalate the delay.
-    failures = lasted >= HEALTHY_SESSION_MS ? 0 : failures + 1;
+    // deployment: only consecutive short-lived ones escalate the delay. One the
+    // keepalive closed is evidence whatever its length: a task that answers at
+    // open and stops a few minutes in is a crash loop, and crediting it for the
+    // minutes it lasted would reopen against it every four minutes forever.
+    failures = closed === undefined && lasted >= HEALTHY_SESSION_MS ? 0 : failures + 1;
     deps.log(`session ended after ${seconds(lasted)} (${exit.how}) — reopening in ${seconds(wait())}`);
     await deps.sleep(wait());
   }
@@ -488,8 +591,11 @@ export function holdTunnel(
   ).finally(() => {
     // Whatever ended it, the forward is a child process and the record claims a
     // live session: leaving either behind is what makes the next attempt look
-    // like it worked while forwarding into nothing.
+    // like it worked while forwarding into nothing. The last sleep can still be
+    // pending — a keepalive interval the forward's death cut short — and an
+    // uncleared timer keeps the process alive minutes past the work.
     current?.stop();
+    wakeAll();
     clearTunnelRecord(home, localPort);
   });
 

@@ -3,9 +3,12 @@
 //
 // The supervisor is exercised through injected fakes with a virtual clock, so
 // every reconnect path (session death, endpoint change, backoff growth and
-// reset, a resolution that fails outright) is a real assertion rather than a
-// timing-dependent hope. The end-to-end test at the bottom drives the actual
-// CLI against a fake `aws` on PATH and a real listener on the local port.
+// reset, keepalive polling, a resolution that fails outright) is a real
+// assertion rather than a timing-dependent hope. Two properties that clock
+// cannot express — it only moves when the supervisor sleeps — are driven
+// against hand-written deps instead (`sessionOnRealTime`). The end-to-end test
+// at the bottom drives the actual CLI against a fake `aws` on PATH and a real
+// listener on the local port.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,7 +27,12 @@ import {
   pidAlive,
   listTunnelRecords,
   clearTunnelRecord,
+  FORWARD_SHUTDOWN_MS,
   HEALTH_INTERVAL_MS,
+  HEALTH_TIMEOUT_MS,
+  IDLE_TIMEOUT_MS,
+  KEEPALIVE_INTERVAL_MS,
+  KEEPALIVE_MISSES,
   type ForwardExit,
   type ForwardHandle,
   type SuperviseDeps,
@@ -165,6 +173,14 @@ type FakeSession = {
   lastsMs: number;
   /** Does /health answer during it? */
   healthy: boolean;
+  /**
+   * Overrides `healthy` per moment: elapsed virtual ms into the session → does
+   * /health answer right then? How a far end that goes away under a forward
+   * that keeps running is expressed — the failure mode nothing but a poll sees.
+   */
+  answers?: (elapsedMs: number) => boolean;
+  /** The forward ignores SIGTERM: a wedged session-manager-plugin. */
+  ignoresStop?: boolean;
   /** The forward command could not be started at all (no aws on PATH). */
   startFailed?: boolean;
 };
@@ -177,24 +193,47 @@ type Harness = {
   spawned: string[][];
   /** Every backoff/poll wait, in order. */
   slept: number[];
+  /** Virtual clock reading at each /health probe — the traffic the far end counts. */
+  probed: number[];
   log: string[];
 };
 
 /**
  * Supervisor harness on a virtual clock. `open` hands back a new endpoint id
  * each call (a deployment replaces the daemon task, so a correct supervisor
- * must use the newest one); each forward exits on the next macrotask, having
- * advanced the clock by its session length.
+ * must use the newest one); each forward exits once the clock reaches its
+ * session length, or when the supervisor stops it.
+ *
+ * Sleeps drive that clock, and never run past the running forward's death: the
+ * supervisor races the two, so a sleep begun before the exit ends at the exit.
+ * Without the cap a two-minute keepalive would make every ten-millisecond
+ * session read as one that stayed up for two minutes.
  */
-function harness(sessions: FakeSession[], opts: { openFailures?: number } = {}): Harness {
+function harness(
+  sessions: FakeSession[],
+  opts: { openFailures?: number; stopAfter?: number } = {},
+): Harness {
   let clock = 0;
   let started = 0;
   let completed = 0;
   let openCalls = 0;
+  let startedAt = 0;
   const opened: string[] = [];
   const spawned: string[][] = [];
   const slept: number[] = [];
+  const probed: number[] = [];
   const log: string[] = [];
+
+  let live: { session: FakeSession; endsAt: number; resolve: (exit: ForwardExit) => void } | undefined;
+  const end = (exit: ForwardExit): void => {
+    if (!live) return;
+    const { resolve } = live;
+    live = undefined;
+    completed += 1;
+    resolve(exit);
+  };
+  const died = (session: FakeSession): ForwardExit =>
+    session.startFailed ? { how: 'could not start aws: spawn aws ENOENT', startFailed: true } : { how: 'exit 255' };
 
   const deps: SuperviseDeps = {
     open: async (localPort): Promise<TunnelEndpoint> => {
@@ -208,37 +247,89 @@ function harness(sessions: FakeSession[], opts: { openFailures?: number } = {}):
       spawned.push(argv);
       const session = sessions[started] ?? { lastsMs: 0, healthy: false };
       started += 1;
-      const startedAt = clock;
-      const exited = new Promise<ForwardExit>((resolve) => {
-        setTimeout(() => {
-          clock = Math.max(clock, startedAt + session.lastsMs);
-          completed += 1;
-          resolve(session.startFailed ? { how: 'could not start aws: spawn aws ENOENT', startFailed: true } : { how: 'exit 255' });
-        }, 0);
-      });
-      return { exited, stop: () => {} };
+      startedAt = clock;
+      const { promise, resolve } = Promise.withResolvers<ForwardExit>();
+      live = { session, endsAt: clock + session.lastsMs, resolve };
+      if (session.lastsMs <= 0) end(died(session)); // never got going
+      return {
+        exited: promise,
+        stop: () => {
+          if (!session.ignoresStop) end({ how: 'killed by SIGTERM' });
+        },
+      };
     },
-    probeHealth: async () => (sessions[Math.max(0, started - 1)]?.healthy ?? false),
+    probeHealth: async () => {
+      probed.push(clock);
+      const session = sessions[Math.max(0, started - 1)];
+      if (!session?.healthy) return false;
+      return session.answers?.(clock - startedAt) ?? true;
+    },
     sleep: async (ms) => {
       slept.push(ms);
-      clock += ms;
+      clock = live ? Math.min(clock + ms, live.endsAt) : clock + ms;
+      if (live && clock >= live.endsAt) end(died(live.session));
+      // Yield the macrotask queue: a sleep that only ever resolves a microtask
+      // would starve anything real the supervisor is waiting on beside it.
+      await new Promise((resolve) => setImmediate(resolve));
     },
     now: () => clock,
     log: (line) => log.push(line),
-    stopped: () => completed >= sessions.length,
+    // A wedged forward never ends its session, so counting ended ones would
+    // never stop; `stopAfter` says how many the test needs.
+    stopped: () => completed >= (opts.stopAfter ?? sessions.length),
   };
-  return { deps, opened, spawned, slept, log };
+  return { deps, opened, spawned, slept, probed, log };
 }
 
-/** Waits the supervisor took between sessions (health polling uses a fixed small interval). */
+/** Waits the supervisor took between sessions (the other waits are fixed intervals). */
 function backoffs(slept: number[]): number[] {
-  return slept.filter((ms) => ms !== HEALTH_INTERVAL_MS);
+  const fixed = [HEALTH_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, FORWARD_SHUTDOWN_MS];
+  return slept.filter((ms) => !fixed.includes(ms));
 }
 
-test('the health poll interval is not a backoff value', () => {
-  // backoffs() separates the two kinds of wait by value. If they ever collide,
-  // every backoff assertion below silently starts counting health polls.
-  assert.ok(!RECONNECT_BACKOFF_MS.includes(HEALTH_INTERVAL_MS));
+/**
+ * Supervise a harness under a real-time guard. Virtual time only moves when the
+ * supervisor sleeps, so a supervisor that stops polling stops the clock and
+ * waits forever on a forward whose death it can no longer reach: without this,
+ * the regressions these tests exist for read as a hung suite (`node --test` has
+ * no default per-test timeout) rather than as a failure.
+ */
+async function superviseWithGuard(h: Harness, ms = 10_000): Promise<void> {
+  const guard = Promise.withResolvers<never>();
+  const timer = setTimeout(
+    () => guard.reject(new Error(`the supervisor held a session for ${ms}ms of real time without polling it to its end`)),
+    ms,
+  );
+  try {
+    await Promise.race([superviseTunnel(19000, h.deps), guard.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** How long the supervisor said a session lasted, in virtual ms. */
+function endedAfter(log: string[]): number[] {
+  return log
+    .filter((line) => line.startsWith('session ended'))
+    .map((line) => Number(/after ([\d.]+)s/.exec(line)?.[1]) * 1_000);
+}
+
+test('the fixed waits are not backoff values', () => {
+  // backoffs() separates the kinds of wait by value. If they ever collide,
+  // every backoff assertion below silently starts counting something else.
+  for (const fixed of [HEALTH_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, FORWARD_SHUTDOWN_MS]) {
+    assert.ok(!RECONNECT_BACKOFF_MS.includes(fixed), `${fixed}ms is also a backoff`);
+  }
+  assert.equal(new Set([HEALTH_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, FORWARD_SHUTDOWN_MS]).size, 3);
+});
+
+test('the keepalive interval leaves room inside the idle window it exists for', () => {
+  // Sized against the shortest idle timeout we know of, with room for a poll to
+  // be slow or to miss: at the boundary, one hiccup is a reaped session.
+  assert.ok(
+    KEEPALIVE_INTERVAL_MS * (KEEPALIVE_MISSES + 1) < IDLE_TIMEOUT_MS,
+    `${KEEPALIVE_INTERVAL_MS}ms polls must stay well inside a ${IDLE_TIMEOUT_MS}ms idle window`,
+  );
 });
 
 test('a dead forward is reopened against a freshly resolved endpoint', async () => {
@@ -250,7 +341,7 @@ test('a dead forward is reopened against a freshly resolved endpoint', async () 
     { lastsMs: 100, healthy: true },
     { lastsMs: 100, healthy: true },
   ]);
-  await superviseTunnel(19000, h.deps);
+  await superviseWithGuard(h);
 
   assert.equal(h.spawned.length, 3, 'each death reopened the tunnel');
   assert.deepEqual(h.opened, [
@@ -304,7 +395,7 @@ test('backoff grows across consecutive short sessions', async () => {
     { lastsMs: 10, healthy: false },
     { lastsMs: 10, healthy: false },
   ]);
-  await superviseTunnel(19000, h.deps);
+  await superviseWithGuard(h);
   assert.deepEqual(backoffs(h.slept).slice(0, 2), [RECONNECT_BACKOFF_MS[0], RECONNECT_BACKOFF_MS[1]]);
 });
 
@@ -318,7 +409,7 @@ test('a session that stayed up resets the backoff', async () => {
     { lastsMs: 10, healthy: true },
     { lastsMs: 10, healthy: true },
   ]);
-  await superviseTunnel(19000, h.deps);
+  await superviseWithGuard(h);
   // The supervisor stops after the last session, so the final wait is not taken.
   assert.deepEqual(
     backoffs(h.slept),
@@ -331,7 +422,7 @@ test('a resolution failure is retried with backoff, not fatal', async () => {
   // force-new-deployment leaves the service with no running task for a while.
   // Exiting there would put the operator back to hand-run aws commands.
   const h = harness([{ lastsMs: 10, healthy: true }], { openFailures: 2 });
-  await superviseTunnel(19000, h.deps);
+  await superviseWithGuard(h);
   assert.equal(h.spawned.length, 1, 'the tunnel opened once resolution succeeded');
   assert.equal(h.opened[0], 'ecs:fleet_task-3_rt-3', 'it used the endpoint from the successful attempt');
   assert.ok(
@@ -350,11 +441,256 @@ test('a forward that cannot start at all stops the supervisor instead of looping
 });
 
 test('a forward that never serves /health is reported but still supervised', async () => {
-  const h = harness([{ lastsMs: 10, healthy: false }]);
-  await superviseTunnel(19000, h.deps);
+  // It has to outlive the wait to be silent rather than simply gone.
+  const h = harness([{ lastsMs: HEALTH_TIMEOUT_MS + 5_000, healthy: false }]);
+  await superviseWithGuard(h);
   assert.ok(
     h.log.some((line) => line.includes('/health did not answer')),
     `a silent tunnel is named: ${h.log.join(' | ')}`,
+  );
+});
+
+// ---------- keepalive: traffic while the session is quiet ----------
+
+test('a session nobody uses is kept alive with periodic /health traffic', async () => {
+  // The acceptance case for #63. SSM Session Manager reaps a session that
+  // carries no traffic, so an operator who opened a tunnel and then typed
+  // nothing lost it every idle window — and a delegate typed during the reopen
+  // gap got ECONNREFUSED. This session lasts three idle windows with zero
+  // operator traffic; the only thing keeping it alive is the poll.
+  const session = 3 * IDLE_TIMEOUT_MS;
+  const h = harness([{ lastsMs: session, healthy: true }]);
+  await superviseWithGuard(h);
+
+  assert.equal(h.spawned.length, 1, 'one session, held the whole way');
+  const gaps: number[] = [];
+  let previous = 0;
+  for (const at of h.probed) {
+    gaps.push(at - previous);
+    previous = at;
+  }
+  gaps.push(session - previous); // and the tail: silence up to the moment it ended
+  assert.ok(
+    Math.max(...gaps) < IDLE_TIMEOUT_MS,
+    `longest silence was ${Math.max(...gaps)}ms of a ${IDLE_TIMEOUT_MS}ms idle window (probes at ${h.probed.join(',')})`,
+  );
+  // Log nothing on success: this runs for as long as the tunnel is open.
+  assert.deepEqual(
+    h.log.filter((line) => line.includes('/health')),
+    ['daemon /health ok on http://127.0.0.1:19000'],
+  );
+});
+
+test('a forward that dies between keepalive polls is reopened by the exit path', async () => {
+  // The keepalive must not swallow the ordinary signal: killing the daemon (or
+  // the plugin) mid-session ends the forward, and that is still what reopens
+  // the tunnel — without waiting out an interval first.
+  const h = harness([
+    { lastsMs: 2.5 * KEEPALIVE_INTERVAL_MS, healthy: true },
+    { lastsMs: 10, healthy: true },
+  ]);
+  await superviseWithGuard(h);
+  assert.equal(h.spawned.length, 2, 'the death reopened the tunnel');
+  assert.equal(h.opened[1], 'ecs:fleet_task-2_rt-2', 'against a freshly resolved endpoint');
+  assert.ok(
+    h.log.some((line) => line.includes('(exit 255)')),
+    `ended as its own exit, not as a keepalive verdict: ${h.log.join(' | ')}`,
+  );
+  assert.deepEqual(endedAfter(h.log).slice(0, 1), [2.5 * KEEPALIVE_INTERVAL_MS], 'ended when the forward did');
+  assert.ok(!h.log.some((line) => line.includes('stopped answering')), 'and not as a keepalive failure');
+});
+
+test('a forward whose far end stops answering is closed without waiting for its process', async () => {
+  // A forward outliving what it points at is the silent failure: the local port
+  // stays bound, /health answers nothing, and no process exits to say so. The
+  // poll is what notices. One miss is tolerated — a daemon restart is not a
+  // dead tunnel — so the session ends on the second, three intervals in.
+  //
+  // Three such sessions, because the backoff must escalate across them: a task
+  // that answers at open and stops a few minutes in is a crash loop, and a
+  // supervisor that credited it for those minutes would reopen every four
+  // minutes forever at the shortest delay. (The last session's end is not
+  // logged: the supervisor has been stopped by then.)
+  const crashLoop: FakeSession = {
+    lastsMs: 100 * KEEPALIVE_INTERVAL_MS,
+    healthy: true,
+    answers: (elapsed) => elapsed <= KEEPALIVE_INTERVAL_MS,
+  };
+  const h = harness([crashLoop, crashLoop, crashLoop]);
+  await superviseWithGuard(h);
+  assert.equal(h.spawned.length, 3, 'it reopened instead of holding a dead forward');
+  assert.equal(
+    h.log.filter((line) => line.includes('daemon /health stopped answering through the forward')).length,
+    3,
+    `it says why, each time: ${h.log.join(' | ')}`,
+  );
+  assert.deepEqual(
+    endedAfter(h.log),
+    [3 * KEEPALIVE_INTERVAL_MS + FORWARD_SHUTDOWN_MS, 3 * KEEPALIVE_INTERVAL_MS + FORWARD_SHUTDOWN_MS],
+    'closed on the second miss, not the first',
+  );
+  assert.ok(
+    h.log.some((line) => line.includes('(killed by SIGTERM)')),
+    `the forward was actually stopped: ${h.log.join(' | ')}`,
+  );
+  assert.deepEqual(
+    backoffs(h.slept),
+    [RECONNECT_BACKOFF_MS[0], RECONNECT_BACKOFF_MS[1]],
+    'a keepalive close is a failure however long the session lasted',
+  );
+});
+
+test('a single missed poll is not a dead tunnel', async () => {
+  // A daemon restart, or one slow answer, is not worth a new SSM session and
+  // the ECONNREFUSED window that opening one costs. Only consecutive misses are.
+  const h = harness([
+    {
+      lastsMs: 6 * KEEPALIVE_INTERVAL_MS,
+      healthy: true,
+      answers: (elapsed) => elapsed !== 2 * KEEPALIVE_INTERVAL_MS && elapsed !== 5 * KEEPALIVE_INTERVAL_MS,
+    },
+    { lastsMs: 10, healthy: true }, // only so the first session's end is logged
+  ]);
+  await superviseWithGuard(h);
+  assert.ok(!h.log.some((line) => line.includes('stopped answering')), h.log.join(' | '));
+  assert.deepEqual(endedAfter(h.log), [6 * KEEPALIVE_INTERVAL_MS], 'it ran to its own end, through both misses');
+});
+
+test('a session that starts silent and then answers is closed when it stops again', async () => {
+  // The other half of the silent-session rule: tolerated for never having
+  // answered, not exempt forever. Once a poll answers, the tunnel has proven it
+  // can, and going quiet after that is the same evidence as any other session's.
+  const h = harness([
+    {
+      lastsMs: 100 * KEEPALIVE_INTERVAL_MS,
+      healthy: true,
+      answers: (elapsed) => elapsed >= 2 * KEEPALIVE_INTERVAL_MS && elapsed < 4 * KEEPALIVE_INTERVAL_MS,
+    },
+    { lastsMs: 10, healthy: true },
+  ]);
+  await superviseWithGuard(h);
+  assert.ok(
+    h.log.some((line) => line.includes('/health did not answer')),
+    `it opened silent: ${h.log.join(' | ')}`,
+  );
+  assert.ok(
+    h.log.some((line) => line.includes('daemon /health stopped answering through the forward')),
+    `and was closed once it had proven itself: ${h.log.join(' | ')}`,
+  );
+  assert.equal(h.spawned.length, 2, 'it reopened');
+});
+
+test('a forward that ignores SIGTERM does not strand the supervisor', async () => {
+  // Closing the session was a verdict on a process that had stopped being a
+  // signal. Waiting on that same process without a bound is how a wedged
+  // session-manager-plugin would take the whole supervisor down with it —
+  // silently, since the last thing it logged was that it was closing the session.
+  const h = harness(
+    [
+      {
+        lastsMs: 100 * KEEPALIVE_INTERVAL_MS,
+        healthy: true,
+        answers: (elapsed) => elapsed === 0,
+        ignoresStop: true,
+      },
+      { lastsMs: 10, healthy: true },
+    ],
+    { stopAfter: 1 }, // the wedged session never ends, so it cannot be counted
+  );
+  await superviseWithGuard(h);
+  assert.equal(h.spawned.length, 2, 'it reopened past the forward that would not die');
+  assert.ok(
+    h.log.some((line) => line.includes('no exit after SIGTERM')),
+    `and said so: ${h.log.join(' | ')}`,
+  );
+});
+
+/**
+ * Drive one session against hand-written deps whose keepalive interval never
+ * elapses, and return what the supervisor said. For the two properties the
+ * virtual clock cannot express, because there the clock only moves when the
+ * supervisor sleeps: that the keepalive races the forward's death instead of
+ * waiting out its interval, and what it makes of a death that lands inside a poll.
+ */
+async function sessionOnRealTime(
+  parts: Pick<SuperviseDeps, 'spawnForward' | 'probeHealth'> & { intervalElapses?: boolean },
+): Promise<string[]> {
+  let stopped = false;
+  const log: string[] = [];
+  const supervised = superviseTunnel(19000, {
+    open: async () => ({ argv: ['aws', 'ssm', 'start-session'], id: 'ecs:fleet_task-1_rt-1' }),
+    spawnForward: parts.spawnForward,
+    probeHealth: parts.probeHealth,
+    sleep: async (ms) => {
+      if (ms !== KEEPALIVE_INTERVAL_MS) return;
+      // The interval either lands at once or never — one poll per turn, or a
+      // supervisor that only gets past it by racing the forward's death.
+      if (!parts.intervalElapses) await new Promise<never>(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    now: () => 0,
+    log: (line) => {
+      log.push(line);
+      if (line.startsWith('session ended')) stopped = true; // one session is the whole test
+    },
+    stopped: () => stopped,
+  });
+  const guard = Promise.withResolvers<never>();
+  const timer = setTimeout(() => guard.reject(new Error(`the session outlived its forward: ${log.join(' | ')}`)), 5_000);
+  try {
+    await Promise.race([supervised, guard.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+  return log;
+}
+
+test('a forward that dies mid-interval ends the session at once, not at the next poll', async () => {
+  // Killing the daemon must still reopen the tunnel through the ordinary exit
+  // path, on the death rather than two minutes after it — otherwise the
+  // keepalive turns every session death into an ECONNREFUSED window.
+  const { promise: exited, resolve: die } = Promise.withResolvers<ForwardExit>();
+  const log = await sessionOnRealTime({
+    spawnForward: () => {
+      setTimeout(() => die({ how: 'exit 255' }), 5); // the daemon is killed mid-session
+      return { exited, stop: () => {} };
+    },
+    probeHealth: async () => true,
+  });
+  assert.ok(log.some((line) => line.includes('session ended after 0s (exit 255)')), log.join(' | '));
+});
+
+test('a forward that dies inside a poll is reported as having exited, not as closed', async () => {
+  // A probe takes seconds, and the forward can die in one — on the very poll
+  // that would have closed the session. Two lines then contradict each other,
+  // and the reason the operator is given for the reopen is the wrong one.
+  const { promise: exited, resolve: die } = Promise.withResolvers<ForwardExit>();
+  let probes = 0;
+  const log = await sessionOnRealTime({
+    intervalElapses: true,
+    spawnForward: () => ({ exited, stop: () => die({ how: 'killed by SIGTERM' }) }),
+    probeHealth: async () => {
+      probes += 1;
+      if (probes === 1) return true; // it answered once: from here misses count
+      if (probes > KEEPALIVE_MISSES) die({ how: 'exit 255' }); // died inside the poll that would have closed it
+      return false;
+    },
+  });
+  assert.ok(!log.some((line) => line.includes('closing the session')), log.join(' | '));
+  assert.ok(log.some((line) => line.includes('session ended after 0s (exit 255)')), log.join(' | '));
+});
+
+test('a session that never answered /health is polled but not closed for it', async () => {
+  // waitForHealth already chose to hold a silent session open; killing it two
+  // minutes later on the same symptom would churn the deployment for nothing.
+  // The polls still go through the forward, which is what the far end counts.
+  const h = harness([{ lastsMs: HEALTH_TIMEOUT_MS + 4 * KEEPALIVE_INTERVAL_MS, healthy: false }]);
+  await superviseWithGuard(h);
+  assert.equal(h.spawned.length, 1, 'held open, as the warning promised');
+  assert.ok(!h.log.some((line) => line.includes('stopped answering')), h.log.join(' | '));
+  assert.ok(
+    h.probed.filter((at) => at >= HEALTH_TIMEOUT_MS).length >= 3,
+    `kept polling after giving up on a first answer: ${h.probed.join(',')}`,
   );
 });
 
