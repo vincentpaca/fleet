@@ -21,7 +21,9 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
+import { chooseLocalPort } from './connect.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
 
@@ -130,11 +132,27 @@ export async function interview(prompts: PromptSpec[], opts: InterviewOptions): 
         rejection ? `--${flagName(spec.key)} (default "${fallback}" rejected: ${rejection})` : `--${flagName(spec.key)}`,
       );
       // Keep going: the point of collecting is to name them all at once. The
-      // key stays unset, so a `when` that depends on it reads as "not asked".
+      // key stays unset — so a `when` predicate must treat "absent" as "no", the
+      // way `!answers.vpc_id` does; comparing to '' would read a missing answer
+      // as a real one.
       continue;
     }
 
     answers[spec.key] = await askOne(spec, fallback, opts);
+  }
+
+  // A flag whose prompt never ran is a description of infrastructure the
+  // operator will not get. Silence there is the dangerous kind: `--subnet-ids`
+  // without `--vpc-id` reads as "deploy into my network" and would apply a
+  // brand-new VPC instead, and with --yes nobody reads the plan.
+  const unused = Object.entries(opts.flags)
+    .filter(([key, value]) => value !== undefined && answers[key] === undefined)
+    .map(([key]) => `--${flagName(key)}`);
+  if (unused.length > 0) {
+    throw new SetupError(
+      `${unused.join(' ')}: the other answers make ${unused.length === 1 ? 'that question' : 'those questions'} irrelevant, so ${unused.length === 1 ? 'it was' : 'they were'} never asked\n` +
+        '  supply what they depend on, or drop them — applying while ignoring a value you passed is how you get infrastructure you did not describe',
+    );
   }
 
   return { answers, missing };
@@ -257,7 +275,11 @@ export function writeScaffold(
   if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
   written.push(`wrote ${gitkeepPath}`);
 
-  ensureFleetGitignore(fleetDir, ['.env']);
+  // The whole default set, not just `.env`: a hand-written .fleet/.gitignore
+  // that covers one entry left `out/`, `infra/` and `dispatched.jsonl`
+  // committable, and which of those leaked depended on which command the
+  // operator happened to run first.
+  ensureFleetGitignore(fleetDir, FLEET_GITIGNORE.split('\n').filter(Boolean));
   const dotEnvExamplePath = path.join(fleetDir, '.env.example');
   if (!fs.existsSync(dotEnvExamplePath)) fs.writeFileSync(dotEnvExamplePath, DOT_ENV_EXAMPLE);
   return written;
@@ -290,12 +312,17 @@ export function resolveModuleSource(opts: {
   if (override) return override;
 
   const unitDir = path.join(opts.root, 'infra', opts.provider);
-  const git = opts.git ?? ((args: string[]) => gitValue(['-C', opts.root, ...args]));
+  const git = opts.git ?? ((args: string[]) => gitValue(args, opts.root));
   if (fs.existsSync(path.join(unitDir, 'main.tf'))) {
     const origin = git(['remote', 'get-url', 'origin']);
     const ref = git(['describe', '--tags', '--exact-match']) ?? git(['rev-parse', 'HEAD']);
-    if (origin && ref) {
-      return `git::${toHttpsGitUrl(origin).replace(/\.git$/, '')}.git//infra/${opts.provider}?ref=${ref}`;
+    // Only a URL terraform can actually fetch. `toHttpsGitUrl` normalises
+    // github.com and leaves every other host alone, so an ssh remote elsewhere
+    // would otherwise be pasted into the module source as `git@host:org/repo` —
+    // not a source terraform understands, discovered at `init` rather than here.
+    const url = origin === undefined ? undefined : toHttpsGitUrl(origin);
+    if (url && ref && /^(https?|ssh):\/\//.test(url)) {
+      return `git::${url.replace(/\.git$/, '')}.git//infra/${opts.provider}?ref=${ref}`;
     }
   }
 
@@ -303,13 +330,6 @@ export function resolveModuleSource(opts: {
     `cannot tell which Fleet terraform module to use for ${opts.provider}: this installation has no infra/${opts.provider}/ beside it with a git remote to pin\n` +
       `  pass --module-source <source> (a git source such as git::https://github.com/<org>/fleet.git//infra/${opts.provider}?ref=<tag>, or the path to a Fleet checkout's infra/${opts.provider})`,
   );
-}
-
-/** git stdout, or undefined on any failure. */
-function gitValue(args: string[]): string | undefined {
-  const res = spawnSync('git', args, { encoding: 'utf8' });
-  const out = res.status === 0 ? res.stdout.trim() : '';
-  return out === '' ? undefined : out;
 }
 
 // ---------- generating the root module ----------
@@ -356,7 +376,7 @@ export function renderMainTf(opts: RenderOptions): string {
 # fleet-config.json capture the CLI reads.
 
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= ${MIN_TERRAFORM}"
 ${backendBlock}
   required_providers {
 ${providers}
@@ -387,7 +407,7 @@ output "connect_hint" {
 
 // ---------- running terraform ----------
 
-export type RunResult = { status: number; stdout: string; missing: boolean };
+export type RunResult = { status: number; stdout: string; stderr: string; missing: boolean };
 
 /**
  * Run a command for setup. `capture` reads stdout (JSON we parse); without it
@@ -403,7 +423,9 @@ export const spawnRunner: Runner = (argv, opts) => {
     stdio: opts.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
   });
   const missing = (res.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
-  return { status: missing ? -1 : (res.status ?? -1), stdout: res.stdout ?? '', missing };
+  // stderr only exists for captured runs; an inherited one already reached the
+  // terminal, and reporting it twice is worse than not having it.
+  return { status: missing ? -1 : (res.status ?? -1), stdout: res.stdout ?? '', stderr: res.stderr ?? '', missing };
 };
 
 /**
@@ -420,10 +442,43 @@ export function preflight(unit: SetupUnit, cwd: string, run: Runner): void {
     );
   }
   if (terraform.status !== 0) throw new SetupError(`terraform is on PATH but \`terraform version\` failed (exit ${terraform.status})`);
+  // The version is read, not just proven present: the module we generate
+  // declares `required_version`, so an older terraform passes this preflight
+  // and dies at `init` — after the whole interview, which is precisely what
+  // preflighting exists to prevent.
+  const tooOld = terraformTooOld(terraform.stdout);
+  if (tooOld) throw new SetupError(tooOld);
 
   const creds = run(unit.credentials.argv, { cwd, capture: true });
   if (creds.missing) throw new SetupError(unit.credentials.absent);
   if (creds.status !== 0) throw new SetupError(unit.credentials.denied);
+}
+
+/**
+ * Minimum terraform the generated root module declares — one constant, because
+ * a `required_version` the preflight does not know about is a check that only
+ * runs after the interview.
+ */
+export const MIN_TERRAFORM = '1.5.0';
+
+/**
+ * Rejection message when `terraform version`'s output names a version older
+ * than the generated module requires; undefined when it is fine, and also when
+ * the output is not recognisable — refusing on an unparsed version would block
+ * a terraform that works on the strength of a string we failed to read.
+ */
+export function terraformTooOld(versionOutput: string): string | undefined {
+  const found = versionOutput.match(/Terraform v(\d+)\.(\d+)\.(\d+)/);
+  if (!found) return undefined;
+  const version = found.slice(1, 4).map(Number);
+  const minimum = MIN_TERRAFORM.split('.').map(Number);
+  for (const [i, floor] of minimum.entries()) {
+    if (version[i] > floor) return undefined;
+    if (version[i] < floor) {
+      return `terraform ${version.join('.')} is too old — the module fleet generates needs >= ${MIN_TERRAFORM} (https://developer.hashicorp.com/terraform/install)`;
+    }
+  }
+  return undefined;
 }
 
 /** Run a terraform step, failing the command when it fails. */
@@ -546,6 +601,10 @@ async function interviewAndApply(
     }
     if (!(await confirm(`apply this plan to ${unit.provider} as "${answers.name}"?`, ask))) {
       opts.log(`nothing applied. The plan is saved: terraform -chdir=${path.relative(opts.cwd, dir)} apply ${planFile}`);
+      // The generated file stays, because the saved plan cannot be applied
+      // without it — but it now describes answers nothing was created from, and
+      // a later `--destroy` reads its name for the confirmation it prints.
+      opts.log(`  ${path.relative(opts.cwd, mainTf)} describes these answers, not what is deployed.`);
       return 0;
     }
   }
@@ -568,8 +627,14 @@ async function interviewAndApply(
  * bring-up — is exactly the handoff this command exists to close.
  */
 export function captureFleetConfig(dir: string, run: Runner): string {
+  const configPath = path.join(dir, 'fleet-config.json');
   const res = run(['terraform', 'output', '-json', 'fleet_config'], { cwd: dir, capture: true });
-  if (res.status !== 0) throw new SetupError('terraform output -json fleet_config failed — the apply succeeded but its description could not be read');
+  if (res.status !== 0) {
+    throw new SetupError(
+      'terraform output -json fleet_config failed — the apply succeeded but its description could not be read\n' +
+        `${indented(res.stderr)}  the apply is not lost; take the capture again with: terraform -chdir=${dir} output -json fleet_config > ${configPath}`,
+    );
+  }
   let config: unknown;
   try {
     config = JSON.parse(res.stdout);
@@ -580,14 +645,38 @@ export function captureFleetConfig(dir: string, run: Runner): string {
     throw new SetupError('terraform output -json fleet_config did not return an object');
   }
   const described = config as Record<string, unknown>;
-  if (described.daemon_url === undefined && typeof described.daemon_port === 'number') {
-    // The connect_hint convention: prefix the remote port with 1. Local agents
-    // squat low ports and accept connections silently, so never the port itself.
-    described.daemon_url = `http://127.0.0.1:1${described.daemon_port}`;
+  // daemon_url is the operator's own choice of local port, and this file is the
+  // only place it lives (src/cli/connect.ts) — a terraform output never carries
+  // it. So a re-capture keeps the one already here: deriving it every time
+  // would silently reset a port a live tunnel is holding, and every command
+  // would then report an unreachable daemon while the tunnel is fine.
+  const kept = keptDaemonUrl(configPath);
+  if (kept !== undefined) {
+    described.daemon_url = kept;
+  } else if (typeof described.daemon_port === 'number') {
+    // The connect_hint convention, from the one place that owns it: never the
+    // remote port itself, because local agents squat low ports and accept
+    // connections silently.
+    described.daemon_url = `http://127.0.0.1:${chooseLocalPort(undefined, undefined, described.daemon_port)}`;
   }
-  const configPath = path.join(dir, 'fleet-config.json');
   fs.writeFileSync(configPath, `${JSON.stringify(described, null, 2)}\n`);
   return configPath;
+}
+
+/** The `daemon_url` a previous capture already carries, if this file has one. */
+function keptDaemonUrl(configPath: string): string | undefined {
+  try {
+    const previous = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    return typeof previous.daemon_url === 'string' && previous.daemon_url !== '' ? previous.daemon_url : undefined;
+  } catch {
+    return undefined; // absent, or unreadable: either way there is nothing to keep
+  }
+}
+
+/** Indent captured stderr under a message, or nothing when there was none. */
+function indented(stderr: string): string {
+  const text = stderr.trim();
+  return text === '' ? '' : `${text.split('\n').map((line) => `  ${line}`).join('\n')}\n`;
 }
 
 /** The deployment name the generated root module was written with, for messages. */
@@ -611,6 +700,21 @@ async function destroyInfra(
     );
   }
   const name = generatedName(fs.readFileSync(mainTf, 'utf8')) ?? opts.unit.provider;
+
+  // A destroy tears down what the state in *this* directory owns; the prompt
+  // flags describe something to create and cannot steer it. Accepting them
+  // silently is the bad failure: `--destroy --yes --name staging` run from the
+  // production checkout would destroy production and, with no prompt, never say
+  // whose name it actually used.
+  const contradicting = Object.entries(opts.flags)
+    .filter(([key, value]) => value !== undefined && !(key === 'name' && value === name))
+    .map(([key, value]) => `--${flagName(key)} ${value}`);
+  if (contradicting.length > 0) {
+    throw new SetupError(
+      `--destroy does not take ${contradicting.join(' ')}: it tears down the deployment ${path.relative(opts.cwd, mainTf)} generated, which is "${name}"\n` +
+        `  rerun as: fleet setup infra --destroy${opts.yes ? ' --yes' : ''} --name ${name}   (or from the checkout whose deployment you meant)`,
+    );
+  }
 
   terraformStep(run, dir, ['init', '-input=false', ...opts.backendConfig.map((c) => `-backend-config=${c}`)], 'init');
   // The plan IS the confirmation prompt's evidence: "what dies" is a list only
@@ -823,17 +927,44 @@ export type SetupRepoOptions = {
  * the interview to change one answer is the ordinary way this command is used
  * the second time. Overwriting it still takes an explicit yes.
  */
+/**
+ * An existing manifest, but only if it is one. `repoPrompts` reads nested
+ * fields off it for its defaults, so anything that merely parses as JSON — `{}`,
+ * a half-finished edit, somebody else's config — would crash the interview with
+ * a stack trace on exactly the file this command exists to repair. The schema is
+ * the authority on what a manifest is, here as everywhere: what it rejects is
+ * not defaults, and the interview starts from the checkout instead.
+ */
+function readExistingManifest(manifestPath: string, opts: SetupRepoOptions): RepoManifest | undefined {
+  const scratch = (why: string): undefined => {
+    opts.log(`note: ${path.relative(opts.cwd, manifestPath)} ${why} — answering from the checkout instead`);
+    return undefined;
+  };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return scratch('is not valid JSON');
+  }
+  const check = opts.validate(parsed);
+  if (!check.ok) {
+    const first = check.errors[0];
+    return scratch(`is not a valid manifest (${first?.instancePath || '/'} ${first?.message ?? 'invalid'})`);
+  }
+  return parsed as RepoManifest;
+}
+
 export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
   const fleetDir = path.join(opts.cwd, '.fleet');
   const manifestPath = path.join(fleetDir, 'manifest.json');
 
+  // Existence and usability are two questions, and conflating them cost both
+  // ways: a file too broken to read as defaults was also a file overwritten
+  // with no confirmation, while a valid one got the prompt.
+  const manifestExists = fs.existsSync(manifestPath);
   let existing: RepoManifest | undefined;
-  if (fs.existsSync(manifestPath)) {
-    try {
-      existing = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as RepoManifest;
-    } catch {
-      opts.log(`note: ${path.relative(opts.cwd, manifestPath)} is not valid JSON — answering from scratch`);
-    }
+  if (manifestExists) {
+    existing = readExistingManifest(manifestPath, opts);
     if (!opts.yes && !opts.interactive) {
       throw new SetupError(
         `${path.relative(opts.cwd, manifestPath)} already exists, and there is no terminal to confirm overwriting it — rerun with --yes if you mean to replace it`,
@@ -851,7 +982,7 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
       ask,
       log: opts.log,
     });
-    if (merged.missing.length === 0 && existing && !opts.yes && ask) {
+    if (merged.missing.length === 0 && manifestExists && !opts.yes && ask) {
       const approved = await confirm(`overwrite ${path.relative(opts.cwd, manifestPath)}?`, ask);
       if (!approved) {
         opts.log('nothing written.');

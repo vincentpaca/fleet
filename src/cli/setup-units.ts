@@ -168,7 +168,9 @@ const AWS: SetupUnit = {
       question: 'subnets in that VPC (comma-separated)',
       required: true,
       validate: validateSubnetIds,
-      when: (a) => a.vpc_id !== '',
+      // Truthiness, not `!== ''`: headless with no `--vpc-id` the key can be
+      // absent entirely, and an absent answer is not a VPC to reuse.
+      when: (a) => Boolean(a.vpc_id),
     },
   ],
 };

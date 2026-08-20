@@ -31,7 +31,9 @@ if (existsSync(join(dir, `fail-${command}`))) {
 }
 
 if (command === 'version') {
-  process.stdout.write('Terraform v1.9.8\n');
+  // FAKE_TF_VERSION is how a test says "this machine has an old terraform";
+  // the CLI reads the version, because the module it generates requires one.
+  process.stdout.write(`Terraform v${process.env.FAKE_TF_VERSION ?? '1.9.8'}\n`);
 } else if (command === 'init') {
   process.stdout.write('Terraform has been successfully initialized!\n');
 } else if (command === 'plan') {

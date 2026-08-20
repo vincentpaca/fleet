@@ -23,7 +23,6 @@
  * grammar are all tested without a terminal. The resident-loop section owns
  * everything else: the interval, the sockets, the child process, the screen.
  */
-import { spawnSync } from 'node:child_process';
 import {
   ENTER_ALT,
   RESTORE_SEQ,
@@ -51,6 +50,7 @@ import {
   type FrameOpts,
   type RosterRow,
 } from './board.ts';
+import { gitValue } from '../shared/git.ts';
 import { daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
 import { logsNoColor } from './format.ts';
 import { holdTunnel, portAccepts, resolveTunnel, tunnelReport, type HeldTunnel } from './connect.ts';
@@ -593,10 +593,7 @@ function errorText(err: unknown): string {
 /** Best-effort repo/branch/provider for the header strip; every field is optional. */
 function detectContext(cwd: string): ContextInfo {
   const context: ContextInfo = {};
-  const git = (args: string[]): string | undefined => {
-    const res = spawnSync('git', args, { cwd, encoding: 'utf8' });
-    return res.status === 0 && res.stdout.trim() !== '' ? res.stdout.trim() : undefined;
-  };
+  const git = (args: string[]): string | undefined => gitValue(args, cwd);
   context.branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const origin = git(['remote', 'get-url', 'origin']);
   const named = origin?.match(/[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);

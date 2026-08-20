@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { fleetHome } from '../shared/home.ts';
+import { gitValue } from '../shared/git.ts';
 import {
   clearRetainedRecord,
   listRetainedRecords,
@@ -407,13 +408,6 @@ function loadDotEnv(fleetDir: string): Record<string, string> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw err;
   }
-}
-
-/** git stdout in cwd, or undefined on any failure. */
-function gitValue(args: string[]): string | undefined {
-  const res = spawnSync('git', args, { encoding: 'utf8' });
-  const out = res.status === 0 ? res.stdout.trim() : '';
-  return out === '' ? undefined : out;
 }
 
 type ModePreset = {

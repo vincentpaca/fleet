@@ -12,8 +12,17 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { validateManifest } from '../src/validate.mjs';
 import { runCli, makeTempDir, fakeCloudBin } from './cli-helpers.ts';
-import { interview, renderMainTf, resolveModuleSource, repoManifest, SetupError } from '../src/cli/setup.ts';
-import { unitFor } from '../src/cli/setup-units.ts';
+import {
+  interview,
+  renderMainTf,
+  resolveModuleSource,
+  repoManifest,
+  runSetupRepo,
+  terraformTooOld,
+  MIN_TERRAFORM,
+  SetupError,
+} from '../src/cli/setup.ts';
+import { SETUP_UNITS, unitFor } from '../src/cli/setup-units.ts';
 
 const AWS = unitFor('aws')!;
 
@@ -199,6 +208,98 @@ test('setup infra: an unknown provider is refused, in either flag spelling', asy
   }
 });
 
+test('setup infra: a flag whose question never ran is refused, not ignored', async () => {
+  const s = scratch();
+  // Subnets without a VPC to put them in: the operator meant "deploy into my
+  // network". Ignoring it would create a whole new VPC instead, and --yes means
+  // nobody reads the plan that would have shown it.
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--subnet-ids', 'subnet-01', '--yes'], {
+    cwd: s.cwd,
+    env: s.env,
+  });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /--subnet-ids/);
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'refused before anything was planned');
+  assert.ok(!fs.existsSync(path.join(s.cwd, '.fleet', 'infra')), 'nothing generated');
+});
+
+test('setup infra: a terraform too old for the generated module is refused up front', async () => {
+  const s = scratch({ FAKE_TF_VERSION: '1.4.6' });
+  const res = await runCli(['setup', 'infra'], {
+    cwd: s.cwd,
+    env: { ...s.env, FLEET_FORCE_TTY: '1' },
+    stdin: 'demo\n\n\ny\n',
+  });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /1\.4\.6 is too old/);
+  assert.match(res.stderr, new RegExp(MIN_TERRAFORM.replace('.', '\\.')));
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'the interview never started');
+});
+
+test('setup infra: a re-capture keeps the local port the operator chose', async () => {
+  const s = scratch();
+  assert.equal((await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  const configPath = path.join(infraDir(s.cwd), 'fleet-config.json');
+  const captured = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.equal(captured.daemon_url, 'http://127.0.0.1:19000');
+
+  // The operator picks another local port — the one field of this file that is
+  // theirs, and that no terraform output carries.
+  fs.writeFileSync(configPath, JSON.stringify({ ...captured, daemon_url: 'http://127.0.0.1:18080' }, null, 2));
+  assert.equal((await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+
+  const recaptured = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.equal(
+    recaptured.daemon_url,
+    'http://127.0.0.1:18080',
+    'a rerun that reset this would point every command at a port no tunnel is on',
+  );
+  assert.equal(recaptured.cluster, 'demo', 'the rest of the description is still refreshed');
+});
+
+test('setup infra: a capture that cannot be read says so, and how to retake it', async () => {
+  const s = scratch();
+  fs.writeFileSync(path.join(s.state, 'fail-output'), '');
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1);
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan', 'apply', 'output'], 'the apply did happen');
+  assert.match(res.stderr, /output -json fleet_config failed/);
+  assert.match(res.stderr, /fake-terraform: output failed/, "terraform's own reason is not swallowed");
+  assert.match(res.stderr, /terraform -chdir=.* output -json fleet_config/, 'names the way out');
+});
+
+test('setup infra: a failing apply fails the command and captures nothing', async () => {
+  const s = scratch();
+  fs.writeFileSync(path.join(s.state, 'fail-apply'), '');
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /terraform apply failed/);
+  assert.ok(!fs.existsSync(path.join(infraDir(s.cwd), 'fleet-config.json')), 'nothing to describe');
+});
+
+test('setup infra: a fleet_config that is not an object is refused, not written', async () => {
+  const s = scratch();
+  fs.writeFileSync(path.join(s.state, 'fleet-config'), '[]');
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /did not return an object/);
+  assert.ok(!fs.existsSync(path.join(infraDir(s.cwd), 'fleet-config.json')));
+});
+
+test('setup infra: stdin that ends mid-interview exits rather than hanging', async () => {
+  const s = scratch();
+  // One answer for three questions. "Never hang waiting for input" has to hold
+  // for input that runs out, not only for input that was never there.
+  const res = await runCli(['setup', 'infra'], {
+    cwd: s.cwd,
+    env: { ...s.env, FLEET_FORCE_TTY: '1' },
+    stdin: 'demo\n',
+  });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /stdin ended/);
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'nothing was planned on half an interview');
+});
+
 // ---------- preflight ----------
 
 test('setup infra: no terraform exits 1 before touching anything', async () => {
@@ -262,6 +363,26 @@ test('setup infra --destroy: answering no destroys nothing', async () => {
   assert.equal(res.code, 0, res.stderr);
   assert.ok(!subcommands(s.calls()).includes('destroy'));
   assert.ok(fs.existsSync(path.join(infraDir(s.cwd), 'fleet-config.json')), 'the capture survives');
+});
+
+test('setup infra --destroy: a name that is not this deployment refuses to destroy', async () => {
+  const s = scratch();
+  assert.equal((await runCli(['setup', 'infra', '--name', 'prod', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  fs.writeFileSync(path.join(s.state, 'calls.log'), '');
+
+  // Two deployments, two checkouts, one tired operator. Destroy takes its
+  // target from the state in this directory, so a disagreeing --name means the
+  // operator is standing in the wrong one — and --yes means no prompt would
+  // ever have shown them whose infrastructure was about to go.
+  const res = await runCli(['setup', 'infra', '--destroy', '--yes', '--name', 'staging'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /"prod"/, 'names what this directory actually owns');
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'refused at the preflight, before any plan or destroy');
+
+  // Naming it correctly is a statement of intent, not a contradiction.
+  const agreeing = await runCli(['setup', 'infra', '--destroy', '--yes', '--name', 'prod'], { cwd: s.cwd, env: s.env });
+  assert.equal(agreeing.code, 0, agreeing.stderr);
+  assert.ok(subcommands(s.calls()).includes('destroy'));
 });
 
 test('setup infra --destroy: nothing generated here means nothing to destroy', async () => {
@@ -436,13 +557,29 @@ test('terraform validate accepts the generated root module', { skip: terraformSk
       version: '0.0.0-test',
     }),
   );
+  // This CLI is now a terraform *producer*, and AGENTS.md requires this repo's
+  // terraform to be fmt-clean — including the terraform it writes into an
+  // operator's project, which they will read and edit.
+  const fmt = spawnSync('terraform', ['fmt', '-check', '-diff', 'main.tf'], { cwd: dir, encoding: 'utf8' });
+  assert.equal(fmt.status, 0, `the generated root module is not fmt-clean:\n${fmt.stdout}${fmt.stderr}`);
+
   const init = spawnSync('terraform', ['init', '-input=false', '-backend=false'], { cwd: dir, encoding: 'utf8' });
   assert.equal(init.status, 0, `terraform init failed (needs registry access for the aws provider):\n${init.stderr}`);
   const validate = spawnSync('terraform', ['validate'], { cwd: dir, encoding: 'utf8' });
   assert.equal(validate.status, 0, validate.stdout + validate.stderr);
 });
 
-/** Skip reason when terraform is not installed; the live path is #9's drill. */
+/**
+ * Skip reason when terraform is not installed; the live path is #9's drill.
+ *
+ * NOT WIRED IN CI YET, and a check that always skips proves nothing: neither
+ * the `test` job nor a typical developer machine has terraform, so today this
+ * runs only where somebody installed it. It belongs in `.github/workflows/`'s
+ * `terraform` job, which has the binary — that step could not be pushed from
+ * the job that wrote this file (its token has no `workflow` scope), so the
+ * patch travels in the PR body instead. Until it lands, read a pass here as
+ * "not checked" unless the run reports this test as passing rather than skipped.
+ */
 function terraformSkip(): string | false {
   const res = spawnSync('terraform', ['version'], { encoding: 'utf8' });
   return res.error === undefined && res.status === 0 ? false : 'terraform is not installed here';
@@ -543,10 +680,93 @@ test('setup repo: no terminal and an existing manifest refuses instead of overwr
   assert.match(res.stderr, /--yes/);
 });
 
-test('setup repo: the manifest a bad answer would make is refused, not written', () => {
-  // repoManifest is schema-shaped by construction; the guard is that the CLI
-  // validates before writing, so a shape the schema rejects never lands.
-  const manifest = repoManifest({ repo: 'origin', image: '', pickup: 'gate', command_path: 'c.md', critic: '' });
-  const { ok } = validateManifest({ ...manifest, setup: { image: '', script: '.fleet/setup.sh', dockerfile: 'x' } });
-  assert.equal(ok, false, 'the schema is the authority on manifest shape, not the interview');
+test('setup repo: a manifest the schema rejects is refused, not written', async () => {
+  const cwd = scratchRepo();
+  // The schema is the authority on manifest shape, and the CLI consults it
+  // before writing: whatever the interview assembled, a rejected manifest must
+  // not reach disk — `fleet lint` failing on a file setup just wrote is worse
+  // than setup refusing to write it.
+  const code = await runSetupRepo({
+    cwd,
+    env: {},
+    flags: { repo: 'origin', image: 'node:22', pickup: 'gate', command_path: '.claude/commands/dev.md', critic: 'c' },
+    yes: true,
+    interactive: false,
+    log: () => {},
+    validate: () => ({ ok: false, errors: [{ instancePath: '/setup/image', message: 'must be a real image' }] }),
+  }).then(
+    () => 'resolved',
+    (err: unknown) => err,
+  );
+  assert.ok(code instanceof SetupError, `expected a SetupError, got ${String(code)}`);
+  assert.match((code as SetupError).message, /must be a real image/);
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'manifest.json')), 'nothing written');
+});
+
+test('setup repo: a manifest that parses but is not one becomes no defaults, and still takes a yes', async () => {
+  const cwd = scratchRepo();
+  // The file this command exists to repair: valid JSON, not a manifest. Reading
+  // defaults off it used to crash on `existing.workspace.repo`, and — because
+  // "unusable" was conflated with "absent" — a file too broken to read was also
+  // one overwritten without asking.
+  fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), '{"version":1}\n');
+
+  const declined = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1' },
+    stdin: `${'\n'.repeat(8)}n\n`,
+  });
+  assert.equal(declined.code, 0, declined.stderr);
+  assert.match(declined.stdout, /is not a valid manifest/);
+  assert.match(declined.stdout, /nothing written/);
+  assert.equal(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'), '{"version":1}\n', 'untouched');
+
+  const accepted = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1' },
+    stdin: `${'\n'.repeat(8)}y\n`,
+  });
+  assert.equal(accepted.code, 0, accepted.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(validateManifest(manifest).ok, true, 'the defaults came from the checkout, not the broken file');
+  assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs');
+});
+
+test('setup repo: a manifest that is not JSON at all is not silently replaced either', async () => {
+  const cwd = scratchRepo();
+  fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), '{ "version": 1, }\n');
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1' },
+    stdin: `${'\n'.repeat(8)}n\n`,
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /is not valid JSON/);
+  assert.equal(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'), '{ "version": 1, }\n');
+});
+
+// ---------- the unit contract ----------
+
+test('every setup unit asks for the name the rest of setup depends on', () => {
+  // `answers.name` is read by the apply confirmation, the destroy guard and
+  // `generatedName`; a unit without that prompt would print `as "undefined"`
+  // and fall back to the provider string on teardown. The map is the place a
+  // second cloud is added, so this is the place that catches it.
+  for (const unit of SETUP_UNITS) {
+    const name = unit.prompts.find((p) => p.key === 'name');
+    assert.ok(name, `unit ${unit.provider} has no "name" prompt`);
+    assert.equal(name.required, true, `unit ${unit.provider}: name must be required — it names the deployment`);
+    assert.deepEqual(
+      unit.moduleArgs({ name: 'demo', region: 'us-east-1' }).find(([key]) => key === 'name'),
+      ['name', '"demo"'],
+      `unit ${unit.provider}: the name answer must reach the module`,
+    );
+  }
+});
+
+test('terraformTooOld reads a version rather than trusting the binary exists', () => {
+  assert.match(terraformTooOld('Terraform v1.4.6\n') ?? '', /too old/);
+  assert.equal(terraformTooOld('Terraform v1.5.0\n'), undefined, 'the floor itself passes');
+  assert.equal(terraformTooOld('Terraform v2.0.1\n'), undefined);
+  assert.equal(terraformTooOld('OpenTofu v1.6.0\n'), undefined, 'an unreadable version is not a refusal');
 });

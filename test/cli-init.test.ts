@@ -103,12 +103,30 @@ test('init: .env appended to an existing .fleet/.gitignore that lacks it', async
 test('init: .env not appended when /.env already present in .gitignore', async () => {
   const cwd = makeTempDir('fleet-cli-init-dotenv4-');
   fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
-  fs.writeFileSync(path.join(cwd, '.fleet', '.gitignore'), 'out/\ninfra/\n/.env\n');
+  // The complete default set, with .env in its root-anchored form: nothing to add.
+  const complete = 'out/\ninfra/\n/.env\ndispatched.jsonl\n';
+  fs.writeFileSync(path.join(cwd, '.fleet', '.gitignore'), complete);
   const res = await runCli(['init'], { cwd });
   assert.equal(res.code, 0, res.stderr);
   const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
   // The root-anchored form already covers .env — don't add a bare .env too.
-  assert.equal(gitignore, 'out/\ninfra/\n/.env\n', 'gitignore unchanged when /.env already present');
+  assert.equal(gitignore, complete, 'gitignore unchanged when /.env already present');
+});
+
+test('init: an existing .gitignore gains every default entry it is missing', async () => {
+  const cwd = makeTempDir('fleet-cli-init-dotenv5-');
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  // A hand-written (or older) .fleet/.gitignore. Which of the runtime paths
+  // stayed committable used to depend on which command the operator ran —
+  // `init` ensured .env only, `setup infra` only infra/ — so the answer to "is
+  // my job's out/ channel in git?" was "it depends".
+  fs.writeFileSync(path.join(cwd, '.fleet', '.gitignore'), '.env\n');
+  assert.equal((await runCli(['init'], { cwd })).code, 0);
+  const lines = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8').split('\n');
+  for (const entry of ['out/', 'infra/', '.env', 'dispatched.jsonl']) {
+    assert.ok(lines.includes(entry), `${entry} missing from .fleet/.gitignore: ${JSON.stringify(lines)}`);
+  }
+  assert.equal(lines.filter((l) => l === '.env').length, 1, 'no duplicate entries');
 });
 
 test('init: .env.example not clobbered on reinit (manifest check fires first)', async () => {
