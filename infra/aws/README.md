@@ -21,24 +21,34 @@ opens and holds (the `connect_hint` output is the same thing by hand). Intra-VPC
 
 ## Bring-up
 
-**1. Apply.**
+**1. Apply, and capture the deployment's own description — one command.** Run it from the
+project that will dispatch jobs, not from this unit:
+
+```sh
+fleet setup infra                    # add --yes plus --name/--region/… to run it headless
+```
+
+The CLI owns this step. It interviews you for the values this unit's defaults cannot
+assume (`name`, `region`, an optional existing VPC), generates
+`.fleet/infra/aws/main.tf` consuming this module at a pinned git ref, shows you the
+plan, applies on an explicit yes, and writes the `fleet_config` output to
+`.fleet/infra/aws/fleet-config.json` — every value the image build and the rest of the
+CLI need, including the `daemon_url` line step 3 used to ask you to paste in by hand.
+State is local, beside the generated root module (`--backend` + `--backend-config` for a
+real backend); `.fleet/infra/` is gitignored, so two people on one repo can point at
+different deployments. `fleet setup infra --destroy` plans the teardown, shows what dies,
+and takes it down on a yes.
+
+Driving terraform yourself is still supported — the module is a module:
 
 ```sh
 cd examples/basic && terraform init && terraform apply
+mkdir -p <project>/.fleet/infra/aws
+terraform -chdir=$PWD output -json fleet_config \
+  > <project>/.fleet/infra/aws/fleet-config.json
 ```
 
-**2. Capture the deployment's own description.** Every value the image build and the
-CLI need is in the `fleet_config` output; keep it beside the project that dispatches
-jobs (`.fleet/infra/` is gitignored — two people on one repo can point at different
-deployments). Steps 2 and 3 run from that project directory, not from this unit:
-
-```sh
-mkdir -p .fleet/infra/aws
-terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config \
-  > .fleet/infra/aws/fleet-config.json
-```
-
-**3. Publish both images and start the daemon on them — one command.**
+**2. Publish both images and start the daemon on them — one command.**
 
 ```sh
 <fleet-checkout>/images/build.sh --redeploy-daemon
@@ -51,9 +61,10 @@ repository from `fleet_config`, and forces a new deployment of the daemon servic
 it starts from the image just pushed. You never set `DOCKER_DEFAULT_PLATFORM`,
 `docker tag`, or `aws ecs update-service` by hand.
 
-**4. Open the tunnel.** Add `"daemon_url": "http://127.0.0.1:19000"` to
-`fleet-config.json` (any free local port; `1` + `daemon_tcp_port` is the convention),
-then from that project directory:
+**3. Open the tunnel.** `fleet setup infra` already wrote `"daemon_url":
+"http://127.0.0.1:19000"` into `fleet-config.json` (any free local port works; `1` +
+`daemon_tcp_port` is the convention — add it by hand if you captured the output
+yourself). From the project directory:
 
 ```sh
 fleet connect          # foreground; --detach to supervise in the background

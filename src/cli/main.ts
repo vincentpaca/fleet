@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
 import { fleetHome } from '../shared/home.ts';
+import { gitValue } from '../shared/git.ts';
 import {
   clearRetainedRecord,
   listRetainedRecords,
@@ -21,6 +22,8 @@ import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
+import { unitFor, SETUP_UNITS } from './setup-units.ts';
+import { runSetupInfra, runSetupRepo, repoPrompts, flagName, writeScaffold, SetupError, SETUP_STUB } from './setup.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -45,7 +48,22 @@ selected job's tail, and a command line to dispatch and answer from. It adopts a
 healthy daemon tunnel or opens its own, and closing it leaves running jobs alone.
 
 Commands:
-  init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/)
+  setup infra [--destroy] [--yes] [...]    Stand up (or tear down) the infrastructure in your
+                                           cloud. A wizard on a terminal: it asks only what the
+                                           infra contract cannot assume (name, region, optional
+                                           existing VPC), shows the plan, and applies on an
+                                           explicit yes. Generates .fleet/infra/<provider>/main.tf
+                                           against Fleet's terraform unit at a pinned ref and
+                                           captures fleet-config.json when the apply succeeds.
+                                           Flags are headless overrides for any prompt
+                                           (--name, --region, --vpc-id, --subnet-ids), plus
+                                           --provider, --backend, --backend-config (repeatable),
+                                           --module-source. Without a terminal, a missing value
+                                           exits 1 naming it — it never waits for input.
+  setup repo [--yes] [...]                 Write .fleet/manifest.json by interview, with defaults
+                                           extracted from this checkout. Same flag-override rules.
+  init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
+                                           placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
   delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
@@ -124,14 +142,6 @@ function formatFindings(file: string, errors: AjvError[]): string[] {
 
 // ---------- init ----------
 
-const SETUP_STUB = `#!/usr/bin/env sh
-# Fleet setup script: everything the job image needs before the harness runs
-# (dependencies, build, seed data). Runs with unrestricted egress.
-set -eu
-
-echo "fleet setup: replace this stub with your project's setup steps (e.g. npm ci)"
-`;
-
 const BROWNFIELD_GUIDANCE = `Brownfield init: this repo already has a life outside Fleet.
 Extract .fleet/setup.sh from your real "new laptop" steps — the commands you
 actually run to make a fresh clone workable (install deps, build, seed, env).
@@ -152,71 +162,163 @@ function initManifest(): unknown {
   };
 }
 
-// Runtime and per-deployment artifacts never belong in the user's repo:
-// out/ is the job's decision/answer/report channel; infra/ holds generated
-// terraform + local state + the per-deployment fleet-config.json (two people
-// on the same repo can point at different infra). .env holds secrets — only
-// .env.example (the key template) belongs in git. dispatched.jsonl is a
-// local pointer ledger — per-checkout, never shared.
-const FLEET_GITIGNORE = `out/
-infra/
-.env
-dispatched.jsonl
-`;
-
-// Template only — the operator fills in real values in .fleet/.env (gitignored).
-const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in real values.
-# .env is gitignored; this file is the template that lives in the repo.
-# Declare the same keys in manifest.json env.vars so Fleet picks them up.
-# EXAMPLE_VAR=replace-with-real-value
-`;
-
 function cmdInit(args: string[]): number {
   const { values } = parseCommand(args, { existing: { type: 'boolean' } }, 0, 0);
   const existing = values.existing === true;
   const fleetDir = path.resolve('.fleet');
   const manifestPath = path.join(fleetDir, 'manifest.json');
   const setupPath = path.join(fleetDir, 'setup.sh');
-  const gitkeepPath = path.join(fleetDir, 'out', '.gitkeep');
 
   if (fs.existsSync(manifestPath)) {
     fail(`refusing to overwrite existing ${manifestPath} — remove it first if you really want a fresh scaffold`);
   }
-  const setupExists = fs.existsSync(setupPath);
-  if (setupExists && !existing) {
+  if (fs.existsSync(setupPath) && !existing) {
     fail(`refusing to overwrite existing ${setupPath} — rerun with --existing to keep it`);
   }
 
-  fs.mkdirSync(path.join(fleetDir, 'out'), { recursive: true });
-  fs.writeFileSync(manifestPath, `${JSON.stringify(initManifest(), null, 2)}\n`);
-  if (!setupExists) fs.writeFileSync(setupPath, SETUP_STUB, { mode: 0o755 });
-  if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
-
-  // .gitignore: create with defaults when absent; ensure .env is covered when
-  // the file already exists (e.g. an older init omitted it).
-  const gitignorePath = path.join(fleetDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
-  } else {
-    const currentIgnore = fs.readFileSync(gitignorePath, 'utf8');
-    const lines = currentIgnore.split('\n').map((l) => l.trim());
-    // Accept both '.env' and the root-anchored form '/.env'.
-    if (!lines.includes('.env') && !lines.includes('/.env')) {
-      fs.appendFileSync(gitignorePath, currentIgnore.endsWith('\n') ? '.env\n' : '\n.env\n');
-    }
-  }
-
-  // .env.example: template for the gitignored .fleet/.env; never clobber.
-  const dotEnvExamplePath = path.join(fleetDir, '.env.example');
-  if (!fs.existsSync(dotEnvExamplePath)) fs.writeFileSync(dotEnvExamplePath, DOT_ENV_EXAMPLE);
-
-  console.log(`wrote ${manifestPath}`);
-  if (setupExists) console.log(`kept existing ${setupPath}`);
-  else console.log(`wrote ${setupPath}`);
-  console.log(`wrote ${gitkeepPath}`);
+  // The scaffold itself is shared with `fleet setup repo` (#13): the two
+  // commands differ in where the manifest's values come from, never in what a
+  // .fleet/ directory contains.
+  for (const line of writeScaffold(fleetDir, initManifest(), SETUP_STUB)) console.log(line);
   if (existing) console.log(`\n${BROWNFIELD_GUIDANCE}`);
   else console.log('\nEdit .fleet/manifest.json (repo URL, pickup gate) and .fleet/setup.sh before delegating.');
+  console.log('Or answer for them: fleet setup repo');
   return EXIT_OK;
+}
+
+// ---------- setup ----------
+
+/**
+ * Is there someone to interview? stdin, not stdout: the wizard reads answers,
+ * and a `fleet setup infra` whose output is piped into a log is still being
+ * driven by a human. FLEET_FORCE_TTY is the same test hook the cockpit uses —
+ * an env var rather than a flag, so the command surface stays honest.
+ */
+function promptable(): boolean {
+  if (process.env.FLEET_FORCE_TTY === '1') return true;
+  return process.stdin.isTTY ?? false;
+}
+
+function fleetVersion(): string {
+  const pkg = readJsonFile(
+    fileURLToPath(new URL('../../package.json', import.meta.url)),
+    'package.json',
+  ) as { version: string };
+  return pkg.version;
+}
+
+/** Root of this Fleet installation — the directory holding `infra/` when it is a checkout. */
+function installRoot(): string {
+  return fileURLToPath(new URL('../..', import.meta.url));
+}
+
+/** Prompt values a flag pre-supplied, keyed the way the prompt list keys them. */
+function suppliedFlags(
+  prompts: { key: string }[],
+  values: Record<string, string | boolean | string[] | undefined>,
+): Record<string, string | undefined> {
+  const supplied: Record<string, string | undefined> = {};
+  for (const { key } of prompts) {
+    const value = values[flagName(key)];
+    if (typeof value === 'string') supplied[key] = value;
+  }
+  return supplied;
+}
+
+/** Declare one string option per prompt: the prompt list owns the flag surface. */
+function promptOptions(prompts: { key: string }[]): Record<string, { type: 'string' }> {
+  return Object.fromEntries(prompts.map(({ key }) => [flagName(key), { type: 'string' as const }]));
+}
+
+async function cmdSetup(args: string[]): Promise<number> {
+  const [subcommand, ...rest] = args;
+  if (subcommand === 'infra') return await cmdSetupInfra(rest);
+  if (subcommand === 'repo') return await cmdSetupRepo(rest);
+  if (!subcommand) {
+    console.error('fleet setup: subcommand required (infra, repo)');
+    return EXIT_USAGE;
+  }
+  console.error(`fleet setup: unknown subcommand: ${subcommand}`);
+  return EXIT_USAGE;
+}
+
+/**
+ * `--provider` is read before the real parse, because it decides which prompts —
+ * and therefore which flags — exist at all. Both spellings, deliberately: a
+ * `--provider=gcp` that this missed would fall through to the first unit and
+ * generate terraform for the wrong cloud without saying so.
+ */
+function providerArg(args: string[]): string | undefined {
+  const inline = args.find((arg) => arg.startsWith('--provider='));
+  if (inline) return inline.slice('--provider='.length);
+  const at = args.indexOf('--provider');
+  // A dangling `--provider` reads as the empty provider, which no unit answers
+  // to — reported as a usage error rather than silently defaulting.
+  return at === -1 ? undefined : (args[at + 1] ?? '');
+}
+
+async function cmdSetupInfra(args: string[]): Promise<number> {
+  const provider = providerArg(args) ?? SETUP_UNITS[0].provider;
+  const unit = unitFor(provider);
+  if (!unit) {
+    console.error(`fleet setup infra: no unit for provider "${provider}" — available: ${SETUP_UNITS.map((u) => u.provider).join(', ')}`);
+    return EXIT_USAGE;
+  }
+
+  const { values } = parseCommand(
+    args,
+    {
+      ...promptOptions(unit.prompts),
+      provider: { type: 'string' },
+      yes: { type: 'boolean' },
+      destroy: { type: 'boolean' },
+      backend: { type: 'string' },
+      'backend-config': { type: 'string', multiple: true },
+      'module-source': { type: 'string' },
+    },
+    0,
+    0,
+  );
+
+  try {
+    return await runSetupInfra({
+      cwd: process.cwd(),
+      env: process.env as Record<string, string | undefined>,
+      root: installRoot(),
+      version: fleetVersion(),
+      unit,
+      flags: suppliedFlags(unit.prompts, values),
+      yes: values.yes === true,
+      destroy: values.destroy === true,
+      backend: typeof values.backend === 'string' ? values.backend : undefined,
+      backendConfig: Array.isArray(values['backend-config']) ? values['backend-config'] : [],
+      moduleSource: typeof values['module-source'] === 'string' ? values['module-source'] : undefined,
+      interactive: promptable(),
+      log: (line) => console.log(line),
+    });
+  } catch (err) {
+    if (err instanceof SetupError) fail(`fleet setup infra: ${err.message}`);
+    throw err;
+  }
+}
+
+async function cmdSetupRepo(args: string[]): Promise<number> {
+  const prompts = repoPrompts(process.cwd());
+  const { values } = parseCommand(args, { ...promptOptions(prompts), yes: { type: 'boolean' } }, 0, 0);
+  try {
+    return await runSetupRepo({
+      cwd: process.cwd(),
+      env: process.env as Record<string, string | undefined>,
+      flags: suppliedFlags(prompts, values),
+      yes: values.yes === true,
+      interactive: promptable(),
+      log: (line) => console.log(line),
+      validate: validateManifest,
+    });
+  } catch (err) {
+    if (err instanceof SetupError) fail(`fleet setup repo: ${err.message}`);
+    throw err;
+  }
 }
 
 // ---------- lint ----------
@@ -306,13 +408,6 @@ function loadDotEnv(fleetDir: string): Record<string, string> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
     throw err;
   }
-}
-
-/** git stdout in cwd, or undefined on any failure. */
-function gitValue(args: string[]): string | undefined {
-  const res = spawnSync('git', args, { encoding: 'utf8' });
-  const out = res.status === 0 ? res.stdout.trim() : '';
-  return out === '' ? undefined : out;
 }
 
 type ModePreset = {
@@ -1279,11 +1374,11 @@ async function cmdResume(args: string[]): Promise<number> {
 
 function parseCommand(
   args: string[],
-  options: Record<string, { type: 'string' | 'boolean' }>,
+  options: Record<string, { type: 'string' | 'boolean'; multiple?: boolean }>,
   minPositionals: number,
   maxPositionals: number,
-): { values: Record<string, string | boolean | undefined>; positionals: string[] } {
-  let parsed: { values: Record<string, string | boolean | undefined>; positionals: string[] };
+): { values: Record<string, string | boolean | string[] | undefined>; positionals: string[] } {
+  let parsed: { values: Record<string, string | boolean | string[] | undefined>; positionals: string[] };
   try {
     parsed = parseArgs({ args, options, strict: true, allowPositionals: true });
   } catch (err) {
@@ -1338,6 +1433,8 @@ export async function main(argv: string[]): Promise<number> {
       }
       case 'init':
         return cmdInit(rest);
+      case 'setup':
+        return await cmdSetup(rest);
       case 'lint':
         return cmdLint(rest);
       case 'delegate':

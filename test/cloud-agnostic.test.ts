@@ -146,3 +146,24 @@ test('each infra unit self-describes its shape via fleet_config', () => {
     }
   }
 });
+
+/** Source with comments removed — what the code actually says, not what it explains. */
+function codeOnly(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+}
+
+test('the setup wizard engine names no cloud — the unit map does', () => {
+  // `fleet setup infra` is split for the same reason the providers are: the
+  // engine interviews, generates a root module, drives terraform and captures
+  // the deployment description, and every cloud-specific word — which questions,
+  // which credentials to prove, which terraform arguments — lives in the unit
+  // map. Without a gate that split lasts exactly until the first `if (provider
+  // === 'aws')`, and the second cloud arrives as a branch instead of an entry.
+  const engine = codeOnly(readFileSync(join(src, 'cli', 'setup.ts'), 'utf8'));
+  const cloudWords = engine.match(/\b(aws|ecs|ecr|efs|vpc|subnet|azure|gcp|fargate|ssm)\b/gi) ?? [];
+  assert.deepStrictEqual(
+    [...new Set(cloudWords.map((w) => w.toLowerCase()))],
+    [],
+    'src/cli/setup.ts must stay cloud-agnostic — put it in src/cli/setup-units.ts',
+  );
+});

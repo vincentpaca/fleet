@@ -35,11 +35,23 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 
 ## How it works
 
-1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work.
-2. A Terraform unit sets up the infrastructure in your cloud account — one self-contained module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports.
+1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work. `fleet setup repo` writes it by interview, with the defaults read out of your checkout.
+2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. `fleet setup infra --destroy` takes it back down.
 3. `fleet delegate TICKET-123` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back.
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
 5. The job ends as a draft pull request (or a report with downloadable artifacts, for investigation work). A human merges it. Fleet never merges and never deploys.
+
+From an empty checkout that is the whole path:
+
+```sh
+fleet setup repo        # interview → .fleet/manifest.json (fleet init for the placeholder scaffold)
+fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
+<fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
+fleet connect           # hold the SSM tunnel to the daemon
+fleet delegate TICKET-123
+```
+
+`setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
 
 Run `fleet` with no arguments and you get the cockpit: the live board on top with blocked decisions floating up, the selected job's streaming transcript below it, and a command line at the bottom to dispatch from, answer a question, or cancel — one window instead of three. It adopts the daemon tunnel if one is healthy and opens its own if not, so a dead port-forward stops being something you rebuild by hand. Closing it changes nothing about the jobs; watching is a view, never a lifeline.
 
