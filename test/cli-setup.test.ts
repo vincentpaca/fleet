@@ -183,6 +183,22 @@ test('setup infra: a bad flag value is rejected at the flag, not at apply time',
   assert.deepEqual(subcommands(s.calls()), ['version']);
 });
 
+test('setup infra: an unknown provider is refused, in either flag spelling', async () => {
+  const s = scratch();
+  for (const args of [
+    ['setup', 'infra', '--provider', 'gcp', '--name', 'demo', '--yes'],
+    ['setup', 'infra', '--provider=gcp', '--name', 'demo', '--yes'],
+  ]) {
+    const res = await runCli(args, { cwd: s.cwd, env: s.env });
+    assert.equal(res.code, 2, `${args.join(' ')}: ${res.stdout}${res.stderr}`);
+    assert.match(res.stderr, /no unit for provider "gcp"/);
+    // The failure that matters: falling through to the first unit would have
+    // generated AWS terraform for someone who asked for another cloud.
+    assert.deepEqual(s.calls(), [], 'nothing ran');
+    assert.ok(!fs.existsSync(path.join(s.cwd, '.fleet', 'infra')), 'nothing generated');
+  }
+});
+
 // ---------- preflight ----------
 
 test('setup infra: no terraform exits 1 before touching anything', async () => {
@@ -266,6 +282,24 @@ test('setup infra --destroy: no terminal and no --yes refuses rather than procee
 });
 
 // ---------- backends ----------
+
+test('setup infra: --backend writes the block and --backend-config reaches init', async () => {
+  const s = scratch();
+  const res = await runCli(
+    [
+      'setup', 'infra', '--name', 'demo', '--yes',
+      '--backend', 's3',
+      '--backend-config', 'bucket=tf-state',
+      '--backend-config', 'key=fleet/demo.tfstate',
+    ],
+    { cwd: s.cwd, env: s.env },
+  );
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8'), /backend "s3" \{\}/);
+  const init = s.calls().find((line) => line.includes('\tinit'))!;
+  assert.ok(init.includes('-backend-config=bucket=tf-state'), init);
+  assert.ok(init.includes('-backend-config=key=fleet/demo.tfstate'), init);
+});
 
 // ---------- prompt/flag merging ----------
 
@@ -414,24 +448,6 @@ function terraformSkip(): string | false {
   return res.error === undefined && res.status === 0 ? false : 'terraform is not installed here';
 }
 
-test('setup infra: --backend writes the block and --backend-config reaches init', async () => {
-  const s = scratch();
-  const res = await runCli(
-    [
-      'setup', 'infra', '--name', 'demo', '--yes',
-      '--backend', 's3',
-      '--backend-config', 'bucket=tf-state',
-      '--backend-config', 'key=fleet/demo.tfstate',
-    ],
-    { cwd: s.cwd, env: s.env },
-  );
-  assert.equal(res.code, 0, res.stderr);
-  assert.match(fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8'), /backend "s3" \{\}/);
-  const init = s.calls().find((line) => line.includes('\tinit'))!;
-  assert.ok(init.includes('-backend-config=bucket=tf-state'), init);
-  assert.ok(init.includes('-backend-config=key=fleet/demo.tfstate'), init);
-});
-
 // ---------- setup repo ----------
 
 /** A scratch project that looks like a real repo: an ecosystem, a gate, a command. */
@@ -483,8 +499,8 @@ test('setup repo: a rejected answer is asked again rather than written', async (
 
 test('setup repo headless: flags supply the answers, and a missing one names its flag', async () => {
   const cwd = scratchRepo();
-  const missing = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
-  assert.equal(missing.code, 0, 'every repo prompt has an extractable default here');
+  const extracted = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
+  assert.equal(extracted.code, 0, 'every repo prompt has an extractable default here');
 
   const bare = makeTempDir('fleet-setup-repo-bare-');
   const res = await runCli(['setup', 'repo'], { cwd: bare });

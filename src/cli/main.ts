@@ -241,11 +241,23 @@ async function cmdSetup(args: string[]): Promise<number> {
   return EXIT_USAGE;
 }
 
+/**
+ * `--provider` is read before the real parse, because it decides which prompts —
+ * and therefore which flags — exist at all. Both spellings, deliberately: a
+ * `--provider=gcp` that this missed would fall through to the first unit and
+ * generate terraform for the wrong cloud without saying so.
+ */
+function providerArg(args: string[]): string | undefined {
+  const inline = args.find((arg) => arg.startsWith('--provider='));
+  if (inline) return inline.slice('--provider='.length);
+  const at = args.indexOf('--provider');
+  // A dangling `--provider` reads as the empty provider, which no unit answers
+  // to — reported as a usage error rather than silently defaulting.
+  return at === -1 ? undefined : (args[at + 1] ?? '');
+}
+
 async function cmdSetupInfra(args: string[]): Promise<number> {
-  // The provider is read before the rest, because it decides which prompts —
-  // and therefore which flags — exist at all.
-  const providerFlag = args[args.indexOf('--provider') + 1];
-  const provider = args.includes('--provider') ? (providerFlag ?? '') : SETUP_UNITS[0].provider;
+  const provider = providerArg(args) ?? SETUP_UNITS[0].provider;
   const unit = unitFor(provider);
   if (!unit) {
     console.error(`fleet setup infra: no unit for provider "${provider}" — available: ${SETUP_UNITS.map((u) => u.provider).join(', ')}`);

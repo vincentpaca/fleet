@@ -9,9 +9,9 @@ Fleet runs this repo's own harness commands in a remote container and reports ba
 
 ## Preconditions
 
-1. `.fleet/manifest.json` exists (if not: run `fleet init`, then help the human fill in the placeholders — the setup script and pickup gate are theirs to own).
+1. `.fleet/manifest.json` exists. If not, the human's command is `fleet setup repo` — an interview that reads its defaults out of the checkout, so offer it rather than answering for them; the setup script and pickup gate are theirs to own. `fleet init` is the non-interactive alias and writes placeholders you then help them fill in (that is the path in CI, or when you are asked to draft the manifest yourself).
 2. `fleet lint` passes.
-3. The daemon is reachable (`fleet status` responds). If it is not, run `fleet doctor` and relay what it says about the tunnel: a cloud daemon is reached through a port-forward, and a dead session is the usual cause. Reopening it is `fleet connect` (foreground) or `fleet connect --detach` — offer that to the human rather than running it unasked, and never try to stand up infrastructure.
+3. The daemon is reachable (`fleet status` responds). If it is not, run `fleet doctor` and relay what it says about the tunnel: a cloud daemon is reached through a port-forward, and a dead session is the usual cause. Reopening it is `fleet connect` (foreground) or `fleet connect --detach` — offer that to the human rather than running it unasked. Never stand up infrastructure: if there is no deployment at all, say so and point at `fleet setup infra`, which is the human's wizard and applies only on their explicit yes.
 
 ## Dispatch
 

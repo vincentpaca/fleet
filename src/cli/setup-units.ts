@@ -136,6 +136,11 @@ const AWS: SetupUnit = {
     }
     return args;
   },
+  // No budget prompt, deliberately: #13 asked for monthly budget USD + email,
+  // but D12's 2026-08-19 amendment took billing products out of the unit, so
+  // there is no variable to fill and nothing to ask. Confirmed with a human on
+  // the job rather than decided here (decision d1) — a wizard cannot ask for a
+  // value the contract has no home for.
   prompts: [
     {
       key: 'name',
