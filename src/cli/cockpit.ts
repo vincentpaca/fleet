@@ -32,6 +32,7 @@ import {
   ENTER_ALT,
   RESTORE_SEQ,
   detectColorLevel,
+  decisionCardLines,
   fetchBoardJobs,
   followJobEvents,
   jobCounts,
@@ -238,8 +239,16 @@ export function renderCockpit(
           job ? renderJobLine(job, { ...opts, noColor }) : 'no job selected',
         ).split('\n')
       : [];
-    const body = renderTailPane(m, w, noColor, h - strip.length - foot.length);
-    return [...strip, ...body, ...foot].join('\n');
+    // A blocked job's open decision is pinned above the input line, not left
+    // to scroll: the question was unfindable under a long transcript, and the
+    // one thing a blocked drill-down must say is what it needs from the human.
+    // Skipped only when the terminal is too short to fit it at all.
+    const pinned = job?.state === 'blocked' && job.decision
+      ? decisionCardLines(job.decision, w, noColor)
+      : [];
+    const card = h - strip.length - foot.length - pinned.length >= 0 ? pinned : [];
+    const body = renderTailPane(m, w, noColor, h - strip.length - card.length - foot.length);
+    return [...strip, ...body, ...card, ...foot].join('\n');
   }
 
   // Board view, outermost chrome first: each piece appears only once there is

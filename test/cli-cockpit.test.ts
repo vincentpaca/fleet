@@ -179,6 +179,15 @@ test('the tail renders only in the drill-down, verbatim, windowed to its end', (
   const drilled = frame(model({ view: 'job', tail: long }));
   assert.match(drilled.join('\n'), /line 4999/, 'the newest event is on screen');
   assert.doesNotMatch(drilled.join('\n'), /line 0\b/, 'the oldest is not');
+  // A blocked job's open decision is pinned above the input line — visible no
+  // matter how much transcript is above it (the question was unfindable under
+  // a long noisy tail: operator feedback, first parked decision).
+  const pinned = drilled.slice(-6).join('\n');
+  assert.match(pinned, /Rename the endpoint\?/, 'the question is pinned at the bottom');
+  assert.match(pinned, /answer: type an option id below — keep \| rename/, 'and how to act on it');
+  // A running selection pins nothing.
+  const runningDrill = frame(model({ view: 'job', selection: 1, tail: long }));
+  assert.doesNotMatch(runningDrill.slice(-6).join('\n'), /answer: type an option id/);
   // Scrolled back, the window moves with the scroll rather than clamping to the
   // slice that happened to be rendered.
   assert.match(frame(model({ view: 'job', tail: long, tailScroll: 100 })).join('\n'), /line 489\d/);

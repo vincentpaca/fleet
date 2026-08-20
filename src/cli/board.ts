@@ -476,6 +476,26 @@ export type RosterRow = { jobIndex: number; lines: string[] };
  * Blocked rows carry the pulsing urgency marker and their open decision;
  * running rows carry the latest activity the daemon reported.
  */
+/**
+ * A pending decision as lines: question, options (★ on the recommended one),
+ * and how to act — an option id with no visible way to send it reads as a dead
+ * end (operator feedback, first parked decision). One renderer for every place
+ * a card appears: the roster and the drill-down's pinned card.
+ */
+export function decisionCardLines(decision: BoardDecision, w: number, noColor: boolean): string[] {
+  const col = makeCol(noColor);
+  const lines: string[] = [visualClip(`     ${col(decision.question, 1)}`, w)];
+  for (const opt of decision.options) {
+    const rec = opt.recommended ? col(' ★', 33) : '';
+    lines.push(visualClip(`     [${opt.id}] ${opt.label ?? opt.id}${rec}`, w));
+  }
+  lines.push(visualClip(
+    `     ${col(`answer: type an option id below — ${decision.options.map((o) => o.id).join(' | ')}`, 33)}`,
+    w,
+  ));
+  return lines;
+}
+
 export function renderRosterRows(
   ordered: BoardJob[],
   selection: number,
@@ -509,18 +529,7 @@ export function renderRosterRows(
     lines.push(visualClip(row, w));
 
     if (job.state === 'blocked' && job.decision) {
-      lines.push(visualClip(`     ${col(job.decision.question, 1)}`, w));
-      for (const opt of job.decision.options) {
-        const rec = opt.recommended ? col(' ★', 33) : '';
-        lines.push(visualClip(`     [${opt.id}] ${opt.label ?? opt.id}${rec}`, w));
-      }
-      // The card must say how to act on it: the divider that used to carry
-      // this hint is gone (#68), and an option id with no visible way to send
-      // it reads as a dead end (operator feedback, first parked decision).
-      lines.push(visualClip(
-        `     ${col(`answer: type an option id below — ${job.decision.options.map((o) => o.id).join(' | ')}`, 33)}`,
-        w,
-      ));
+      lines.push(...decisionCardLines(job.decision, w, noColor));
       lines.push('');
     } else if ((job.state === 'running' || job.state === 'queued') && job.lastActivity) {
       // The daemon reports the latest activity for every live job, so this line
