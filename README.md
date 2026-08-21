@@ -77,3 +77,9 @@ npm test
 ```
 
 Rules the schemas enforce, because prose rules get ignored: every command names a reviewer; jobs can never hold merge or deploy permission; a question to a human offers real options with exactly one recommended; a final report names exactly one next action; and the suite scans the whole tree for client- or operator-specific content — this is a generic tool and stays that way.
+
+## License
+
+Fleet is **source-available** under the [PolyForm Shield License 1.0.0](LICENSE.md): use it, modify it, self-host it — commercially included — and contribute back. The one thing the license forbids is offering a product or service that competes with Fleet. It is not an OSI open-source license, deliberately; the same terms protect [AutoGPT's platform](https://github.com/Significant-Gravitas/AutoGPT) and [Micro](https://m3o.org/company/licensing.html).
+
+Required Notice: Copyright © 2026 the Fleet maintainers (github.com/<org>/fleet)

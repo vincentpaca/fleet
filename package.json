@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Run coding-agent jobs in containers on your own AWS account.",
+  "license": "PolyForm-Shield-1.0.0",
   "engines": {
     "node": ">=23.6"
   },
