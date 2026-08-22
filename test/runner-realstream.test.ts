@@ -55,7 +55,7 @@ for (const [i, line] of lines.entries()) {
         assert.ok(out.every((e) => e.type === 'think' || e.type === 'log'));
         // Never the raw-JSON fallback: mapped output is block content, not the whole line.
         assert.ok(
-          out.every((e) => e.type === 'result' || !e.text.startsWith('{"type":"assistant"')),
+          out.filter(isTextEvent).every((e) => !e.text.startsWith('{"type":"assistant"')),
           'assistant line hit the unknown fallback',
         );
         break;
@@ -76,13 +76,15 @@ for (const [i, line] of lines.entries()) {
             // Noise: must be dropped entirely.
             assert.deepStrictEqual(out, [], `${label} must be dropped, got ${JSON.stringify(out)}`);
             break;
-          case 'init':
+          case 'init': {
             // Tersed: one log line, no UUIDs.
             assert.equal(out.length, 1, `system/init must produce exactly one log`);
-            assert.equal(out[0].type, 'log');
-            assert.match(out[0].text, /harness session started model=/);
-            assert.doesNotMatch(out[0].text, /session_id|uuid/i, 'system/init log must not contain UUIDs');
+            const [init] = out;
+            assert.ok(isTextEvent(init) && init.type === 'log');
+            assert.match(init.text, /harness session started model=/);
+            assert.doesNotMatch(init.text, /session_id|uuid/i, 'system/init log must not contain UUIDs');
             break;
+          }
           default:
             // Unknown system subtype: best-effort log, never a crash.
             assert.ok(out.every((e) => e.type === 'log'));

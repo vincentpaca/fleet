@@ -212,8 +212,10 @@ function payload(rand: () => number, depth: number): unknown {
   return obj;
 }
 
+// Every entry must be a type the translator does NOT know: a DROPPED name here
+// would render nothing and assert nothing, quietly shrinking the sample.
 const UNKNOWN_TYPES = [
-  'tool_progress_v2', 'task_escalated', 'compaction', 'stream_event',
+  'tool_progress_v2', 'task_escalated', 'compaction', 'context_low',
   'rate_limit_event', 'checkpoint_saved', 'permission_request',
   // Adversarial `type` values: payload text, control chars, absurd length.
   `${MARKER} not a shape name`, 'a\nb', 'x'.repeat(5000), '', '{"type":"system"}',
@@ -345,4 +347,62 @@ test('an interrupt echo is one short line, both content shapes', () => {
   }));
   assert.equal(asString.length, 1);
   assert.ok(textOf(asString[0]).length < 210);
+});
+
+test('a bracketed model id survives system/init intact', () => {
+  // Rejecting anything non-identifier would blank a legitimate value: real
+  // model ids carry brackets, and `model=unknown` is a legibility regression.
+  const out = translateLine(JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-opus-5[1m]', session_id: 'sid',
+  }));
+  assert.deepEqual(out, [{ type: 'log', text: 'harness session started model=claude-opus-5[1m]' }]);
+});
+
+test('an absurd model id is clipped, not forwarded', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'system', subtype: 'init', model: `m-${'z'.repeat(4000)}`,
+  }));
+  assert.ok(textOf(out[0]).length < 120, `init line was ${textOf(out[0]).length} chars`);
+});
+
+test('an MCP-style tool name renders whole', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'mcp__tracker__get_issue', input: { path: 'x' } }] },
+  }));
+  assert.match(textOf(out[0]), /^tool_use mcp__tracker__get_issue: x$/);
+});
+
+test('every UNKNOWN_TYPES entry really is unknown to the translator', () => {
+  // Guards the property test's own sample: a DROPPED name in that list would
+  // render nothing, assert nothing, and shrink the coverage invisibly.
+  for (const type of UNKNOWN_TYPES) {
+    const out = translateLine(JSON.stringify({ type, some: 'payload' }));
+    assert.equal(out.length, 1, `${JSON.stringify(type)} is not an unknown type any more`);
+  }
+});
+
+test('a non-string primary argument renders as no argument, never as payload', () => {
+  // The fallback scans for a *string*; `[object Object]` is noise and a nested
+  // object is payload, so a call whose only args are structured names itself.
+  const out = translateLine(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'TodoWrite', input: {
+      todos: [{ content: 'SECRET_TODO_MUST_NOT_APPEAR', status: 'pending' }], count: 3,
+    } }] },
+  }));
+  assert.deepEqual(out, [{ type: 'log', text: 'tool_use TodoWrite', who: 'assistant' }]);
+});
+
+test('a blank text or thinking block produces no event at all', () => {
+  for (const block of [
+    { type: 'text', text: '' },
+    { type: 'text', text: '   \n  ' },
+    { type: 'thinking', thinking: '', signature: 'SIG' },
+    { type: 'thinking', thinking: 42 },
+  ]) {
+    const out = translateLine(JSON.stringify({ type: 'assistant', message: { content: [block] } }));
+    assert.deepEqual(out, [], `blank block produced ${JSON.stringify(out)}`);
+  }
+  assert.deepEqual(translateLine('{"type":"thinking","thinking":"  "}'), []);
 });

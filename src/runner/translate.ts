@@ -42,6 +42,8 @@ const MAX_TEXT = 4000;
 const MAX_NOTICE = 200;
 /** A bounded tag is a shape name, never content. */
 const MAX_TAG_PART = 40;
+/** Model names, tool names, tool_use_ids: identifiers, so short by nature. */
+const MAX_ID = 60;
 
 /**
  * Harness bookkeeping with zero evidence value. Matched on the record's
@@ -91,6 +93,20 @@ function tagPart(value: unknown): string | null {
   const kept = value.replace(/[^A-Za-z0-9_.:-]/g, '');
   if (kept === '' || kept !== value) return null;
   return kept.length > MAX_TAG_PART ? kept.slice(0, MAX_TAG_PART) : kept;
+}
+
+/**
+ * Sanitize a known identifier field we *do* intend to show — a model name, a
+ * tool name, a tool_use_id. Unlike `tagPart` this clips rather than rejects,
+ * because rejecting would silently blank a legitimate value: model ids carry
+ * brackets (`claude-opus-5[1m]`), MCP tool names carry slashes. Bounded is the
+ * requirement here; strictness is only load-bearing on the fail-closed path.
+ */
+function idPart(value: unknown, maxLen = MAX_ID): string | null {
+  if (typeof value !== 'string') return null;
+  const kept = value.replace(/[^A-Za-z0-9_.:@/[\]-]/g, '');
+  if (kept === '') return null;
+  return kept.length > maxLen ? kept.slice(0, maxLen) : kept;
 }
 
 /**
@@ -149,7 +165,7 @@ function toolResultText(content: unknown): string {
 }
 
 function renderToolUse(rec: Record<string, unknown>): Translated {
-  const name = tagPart(rec.name) ?? 'unknown';
+  const name = idPart(rec.name) ?? 'unknown';
   const input = asRecord(rec.input);
   const arg = input ? pickPrimaryArg(input, MAX_TOOL_ARG) : null;
   return {
@@ -160,7 +176,7 @@ function renderToolUse(rec: Record<string, unknown>): Translated {
 }
 
 function renderToolResult(rec: Record<string, unknown>): Translated {
-  const id = tagPart(rec.tool_use_id) ?? '?';
+  const id = idPart(rec.tool_use_id) ?? '?';
   const body = toolResultText(rec.content);
   const failed = rec.is_error === true;
   const text = failed
@@ -231,7 +247,7 @@ function fromSystem(msg: Record<string, unknown>): Translated[] {
   const subtype = typeof msg.subtype === 'string' ? msg.subtype : '';
   if (subtype === 'init') {
     // One terse line — model name useful, UUIDs/paths are not.
-    const model = tagPart(msg.model) ?? 'unknown';
+    const model = idPart(msg.model) ?? 'unknown';
     return [{ type: 'log', text: `harness session started model=${model}` }];
   }
   return unknownTag(msg.type, msg.subtype);

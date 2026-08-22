@@ -5,6 +5,7 @@ import type { ServerResponse } from 'node:http';
 import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
 import { TERSE_RESULT_MAX } from '../src/shared/tool-text.ts';
+import { translateLine } from '../src/runner/translate.ts';
 
 const RUNNING_JOB = {
   id: 'job-1',
@@ -112,6 +113,28 @@ test('formatEvent: a LOUD tool_result summary survives too — it is the diagnos
   const loud = { seq: 4, type: 'log', text: `tool_result toolu_08 ERROR: ${body}` };
   assert.match(formatEvent(loud, true), /AssertionError: stack frame/);
   assert.doesNotMatch(formatEvent(loud, true), /bytes/);
+});
+
+test('translator output survives the CLI compactor, across the module boundary', () => {
+  // #50's original bug was drift between two modules that each looked correct
+  // alone: the translator's error budget and the compactor's dump threshold.
+  // Two hand-written fixtures on opposite sides cannot catch that — only
+  // feeding real translator output through the real formatter can.
+  // Frames long enough that the joined head clears any plausible dump
+  // threshold — that head is exactly what a mis-tuned threshold would delete.
+  const frame = '  at deeplyNestedHelper (file:///workspace/src/some/long/path/to/module.ts:1234:56)';
+  const [rendered] = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{
+      type: 'tool_result', tool_use_id: 'toolu_42', is_error: true,
+      content: `AssertionError: expected 0 got 1\n${`${frame}\n`.repeat(30)}# fail 1`,
+    }] },
+  }));
+  assert.ok(rendered.type === 'log');
+  assert.ok(rendered.text.length > 320, `rendered head was only ${rendered.text.length} chars`);
+  const compacted = formatEvent({ seq: 0, type: 'log', text: rendered.text }, true);
+  assert.match(compacted, /AssertionError: expected 0 got 1/, 'the diagnosis must survive both hops');
+  assert.doesNotMatch(compacted, /bytes/, 'a summary must never be traded for a byte count');
 });
 
 test('formatJobState: cancellations name their kind; blocked keeps its marker', () => {

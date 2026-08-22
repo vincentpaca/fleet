@@ -269,23 +269,27 @@ async function main(): Promise<void> {
     idle.touch();
     if (capture) appendFileSync(capture, line + '\n');
     const translated = translateLine(line);
-    const bodies = translated.filter((item) => item.type !== 'result');
-    // {"type":"result"} marks the end of the run; it precedes settle and is
-    // not itself an event.
-    if (bodies.length === 0) {
+    if (translated.length === 0) {
+      // The translator dropped this line. Coalesce: one heartbeat per window,
+      // never one per dropped line — the flood is what #50 was about.
       const now = Date.now();
       if (now - lastEmitAt >= heartbeatWindow) {
         lastEmitAt = now;
         emits.push(sink.emit({
           type: 'log',
+          who: 'runner',
           text: `harness working — ${toMinutes(now - startedAt)}m elapsed, no reportable output`,
         }));
       }
       return;
     }
+    // {"type":"result"} marks the end of the run; it precedes settle and is
+    // not itself an event — and it is not a silent line either, so it must not
+    // trigger a heartbeat one line before the settle.
+    const bodies = translated.filter((item) => item.type !== 'result');
     lastEmitAt = Date.now();
     if (bodies.length === 1) emits.push(sink.emit(bodies[0]));
-    else emits.push(sink.emitBatch(bodies));
+    else if (bodies.length > 1) emits.push(sink.emitBatch(bodies));
   });
 
   const exit = Promise.withResolvers<number>();
