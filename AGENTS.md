@@ -22,7 +22,8 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 - **Tests own their state:** point `FLEET_HOME` at a temp dir; never touch `~/.fleet`; mock daemons are in-test HTTP servers on port 0.
 - **`test/sanitized.test.mjs` scans the whole tree** and fails on client/operator-specific strings. Examples are `acme`, `APP-123`, `example.com`. External data is referenced by env pointer, never vendored.
 - **`agents/` is canonical; `.claude/**` files are three-line pointers.** Edit canonicals only; `test/harness-mirrors.test.ts` fails a mirror that grows content or a canonical that leaks harness dialect (`$ARGUMENTS`).
-- **A static-analysis finding resolves into git, never into a UI click.** Three endings only: a code change, a scoped exclusion in `.github/codeql/codeql-config.yml` or `.codacy.yaml`, or a written threat-model call in `docs/decisions.md` that a dismissal cites. `test/analyzer-scope.test.ts` fails if either exclusion list reaches past the build harness — silencing the scanner is always the cheapest way to a green check, so it stays a human's decision and a visible diff.
+- **A static-analysis finding resolves into git, not into a UI click.** Three endings: a code change; a scoped exclusion in `.github/codeql/codeql-config.yml` or `.codacy.yaml`; a threat-model call written into `docs/decisions.md` that the dismissal cites.
+- **Widening an analyzer exclusion is a human's call.** Silencing the scanner is the cheapest route to a green check. `test/analyzer-scope.test.ts` fails if either exclusion list reaches past the build harness, so the move costs a visible diff.
 - **Reuse the existing pattern.** A second convention living beside an existing one (a new helper duplicating `src/shared/`, a hand-rolled validator beside ajv, a second event-rendering path) is a defect even when it works.
 
 ## Rules with reasons
