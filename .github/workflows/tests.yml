@@ -68,7 +68,14 @@ jobs:
       # by our choice: internally it runs `bash <(curl -Ls .../master/get.sh)`
       # twice, so the code that executes comes from a mutable ref at runtime.
       # The SHA pins the wrapper, not the thing it downloads. Tracked in #105.
+      #
+      # Never fails the job. This is a reporting step: the suite above already
+      # decided whether the code is good, and a rejected token or a Codacy
+      # outage says nothing about that. Skipping the step when there is no token
+      # and then going red when the upload breaks would be the same mistake with
+      # extra steps — the step still shows failed, and `test` still means tests.
       - if: env.CODACY_PROJECT_TOKEN != '' || env.CODACY_API_TOKEN != ''
+        continue-on-error: true
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
           project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
