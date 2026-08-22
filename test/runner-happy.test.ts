@@ -93,6 +93,7 @@ test('full happy path: running → gate ok → harness replay → settle → don
       'log', // tool_result toolu_02
       'log', // unknown structured line
       'log', // non-JSON line
+      'log', // empty-handed note (#81): no git, no PR, no artifacts in this run
       'settle',
       'state', // done
     ]);
@@ -107,11 +108,21 @@ test('full happy path: running → gate ok → harness replay → settle → don
     const [running] = daemon.events;
     assert.equal(running.state, 'running');
 
+    // The run pushed nothing, opened no PR and delivered no artifacts, so the
+    // empty-handed note (#81) precedes the settle and rides its not_done.
+    const emptyHanded = daemon.events.at(-3);
+    assert.ok(emptyHanded);
+    assert.match(String(emptyHanded.text), /no deliverable landed/);
+
     const settle = daemon.events.at(-2);
     assert.ok(settle);
     assert.equal(settle.rung, 'implemented');
     assert.deepEqual(settle.outcome, { produced: [], findings: 0, decisions: 0 });
-    assert.deepEqual(settle.report, report);
+    const settleReport = settle.report as Record<string, unknown>;
+    const { not_done: notDone, ...rest } = settleReport;
+    assert.deepEqual(rest, report, 'the harness report survives intact');
+    assert.ok(Array.isArray(notDone) && notDone.length === 1);
+    assert.match(String(notDone[0]), /no deliverable landed/);
     assert.ok(typeof settle.minutes === 'number' && settle.minutes >= 0);
 
     const done = daemon.events.at(-1);
@@ -279,9 +290,11 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.deepEqual(daemon.rejected, []);
 
     const types = daemon.events.map((event) => event.type);
-    assert.deepEqual(types, ['state', 'log', 'log', 'think', 'settle', 'state']);
+    // The extra log before settle is the empty-handed note (#81): a failed run
+    // that also delivered nothing says so too.
+    assert.deepEqual(types, ['state', 'log', 'log', 'think', 'log', 'settle', 'state']);
 
-    const settle = daemon.events[4];
+    const settle = daemon.events[5];
     assert.equal(settle.rung, undefined, 'no rung claimed on failure');
     assert.deepEqual(settle.outcome, { produced: [], findings: 0, decisions: 0 });
     const report = settle.report;
@@ -290,7 +303,7 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.ok('next_action' in report);
     assert.match(String(report.next_action), /harness exit 2/);
 
-    const cancelled = daemon.events[5];
+    const cancelled = daemon.events[6];
     assert.equal(cancelled.state, 'cancelled');
     assert.equal(cancelled.reason, 'harness-exit');
   } finally {
