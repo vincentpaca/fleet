@@ -552,6 +552,7 @@ async function main(): Promise<void> {
     decisions: watcher.count,
     workspace,
     produced: artifactProduced,
+    workPushed,
     ...(settleRung !== undefined ? { rung: settleRung } : {}),
     ...(retainedWorkspace !== undefined ? { retainedWorkspace } : {}),
     prUrl,

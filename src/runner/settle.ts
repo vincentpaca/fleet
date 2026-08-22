@@ -32,6 +32,12 @@ export function composeSettle(opts: {
   /** PR URL from authority.publish — merged into report.pr (issue #3). */
   prUrl?: string;
   /**
+   * True when work commits landed on the job branch (pushed or delivered by
+   * the agent itself). Feeds the empty-handed check (issue #81): a settle with
+   * no pushed work, no PR and no artifacts delivered nothing retrievable.
+   */
+  workPushed?: boolean;
+  /**
    * Pre-collected artifact produced[] entries (issue #18). Populated by
    * collectArtifacts() in main.ts before composeSettle is called; the
    * daemon has already received the artifact files by this point.
@@ -82,6 +88,23 @@ export function composeSettle(opts: {
         ? `${errors[0].instancePath ?? ''} ${errors[0].message ?? ''}`.trim()
         : 'schema validation failed';
       notes.push(`report omitted from settle (invalid): ${first}`);
+    }
+  }
+
+  // Empty-handed settle (issue #81): nothing pushed, no PR, zero artifacts —
+  // whatever the job concluded lives only in its transcript. Say so loudly:
+  // as a note (→ log event, visible in fleet logs and the cockpit drill-down)
+  // and inside the report's not_done when a report survived validation.
+  // Appending a string to not_done cannot invalidate an already-valid report.
+  if (opts.workPushed !== true && !opts.prUrl && (opts.produced ?? []).length === 0) {
+    const note =
+      'no deliverable landed: no pushed commits, no PR, no artifacts — ' +
+      `the answer exists only in the transcript (fleet logs ${opts.jobId})`;
+    notes.push(note);
+    if (body.report !== undefined) {
+      const report = body.report as Record<string, unknown>;
+      const notDone = Array.isArray(report.not_done) ? report.not_done as unknown[] : [];
+      body.report = { ...report, not_done: [...notDone, note] } as EventBody;
     }
   }
   return { body, notes };
