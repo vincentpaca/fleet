@@ -48,10 +48,26 @@ fleet setup repo        # interview → .fleet/manifest.json (fleet init for the
 fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
 <fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
 fleet connect           # hold the SSM tunnel to the daemon
+fleet setup harness     # install the delegate skill into your coding harness
 fleet delegate TICKET-123
 ```
 
 `setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
+
+## Using Fleet from your coding harness
+
+Fleet has no UI of its own — your harness is the UI. The session you already talk to dispatches the job, holds the watch, relays a blocked job's question to you through its own ask mechanism, and reports the settle. That behaviour is one skill file, and `fleet setup harness` installs it where your harness looks for it:
+
+```sh
+fleet setup harness                      # detects what you have, asks, installs
+fleet setup harness --scope project      # this checkout only, and committable
+```
+
+Then say *"delegate TICKET-123 to fleet"* in your session. It dispatches, reports the job id, polls quietly, and when the job blocks it asks **you** — the options verbatim, the recommended one marked, nothing auto-answered. Answering resumes the job; the settle report comes back status-first, with its artifacts listed if the mode produced any.
+
+Claude Code, Codex and OpenCode all discover skills as a `<name>/SKILL.md` directory, so there is exactly one canonical file — [`integrations/SKILL.md`](integrations/SKILL.md) — and the per-harness variants are generated from it at install time. Only two things differ per harness: which directory it goes in, and how that harness asks its human. Reruns are idempotent, an edited copy is never overwritten without `--force`, and no variant is ever committed to this repo (the test suite fails a forked copy). A harness Fleet has no convention for yet is a new record in `src/cli/setup-harnesses.ts`, not new code — integration is a skill file over the CLI, permanently ([D8](docs/decisions.md)).
+
+The live end-to-end check — a real session, a real block, a human answering — is [docs/drill.md#the-harness-drill](docs/drill.md#the-harness-drill).
 
 Run `fleet` with no arguments and you get the cockpit: the live board on top with blocked decisions floating up, the selected job's streaming transcript below it, and a command line at the bottom to dispatch from, answer a question, or cancel — one window instead of three. It adopts the daemon tunnel if one is healthy and opens its own if not, so a dead port-forward stops being something you rebuild by hand. Closing it changes nothing about the jobs; watching is a view, never a lifeline.
 
@@ -65,7 +81,7 @@ Honest, per our own rules:
 
 ## Using Fleet vs. building Fleet
 
-Users consume three things: the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness. Everything else in this repo — `AGENTS.md`, `agents/`, `.claude/`, `.fleet/`, `test/` — is the harness for building Fleet itself and never ships; the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
+Users consume three things: the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness — installed by `fleet setup harness`, never copied by hand. Everything else in this repo — `AGENTS.md`, `agents/`, `.claude/`, `.fleet/`, `test/` — is the harness for building Fleet itself and never ships; the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
 
 ## Working on this repo
 
