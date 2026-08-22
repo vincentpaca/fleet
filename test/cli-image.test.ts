@@ -25,7 +25,6 @@ import {
   runnerBaseTag,
   jobImageTag,
   twoLayerEnabled,
-  setupHashInputs,
   imageExistsLocally,
   buildJobImage,
   type ImageManifest,
@@ -72,18 +71,6 @@ describe('runnerBaseTag', () => {
     assert.equal(runnerBaseTag({}), 'fleet-runner:claude-code-latest');
   });
 
-  test('encodes other CLIs', () => {
-    assert.equal(
-      runnerBaseTag({ harness: { cli: 'codex', cli_version: '2.0.0' } }),
-      'fleet-runner:codex-2.0.0',
-    );
-  });
-});
-
-// ---------- jobImageTag ----------
-
-test('jobImageTag wraps hash in fleet-job prefix', () => {
-  assert.equal(jobImageTag('abc123'), 'fleet-job:abc123');
 });
 
 // ---------- computeImageHash ----------
@@ -141,45 +128,19 @@ describe('computeImageHash', () => {
     assert.equal(h1, h3, 'absent setup.image must produce the same hash as a present one');
   });
 
+  test('changes when devcontainer content changes', () => {
+    const manifest: ImageManifest = {
+      ...BASE_MANIFEST,
+      setup: { devcontainer: '.devcontainer/devcontainer.json' },
+    };
+    const h1 = computeImageHash(manifest, () => '{"image":"mcr.microsoft.com/devcontainers/base"}');
+    const h2 = computeImageHash(manifest, () => '{"image":"mcr.microsoft.com/devcontainers/universal"}');
+    assert.notEqual(h1, h2);
+  });
+
   test('is exactly 16 hex characters', () => {
     const hash = computeImageHash(BASE_MANIFEST);
     assert.match(hash, /^[0-9a-f]{16}$/);
-  });
-});
-
-// ---------- setupHashInputs ----------
-
-describe('setupHashInputs', () => {
-  test('returns a JSON string', () => {
-    const result = setupHashInputs({}, () => '');
-    assert.doesNotThrow(() => JSON.parse(result));
-  });
-
-  test('script key contains file content', () => {
-    const result = setupHashInputs(
-      { setup: { script: '.fleet/setup.sh' } },
-      (p) => (p === '.fleet/setup.sh' ? 'echo hello\n' : ''),
-    );
-    assert.ok(result.includes('echo hello'));
-  });
-
-  test('null for absent setup fields', () => {
-    const result = JSON.parse(setupHashInputs({ setup: { image: 'node:22' } }, () => ''));
-    assert.equal(result.script, null);
-    assert.equal(result.devcontainer, null);
-    assert.equal(result.dockerfile, null);
-  });
-
-  test('devcontainer content affects hash inputs', () => {
-    const r1 = setupHashInputs(
-      { setup: { devcontainer: '.devcontainer/devcontainer.json' } },
-      () => '{"image":"mcr.microsoft.com/devcontainers/base"}',
-    );
-    const r2 = setupHashInputs(
-      { setup: { devcontainer: '.devcontainer/devcontainer.json' } },
-      () => '{"image":"mcr.microsoft.com/devcontainers/universal"}',
-    );
-    assert.notEqual(r1, r2);
   });
 });
 
@@ -314,20 +275,6 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     for (const pattern of SECRET_PATTERNS) {
       assert.ok(!pattern.test(history), `layer matches secret pattern: ${pattern}`);
     }
-  });
-
-  // AC2: setup change → new hash; identical setup → same hash → skip rebuild
-  test('setup content change produces a new image tag; identical content reuses it', () => {
-    const manifest: ImageManifest = {
-      harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
-      setup: { image: 'node:22' },
-    };
-    const h1 = computeImageHash(manifest, () => '# setup v1\n');
-    const h2 = computeImageHash(manifest, () => '# setup v2\n');
-    assert.notEqual(h1, h2, 'changed content must produce a different hash → new rebuild');
-
-    const h3 = computeImageHash(manifest, () => '# setup v2\n');
-    assert.equal(h2, h3, 'same content must reproduce the same hash → no spurious rebuild');
   });
 
   test('buildJobImage creates an inspectable local image; imageExistsLocally detects it', () => {

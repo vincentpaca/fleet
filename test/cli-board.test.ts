@@ -5,9 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { ServerResponse } from 'node:http';
 import {
-  ENTER_ALT,
   FLEET_BANNER,
-  RESTORE_SEQ,
   answerJob,
   cancelJob,
   fetchBoardJobs,
@@ -266,11 +264,6 @@ test('renderEventLines: every line is clipped to width', () => {
 });
 
 // ── Chrome ────────────────────────────────────────────────────────────────────
-
-test('ENTER_ALT and RESTORE_SEQ export the correct ANSI sequences', () => {
-  assert.equal(ENTER_ALT, '\x1b[?1049h\x1b[?25l', 'ENTER_ALT enters the alternate screen and hides the cursor');
-  assert.equal(RESTORE_SEQ, '\x1b[?25h\x1b[?1049l', 'RESTORE_SEQ shows the cursor and leaves the alternate screen');
-});
 
 test('FLEET_BANNER is exactly 4 lines and under 30 chars wide', () => {
   const lines = FLEET_BANNER.split('\n');

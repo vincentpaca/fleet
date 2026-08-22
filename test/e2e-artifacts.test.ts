@@ -81,6 +81,13 @@ test('artifact delivery: produced[] lists both files, get round-trips content, b
     ...process.env,
     FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
     FLEET_HARNESS_CMD: `node ${artifactsHarness}`,
+    // `fleet delegate` refuses without a git identity; supply one through git's
+    // own env config so the test does not depend on the machine's ~/.gitconfig.
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
   };
   const fleet = (args: string[], cwd: string = project) => run('node', [cli, ...args], { cwd, env });
 
@@ -184,7 +191,9 @@ mkdirSync(out, { recursive: true });
 const artDir = join(out, 'artifacts');
 mkdirSync(artDir, { recursive: true });
 writeFileSync(join(artDir, 'small.txt'), 'ok');
-// Write 10MB + 1 byte to trigger the per-file cap on the daemon side.
+// Write 10MB + 1 byte to trip the per-file cap. The runner pre-filters this
+// client-side (src/runner/artifacts.ts) and never uploads it; the daemon's
+// own 413 path is exercised in daemon-artifacts.test.ts.
 writeFileSync(join(artDir, 'huge.bin'), Buffer.alloc(10 * 1024 * 1024 + 1));
 const line = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 line({ type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } });
@@ -201,6 +210,11 @@ line({ type: 'result', subtype: 'success' });
     ...process.env,
     FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
     FLEET_HARNESS_CMD: `node ${overCapHarnessPath}`,
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
   };
   const fleet = (args: string[], cwd: string = project) => run('node', [cli, ...args], { cwd, env });
 

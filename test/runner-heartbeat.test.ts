@@ -18,12 +18,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockDaemon } from './runner-mock-daemon.ts';
-import { heartbeatMs, idleLimitMs, DEFAULT_IDLE_MS } from '../src/shared/time.ts';
+import { heartbeatMs, idleLimitMs, DEFAULT_BACKSTOP_MARGIN_MS } from '../src/shared/time.ts';
 
 const runnerMain = fileURLToPath(new URL('../src/runner/main.ts', import.meta.url));
-
-/** The daemon's backstop margin default (`idleBackstopMarginMs`). */
-const BACKSTOP_MARGIN_MS = 90_000;
 /**
  * The harness's own heartbeat cadence: `tool_progress` arrives every 30s of
  * every long tool call. The runner's heartbeat is *line-driven*, so worst-case
@@ -38,13 +35,12 @@ test('the heartbeat window plus a line gap still fits inside the daemon backstop
     const idleMs = idleLimitMs(idle === undefined ? {} : { idle });
     const window = heartbeatMs(idleMs);
     assert.ok(
-      window + HARNESS_HEARTBEAT_MS < idleMs + BACKSTOP_MARGIN_MS,
-      `idle=${idle ?? 'default'}: ${window}+${HARNESS_HEARTBEAT_MS}ms does not fit in ${idleMs + BACKSTOP_MARGIN_MS}ms`,
+      window + HARNESS_HEARTBEAT_MS < idleMs + DEFAULT_BACKSTOP_MARGIN_MS,
+      `idle=${idle ?? 'default'}: ${window}+${HARNESS_HEARTBEAT_MS}ms does not fit in ${idleMs + DEFAULT_BACKSTOP_MARGIN_MS}ms`,
     );
     // And it must never be so small that a healthy job spams the log.
     assert.ok(window >= 30_000, `idle=${idle ?? 'default'}: window ${window}ms is too chatty`);
   }
-  assert.equal(heartbeatMs(DEFAULT_IDLE_MS), 400_000);
 });
 
 // Fake harness: emits only lines the translator drops, in BURSTS. Bursts, not

@@ -32,6 +32,14 @@ export function idleLimitMs(limits: unknown): number {
 }
 
 /**
+ * Default slack the daemon's backstops grant past a limit before terminating
+ * (wall-clock and idle sweeps alike). Shared so tests that reason about the
+ * heartbeat window fitting inside the backstop can never drift from the
+ * daemon's real default.
+ */
+export const DEFAULT_BACKSTOP_MARGIN_MS = 90_000;
+
+/**
  * How often a live-but-event-silent job must emit one liveness line (#50).
  *
  * The daemon's stall backstop measures silence on the *event stream*, not on

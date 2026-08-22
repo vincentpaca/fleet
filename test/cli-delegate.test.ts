@@ -202,34 +202,56 @@ test('delegate: non-numeric target (APP-123) never sets workOrder.title', async 
   assert.equal(body.workOrder.title, undefined, 'non-numeric target must never set title');
 });
 
-test('delegate: numeric target stamps workOrder.title when gh succeeds, skips gracefully when gh fails', async (t) => {
-  // Minimal manifest with no env vars or sync, so the test is self-contained.
-  const minManifest = {
-    version: 1,
-    setup: { image: 'node:22' },
-    workspace: { repo: 'git@github.com:acme/example-app.git', strategy: 'branch-per-job' },
-    harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev-sprint.md', critic: 'code-reviewer' }] },
-    gates: { pickup: 'node .fleet/check-ready.js', default_finish: 'merge-ready' },
-  };
-  const cwd = scaffold(minManifest);
+// Minimal manifest with no env vars or sync, so the gh-title tests are
+// self-contained; gh itself is faked on PATH so both branches are forced,
+// not left to whatever the machine's real gh returns.
+const MIN_MANIFEST = {
+  version: 1,
+  setup: { image: 'node:22' },
+  workspace: { repo: 'git@github.com:acme/example-app.git', strategy: 'branch-per-job' },
+  harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev-sprint.md', critic: 'code-reviewer' }] },
+  gates: { pickup: 'node .fleet/check-ready.js', default_finish: 'merge-ready' },
+};
+
+function fakeGh(script: string): string {
+  const bin = makeTempDir('fleet-fake-gh-');
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  return bin;
+}
+
+test('delegate: numeric target stamps workOrder.title from gh', async (t) => {
+  const cwd = scaffold(MIN_MANIFEST);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
 
   const res = await runCli(['delegate', '42'], {
     cwd,
-    env: { FLEET_DAEMON_URL: daemon.url },
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
   });
   assert.equal(res.code, 0, res.stderr);
   const body = JSON.parse(daemon.requests[0].body);
   assert.equal(body.workOrder.target, '42', 'target preserved');
-  // title is either a non-empty string (gh succeeded) or absent (gh failed/not available) — never an empty string.
-  if (body.workOrder.title !== undefined) {
-    assert.ok(typeof body.workOrder.title === 'string' && body.workOrder.title.length > 0,
-      'title, when present, must be a non-empty string');
-  }
-  // In either case, the work order must validate against the schema.
+  assert.equal(body.workOrder.title, 'Fix the flaky heartbeat', 'title stamped from gh');
   const { ok, errors } = validateWorkOrder(body.workOrder);
   assert.ok(ok, `work order with numeric target must validate: ${JSON.stringify(errors)}`);
+});
+
+test('delegate: a gh failure degrades to no title, never an empty one', async (t) => {
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('exit 1');
+
+  const res = await runCli(['delegate', '42'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(body.workOrder.title, undefined, 'failed gh lookup must leave title absent');
+  const { ok, errors } = validateWorkOrder(body.workOrder);
+  assert.ok(ok, `work order without title must validate: ${JSON.stringify(errors)}`);
 });
 
 test('delegate rewrites an ssh github remote to https when the job ships a GitHub token', async (t) => {

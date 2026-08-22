@@ -42,6 +42,17 @@ test('CodeQL excludes the build harness and nothing else', () => {
   );
 });
 
+test('CodeQL has no include-list — narrowing `paths:` would neuter the scan', () => {
+  // `paths-ignore` is the pinned exclude-list above; a `paths:` include-list
+  // is the same silencing move through the other door (scan only docs/ and
+  // everything else falls out of scope without touching the exclusions).
+  const config = readFileSync(join(root, '.github/codeql/codeql-config.yml'), 'utf8');
+  assert.ok(
+    !config.split('\n').some((line) => line.trimEnd() === 'paths:'),
+    'codeql-config.yml grew a `paths:` include-list; scanning scope is a human call',
+  );
+});
+
 test('Codacy excludes the same trees', () => {
   const excluded = listAfter(readFileSync(join(root, '.codacy.yaml'), 'utf8'), 'exclude_paths');
   for (const dir of OUT_OF_SCOPE) {

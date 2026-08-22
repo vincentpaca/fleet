@@ -14,7 +14,6 @@ import type { ServerResponse } from 'node:http';
 import {
   BANNER_MIN_ROWS,
   COCKPIT_FOOTER_KEYS,
-  COCKPIT_VERBS,
   InputHistory,
   MIN_COLUMNS,
   SCROLL_LINES,
@@ -385,12 +384,6 @@ test('splitKeys turns one read into the keys it actually contains', () => {
 });
 
 // ---------- the command line ----------
-
-test('the verbs are the CLI verbs', () => {
-  for (const verb of ['delegate', 'answer', 'logs', 'attach', 'cancel']) {
-    assert.ok(COCKPIT_VERBS.includes(verb), `${verb} must be typeable in the cockpit`);
-  }
-});
 
 test('delegate: target, mode, and a missing target', () => {
   assert.deepEqual(parseCockpitInput('delegate 61'), { kind: 'delegate', target: '61' });

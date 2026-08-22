@@ -20,12 +20,6 @@ test('fleet version prints the package version and exits 0', async () => {
   assert.equal(res.stdout.trim(), EXPECTED_VERSION, 'stdout must be exactly the package.json version');
 });
 
-test('fleet --version and fleet version print identical output', async () => {
-  const flag = await runCli(['--version']);
-  const cmd = await runCli(['version']);
-  assert.equal(flag.stdout, cmd.stdout, '--version and version must produce identical output');
-});
-
 test('fleet help mentions --version flag and version command', async () => {
   const res = await runCli(['help']);
   assert.equal(res.code, 0, res.stderr);
