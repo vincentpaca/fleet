@@ -2,11 +2,16 @@
 # Codacy scope. Mirrors .github/codeql/codeql-config.yml — the build harness is
 # out of scope for both analyzers, for the same reason (see that file).
 #
-# What this file cannot express: the quality-gate thresholds (which severities
-# and categories fail a pull request). Those live in Codacy's repository
-# settings, outside git. Keep them narrow enough that a red check means
-# something.
+# AGENTS.md is here because Codacy's gate is a plain count (issueThreshold: 0 —
+# any new issue fails the pull request), with no way to warn without blocking.
+# Codacy's Agentlinter reads AGENTS.md and reports prose opinions: sentence
+# length, bullets carrying several instructions, rules stated without an escape
+# hatch. Those are worth reading and are not merge blockers. Across four PRs,
+# Agentlinter and Lizard-on-test-files were the only things Codacy ever
+# reported here — nothing in src/, nothing security. Excluding this file is what
+# makes a threshold of zero mean "there is a problem in real code".
 exclude_paths:
   - 'test/**'
   - 'fixtures/**'
   - 'node_modules/**'
+  - 'AGENTS.md'
