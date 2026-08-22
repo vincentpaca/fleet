@@ -59,6 +59,24 @@ test('CodeQL has no include-list — narrowing `paths:` would neuter the scan', 
 // one added line here is the difference between a meaningful zero and a lie.
 const CODACY_EXCLUSIONS = ['test/**', 'fixtures/**', 'node_modules/**', 'AGENTS.md'];
 
+// Coverage has the same shape of hole as the analyzers, with a louder incentive
+// behind it: a threshold someone has to meet is one `--test-coverage-exclude`
+// away from being met. Excluding src/ raises the number and nothing about the
+// diff says so.
+test('coverage measures the product, not the harness', () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+    scripts: Record<string, string>;
+  };
+  const script = pkg.scripts.coverage;
+  assert.ok(script, 'no coverage script');
+  const excluded = [...script.matchAll(/--test-coverage-exclude=(\S+)/g)].map((m) => m[1]);
+  assert.deepStrictEqual(
+    excluded.sort(),
+    OUT_OF_SCOPE.map((dir) => `${dir}/**`).sort(),
+    'coverage exclusions drifted from the build-harness trees',
+  );
+});
+
 test('Codacy excludes the build harness and nothing else', () => {
   const excluded = listAfter(readFileSync(join(root, '.codacy.yaml'), 'utf8'), 'exclude_paths');
   assert.deepStrictEqual(
