@@ -1,0 +1,16 @@
+# Actions are pinned to commit SHAs in .github/workflows/. Pinning without an
+# updater is how a workflow ends up running a two-year-old action, so this is
+# the other half of that decision, not an extra.
+#
+# github-actions only. npm is deliberately absent: the runtime dependency set
+# is ajv and nothing else (AGENTS.md), and a weekly bump PR on a two-entry
+# manifest is noise, not safety.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: 'ci'
