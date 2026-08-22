@@ -25,6 +25,11 @@ const DENYLIST = [
   /vincentpaca|pacavincentpaul|vincent\.paca|paca\.vincentpaul/i,
 ];
 
+// The repo's own public address is not a leak: badges, install lines, and
+// Terraform git sources legitimately carry the slug. Strip it before
+// matching so the operator pattern still catches the name anywhere else.
+const REPO_SLUG = /vincentpaca\/fleet/gi;
+
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // Scan everything COMMITTABLE: tracked + untracked-unignored, per git.
@@ -48,7 +53,7 @@ function* files() {
 test('repo content carries no client- or operator-specific material', () => {
   const hits = [];
   for (const file of files()) {
-    const text = readFileSync(file, 'utf8');
+    const text = readFileSync(file, 'utf8').replace(REPO_SLUG, '');
     for (const pattern of DENYLIST) {
       if (pattern.test(text)) hits.push(`${file.slice(root.length + 1)}: ${pattern}`);
     }
