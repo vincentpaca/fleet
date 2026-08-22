@@ -12,7 +12,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from '../shared/home.ts';
 
@@ -67,22 +67,40 @@ export async function collectArtifacts(opts: {
 
   for (const fullPath of allFiles) {
     const relPath = relative(artifactsDir, fullPath).replace(/\\/g, '/');
-    const bytes = statSync(fullPath).size;
 
-    if (bytes > ARTIFACT_PER_FILE_CAP) {
-      notes.push(
-        `artifact skipped (exceeds ${ARTIFACT_PER_FILE_CAP / 1024 / 1024} MB per-file cap): ${relPath}`,
-      );
-      continue;
-    }
-    if (totalBytes + bytes > ARTIFACT_TOTAL_CAP) {
-      notes.push(
-        `artifact skipped (total cap of ${ARTIFACT_TOTAL_CAP / 1024 / 1024} MB reached): ${relPath}`,
-      );
-      continue;
+    // Measure and read one open file, not one path twice. Sizing by
+    // `statSync(path)` and then reading by `readFileSync(path)` asks the
+    // filesystem to resolve the name twice, and what answers the second time
+    // need not be what answered the first — the daemon would record a byte
+    // count that does not describe the bytes stored beside it.
+    //
+    // The size check still comes first, because finding out a file is 500 MB by
+    // pulling it into the container's memory is its own kind of failure.
+    let content: Buffer;
+    const fd = openSync(fullPath, 'r');
+    try {
+      const bytes = fstatSync(fd).size;
+      if (bytes > ARTIFACT_PER_FILE_CAP) {
+        notes.push(
+          `artifact skipped (exceeds ${ARTIFACT_PER_FILE_CAP / 1024 / 1024} MB per-file cap): ${relPath}`,
+        );
+        continue;
+      }
+      if (totalBytes + bytes > ARTIFACT_TOTAL_CAP) {
+        notes.push(
+          `artifact skipped (total cap of ${ARTIFACT_TOTAL_CAP / 1024 / 1024} MB reached): ${relPath}`,
+        );
+        continue;
+      }
+      content = readFileSync(fd);
+    } finally {
+      closeSync(fd);
     }
 
-    const content = readFileSync(fullPath);
+    // Still from the buffer rather than from fstat: a file being appended to
+    // while we read it hands back more than it measured, and `bytes` has to
+    // describe this content.
+    const bytes = content.length;
     const sha256 = createHash('sha256').update(content).digest('hex');
     const body = JSON.stringify({
       path: relPath,
