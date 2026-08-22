@@ -988,7 +988,10 @@ async function cmdConnect(args: string[]): Promise<number> {
       home: fleetHome(),
       port,
       detach: values.detach === true,
-      selfPath: fileURLToPath(new URL('./main.ts', import.meta.url)),
+      // bin.mjs, not main.ts: the detached child must start the same way the
+      // bin does, because a .ts entry cannot be spawned from an npm-installed
+      // copy (type stripping is refused under node_modules — see bin.mjs).
+      selfPath: fileURLToPath(new URL('./bin.mjs', import.meta.url)),
       log: (line) => console.log(line),
       warn: (line) => console.error(`fleet connect: ${line}`),
     });

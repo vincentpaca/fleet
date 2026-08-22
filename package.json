@@ -1,7 +1,6 @@
 {
   "name": "fleet",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Run coding-agent jobs in containers on your own AWS account.",
   "license": "PolyForm-Shield-1.0.0",
@@ -17,7 +16,7 @@
     "docs"
   ],
   "bin": {
-    "fleet": "src/cli/main.ts"
+    "fleet": "src/cli/bin.mjs"
   },
   "scripts": {
     "test": "node --test"
