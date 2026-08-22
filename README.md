@@ -1,4 +1,5 @@
 # Fleet
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/771617780d6943a18b5acc2d0125536c)](https://app.codacy.com/gh/vincentpaca/fleet/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 **Fleet lets you delegate the harness you already use, detach from it, and safely pick it up anywhere.**
 
