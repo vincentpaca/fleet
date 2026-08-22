@@ -268,6 +268,118 @@ test('delegate keeps the ssh remote verbatim when no GitHub token ships', async 
   );
 });
 
+// --- Typed PR target (#80): delegate pr/<n> continues an existing PR ---
+
+/** A bin dir whose `gh` prints the given JSON (recording its args); prepended to PATH. */
+function fakeGhBin(stdout: string, exitCode = 0): { bin: string; calls: () => string[] } {
+  const bin = makeTempDir('fleet-fake-gh-');
+  const log = path.join(bin, 'gh-calls.log');
+  fs.writeFileSync(
+    path.join(bin, 'gh'),
+    `#!/bin/sh\necho "$@" >> "${log}"\ncat <<'EOF'\n${stdout}\nEOF\nexit ${exitCode}\n`,
+    { mode: 0o755 },
+  );
+  return {
+    bin,
+    calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
+  };
+}
+
+const OPEN_PR = JSON.stringify({
+  number: 41,
+  state: 'OPEN',
+  headRefName: 'fleet/9-job-old',
+  title: 'Fix the widget pipeline',
+  closingIssuesReferences: [{ number: 9 }],
+});
+
+test('delegate pr/<n> implies followthrough, resolves the head branch, and ships continues', async (t) => {
+  const cwd = scaffold();
+  const gh = fakeGhBin(OPEN_PR);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'pr/41'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(body.workOrder.mode, 'followthrough', 'a PR target implies followthrough');
+  assert.deepEqual(body.workOrder.continues, { pr: 41, branch: 'fleet/9-job-old' });
+  assert.equal(body.workOrder.target, '9', 'the linked issue becomes the target — board lineage');
+  assert.equal(body.workOrder.title, 'Fix the widget pipeline');
+  const { ok, errors } = validateWorkOrder(body.workOrder);
+  assert.ok(ok, JSON.stringify(errors));
+  assert.match(gh.calls()[0], /^pr view 41 --json /, 'resolved via gh pr view at dispatch');
+});
+
+test('delegate accepts a full GitHub PR URL and falls back to a pr/<n> target without a linked issue', async (t) => {
+  const cwd = scaffold();
+  const gh = fakeGhBin(JSON.stringify({
+    number: 41, state: 'OPEN', headRefName: 'fleet/9-job-old', title: 'Fix the widget pipeline',
+    closingIssuesReferences: [],
+  }));
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'https://github.com/acme/example-app/pull/41'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.deepEqual(body.workOrder.continues, { pr: 41, branch: 'fleet/9-job-old' });
+  assert.equal(body.workOrder.target, 'pr/41', 'no single linked issue — the PR reference is the target');
+  assert.match(gh.calls()[0], /^pr view https:\/\/github\.com\/acme\/example-app\/pull\/41 /, 'URLs pass to gh verbatim — they name the repo');
+});
+
+test('delegate refuses a non-open PR before any POST', async (t) => {
+  // The bug this catches: resolving (or failing) only after the daemon has a
+  // job record — a container would burn on a branch nobody can update a PR from.
+  const cwd = scaffold();
+  const gh = fakeGhBin(JSON.stringify({ number: 41, state: 'MERGED', headRefName: 'fleet/9-job-old', title: 'x', closingIssuesReferences: [] }));
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'pr/41'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /PR #41 is MERGED, not open/);
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
+test('delegate refuses a gh resolution failure before any POST', async (t) => {
+  const cwd = scaffold();
+  const gh = fakeGhBin('', 1);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'pr/404'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /cannot resolve PR target pr\/404/);
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
+test('delegate rejects a PR target with a conflicting --mode', async (t) => {
+  const cwd = scaffold();
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'pr/41', '--mode', 'implement'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value' },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /implies --mode followthrough/);
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
 test('toHttpsGitUrl: github ssh forms rewrite, everything else passes through', () => {
   assert.equal(toHttpsGitUrl('git@github.com:acme/example-app.git'), 'https://github.com/acme/example-app.git');
   assert.equal(toHttpsGitUrl('ssh://git@github.com/acme/example-app.git'), 'https://github.com/acme/example-app.git');

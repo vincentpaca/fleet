@@ -45,6 +45,16 @@
       "default": "status-first",
       "description": "Settle payload shape: Status line first (READY/BLOCKED/...), then rung reached vs target, SHAs/PR, verification, self-review, not-done, one exact next action."
     },
+    "continues": {
+      "type": "object",
+      "required": ["pr", "branch"],
+      "additionalProperties": false,
+      "description": "Post-settle feedback re-entry (#80): this dispatch adopts an existing open PR's head branch instead of creating a fresh job branch. The runner fetches and checks out `branch`, pushes work to it (the PR updates in place), and never opens a new PR. Only valid in followthrough mode — adoption is deliberate; every other mode still trips the claim guard.",
+      "properties": {
+        "pr": { "type": "integer", "minimum": 1, "description": "The open PR being continued." },
+        "branch": { "type": "string", "minLength": 1, "description": "The PR's head branch, resolved by the CLI at dispatch." }
+      }
+    },
     "limits": {
       "type": "object",
       "additionalProperties": false,
@@ -54,6 +64,11 @@
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$" },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$" }
       }
+    }
+  },
+  "dependentSchemas": {
+    "continues": {
+      "properties": { "mode": { "const": "followthrough" } }
     }
   },
   "$defs": {
