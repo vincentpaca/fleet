@@ -27,8 +27,17 @@ jobs:
       contents: read
     # Read here rather than only in the upload step: a secret cannot be tested
     # in a step-level `if`, and the upload has to be skippable — see below.
+    #
+    # Two tokens because Codacy has two kinds and they are not interchangeable.
+    # A project token is scoped to one repository; an account token is scoped to
+    # you and needs the org and repo named alongside it. Passing an account
+    # token where a project token is expected fails with "Request URL not found",
+    # which reads like a broken URL and is actually the wrong credential. The
+    # action accepts either input and derives org and repo from GITHUB_REPOSITORY
+    # for the account case, so whichever one exists is the one used.
     env:
       CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+      CODACY_API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}
     steps:
       # Third-party actions are pinned to a commit, not a tag: a tag is a
       # mutable pointer in someone else's repo. Dependabot moves the pins
@@ -54,11 +63,21 @@ jobs:
       # and a check that goes red for a missing secret is a check people learn
       # to ignore. Coverage is a report here: Codacy's coverage threshold is off
       # (-1), so nothing about this can block a merge until someone sets one.
-      - if: env.CODACY_PROJECT_TOKEN != ''
+      #
+      # The pin on this action is weaker than the others in this file, and not
+      # by our choice: internally it runs `bash <(curl -Ls .../master/get.sh)`
+      # twice, so the code that executes comes from a mutable ref at runtime.
+      # The SHA pins the wrapper, not the thing it downloads. Tracked in #105.
+      - if: env.CODACY_PROJECT_TOKEN != '' || env.CODACY_API_TOKEN != ''
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
           project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          api-token: ${{ secrets.CODACY_API_TOKEN }}
           coverage-reports: coverage.lcov
+          # The report covers .ts and two .mjs files, which the reporter reads as
+          # two languages and then uploads only the first of. Naming one keeps it
+          # from picking.
+          language: TypeScript
 
   terraform:
     runs-on: ubuntu-latest
