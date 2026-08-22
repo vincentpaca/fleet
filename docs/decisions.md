@@ -57,3 +57,18 @@ Fleet is two steps: (1) stand up infrastructure — on any cloud, possibly sever
 ## D13 — Source-available under PolyForm Shield; "open source" is not claimed
 
 Fleet's license must let anyone use, modify, and self-host it — commercially included, because adoption is the point — while making the one feared act impossible: someone offering Fleet itself as a competing product or managed service. That is PolyForm Shield 1.0.0 (`LICENSE.md`), professionally drafted, SPDX-listed, permanent (no delayed conversion), and precedented in this exact product category (AutoGPT's platform, Micro). Alternatives considered: MIT/Apache (no protection), AGPL (permits commercialization, scares legitimate adopters' legal teams), FSL/BUSL (protection expires by design), n8n-style sustainable-use (blocks more than necessary). Because OSI open source definitionally forbids use restrictions, Fleet says "source-available", never "open source" — overclaiming invites the community's justified correction. Relicensing toward permissive stays cheap only while contributions are few; revisit before accepting substantial outside work.
+
+## D14 — Files crossing the runner↔daemon boundary are the operator's own
+
+Four CodeQL alerts describe Fleet's central mechanism as a vulnerability, and they will keep doing so, so the answer belongs here rather than in four dismissal comments.
+
+`js/file-access-to-http` flags `src/cli/client.ts` and `src/runner/artifacts.ts` for reading a file and putting it in an HTTP request. `js/http-to-file-access` flags `src/runner/decisions.ts` for taking an HTTP response and writing it to disk. Those queries look for a file whose content an attacker chose reaching a network call, and for a response from a host an attacker chose landing on a filesystem — server-side request forgery and remote file write. Fleet's job is to carry the operator's own repository files from the operator's own sandbox to the operator's own coordinator, over a unix socket or a tunnel the operator opened. There is no untrusted source and no attacker-chosen sink; the flow the queries found is real and is the product.
+
+Accepting that is not the same as accepting the boundary is unguarded. What actually protects it, and where each control is tested:
+
+- Synced paths that resolve outside the workspace root are dropped, in `materializeWorkspace` and in `ProcessProvider.prepareWorkspace`. A work order cannot write into the container's filesystem at large.
+- The runner's token authorizes `/internal/*` for its own job and nothing else. The answer API is unreachable with it, which is the invariant the whole design exists for.
+- The daemon validates every event against `schemas/` at intake and rejects rather than coerces.
+- Artifacts are the files the collector walked out of `.fleet/out/artifacts/`, sized by the bytes read, under a per-file and a total cap.
+
+This decision expires if any of four things changes: the daemon becomes reachable from outside the operator's own network path; artifact paths start coming from a work order or an event instead of the directory walk; the answer written to `.fleet/out/` starts being consumed as anything but data; or a job's files start arriving from a source the operator did not name. Any of those makes the queries right and this entry wrong.
