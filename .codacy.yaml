@@ -1,0 +1,12 @@
+---
+# Codacy scope. Mirrors .github/codeql/codeql-config.yml — the build harness is
+# out of scope for both analyzers, for the same reason (see that file).
+#
+# What this file cannot express: the quality-gate thresholds (which severities
+# and categories fail a pull request). Those live in Codacy's repository
+# settings, outside git. Keep them narrow enough that a red check means
+# something.
+exclude_paths:
+  - 'test/**'
+  - 'fixtures/**'
+  - 'node_modules/**'
