@@ -176,6 +176,7 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
       },
     },
     { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' } },
+    { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'notes' }, artifacts: 3 },
   ];
   assert.equal(roster(jobs, 0, 80), [
     '▶ !! job-blk                 blocked    assess      docs               ',
@@ -185,7 +186,26 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
     '     answer: type an option id below — go | wait',
     '',
     '  ●  job-run                 running    implement   app                ',
+    '  ·  job-done                done       assess      notes                3 files',
   ].join('\n'));
+});
+
+test('a done row shows its delivered-artifact count; empty or live rows do not (#81)', () => {
+  // The delivery guarantee has to be visible where the job reads as finished:
+  // a done job with files waiting must not look identical to an empty-handed one.
+  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'docs' }, artifacts: 3 };
+  assert.match(roster([done]), /job-done.*3 files/);
+  // Singular for one file — "1 files" reads as a bug.
+  assert.match(roster([{ ...done, artifacts: 1 }]), /job-done.*1 file(?!s)/);
+  // Zero or unknown: no marker at all, not "0 files".
+  assert.doesNotMatch(roster([{ ...done, artifacts: 0 }]), /file/);
+  assert.doesNotMatch(roster([{ ...done, artifacts: undefined }]), /file/);
+  // A live job never carries the marker: its settle has not happened, so any
+  // count on it would be stale data wearing a delivery badge.
+  assert.doesNotMatch(roster([{ ...done, state: 'running' }]), /file/);
+  // A cancelled job that still delivered artifacts shows them — partial
+  // delivery is exactly when the operator needs to know files exist.
+  assert.match(roster([{ ...done, state: 'cancelled', reason: 'stall' }]), /job-done.*3 files/);
 });
 
 test('the blocked marker pulses, and only the blocked one', () => {
@@ -383,6 +403,33 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   assert.equal(reads, 2, 'a changed job is re-read');
   assert.equal(third.jobs![0].decision?.question, 'question 2');
   assert.equal(cache.size, 1, 'the cache is pruned to what is on the board');
+});
+
+test('fetchBoardJobs carries the artifact count from the stored settle (#81)', async (t) => {
+  // The daemon listing already stores the settle; the count must come from it
+  // without any per-job event read — and an empty produced[] must map to no
+  // count at all, not zero.
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jobs: [
+          {
+            id: 'job-art', state: 'done',
+            settle: { outcome: { produced: [{ id: 'a.md', type: 'file', title: 'a.md' }, { id: 'b.csv', type: 'file', title: 'b.csv' }], findings: 0, decisions: 0 } },
+          },
+          { id: 'job-empty', state: 'done', settle: { outcome: { produced: [], findings: 0, decisions: 0 } } },
+          { id: 'job-nosettle', state: 'running' },
+        ],
+      }),
+  });
+  t.after(daemon.close);
+
+  const result = await fetchBoardJobs({ FLEET_DAEMON_URL: daemon.url });
+  assert.ok(result.ok, `fetchBoardJobs failed: ${result.error}`);
+  const byId = new Map(result.jobs!.map((j) => [j.id, j]));
+  assert.equal(byId.get('job-art')?.artifacts, 2);
+  assert.equal(byId.get('job-empty')?.artifacts, undefined, 'empty produced[] maps to no count');
+  assert.equal(byId.get('job-nosettle')?.artifacts, undefined);
 });
 
 test('fetchBoardJobs reports an unreachable daemon rather than throwing', async () => {

@@ -29,6 +29,8 @@ export type BoardJob = {
   updatedAt?: string;
   lastActivity?: { text: string; at: string }; // most recent think/log from the daemon (all jobs)
   decision?: BoardDecision; // pending decision enriched from event stream
+  /** Delivered artifacts (settle outcome produced[] length). Settled jobs only. */
+  artifacts?: number;
 };
 
 /** Context info shown in the header strip. Gathered at startup; optional fields. */
@@ -525,7 +527,14 @@ export function renderRosterRows(
       : job.state === 'running' || job.state === 'queued'
         ? `${col('●', 32)} `
         : `${col('·', 90)} `;
-    const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), stateColor(job))}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}`;
+    // Delivered artifacts on a settled row (issue #81): the fleet's delivery
+    // guarantee has to be visible where the job is read as finished — a done
+    // row with files waiting must not look identical to an empty-handed one.
+    const settled = job.state === 'done' || job.state === 'cancelled';
+    const files = settled && (job.artifacts ?? 0) > 0
+      ? `  ${col(`${job.artifacts} file${job.artifacts === 1 ? '' : 's'}`, 90)}`
+      : '';
+    const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), stateColor(job))}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}${files}`;
     lines.push(visualClip(row, w));
 
     if (job.state === 'blocked' && job.decision) {
@@ -554,6 +563,8 @@ type RawJob = {
   createdAt?: string;
   updatedAt?: string;
   lastActivity?: { text: string; at: string };
+  /** Stored settle (daemon keeps it on the record); produced[] is the artifact list. */
+  settle?: { outcome?: { produced?: unknown[] } };
 };
 
 type WireEvent = {
@@ -635,6 +646,11 @@ export async function fetchBoardJobs(
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       lastActivity: r.lastActivity,
+      // Artifact count from the stored settle (issue #81): the listing already
+      // carries it, so no extra read per job.
+      ...(Array.isArray(r.settle?.outcome?.produced) && r.settle.outcome.produced.length > 0
+        ? { artifacts: r.settle.outcome.produced.length }
+        : {}),
     }));
     for (const job of jobs) {
       if (job.state !== 'blocked') continue;
