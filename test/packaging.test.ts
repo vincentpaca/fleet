@@ -33,7 +33,8 @@ const MUST_SHIP = [
   'README.md',
 ];
 
-const MUST_NOT_SHIP_PREFIXES = ['test/', 'fixtures/', 'agents/', '.claude/', '.fleet/', 'infra/'];
+// images/ ships via git source, not npm (docs/architecture.md#two-layer-job-images).
+const MUST_NOT_SHIP_PREFIXES = ['test/', 'fixtures/', 'agents/', '.claude/', '.fleet/', 'infra/', 'images/'];
 const MUST_NOT_SHIP_FILES = ['AGENTS.md', 'CLAUDE.md', 'tsconfig.json'];
 
 test('the product ships', () => {

@@ -12,7 +12,7 @@ import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
 import { socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
-import { parseDurationMs, idleLimitMs, toMinutes } from "../shared/time.ts";
+import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
@@ -712,7 +712,7 @@ export class FleetDaemon {
    */
   #wallClockSweep(): void {
     const now = Date.now();
-    const margin = this.#options.wallClockBackstopMarginMs ?? 90_000;
+    const margin = this.#options.wallClockBackstopMarginMs ?? DEFAULT_BACKSTOP_MARGIN_MS;
     for (const job of this.registry.listJobs()) {
       if (job.state !== "running" && job.state !== "blocked") continue;
       const limitMs = this.registry.wallClockLimitMs(job.id);
@@ -746,7 +746,7 @@ export class FleetDaemon {
    */
   #idleSweep(): void {
     const now = Date.now();
-    const margin = this.#options.idleBackstopMarginMs ?? 90_000;
+    const margin = this.#options.idleBackstopMarginMs ?? DEFAULT_BACKSTOP_MARGIN_MS;
     for (const job of this.registry.listJobs()) {
       if (job.state !== "running") continue;
       const limitMs = this.registry.idleLimitMs(job.id);

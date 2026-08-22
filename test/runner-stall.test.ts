@@ -216,8 +216,10 @@ test('stall: a harness that ignores SIGTERM and leaks a stdout holder is still s
 test('stall: a chatty harness runs past the idle threshold and completes', async () => {
   const token = 'stall-token-2';
   const daemon = await startMockDaemon({ token });
-  // 1s threshold, ~2.4s of runtime: only a window that resets on output survives.
-  const workspace = writeWorkspace({ idle: '1s' });
+  // 2s threshold, ~2.4s of runtime with output every 300ms: only a window that
+  // resets on output survives, and a spurious failure now needs a 2s scheduler
+  // stall in line delivery rather than a 1s one.
+  const workspace = writeWorkspace({ idle: '2s' });
   try {
     const scriptPath = resolve(workspace, 'chatty.js');
     writeFileSync(

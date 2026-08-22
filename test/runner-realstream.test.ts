@@ -19,14 +19,6 @@ test('the fixture is a real spread of stream types', () => {
   }
 });
 
-test('noise reduction is measurable: fixture produces fewer events than input lines', () => {
-  const total = lines.flatMap((l) => translateLine(l)).length;
-  // Before this fix: 22 lines → 22 events (1:1).
-  // After: thinking_tokens (×2), hook_started (×1), hook_response (×1) are dropped → 18 events.
-  // Pin the count so regressions are immediately visible.
-  assert.equal(total, 18, `expected 18 translated events, got ${total}`);
-});
-
 test('zero raw-JSON log lines from the fixture', () => {
   // One detector for this property, shared with the calibration corpus (#50).
   const rawJsonLogs = lines

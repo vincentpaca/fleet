@@ -42,6 +42,17 @@ test('CodeQL excludes the build harness and nothing else', () => {
   );
 });
 
+test('CodeQL has no include-list — narrowing `paths:` would neuter the scan', () => {
+  // `paths-ignore` is the pinned exclude-list above; a `paths:` include-list
+  // is the same silencing move through the other door (scan only docs/ and
+  // everything else falls out of scope without touching the exclusions).
+  const config = readFileSync(join(root, '.github/codeql/codeql-config.yml'), 'utf8');
+  assert.ok(
+    !config.split('\n').some((line) => line.trimEnd() === 'paths:'),
+    'codeql-config.yml grew a `paths:` include-list; scanning scope is a human call',
+  );
+});
+
 // Codacy's list is longer than CodeQL's: it reads the vendored dependency tree,
 // and it lints AGENTS.md prose (see .codacy.yaml for why that is excluded).
 // Pinned exactly, for the same reason as paths-ignore — its gate is a count, so

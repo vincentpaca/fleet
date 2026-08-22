@@ -71,6 +71,13 @@ test('delegate -> blocked -> answer -> done, over the real wire', async (t) => {
     ...process.env,
     FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
     FLEET_HARNESS_CMD: `node ${harness}`,
+    // `fleet delegate` refuses without a git identity; supply one through git's
+    // own env config so the test does not depend on the machine's ~/.gitconfig.
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
   };
   const fleet = (args: string[], cwd: string = project) => run('node', [cli, ...args], { cwd, env });
 
@@ -102,10 +109,16 @@ test('delegate -> blocked -> answer -> done, over the real wire', async (t) => {
   await fleet(['answer', jobId, '--option', 'rebase']);
   await waitFor((s) => /\bdone\b/i.test(s), 'done');
 
-  // Transcript replays from the daemon's persisted event log.
+  // Transcript replays from the daemon's persisted event log — every marker
+  // present, and in lifecycle order: the daemon re-stamps the authoritative
+  // seq, so a replay that shuffles it (settle before decision) must fail here.
   const { stdout: log } = await fleet(['logs', jobId]);
+  let lastIndex = -1;
   for (const marker of ['running', 'decision', 'answer', 'settle', 'done']) {
-    assert.match(log, new RegExp(marker, 'i'), `transcript missing ${marker}`);
+    const index = log.search(new RegExp(marker, 'i'));
+    assert.ok(index !== -1, `transcript missing ${marker}`);
+    assert.ok(index > lastIndex, `transcript out of order at ${marker}`);
+    lastIndex = index;
   }
   assert.match(log, /rebase/, 'answered option should appear in the transcript');
   assert.match(log, /open the pull request/, 'report next_action should appear in settle');
@@ -155,6 +168,13 @@ test('job children inherit the git credential helper env when a token ships', as
     FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
     FLEET_HARNESS_CMD: `node ${harness}`,
     GH_TOKEN: 'e2e-fake-token',
+    // Identity via env config, same reason as the first test. These reach only
+    // the CLI's own git calls, not the runner child the pickup gate inspects.
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
   };
   const fleet = (args: string[], cwd: string = project) => run('node', [cli, ...args], { cwd, env });
 

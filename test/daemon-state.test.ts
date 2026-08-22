@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { canTransition, isTerminal, isMarkerAllowed, INITIAL_STATE, STATES } from "../src/daemon/state.ts";
 import { verifyRung, RUNG_LADDER } from "../src/daemon/verify.ts";
 
@@ -83,10 +84,12 @@ test("verifyRung: local-gate rungs and edge cases", () => {
 });
 
 test("rung ladder matches the work-order schema order", () => {
-  assert.equal(RUNG_LADDER[0], "inspected");
-  assert.equal(RUNG_LADDER[1], "implemented");
-  assert.equal(RUNG_LADDER.length, 13);
-  assert.ok(RUNG_LADDER.indexOf("merge-ready") < RUNG_LADDER.indexOf("merged"));
+  // The schema's rung enum is the source of truth; verify.ts keeps a parallel
+  // ordered copy. Compare the two whole, so drift in either direction fails.
+  const schema = JSON.parse(
+    readFileSync(new URL("../schemas/work-order.schema.json", import.meta.url), "utf8"),
+  ) as { $defs: { rung: { enum: string[] } } };
+  assert.deepEqual([...RUNG_LADDER], schema.$defs.rung.enum);
 });
 
 // --- gh-runner verification (issue #3) ---
