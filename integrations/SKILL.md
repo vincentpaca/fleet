@@ -30,6 +30,7 @@ fleet delegate <target> [--mode <assess|implement|investigate|followthrough|revi
 ```
 
 - Default mode is `implement`. Use `assess` first when readiness is uncertain — it is read-only and cheap.
+- A PR target — `pr/<n>` or a full GitHub PR URL — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. This implies `--mode followthrough` and refuses non-open PRs before dispatching.
 - The command prints a job id. Report it to the human immediately with one line about what was dispatched.
 - Sync files and env vars are read from the current shell and repo; if `delegate` fails naming a missing var or file, relay that verbatim.
 

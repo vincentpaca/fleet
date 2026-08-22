@@ -35,6 +35,25 @@ test('claude-code adapter ships its dialect env default; overrides carry none', 
   assert.equal(override?.env, undefined);
 });
 
+test('continues (#80) rides into the prompt: PR, branch, gh feedback instructions', () => {
+  const plan = buildHarnessCommand({
+    manifest,
+    target: '77',
+    actualVersion: '2.1.220',
+    continues: { pr: 41, branch: 'fleet/77-job-old' },
+  });
+  assert.ok(plan);
+  assert.match(plan.cmd, /followthrough on PR #41 \(branch fleet\/77-job-old\)/);
+  assert.match(plan.cmd, /review comments and failing checks/);
+  assert.match(plan.cmd, /gh pr checks 41/, 'the agent is told to use gh itself — no runner-side feedback plumbing');
+  assert.match(plan.cmd, /never open a new PR/);
+  // The bug this catches: continuation text leaking into ordinary dispatches,
+  // which would send every implement job hunting for a PR that does not exist.
+  const plain = buildHarnessCommand({ manifest, target: '77', actualVersion: '2.1.220' });
+  assert.ok(plain);
+  assert.doesNotMatch(plain.cmd, /followthrough on PR/);
+});
+
 test('version violations become notes, not failures', () => {
   const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.0.9' });
   assert.ok(plan);
