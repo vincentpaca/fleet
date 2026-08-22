@@ -32,6 +32,21 @@ export function idleLimitMs(limits: unknown): number {
 }
 
 /**
+ * How often a live-but-event-silent job must emit one liveness line (#50).
+ *
+ * The daemon's stall backstop measures silence on the *event stream*, not on
+ * the harness's stdout, and terminating from that path cannot push the partial
+ * work first. Since the translator drops the harness's own heartbeats
+ * (`tool_progress` and friends), a job inside one long tool call can be alive
+ * and event-silent — so the runner coalesces those dropped lines into one
+ * bounded log line per window. A third of the idle limit leaves two missed
+ * windows of slack before the backstop's margin even begins.
+ */
+export function heartbeatMs(idleMs: number): number {
+  return Math.max(30_000, Math.floor(idleMs / 3));
+}
+
+/**
  * ms as minutes rounded to 2dp — the unit the settle event already reports
  * (`minutes`), reused so durations read the same everywhere in the log.
  */

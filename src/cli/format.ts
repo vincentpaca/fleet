@@ -4,6 +4,8 @@
  * Split from main.ts so tests can import without triggering the CLI entry point.
  */
 
+import { pickPrimaryArg, TERSE_RESULT_MAX } from '../shared/tool-text.ts';
+
 export type FleetEvent = {
   seq: number;
   type: string;
@@ -42,39 +44,29 @@ export function logsNoColor(env: Record<string, string | undefined>, isTTY: bool
 }
 
 /**
- * Parse a log event's text for tool_use and tool_result prefixes and return a
- * compact one-liner. Falls back to returning the text unchanged.
+ * Compact a log event's text for the `--tools` view.
+ *
+ * Since #50 the runner's translator already emits terse tool lines, so the
+ * JSON branch below only ever fires on logs persisted by an older runner —
+ * the events of a retained job outlive the build that wrote them. New text
+ * has no `: <json>` to parse and falls through unchanged.
  *
  * tool_use Read: {"file_path":"/p"} → tool_use Read file_path=/p
  * tool_result toolu_01: <body>      → tool_result toolu_01 (N bytes)
  */
 export function formatLogText(text: string): string {
   if (text.startsWith('tool_use ')) {
-    // Format: "tool_use <Name>: <json-input>"
+    // Legacy format: "tool_use <Name>: <json-input>"
     const colonIdx = text.indexOf(': ');
     if (colonIdx !== -1) {
       const namepart = text.slice('tool_use '.length, colonIdx); // e.g. "Read"
       const jsonPart = text.slice(colonIdx + 2);
       try {
-        const input = JSON.parse(jsonPart) as Record<string, unknown>;
-        // Pick first meaningful arg: command, file_path, pattern, path, url, then any first key.
-        const PRIORITY = ['command', 'file_path', 'pattern', 'path', 'url'];
-        let arg = '';
-        for (const key of PRIORITY) {
-          if (typeof input[key] === 'string') {
-            const val = (input[key] as string).slice(0, 120);
-            arg = `${key}=${val}`;
-            break;
-          }
-        }
-        if (!arg) {
-          const firstKey = Object.keys(input)[0];
-          if (firstKey !== undefined) {
-            const val = String(input[firstKey]).slice(0, 120);
-            arg = `${firstKey}=${val}`;
-          }
-        }
-        return arg ? `tool_use ${namepart} ${arg}` : `tool_use ${namepart}`;
+        const parsed: unknown = JSON.parse(jsonPart);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an input object');
+        // Same priority order the translator renders with — one list, shared.
+        const arg = pickPrimaryArg(parsed as Record<string, unknown>, 120);
+        return arg ? `tool_use ${namepart} ${arg.key}=${arg.value}` : `tool_use ${namepart}`;
       } catch {
         // Not valid JSON — fall through to raw text.
       }
@@ -85,7 +77,13 @@ export function formatLogText(text: string): string {
     if (colonIdx !== -1) {
       const idpart = text.slice('tool_result '.length, colonIdx);
       const body = text.slice(colonIdx + 2);
-      return `tool_result ${idpart} (${body.length} bytes)`;
+      // Only a raw dump gets traded for a byte count. Since #50 the translator
+      // emits a one-line summary within TERSE_RESULT_MAX; replacing that with
+      // "(42 bytes)" would hide the summary AND misreport the output's real
+      // size — and on a failed call the summary is the whole diagnosis.
+      if (body.length > TERSE_RESULT_MAX || body.includes('\n')) {
+        return `tool_result ${idpart} (${body.length} bytes)`;
+      }
     }
   }
   return text;

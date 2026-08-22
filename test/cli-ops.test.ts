@@ -4,6 +4,8 @@ import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
+import { TERSE_RESULT_MAX } from '../src/shared/tool-text.ts';
+import { translateLine } from '../src/runner/translate.ts';
 
 const RUNNING_JOB = {
   id: 'job-1',
@@ -83,13 +85,56 @@ test('isNarrativeEvent: narrative mode includes spine; excludes tool lines and p
 });
 
 test('formatEvent: log compacts tool_use and tool_result', () => {
+  // Legacy shapes: events persisted by a pre-#50 runner, which the retained
+  // log of an older job still carries.
   const toolUse = { seq: 0, type: 'log', text: 'tool_use Bash: {"command":"npm test"}' };
-  const toolResult = { seq: 1, type: 'log', text: 'tool_result toolu_01: lots of output here' };
+  const rawDump = { seq: 1, type: 'log', text: `tool_result toolu_01: ${'output line\n'.repeat(40)}` };
   const plainLog = { seq: 2, type: 'log', text: 'ran the tests successfully' };
 
   assert.match(formatEvent(toolUse, true), /tool_use Bash command=npm test/);
-  assert.match(formatEvent(toolResult, true), /tool_result toolu_01 \(\d+ bytes\)/);
+  assert.match(formatEvent(rawDump, true), /tool_result toolu_01 \(\d+ bytes\)/);
   assert.match(formatEvent(plainLog, true), /ran the tests successfully/);
+});
+
+test('formatEvent: a terse tool_result summary survives compaction verbatim', () => {
+  // #50: the translator now emits the one-line summary itself. Trading it for
+  // "(42 bytes)" would hide the line AND misreport the tool output's size.
+  const terse = { seq: 3, type: 'log', text: 'tool_result toolu_07: # fail 1 (+12 lines)' };
+  assert.match(formatEvent(terse, true), /tool_result toolu_07: # fail 1 \(\+12 lines\)/);
+  assert.doesNotMatch(formatEvent(terse, true), /bytes/);
+});
+
+test('formatEvent: a LOUD tool_result summary survives too — it is the diagnosis', () => {
+  // A failed call gets the translator's wide budget (MAX_RESULT_ERROR = 800),
+  // so the compaction threshold must sit above it. A threshold tuned to the
+  // non-error budget silently deletes exactly the line the operator needs.
+  const body = `AssertionError: ${'stack frame / '.repeat(50)}exit 1`;
+  assert.ok(body.length > 240 && body.length <= TERSE_RESULT_MAX, `fixture body is ${body.length} chars`);
+  const loud = { seq: 4, type: 'log', text: `tool_result toolu_08 ERROR: ${body}` };
+  assert.match(formatEvent(loud, true), /AssertionError: stack frame/);
+  assert.doesNotMatch(formatEvent(loud, true), /bytes/);
+});
+
+test('translator output survives the CLI compactor, across the module boundary', () => {
+  // #50's original bug was drift between two modules that each looked correct
+  // alone: the translator's error budget and the compactor's dump threshold.
+  // Two hand-written fixtures on opposite sides cannot catch that — only
+  // feeding real translator output through the real formatter can.
+  // Frames long enough that the joined head clears any plausible dump
+  // threshold — that head is exactly what a mis-tuned threshold would delete.
+  const frame = '  at deeplyNestedHelper (file:///workspace/src/some/long/path/to/module.ts:1234:56)';
+  const [rendered] = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{
+      type: 'tool_result', tool_use_id: 'toolu_42', is_error: true,
+      content: `AssertionError: expected 0 got 1\n${`${frame}\n`.repeat(30)}# fail 1`,
+    }] },
+  }));
+  assert.ok(rendered.type === 'log');
+  assert.ok(rendered.text.length > 320, `rendered head was only ${rendered.text.length} chars`);
+  const compacted = formatEvent({ seq: 0, type: 'log', text: rendered.text }, true);
+  assert.match(compacted, /AssertionError: expected 0 got 1/, 'the diagnosis must survive both hops');
+  assert.doesNotMatch(compacted, /bytes/, 'a summary must never be traded for a byte count');
 });
 
 test('formatJobState: cancellations name their kind; blocked keeps its marker', () => {
@@ -272,7 +317,8 @@ test('logs: default (narrative) filters tool_use/tool_result; --tools includes t
   assert.equal(withTools.code, 0, withTools.stderr);
   assert.match(withTools.stdout, /\[0\] decision d1: Which approach\?/, 'decision in --tools');
   assert.match(withTools.stdout, /\[1\] log tool_use Read file_path=\/src\/main\.ts/, 'tool_use compact in --tools');
-  assert.match(withTools.stdout, /\[2\] log tool_result toolu_01 \(\d+ bytes\)/, 'tool_result compact in --tools');
+  // Already a one-line summary (#50): shown verbatim, not traded for a byte count.
+  assert.match(withTools.stdout, /\[2\] log tool_result toolu_01: console\.log\(hello\)/, 'terse tool_result verbatim in --tools');
   assert.match(withTools.stdout, /\[3\] think Considering options\./, 'think in --tools');
   assert.match(withTools.stdout, /\[4\] settle rung=merge-ready status=READY/, 'settle in --tools');
 });

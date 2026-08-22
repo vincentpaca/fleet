@@ -26,7 +26,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
-import { parseDurationMs, idleLimitMs, toMinutes } from '../shared/time.ts';
+import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
 
@@ -255,15 +255,39 @@ async function main(): Promise<void> {
 
   const emits: Promise<unknown>[] = [];
   const lines = createInterface({ input: child.stdout });
+  // Liveness coalescing (#50). The translator drops the harness's own
+  // heartbeats, so a job inside one long tool call is alive on stdout and
+  // silent on the event stream — and the daemon's backstop only sees the
+  // event stream, where it terminates the container without pushing WIP.
+  // One bounded line per window keeps that visible without the flood.
+  const heartbeatWindow =
+    parseInt(process.env.FLEET_HEARTBEAT_MS ?? '', 10) || heartbeatMs(idleMs);
+  let lastEmitAt = startedAt;
   lines.on('line', (line) => {
     // Any output line is proof of life, translatable or not: the stall clock
     // measures silence on the harness's own stream, not event throughput.
     idle.touch();
     if (capture) appendFileSync(capture, line + '\n');
     const translated = translateLine(line);
-    const bodies = translated.filter((item) => item.type !== 'result');
+    if (translated.length === 0) {
+      // The translator dropped this line. Coalesce: one heartbeat per window,
+      // never one per dropped line — the flood is what #50 was about.
+      const now = Date.now();
+      if (now - lastEmitAt >= heartbeatWindow) {
+        lastEmitAt = now;
+        emits.push(sink.emit({
+          type: 'log',
+          who: 'runner',
+          text: `harness working — ${toMinutes(now - startedAt)}m elapsed, no reportable output`,
+        }));
+      }
+      return;
+    }
     // {"type":"result"} marks the end of the run; it precedes settle and is
-    // not itself an event.
+    // not itself an event — and it is not a silent line either, so it must not
+    // trigger a heartbeat one line before the settle.
+    const bodies = translated.filter((item) => item.type !== 'result');
+    lastEmitAt = Date.now();
     if (bodies.length === 1) emits.push(sink.emit(bodies[0]));
     else if (bodies.length > 1) emits.push(sink.emitBatch(bodies));
   });

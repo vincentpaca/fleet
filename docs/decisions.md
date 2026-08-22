@@ -40,7 +40,7 @@ The dispatching session holds the wait when present; `--watch`/`--answer` serve 
 
 ## D10 — This repo carries zero client, engagement, or operator-specific content
 
-Fleet is a standalone tool. Knowledge from real deployments informs its design as shapes and invariants; the content stays out, permanently. Enforced mechanically: `test/sanitized.test.mjs` scans the whole tree on every test run, and external-data compatibility is verified by pointing `FLEET_DEMO_HISTORY` at files outside the repo, never by vendoring them.
+Fleet is a standalone tool. Knowledge from real deployments informs its design as shapes and invariants; the content stays out, permanently. Enforced mechanically: `test/sanitized.test.mjs` scans the whole tree on every test run, and external-data compatibility is verified by pointing an env var at files outside the repo, never by vendoring them — `FLEET_DEMO_HISTORY` for a real run history, `FLEET_HARNESS_CORPUS` for a captured harness stream. In-repo fixtures for the same shapes are synthetic and generic; only they may be snapshotted.
 
 ## D11 — GitHub Issues are the work source for this repo
 
