@@ -67,15 +67,18 @@ export async function collectArtifacts(opts: {
 
   for (const fullPath of allFiles) {
     const relPath = relative(artifactsDir, fullPath).replace(/\\/g, '/');
-    const bytes = statSync(fullPath).size;
+    // Cheap pre-filter only: rejecting an oversized file on its stat avoids
+    // pulling it into memory to find out. The authoritative size comes from the
+    // bytes actually read, below.
+    const statBytes = statSync(fullPath).size;
 
-    if (bytes > ARTIFACT_PER_FILE_CAP) {
+    if (statBytes > ARTIFACT_PER_FILE_CAP) {
       notes.push(
         `artifact skipped (exceeds ${ARTIFACT_PER_FILE_CAP / 1024 / 1024} MB per-file cap): ${relPath}`,
       );
       continue;
     }
-    if (totalBytes + bytes > ARTIFACT_TOTAL_CAP) {
+    if (totalBytes + statBytes > ARTIFACT_TOTAL_CAP) {
       notes.push(
         `artifact skipped (total cap of ${ARTIFACT_TOTAL_CAP / 1024 / 1024} MB reached): ${relPath}`,
       );
@@ -83,6 +86,15 @@ export async function collectArtifacts(opts: {
     }
 
     const content = readFileSync(fullPath);
+    // Size the upload by what we read, never by the earlier stat. A harness
+    // that is still flushing grows the file between the two calls, and `bytes`
+    // is both what the daemon records next to this content and what the total
+    // cap spends — a stat-derived number can be wrong in either direction.
+    const bytes = content.length;
+    if (bytes > ARTIFACT_PER_FILE_CAP || totalBytes + bytes > ARTIFACT_TOTAL_CAP) {
+      notes.push(`artifact skipped (grew past a cap while being collected): ${relPath}`);
+      continue;
+    }
     const sha256 = createHash('sha256').update(content).digest('hex');
     const body = JSON.stringify({
       path: relPath,

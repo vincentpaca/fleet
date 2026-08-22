@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createIfAbsent } from '../shared/fs.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
@@ -238,10 +239,7 @@ export const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in re
 export function ensureFleetGitignore(fleetDir: string, required: string[]): void {
   fs.mkdirSync(fleetDir, { recursive: true });
   const gitignorePath = path.join(fleetDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
-    return;
-  }
+  if (createIfAbsent(gitignorePath, FLEET_GITIGNORE)) return;
   let current = fs.readFileSync(gitignorePath, 'utf8');
   for (const entry of required) {
     const lines = current.split('\n').map((l) => l.trim());
@@ -273,15 +271,11 @@ export function writeScaffold(
   written.push(`wrote ${manifestPath}`);
 
   const setupPath = path.join(fleetDir, 'setup.sh');
-  if (fs.existsSync(setupPath)) {
-    written.push(`kept existing ${setupPath}`);
-  } else {
-    fs.writeFileSync(setupPath, setupScript ?? SETUP_STUB, { mode: 0o755 });
-    written.push(`wrote ${setupPath}`);
-  }
+  const wroteSetup = createIfAbsent(setupPath, setupScript ?? SETUP_STUB, { mode: 0o755 });
+  written.push(`${wroteSetup ? 'wrote' : 'kept existing'} ${setupPath}`);
 
   const gitkeepPath = path.join(fleetDir, 'out', '.gitkeep');
-  if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
+  createIfAbsent(gitkeepPath, '');
   written.push(`wrote ${gitkeepPath}`);
 
   // The whole default set, not just `.env`: a hand-written .fleet/.gitignore
@@ -290,7 +284,7 @@ export function writeScaffold(
   // operator happened to run first.
   ensureFleetGitignore(fleetDir, FLEET_GITIGNORE.split('\n').filter(Boolean));
   const dotEnvExamplePath = path.join(fleetDir, '.env.example');
-  if (!fs.existsSync(dotEnvExamplePath)) fs.writeFileSync(dotEnvExamplePath, DOT_ENV_EXAMPLE);
+  createIfAbsent(dotEnvExamplePath, DOT_ENV_EXAMPLE);
   return written;
 }
 
