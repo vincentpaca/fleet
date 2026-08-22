@@ -3,3 +3,6 @@ node_modules/
 *.tfstate*
 .terraform.lock.hcl
 .fleet/out/
+# Agent worktrees the coding harness checks out next to the repo. Operator-
+# local scratch, and each one is its own git repo.
+.claude/worktrees/
