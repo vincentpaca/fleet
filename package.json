@@ -19,7 +19,8 @@
     "fleet": "src/cli/bin.mjs"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "coverage": "node --experimental-test-coverage --test-coverage-exclude=test/** --test-coverage-exclude=fixtures/** --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage.lcov --test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0"

@@ -1,8 +1,8 @@
 # CI for every PR and for main. Two jobs:
 #   test      — the full node --test suite, including the sanitized, packaging,
-#               harness-mirrors, and cloud-agnostic gates.
-#   terraform — fmt + validate on the infra unit (the first slice of #48;
-#               plan-level checks need credentials and live there).
+#               harness-mirrors, and cloud-agnostic gates, instrumented for
+#               coverage and reported to Codacy.
+#   terraform — fmt, validate, and each unit's plan-level tests.
 name: tests
 
 on:
@@ -25,6 +25,10 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    # Read here rather than only in the upload step: a secret cannot be tested
+    # in a step-level `if`, and the upload has to be skippable — see below.
+    env:
+      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
     steps:
       # Third-party actions are pinned to a commit, not a tag: a tag is a
       # mutable pointer in someone else's repo. Dependabot moves the pins
@@ -40,7 +44,21 @@ jobs:
       - run: |
           git config --global user.name fleet-ci
           git config --global user.email ci@example.com
-      - run: npm test
+      # The same suite `npm test` runs, instrumented. One run, not two: the spec
+      # reporter still writes the readable result to the log, and the lcov
+      # reporter writes coverage.lcov beside it.
+      - run: npm run coverage
+
+      # Skipped, not failed, when the token is absent. Dependabot pull requests
+      # and forks get no repository secrets, so this step cannot succeed there,
+      # and a check that goes red for a missing secret is a check people learn
+      # to ignore. Coverage is a report here: Codacy's coverage threshold is off
+      # (-1), so nothing about this can block a merge until someone sets one.
+      - if: env.CODACY_PROJECT_TOKEN != ''
+        uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
+        with:
+          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          coverage-reports: coverage.lcov
 
   terraform:
     runs-on: ubuntu-latest
