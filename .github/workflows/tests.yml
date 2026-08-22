@@ -35,9 +35,22 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # One provider cache: the example root and the unit's own tests pull the
+    # same provider — one download, not two per unit.
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
+      - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - run: terraform fmt -check -recursive infra/
-      - run: terraform -chdir=infra/aws/examples/basic init -backend=false -input=false
-      - run: terraform -chdir=infra/aws/examples/basic validate -no-color
+      # Every infra unit, not a hardcoded one: validate its example and run its
+      # own plan-level tests (the #48 smoke — provider-schema constraints that
+      # `validate` alone cannot see).
+      - run: |
+          for unit in infra/*/; do
+            terraform -chdir="${unit}examples/basic" init -backend=false -input=false
+            terraform -chdir="${unit}examples/basic" validate -no-color
+            terraform -chdir="${unit}" init -backend=false -input=false
+            terraform -chdir="${unit}" test -no-color
+          done

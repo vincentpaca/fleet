@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { braceBlock } from './infra-helpers.ts';
 
 const src = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
 const COMPOSITION_ROOTS = [join('daemon', 'main.ts'), join('cli', 'tunnel-openers.ts')];
@@ -37,7 +38,7 @@ test('core never imports a concrete cloud provider', () => {
   assert.deepStrictEqual(offenders, [], `core imports concrete providers:\n${offenders.join('\n')}`);
 });
 
-test('each infra unit is self-contained (module + README + example)', () => {
+test('each infra unit is self-contained (module + README + example + plan smoke)', () => {
   const infra = join(src, '..', 'infra');
   for (const unit of readdirSync(infra)) {
     if (statSync(join(infra, unit)).isDirectory()) {
@@ -47,19 +48,23 @@ test('each infra unit is self-contained (module + README + example)', () => {
           `infra/${unit} is missing ${required} — every cloud unit ships complete`,
         );
       }
+
+      // A unit also ships the check that would have caught #9's three
+      // bring-up failures: a `terraform test` plan against mocked providers,
+      // which sees the provider-schema rejections validate cannot (#48).
+      // `terraform test` on a unit with no test files exits 0 — a deleted
+      // smoke reads as a passing run, so require the file here instead.
+      const testsDir = join(infra, unit, 'tests');
+      const tests = statSync(testsDir, { throwIfNoEntry: false })
+        ? readdirSync(testsDir).filter((name) => name.endsWith('.tftest.hcl'))
+        : [];
+      assert.ok(
+        tests.length > 0,
+        `infra/${unit}/tests holds no .tftest.hcl — every cloud unit ships a plan-level smoke, or its provider rejects values nothing checked`,
+      );
     }
   }
 });
-
-/** The `{ ... }` block starting at `open` (the index of its `{`). */
-function braceBlock(text: string, open: number): string {
-  let depth = 0;
-  for (let i = open; i < text.length; i++) {
-    if (text[i] === '{') depth += 1;
-    else if (text[i] === '}' && --depth === 0) return text.slice(open, i + 1);
-  }
-  throw new Error('unterminated block');
-}
 
 test('each infra unit self-describes its shape via fleet_config', () => {
   // fleet_config is the contract between an infra unit and its runtime

@@ -120,6 +120,37 @@ you publish elsewhere.
 | `connect_hint` | The SSM port-forward commands `fleet connect` runs, for when you want the tunnel by hand. |
 | `fleet_config` | The unit's self-description: what the daemon reads at boot, what `images/build.sh` publishes to (`runner_repository_url`, `cluster`, `daemon_service`), and what `fleet connect` tunnels into (`daemon_container_name`, `daemon_port`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
 
+## Changing this unit
+
+`fmt` and `validate` are not enough, and #9's bring-up proved it: `assign_public_ip`
+carrying a string where the provider wants a bool passed both and died at apply, after
+four paid attempts. Run every check below before an infra change ships — CI's terraform
+job runs `fmt` and `validate` today, and the plan smoke is still yours to run until the
+job learns it (`.github/workflows/tests.yml`, #48):
+
+```sh
+terraform fmt -check -recursive infra/
+terraform -chdir=infra/aws/examples/basic init -backend=false -input=false
+terraform -chdir=infra/aws/examples/basic validate
+terraform -chdir=infra/aws init -backend=false -input=false   # then the plan smoke:
+terraform -chdir=infra/aws test
+npm test                                                      # API-only pins
+```
+
+`terraform test` plans the unit through all three network branches — public subnets, NAT
+gateway, reused VPC — against a mocked AWS provider (`tests/plan.tftest.hcl`): no
+credentials, no API calls, no state, but the real provider schema doing the rejecting. It
+needs terraform ≥ 1.7 for `mock_provider`; the module itself still only requires 1.5.
+Mocking has one cost worth knowing: data sources return canned values, so the unit's
+`aws_iam_policy_document` assume-role documents are not rendered by this plan (policies
+built with `jsonencode()` in the configuration are).
+
+What a plan cannot see, because AWS enforces it in the API rather than in the provider
+schema, is pinned in the Node suite instead (`test/infra-aws.test.ts`) — today the
+character class AWS allows in a security-group description, group's and rule's alike,
+which rejected a unicode arrow mid-apply. New constraint, same fork: schema-shaped goes in the plan
+smoke, API-shaped goes in the suite.
+
 ## Notes
 
 - The ECS-optimized Amazon Linux 2023 AMI is resolved at plan time from the public SSM
