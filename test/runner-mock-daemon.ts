@@ -1,6 +1,7 @@
 /**
- * Tiny in-test daemon implementing the two runner-facing endpoints:
+ * Tiny in-test daemon implementing the three runner-facing endpoints:
  *   POST /internal/jobs/:id/events   (single JSON or ndjson batch)
+ *   POST /internal/jobs/:id/artifacts
  *   GET  /internal/jobs/:id/answer?decision=<id>
  *
  * Every incoming event is validated against events.schema.json and seq is
@@ -14,10 +15,14 @@ import { validateEvent } from '../src/validate.mjs';
 
 export type PostedEvent = Record<string, unknown>;
 
+export type PostedArtifact = { path: string; sha256: string; bytes: number; content: string };
+
 export type MockDaemon = {
   url: string;
   /** Accepted (schema-valid) events in arrival order. */
   events: PostedEvent[];
+  /** Artifact uploads in arrival order. */
+  artifacts: PostedArtifact[];
   /** Rejected posts: schema failures or seq regressions. */
   rejected: { event: unknown; errors: unknown }[];
   /** Requests carrying a wrong/missing runner token. */
@@ -29,6 +34,7 @@ export type MockDaemon = {
 
 export async function startMockDaemon(opts: { token: string }): Promise<MockDaemon> {
   const events: PostedEvent[] = [];
+  const artifacts: PostedArtifact[] = [];
   const rejected: { event: unknown; errors: unknown }[] = [];
   const answers = new Map<string, { option?: string; text?: string }>();
   let badTokenCount = 0;
@@ -72,6 +78,14 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
       return;
     }
 
+    if (req.method === 'POST' && /^\/internal\/jobs\/[^/]+\/artifacts$/.test(url.pathname)) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      artifacts.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as PostedArtifact);
+      res.writeHead(200).end(JSON.stringify({ stored: true }));
+      return;
+    }
+
     if (req.method === 'GET' && /^\/internal\/jobs\/[^/]+\/answer$/.test(url.pathname)) {
       const decision = url.searchParams.get('decision') ?? '';
       const answer = answers.get(decision);
@@ -100,6 +114,7 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
   return {
     url: `http://127.0.0.1:${address.port}`,
     events,
+    artifacts,
     rejected,
     get badTokenCount() {
       return badTokenCount;
