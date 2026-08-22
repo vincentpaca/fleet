@@ -168,3 +168,181 @@ test('top-level thinking event → think event without signature', () => {
   assert.match(out[0].text, /Extended reasoning text/);
   assert.doesNotMatch(out[0].text, /BLOB_MUST_NOT_APPEAR/);
 });
+
+// ---------------------------------------------------------------------------
+// #50: the default path fails CLOSED. Every claude-code release adds stream
+// types; a default branch that forwarded the payload made raw-JSON floods
+// inevitable. These are the properties that make a leak impossible rather
+// than merely absent from today's fixtures.
+// ---------------------------------------------------------------------------
+
+/** Deterministic PRNG — a property test that cannot be re-run is not evidence. */
+function rng(seed: number): () => number {
+  let state = seed >>> 0 || 0x9e3779b9;
+  return () => {
+    state ^= state << 13; state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5; state >>>= 0;
+    return state / 0x100000000;
+  };
+}
+
+/** Marker carrying non-identifier characters: cannot survive tag sanitization. */
+const MARKER = 'LEAK/9f3!';
+/** Marker that IS identifier-safe: only safe because it lives in the payload. */
+const SAFE_MARKER = 'LEAK_9f3';
+
+/** Build an arbitrary nested payload with markers buried throughout. */
+function payload(rand: () => number, depth: number): unknown {
+  if (depth <= 0) {
+    const pick = Math.floor(rand() * 5);
+    if (pick === 0) return `${MARKER} ${SAFE_MARKER} some prose`;
+    if (pick === 1) return `${SAFE_MARKER.repeat(300)}`;
+    if (pick === 2) return Math.floor(rand() * 1e9);
+    if (pick === 3) return rand() < 0.5;
+    return null;
+  }
+  if (rand() < 0.4) {
+    return Array.from({ length: 1 + Math.floor(rand() * 4) }, () => payload(rand, depth - 1));
+  }
+  const obj: Record<string, unknown> = {};
+  for (const key of ['message', 'content', `k_${SAFE_MARKER}`, 'partial_output', 'data', 'text']) {
+    if (rand() < 0.7) obj[key] = payload(rand, depth - 1);
+  }
+  return obj;
+}
+
+const UNKNOWN_TYPES = [
+  'tool_progress_v2', 'task_escalated', 'compaction', 'stream_event',
+  'rate_limit_event', 'checkpoint_saved', 'permission_request',
+  // Adversarial `type` values: payload text, control chars, absurd length.
+  `${MARKER} not a shape name`, 'a\nb', 'x'.repeat(5000), '', '{"type":"system"}',
+];
+
+test('unknown records render to nothing or a bounded tag, never the payload', () => {
+  const rand = rng(20260822);
+  for (let i = 0; i < 600; i++) {
+    const type = UNKNOWN_TYPES[i % UNKNOWN_TYPES.length];
+    const record: Record<string, unknown> = { type, ...(payload(rand, 3) as object) };
+    if (rand() < 0.5) record.subtype = rand() < 0.5 ? `sub_${i}` : `${MARKER}${i}`;
+    // The payload markers go in on top, so no random omission can hide them.
+    record.leaked = `${MARKER} ${SAFE_MARKER}`;
+    record.nested = { deep: { deeper: [`${MARKER}`, SAFE_MARKER] } };
+    const line = JSON.stringify(record);
+
+    const out = translateLine(line);
+    assert.ok(out.length <= 1, `unknown record fanned out to ${out.length} events: ${line.slice(0, 120)}`);
+    for (const event of out) {
+      assert.equal(event.type, 'log', 'an unknown record must never become a think or a result');
+      const text = event.text;
+      // Anti-leak: about the PAYLOAD, not about leading characters.
+      assert.ok(!text.includes(MARKER), `leaked marker: ${text}`);
+      assert.ok(!text.includes(SAFE_MARKER), `leaked payload token: ${text}`);
+      assert.ok(!text.includes('partial_output'), `leaked a payload key: ${text}`);
+      // Bounded: a shape tag, at most `<type>(<subtype>)` with 40-char parts.
+      assert.ok(text.length <= 83, `unbounded tag (${text.length} chars): ${text}`);
+      assert.doesNotMatch(text, /[\n\r\t]/, `tag carried control characters: ${JSON.stringify(text)}`);
+      assert.doesNotMatch(text, /[{}"[\]]/, `tag carried JSON punctuation: ${text}`);
+    }
+  }
+});
+
+test('the tag names the shape, so a new CLI type is visible but silent', () => {
+  assert.deepEqual(translateLine('{"type":"compaction","tokens_freed":9001}'), [
+    { type: 'log', text: 'compaction' },
+  ]);
+  assert.deepEqual(translateLine('{"type":"system","subtype":"quota_warning","detail":"long prose"}'), [
+    { type: 'log', text: 'system(quota_warning)' },
+  ]);
+});
+
+test('known harness noise is dropped at both nesting levels', () => {
+  for (const name of [
+    'tool_progress', 'task_started', 'task_updated', 'task_completed',
+    'task_notification', 'background_tasks_changed', 'stream_event',
+  ]) {
+    assert.deepEqual(
+      translateLine(JSON.stringify({ type: 'system', subtype: name, partial_output: 'x'.repeat(600) })),
+      [],
+      `system/${name} must be dropped`,
+    );
+    assert.deepEqual(
+      translateLine(JSON.stringify({ type: name, partial_output: 'x'.repeat(600) })),
+      [],
+      `top-level ${name} must be dropped`,
+    );
+  }
+});
+
+test('tool_use renders the primary argument, clipped and single-line', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {
+      command: `npm test\n${'y'.repeat(900)}`, description: 'Run the suite', timeout: 600000,
+    } }] },
+  }));
+  assert.equal(out.length, 1);
+  const text = textOf(out[0]);
+  assert.match(text, /^tool_use Bash: npm test ⏎ yyy/);
+  assert.ok(text.length < 260, `tool_use line was ${text.length} chars`);
+  assert.doesNotMatch(text, /\n/);
+  assert.doesNotMatch(text, /timeout|600000/, 'secondary args are not evidence');
+});
+
+test('tool_use with no string argument still names the tool', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'TodoWrite', input: {} }] },
+  }));
+  assert.deepEqual(out, [{ type: 'log', text: 'tool_use TodoWrite', who: 'assistant' }]);
+});
+
+test('tool_result keeps the first meaningful line and counts the rest', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_9', content: '\n\n# fail 1\nfoo\nbar' }] },
+  }));
+  assert.deepEqual(out, [{ type: 'log', text: 'tool_result toolu_9: # fail 1 (+2 lines)', who: 'tool' }]);
+});
+
+test('a failed tool_result is loud: several lines, wider budget', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{
+      type: 'tool_result', tool_use_id: 'toolu_9', is_error: true,
+      content: 'Error: boom\n  at a()\n  at b()\n  at c()\n  at d()\n  at e()',
+    }] },
+  }));
+  const text = textOf(out[0]);
+  assert.match(text, /^tool_result toolu_9 ERROR: Error: boom \/ at a\(\)/);
+  assert.match(text, /\(\+1 line\)$/);
+});
+
+test('a tool_result image block is named, never serialized', () => {
+  const out = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_9', content: [
+      { type: 'text', text: 'Screenshot taken.' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'BLOB_MUST_NOT_APPEAR' } },
+    ] }] },
+  }));
+  const text = textOf(out[0]);
+  assert.match(text, /Screenshot taken\./);
+  assert.doesNotMatch(text, /BLOB_MUST_NOT_APPEAR|base64/);
+});
+
+test('an interrupt echo is one short line, both content shapes', () => {
+  const asBlock = translateLine(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] },
+  }));
+  assert.deepEqual(asBlock, [
+    { type: 'log', text: '[Request interrupted by user for tool use]', who: 'harness' },
+  ]);
+  const asString = translateLine(JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: `[Request interrupted]\n${'z'.repeat(900)}` },
+  }));
+  assert.equal(asString.length, 1);
+  assert.ok(textOf(asString[0]).length < 210);
+});

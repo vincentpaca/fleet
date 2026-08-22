@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { translateLine } from '../src/runner/translate.ts';
+import { isPassthrough, isTextEvent } from './translate-helpers.ts';
 
 const lines = readFileSync(new URL('./fixtures/claude-stream-real.ndjson', import.meta.url), 'utf8')
   .trim()
@@ -27,23 +28,11 @@ test('noise reduction is measurable: fixture produces fewer events than input li
 });
 
 test('zero raw-JSON log lines from the fixture', () => {
+  // One detector for this property, shared with the calibration corpus (#50).
   const rawJsonLogs = lines
     .flatMap((l) => translateLine(l))
-    .filter((e) => {
-      if (e.type !== 'log') return false;
-      // A raw-JSON log is one whose text IS the original top-level event JSON (not just JSON-containing text).
-      // These are the harness system events that leaked as-is before this fix.
-      try {
-        const parsed = JSON.parse(e.text) as Record<string, unknown>;
-        // Detect by the presence of type+subtype from the harness system event shapes.
-        return (
-          (parsed.type === 'system' && typeof parsed.subtype === 'string') ||
-          parsed.type === 'thinking'
-        );
-      } catch {
-        return false;
-      }
-    });
+    .filter(isTextEvent)
+    .filter((e) => isPassthrough(e.text));
   assert.equal(
     rawJsonLogs.length,
     0,

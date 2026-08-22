@@ -5,7 +5,7 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 ## Build and test
 
 - Node ≥ 23.6, no build step: `.ts` runs directly via type stripping. **Erasable syntax only** — no enums, no namespaces, no parameter properties. If `node --test` can't run it, it's wrong.
-- `npm test` = full suite. Focused: `node --test test/<area>-*.test.ts` (areas: `daemon-`, `runner-`, `cli-`, plus `gate`, `e2e-delegate`, `harness-mirrors`, `cloud-agnostic`, `packaging`, `sanitized`). Optional: `FLEET_DEMO_HISTORY=<path> npm test` round-trips an external history file.
+- `npm test` = full suite. Focused: `node --test test/<area>-*.test.ts` (areas: `daemon-`, `runner-`, `cli-`, plus `gate`, `e2e-delegate`, `harness-mirrors`, `cloud-agnostic`, `packaging`, `sanitized`). Optional: `FLEET_DEMO_HISTORY=<path> npm test` round-trips an external history file; `FLEET_HARNESS_CORPUS=<path> npm test` replays a captured real harness stream through the translator. Both point outside the repo — external data is never vendored (`docs/decisions.md#d10`).
 - **Zero new runtime dependencies.** Node builtins + the existing `ajv`. Shelling out to `git`, `gh`, `docker`, `aws` is fine.
 - Terraform: `terraform fmt` clean; validate via the unit's `examples/basic`; never add a resource with an ingress rule (AWS EFS mount targets are the one SG-referenced exception, documented in `infra/aws/main.tf`).
 
