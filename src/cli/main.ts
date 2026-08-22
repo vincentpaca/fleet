@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
@@ -23,7 +24,17 @@ import { parseAnswerLine, renderBanner, detectColorLevel } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
-import { runSetupInfra, runSetupRepo, repoPrompts, flagName, writeScaffold, SetupError, SETUP_STUB } from './setup.ts';
+import {
+  runSetupInfra,
+  runSetupRepo,
+  runSetupHarness,
+  repoPrompts,
+  harnessPrompts,
+  flagName,
+  writeScaffold,
+  SetupError,
+  SETUP_STUB,
+} from './setup.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -62,6 +73,14 @@ Commands:
                                            exits 1 naming it — it never waits for input.
   setup repo [--yes] [...]                 Write .fleet/manifest.json by interview, with defaults
                                            extracted from this checkout. Same flag-override rules.
+  setup harness [--harness ids] [--scope user|project] [--force]
+                                           Install the fleet skill where your coding harness
+                                           discovers it, so a session can delegate, hold the watch,
+                                           relay decisions and report the settle. Detects installed
+                                           harnesses (claude-code, codex, opencode) and defaults to
+                                           them. Every variant is generated from the one canonical
+                                           integrations/SKILL.md; reruns are idempotent and refuse to
+                                           overwrite an edited copy without --force.
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
                                            placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
@@ -234,8 +253,9 @@ async function cmdSetup(args: string[]): Promise<number> {
   const [subcommand, ...rest] = args;
   if (subcommand === 'infra') return await cmdSetupInfra(rest);
   if (subcommand === 'repo') return await cmdSetupRepo(rest);
+  if (subcommand === 'harness') return await cmdSetupHarness(rest);
   if (!subcommand) {
-    console.error('fleet setup: subcommand required (infra, repo)');
+    console.error('fleet setup: subcommand required (infra, repo, harness)');
     return EXIT_USAGE;
   }
   console.error(`fleet setup: unknown subcommand: ${subcommand}`);
@@ -317,6 +337,29 @@ async function cmdSetupRepo(args: string[]): Promise<number> {
     });
   } catch (err) {
     if (err instanceof SetupError) fail(`fleet setup repo: ${err.message}`);
+    throw err;
+  }
+}
+
+async function cmdSetupHarness(args: string[]): Promise<number> {
+  // The prompt list owns the flag surface here too; detection happens inside,
+  // where it can also be reported, so the flags are the same either way.
+  const prompts = harnessPrompts();
+  const { values } = parseCommand(args, { ...promptOptions(prompts), force: { type: 'boolean' } }, 0, 0);
+  try {
+    return await runSetupHarness({
+      cwd: process.cwd(),
+      home: os.homedir(),
+      env: process.env as Record<string, string | undefined>,
+      root: installRoot(),
+      version: fleetVersion(),
+      flags: suppliedFlags(prompts, values),
+      force: values.force === true,
+      interactive: promptable(),
+      log: (line) => console.log(line),
+    });
+  } catch (err) {
+    if (err instanceof SetupError) fail(`fleet setup harness: ${err.message}`);
     throw err;
   }
 }

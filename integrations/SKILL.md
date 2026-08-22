@@ -13,6 +13,16 @@ Fleet runs this repo's own harness commands in a remote container and reports ba
 2. `fleet lint` passes.
 3. The daemon is reachable (`fleet status` responds). If it is not, run `fleet doctor` and relay what it says about the tunnel: a cloud daemon is reached through a port-forward, and a dead session is the usual cause. Reopening it is `fleet connect` (foreground) or `fleet connect --detach` — offer that to the human rather than running it unasked. Never stand up infrastructure: if there is no deployment at all, say so and point at `fleet setup infra`, which is the human's wizard and applies only on their explicit yes.
 
+### Which daemon you are talking to
+
+Every `fleet` command resolves one address, highest priority first:
+
+1. `FLEET_DAEMON_URL` in the environment — an explicit override.
+2. `.fleet/infra/<provider>/fleet-config.json` under the current directory — its `daemon_url` field, captured by `fleet setup infra`. The first parseable capture carrying a usable `daemon_url` wins.
+3. The unix socket at `$FLEET_HOME/daemon.sock` (default `~/.fleet/daemon.sock`) — a daemon running on this machine.
+
+Two consequences worth knowing before you debug anything: the resolution reads the **current working directory**, so running `fleet` from outside the repo can silently mean a different daemon; and a cloud deployment that resolves to the socket has a capture with no `daemon_url`, which is a missing field, not a dead daemon. `fleet doctor` names the address it resolved — read that before concluding anything about reachability, and relay it rather than guessing.
+
 ## Dispatch
 
 ```
@@ -40,8 +50,8 @@ If your harness supports holding an interactive stream, `fleet attach <jobId>` f
 
 A `decision` event carries: a question, two or more options with stable ids, exactly one recommended, and a note on why the agent cannot decide alone.
 
-1. Present it to the human using your question mechanism (ask tool, structured options — whatever your harness provides). Reproduce the options verbatim, mark the recommended one, allow free text.
-2. NEVER answer yourself, never pick the recommendation silently, never let a timeout choose.
+1. Present it to the human through whatever question mechanism your harness gives you. The decision schema is shaped to map one-to-one onto it: the `question` is the prompt, each option's `label` is a choice, its `id` is what you post back. Reproduce the options verbatim, mark the recommended one as recommended, and leave free text open — a human whose answer is none of the options must still be able to give it. If your harness has no structured question tool, print the question with the options as a numbered list and end your turn; waiting is the mechanism.
+2. NEVER answer yourself, never pick the recommendation silently, never let a timeout choose. This is the one thing Fleet's whole design exists to prevent, and the sandbox cannot reach the answer API to do it for you.
 3. Post the human's choice:
 
 ```
