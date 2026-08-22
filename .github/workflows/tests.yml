@@ -73,8 +73,9 @@ jobs:
       # decided whether the code is good, and a rejected token or a Codacy
       # outage says nothing about that. Skipping the step when there is no token
       # and then going red when the upload breaks would be the same mistake with
-      # extra steps — the step still shows failed, and `test` still means tests.
-      - if: env.CODACY_PROJECT_TOKEN != '' || env.CODACY_API_TOKEN != ''
+      # extra steps.
+      - id: codacy
+        if: env.CODACY_PROJECT_TOKEN != '' || env.CODACY_API_TOKEN != ''
         continue-on-error: true
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
@@ -85,6 +86,15 @@ jobs:
           # two languages and then uploads only the first of. Naming one keeps it
           # from picking.
           language: TypeScript
+
+      # continue-on-error rewrites the step's own conclusion to success, so a
+      # rejected token reads as a clean run everywhere except the log — coverage
+      # quietly stops arriving and the job still looks fine. `outcome` keeps the
+      # real result. Surfaced as a warning annotation, which shows on the run
+      # without pretending the tests failed.
+      - if: steps.codacy.outcome == 'failure'
+        run: |
+          echo "::warning title=Coverage not reported::Codacy rejected the upload; the tests above are unaffected. See the previous step's log."
 
   terraform:
     runs-on: ubuntu-latest
