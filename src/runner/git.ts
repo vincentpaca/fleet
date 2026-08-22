@@ -48,6 +48,14 @@ export type GitSetupOptions = {
    * remote, so there is no collision guard to trip.
    */
   reentry?: boolean;
+  /**
+   * Branch adoption (issue #80): a followthrough dispatch continuing an
+   * existing PR names that PR's head branch here. Same mechanics as re-entry —
+   * fetch, check out, set upstream, no creation push — but on the adopted
+   * branch instead of this job's own fleet/<target>-<jobId> name, so work
+   * pushes update the existing PR in place.
+   */
+  adoptBranch?: string;
 };
 
 const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
@@ -110,7 +118,10 @@ function defaultRef(workspace: string, url: string): string {
  * and push the branch immediately. Returns the branch name and base branch.
  */
 export function setupWorkspace(workspace: string, opts: GitSetupOptions): { branch: string; base: string } {
-  const branch = jobBranch(opts.target, opts.jobId);
+  const branch = opts.adoptBranch ?? jobBranch(opts.target, opts.jobId);
+  // Adoption and re-entry share the checkout path: the branch already exists
+  // on the remote, so neither creates nor pushes anything at setup.
+  const existing = opts.reentry === true || opts.adoptBranch !== undefined;
 
   // Capture the dispatch payload before git touches the tree.
   const preserved = new Map<string, Buffer>();
@@ -124,10 +135,11 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   if (opts.email) git(workspace, ['config', 'user.email', opts.email]);
   git(workspace, ['remote', 'add', 'origin', opts.url]);
   const base = defaultRef(workspace, opts.url);
-  if (opts.reentry) {
-    // Re-entry: the job branch already exists on the remote (carries the WIP
-    // commit from parking). Fetch it, check it out, and set the upstream
-    // tracking so subsequent pushes work without specifying the remote.
+  if (existing) {
+    // Re-entry or adoption: the branch already exists on the remote (WIP
+    // commit from parking, or the continued PR's head). Fetch it, check it
+    // out, and set the upstream tracking so subsequent pushes work without
+    // specifying the remote.
     git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', branch]);
     git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
     git(workspace, ['branch', '--set-upstream-to', `origin/${branch}`, branch]);
@@ -150,7 +162,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
   appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
 
-  if (!opts.reentry) {
+  if (!existing) {
     // Initial setup: push the branch immediately so evidence is preserved even
     // if the container dies before any work is committed.
     git(workspace, ['push', '-q', '-u', 'origin', branch]);
@@ -229,6 +241,41 @@ export function remoteHasHead(workspace: string, branch: string): boolean {
     // Unreachable remote, missing branch, or HEAD not an ancestor — all "no".
     return false;
   }
+}
+
+/**
+ * Did the remote branch gain commits beyond a known SHA? The delivery test for
+ * an adopted branch (#80): pushWork's 'delivered' only says the branch is ahead
+ * of base, which an adopted PR branch always is — the original job's commits
+ * are on it. Judging a followthrough by that would claim a rung for doing
+ * nothing. `sinceSha` is the adopted branch tip captured at setup.
+ */
+export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: string): boolean {
+  try {
+    git(workspace, ['fetch', '-q', 'origin', branch]);
+    const count = git(workspace, ['rev-list', '--count', `${sinceSha}..FETCH_HEAD`]).trim();
+    return count !== '0';
+  } catch {
+    // Unreachable remote or unknown SHA — never claim movement it cannot prove.
+    return false;
+  }
+}
+
+/**
+ * The open PR whose head is `branch`, or undefined when none exists (issue
+ * #80): a followthrough that adopted a branch reports the existing PR at
+ * settle instead of creating one. Same GhRunner seam as createDraftPr.
+ */
+export function findOpenPr(workspace: string, branch: string, ghRun?: GhRunner): { url: string; number: number } | undefined {
+  const run = ghRun ?? ((args: string[]) =>
+    execFileSync('gh', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const out = run(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url,number', '--limit', '1']);
+  const parsed = JSON.parse(out) as { url?: unknown; number?: unknown }[];
+  const first = Array.isArray(parsed) ? parsed[0] : undefined;
+  if (first && typeof first.url === 'string' && typeof first.number === 'number') {
+    return { url: first.url, number: first.number };
+  }
+  return undefined;
 }
 
 /**

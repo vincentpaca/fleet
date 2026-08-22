@@ -87,6 +87,11 @@ Commands:
   delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
+                                           A PR target (pr/<n> or a GitHub PR URL) implies
+                                           --mode followthrough: the job adopts the PR's head
+                                           branch, addresses its review comments and failing
+                                           checks, and pushes to the same branch so the PR
+                                           updates in place. Open PRs only.
                                            When harness.cli_version is set, computes the per-repo
                                            job image hash, builds on miss, passes tag to daemon.
   image build [--manifest path] [--push] [--registry ECR_URI] [--region AWS_REGION]
@@ -468,6 +473,62 @@ function loadPresets(): Record<string, ModePreset> {
   return presets.modes;
 }
 
+/** `pr/<n>` or a full GitHub PR URL → the PR number; anything else is not a PR target. */
+function parsePrTarget(target: string): number | undefined {
+  const short = target.match(/^pr\/(\d+)$/);
+  if (short) return Number(short[1]);
+  const url = target.match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)(?:[/?#].*)?$/);
+  if (url) return Number(url[1]);
+  return undefined;
+}
+
+/**
+ * Resolve a PR target via gh at dispatch (#80): the head branch the job will
+ * adopt, the PR title, and the linked issue when exactly one is derivable.
+ * Refuses non-open PRs — a merged or closed PR has no branch to continue, and
+ * the refusal must land BEFORE any POST reaches the daemon.
+ */
+function resolvePrTarget(target: string, prNumber: number): {
+  number: number;
+  branch: string;
+  title?: string;
+  issue?: number;
+} {
+  // A full URL goes to gh verbatim (it names the repo); pr/<n> resolves
+  // against the current checkout's repo, like every other gh call here.
+  const ref = target.startsWith('https://') ? target : String(prNumber);
+  const raw = spawnSync(
+    'gh',
+    ['pr', 'view', ref, '--json', 'number,state,headRefName,title,closingIssuesReferences'],
+    { encoding: 'utf8' },
+  );
+  if (raw.error !== undefined || raw.status !== 0) {
+    const reason = (raw.stderr ?? '').trim().split('\n')[0] || `gh exited ${raw.status}`;
+    fail(`cannot resolve PR target ${target} via gh: ${reason}`);
+  }
+  let pr: { number?: unknown; state?: unknown; headRefName?: unknown; title?: unknown; closingIssuesReferences?: unknown };
+  try {
+    pr = JSON.parse(raw.stdout);
+  } catch {
+    fail(`cannot resolve PR target ${target}: gh returned unparseable JSON`);
+  }
+  if (typeof pr.number !== 'number' || typeof pr.headRefName !== 'string' || pr.headRefName === '') {
+    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  }
+  if (pr.state !== 'OPEN') {
+    fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — followthrough continues only open PRs`);
+  }
+  const linked = Array.isArray(pr.closingIssuesReferences) && pr.closingIssuesReferences.length === 1
+    ? (pr.closingIssuesReferences[0] as { number?: unknown })?.number
+    : undefined;
+  return {
+    number: pr.number,
+    branch: pr.headRefName,
+    ...(typeof pr.title === 'string' && pr.title !== '' ? { title: pr.title } : {}),
+    ...(typeof linked === 'number' ? { issue: linked } : {}),
+  };
+}
+
 /** A dispatch as asked for, with somewhere to put its progress. */
 type DelegateRequest = {
   target: string;
@@ -487,7 +548,7 @@ type DelegateRequest = {
  * same words for the same problem.
  */
 async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; state: string }> {
-  const target = req.target;
+  let target = req.target;
   const manifestPath = req.manifestPath ?? path.join('.fleet', 'manifest.json');
 
   const rawManifest = readJsonFile(manifestPath, 'manifest');
@@ -496,16 +557,36 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // Safe: validated against manifest.schema.json just above.
   const manifest = rawManifest as Manifest;
 
+  // Typed PR target (#80): pr/<n> or a GitHub PR URL implies followthrough and
+  // adopts the PR's head branch. Resolved via gh — and refused when the PR is
+  // not open — before anything is posted.
+  const prNumber = parsePrTarget(target);
+  let continues: { pr: number; branch: string } | undefined;
+  let prTitle: string | undefined;
+  if (prNumber !== undefined) {
+    if (req.mode !== undefined && req.mode !== 'followthrough') {
+      fail(`a PR target implies --mode followthrough; it cannot be dispatched as ${req.mode}`);
+    }
+    const resolved = resolvePrTarget(target, prNumber);
+    continues = { pr: resolved.number, branch: resolved.branch };
+    prTitle = resolved.title;
+    // Lineage on the board: the linked issue when exactly one is derivable,
+    // else the PR reference itself.
+    target = resolved.issue !== undefined ? String(resolved.issue) : `pr/${resolved.number}`;
+    req.log(`fleet: continuing PR #${resolved.number} (branch ${resolved.branch})`);
+  }
+
   const modes = loadPresets();
-  const modeName = req.mode ?? 'implement';
+  const modeName = req.mode ?? (continues !== undefined ? 'followthrough' : 'implement');
   const preset = modes[modeName];
   if (!preset) fail(`unknown mode "${modeName}" — available: ${Object.keys(modes).join(', ')}`);
 
   const flagFinish = req.finish;
 
   // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
-  let issueTitle: string | undefined;
-  if (/^\d+$/.test(target)) {
+  // A PR target already resolved its title from the PR — one gh call, one truth.
+  let issueTitle: string | undefined = prTitle;
+  if (issueTitle === undefined && /^\d+$/.test(target)) {
     try {
       const raw = spawnSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
         encoding: 'utf8',
@@ -525,6 +606,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     report: preset.report ?? 'status-first',
   };
   if (issueTitle !== undefined) workOrder.title = issueTitle;
+  if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);
   if (!orderCheck.ok) fail(formatFindings('work order', orderCheck.errors).join('\n'));
 

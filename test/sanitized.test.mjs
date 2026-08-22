@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,7 +36,12 @@ function* files() {
   });
   for (const rel of out.split('\n')) {
     if (!rel || rel === 'test/sanitized.test.mjs') continue;
-    yield join(root, rel);
+    // `--others` reports a nested repository as one directory entry, not as
+    // its files: git will not commit through it, so neither does this gate.
+    // Reading it as a file throws EISDIR and takes the whole gate down.
+    const abs = join(root, rel);
+    if (statSync(abs).isDirectory()) continue;
+    yield abs;
   }
 }
 

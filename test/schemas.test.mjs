@@ -67,6 +67,22 @@ test('work order rejects non-targetable finish rungs', () => {
   assert.equal(validateWorkOrder({ ...base, finish: 'merge-ready' }).ok, true);
 });
 
+test('work order continues (#80): additive, followthrough-only, both fields required', () => {
+  const ft = { mode: 'followthrough', target: '80', finish: 'merge-ready' };
+  const c = { pr: 77, branch: 'fleet/77-job-abc' };
+  assert.equal(validateWorkOrder(ft).ok, true, 'orders without continues must stay valid — the field is additive');
+  assert.equal(validateWorkOrder({ ...ft, continues: c }).ok, true, 'followthrough may carry continues');
+  // The bug this catches: adoption leaking into other modes — an implement
+  // dispatch carrying continues would bypass the claim guard by design.
+  assert.equal(validateWorkOrder({ ...ft, mode: 'implement', continues: c }).ok, false, 'continues is followthrough-only');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77 } }).ok, false, 'branch is required');
+  assert.equal(validateWorkOrder({ ...ft, continues: { branch: 'x' } }).ok, false, 'pr is required');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 0, branch: 'x' } }).ok, false, 'pr must be >= 1');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: '77', branch: 'x' } }).ok, false, 'pr must be a number, not a string');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77, branch: '' } }).ok, false, 'branch must be non-empty');
+  assert.equal(validateWorkOrder({ ...ft, continues: { ...c, extra: true } }).ok, false, 'unknown continues fields are rejected');
+});
+
 test('job state machine transitions are closed over declared states', () => {
   const states = new Set(jobStates.states);
   for (const t of jobStates.transitions) {

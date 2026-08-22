@@ -23,7 +23,7 @@ import { WallClockTimer } from './wall-clock.ts';
 import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
-import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
@@ -82,11 +82,18 @@ async function main(): Promise<void> {
   let target = 'work';
   let orderTitle: string | undefined;
   let authorityPublish = false;
+  // Continuation (#80): a followthrough order carrying `continues` adopts the
+  // named PR branch instead of creating a fresh one. Schema-validated at
+  // dispatch; the shape check here only guards direct runner invocations.
+  let continues: { pr: number; branch: string } | undefined;
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
     if (typeof order.title === 'string' && order.title) orderTitle = order.title;
     authorityPublish = order?.authority?.publish === true;
+    if (typeof order?.continues?.pr === 'number' && typeof order?.continues?.branch === 'string' && order.continues.branch !== '') {
+      continues = { pr: order.continues.pr, branch: order.continues.branch };
+    }
   } catch {
     // No staged order (direct runner invocation): branch/prompt fall back.
   }
@@ -105,6 +112,10 @@ async function main(): Promise<void> {
   const gitUrl = process.env.FLEET_GIT_URL;
   let branch: string | undefined;
   let base: string | undefined;
+  // Continuation (#80): the adopted branch's tip at setup. Delivery is judged
+  // against this SHA, never against base — the adopted branch is always ahead
+  // of base with the original job's commits.
+  let adoptedTip: string | undefined;
   if (gitUrl) {
     try {
       const setup = setupWorkspace(workspace, {
@@ -116,10 +127,21 @@ async function main(): Promise<void> {
         // Re-entry: check out the existing job branch (WIP commit) instead of
         // creating a fresh branch from the base. No push — no collision guard.
         reentry: !!reentryAnswer,
+        // Adoption (#80): check out the continued PR's head branch. Same
+        // no-push mechanics as re-entry, and re-entry of a parked
+        // followthrough lands on this branch too.
+        ...(continues !== undefined ? { adoptBranch: continues.branch } : {}),
       });
       branch = setup.branch;
       base = setup.base;
-      await sink.emit({ type: 'log', text: `workspace on branch ${branch} (pushed)`, who: 'runner' });
+      if (continues !== undefined) adoptedTip = getHeadSha(workspace);
+      await sink.emit({
+        type: 'log',
+        text: continues !== undefined
+          ? `workspace adopted branch ${branch} (continues PR #${continues.pr})`
+          : `workspace on branch ${branch} (pushed)`,
+        who: 'runner',
+      });
     } catch (err) {
       const firstLine = String(err instanceof Error ? err.message : err).split('\n')[0];
       await settleBlocked(sink, `fix workspace git: ${firstLine}`);
@@ -175,6 +197,7 @@ async function main(): Promise<void> {
     target,
     override: process.env.FLEET_HARNESS_CMD,
     actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
+    continues,
   });
   if (!plan) {
     await settleBlocked(sink, `no harness command derivable for cli "${cli}" — set harness.commands or FLEET_HARNESS_CMD`);
@@ -465,8 +488,15 @@ async function main(): Promise<void> {
     try {
       const outcome = pushWork(workspace, target, jobId, exitCode === 0, base);
       workPushed = outcome === 'pushed' || outcome === 'delivered';
+      // Adopted branch (#80): 'delivered' means ahead-of-base, which the
+      // adopted branch is by construction. Delivery on a continuation is real
+      // only when the remote moved beyond the tip this job adopted.
+      if (continues !== undefined && adoptedTip !== undefined && outcome !== 'pushed') {
+        workPushed = remoteMovedBeyond(workspace, branch, adoptedTip);
+      }
       pushNote = outcome === 'pushed' ? `work pushed to ${branch}`
-        : outcome === 'delivered' ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`
+        : workPushed ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`
+        : continues !== undefined ? `no new commits beyond the adopted tip of ${branch}`
         : `workspace clean; nothing beyond ${branch} creation`;
     } catch (err) {
       const reason = String(err instanceof Error ? err.message : err).split('\n')[0];
@@ -506,6 +536,25 @@ async function main(): Promise<void> {
         text: 'no work commits on the branch — no rung claimed; report claims are unverified',
         who: 'runner',
       });
+    } else if (gitUrl && branch && continues !== undefined) {
+      // Continuation (#80): never create a PR — the adopted branch already has
+      // one, and the work just pushed updated it in place. Detect it and report
+      // it as this settle's PR; a PR that has since closed degrades to 'pushed'.
+      try {
+        const existingPr = findOpenPr(workspace, branch);
+        if (existingPr !== undefined) {
+          prUrl = existingPr.url;
+          settleRung = 'pr-open';
+          await sink.emit({ type: 'log', text: `continued PR updated: ${prUrl} (head ${getHeadSha(workspace)})`, who: 'runner' });
+        } else {
+          settleRung = 'pushed';
+          await sink.emit({ type: 'log', text: `no open PR found for ${branch} (was #${continues.pr}); work pushed, no PR claimed`, who: 'runner' });
+        }
+      } catch (err) {
+        const msg = String(err instanceof Error ? err.message : err).split('\n')[0];
+        settleRung = 'pushed';
+        await sink.emit({ type: 'log', text: `PR lookup failed (proceeding as pushed): ${msg}`, who: 'runner' });
+      }
     } else if (gitUrl && branch && base && authorityPublish) {
       try {
         // Compose per the delivery standard: report sections, never raw JSON.

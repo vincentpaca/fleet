@@ -168,6 +168,106 @@ test('the exempt modes are exactly the presets granting neither edit nor publish
   assert.deepStrictEqual([...REPORT_ONLY_MODES].sort(), readOnly.sort());
 });
 
+// --- Followthrough continuation (#80): the gate checks the PR, not the issue. ---
+
+const adoption = {
+  mode: 'followthrough',
+  issue: '7',
+  jobId: 'job-new',
+  continues: { pr: 41, branch: 'fleet/7-job-old' },
+  prState: 'OPEN',
+  prHead: 'fleet/7-job-old',
+  branches: ['fleet/7-job-old'],
+};
+
+test('followthrough+continues checks the PR instead of issue readiness', () => {
+  // Every issue-readiness fact is hostile (closed, unlabelled, no acceptance);
+  // the continuation must pass anyway — the deliverable is the PR, and the
+  // issue behind a delivered PR is routinely closed.
+  const verdict = evaluate({ ...adoption, state: 'CLOSED', labels: [], body: '' });
+  assert.deepStrictEqual(verdict.findings, []);
+  assert.equal(verdict.ready, true);
+});
+
+test('followthrough+continues fails closed on a non-open or unknown PR', () => {
+  const merged = evaluate({ ...adoption, prState: 'MERGED' });
+  assert.equal(merged.ready, false);
+  assert.match(merged.findings.join('\n'), /PR #41 is MERGED, not open/);
+  // Absent PR facts (gh unreachable, PR deleted) must fail, never pass silently.
+  const unknown = evaluate({ ...adoption, prState: undefined, prHead: undefined });
+  assert.equal(unknown.ready, false);
+  assert.match(unknown.findings.join('\n'), /unknown/);
+});
+
+test('followthrough+continues fails when the PR head is not the adopted branch', () => {
+  // The bug this catches: the operator continues PR A while the order names
+  // branch B — the job would push A's fixes onto the wrong branch.
+  const { ready: ok, findings } = evaluate({ ...adoption, prHead: 'fleet/7-job-other' });
+  assert.equal(ok, false);
+  assert.match(findings.join('\n'), /head is fleet\/7-job-other, not the adopted branch fleet\/7-job-old/);
+});
+
+test('the adopted branch is excluded from the claim guard; a rival branch still blocks', () => {
+  assert.equal(evaluate(adoption).ready, true, 'adopted branch tripped the collision guard');
+  const rival = evaluate({ ...adoption, branches: ['fleet/7-job-old', 'fleet/7-job-rival'] });
+  assert.equal(rival.ready, false);
+  assert.match(rival.findings.join('\n'), /fleet\/7-job-rival/);
+  assert.ok(!rival.findings.join('\n').includes('fleet/7-job-old,'), 'the adopted branch must not be named a claimant');
+});
+
+test('a rival implement dispatch on the same issue is still blocked by the adopted branch', () => {
+  // Adoption is deliberate: only a followthrough order carrying continues may
+  // walk past the claim. An implement dispatch never adopts.
+  const { ready: ok, findings } = evaluate({ ...ready, mode: 'implement', branches: ['fleet/7-job-old'] });
+  assert.equal(ok, false);
+  assert.match(findings.join('\n'), /fleet\/7-job-old/);
+});
+
+test('followthrough WITHOUT continues keeps the full issue-readiness check', () => {
+  // continues is the key, not the mode: a plain followthrough on an issue is
+  // still gated like implement (#56 policy unchanged).
+  assert.equal(evaluate({ ...ready, mode: 'followthrough', labels: [] }).ready, false);
+});
+
+/** A bin dir whose `gh` prints the given JSON; prepended to PATH for script runs. */
+function fakeGhBin(stdout: string, exitCode = 0): string {
+  const bin = mkdtempSync(join(tmpdir(), 'fleet-fake-gh-'));
+  writeFileSync(
+    join(bin, 'gh'),
+    `#!/bin/sh\ncat <<'EOF'\n${stdout}\nEOF\nexit ${exitCode}\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test('script: followthrough+continues gates on the PR via gh, no issue lookup', () => {
+  const bin = fakeGhBin('{"state":"OPEN","headRefName":"fleet/7-job-old"}');
+  const order = {
+    mode: 'followthrough',
+    target: 'pr/41', // non-numeric target: a PR-only continuation must not demand an issue number
+    continues: { pr: 41, branch: 'fleet/7-job-old' },
+  };
+  const { status, out } = runGate(order, { env: { PATH: `${bin}:${process.env.PATH}` } });
+  assert.equal(status, 0, out);
+  assert.match(out, /PR #41 is open on fleet\/7-job-old/);
+});
+
+test('script: followthrough+continues exits 1 when the PR has closed since dispatch', () => {
+  const bin = fakeGhBin('{"state":"CLOSED","headRefName":"fleet/7-job-old"}');
+  const order = { mode: 'followthrough', target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
+  const { status, out } = runGate(order, { env: { PATH: `${bin}:${process.env.PATH}` } });
+  assert.equal(status, 1, out);
+  assert.match(out, /PR #41 is CLOSED, not open/);
+});
+
+test('script: followthrough+continues exits 2 when gh cannot answer', () => {
+  const bin = fakeGhBin('', 1);
+  const order = { mode: 'followthrough', target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
+  const { status, out } = runGate(order, { env: { PATH: `${bin}:${process.env.PATH}` } });
+  assert.equal(status, 2, out);
+  assert.match(out, /cannot evaluate PR #41/);
+});
+
 test('script: investigate mode passes on a prose target with no gh or network', () => {
   const { status, out } = runGate({ mode: 'investigate', target: 'deep research on stall backstops' });
   assert.equal(status, 0, out);

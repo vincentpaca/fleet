@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, createDraftPr, composeDraftPrText, gitCredentialEnv } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -214,6 +214,80 @@ test('setupWorkspace reentry: checks out existing branch with WIP, no collision'
   const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
   assert.match(files, /half-done\.txt/);
   assert.match(files, /final\.txt/);
+});
+
+// --- Branch adoption (issue #80): followthrough continues an existing PR branch ---
+
+test('setupWorkspace adoption: checks out the adopted branch, never a fresh job branch', () => {
+  const remote = makeRemote();
+
+  // A prior job delivered on its own branch (the branch the PR points at).
+  const ws1 = makeWorkspace();
+  const { branch } = setupWorkspace(ws1, opts(remote)); // fleet/APP-7-job-1
+  writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
+  assert.equal(pushWork(ws1, 'APP-7', 'job-1', true), 'pushed');
+
+  // The followthrough job adopts that branch.
+  const ws2 = makeWorkspace();
+  const result = setupWorkspace(ws2, {
+    url: remote, jobId: 'job-2', target: 'APP-7',
+    name: 'Operator One', email: 'op@example.com',
+    adoptBranch: branch,
+  });
+  assert.equal(result.branch, branch, 'the adopted branch is the job branch');
+  assert.equal(readFileSync(join(ws2, 'delivered.txt'), 'utf8'), 'v1\n', 'the delivered work is checked out');
+
+  // The bug this catches: adoption falling back to the fresh-branch path would
+  // push fleet/APP-7-job-2 — stranding the PR and tripping the claim guard.
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(!refs.includes('fleet/APP-7-job-2'), 'no fresh branch may be created on adoption');
+
+  // Work pushes to the SAME branch, so the PR updates in place.
+  writeFileSync(join(ws2, 'fix.txt'), 'review feedback addressed\n');
+  assert.equal(pushWork(ws2, 'APP-7', 'job-2', true), 'pushed');
+  const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
+  assert.match(files, /delivered\.txt/);
+  assert.match(files, /fix\.txt/);
+});
+
+test('remoteMovedBeyond judges delivery against the adopted tip, not against base', () => {
+  const remote = makeRemote();
+  const ws1 = makeWorkspace();
+  const { branch } = setupWorkspace(ws1, opts(remote));
+  writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
+  pushWork(ws1, 'APP-7', 'job-1', true);
+
+  const ws2 = makeWorkspace();
+  setupWorkspace(ws2, { url: remote, jobId: 'job-2', target: 'APP-7', name: 'Operator One', email: 'op@example.com', adoptBranch: branch });
+  const adoptedTip = getHeadSha(ws2);
+
+  // The bug this catches: the adopted branch is ALWAYS ahead of base (the
+  // original job's commits), so an ahead-of-base test would let a do-nothing
+  // followthrough claim delivery.
+  assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), false, 'nothing pushed yet — no movement');
+
+  writeFileSync(join(ws2, 'fix.txt'), 'fix\n');
+  pushWork(ws2, 'APP-7', 'job-2', true);
+  assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), true, 'a pushed fix moves the branch beyond the adopted tip');
+
+  // Unknown SHA or unreachable remote: never claim movement it cannot prove.
+  assert.equal(remoteMovedBeyond(ws2, branch, '0'.repeat(40)), false);
+});
+
+test('findOpenPr queries gh for the branch head and reports the PR, or undefined', () => {
+  const calls: string[][] = [];
+  const workspace = makeWorkspace();
+  const withList = (out: string) => (args: string[]): string => {
+    calls.push(args);
+    return out;
+  };
+  const found = findOpenPr(workspace, 'fleet/APP-7-job-1', withList('[{"url":"https://github.com/acme/example-app/pull/41","number":41}]\n'));
+  assert.deepEqual(found, { url: 'https://github.com/acme/example-app/pull/41', number: 41 });
+  assert.deepEqual(calls[0], ['pr', 'list', '--head', 'fleet/APP-7-job-1', '--state', 'open', '--json', 'url,number', '--limit', '1']);
+  assert.ok(calls.every((c) => c[1] !== 'create'), 'a continuation settle must never create a PR');
+
+  // No open PR for the branch (closed since dispatch): undefined, not a throw.
+  assert.equal(findOpenPr(workspace, 'fleet/APP-7-job-1', withList('[]\n')), undefined);
 });
 
 test('composeDraftPrText: full report renders per the delivery standard, never a bare number', () => {
