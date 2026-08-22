@@ -53,8 +53,19 @@ test('CodeQL has no include-list — narrowing `paths:` would neuter the scan', 
   );
 });
 
-test('Codacy excludes the same trees', () => {
+// Codacy's list is longer than CodeQL's: it reads the vendored dependency tree,
+// and it lints AGENTS.md prose (see .codacy.yaml for why that is excluded).
+// Pinned exactly, for the same reason as paths-ignore — its gate is a count, so
+// one added line here is the difference between a meaningful zero and a lie.
+const CODACY_EXCLUSIONS = ['test/**', 'fixtures/**', 'node_modules/**', 'AGENTS.md'];
+
+test('Codacy excludes the build harness and nothing else', () => {
   const excluded = listAfter(readFileSync(join(root, '.codacy.yaml'), 'utf8'), 'exclude_paths');
+  assert.deepStrictEqual(
+    [...excluded].sort(),
+    [...CODACY_EXCLUSIONS].sort(),
+    'Codacy exclude_paths drifted',
+  );
   for (const dir of OUT_OF_SCOPE) {
     assert.ok(excluded.includes(`${dir}/**`), `Codacy still scans ${dir}/`);
   }
