@@ -35,9 +35,15 @@ jobs:
     # which reads like a broken URL and is actually the wrong credential. The
     # action accepts either input and derives org and repo from GITHUB_REPOSITORY
     # for the account case, so whichever one exists is the one used.
+    #
+    # Concatenated into one variable, and deliberately not named after either
+    # token. The reporter reads CODACY_PROJECT_TOKEN and CODACY_API_TOKEN from
+    # the environment itself, so exporting the unset one as an empty string —
+    # which is what a missing secret expands to — makes it fail with "Empty
+    # argument for --project-token" even when the other token is fine. The
+    # tokens reach the step through `with:` only.
     env:
-      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
-      CODACY_API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}
+      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}${{ secrets.CODACY_API_TOKEN }}
     steps:
       # Third-party actions are pinned to a commit, not a tag: a tag is a
       # mutable pointer in someone else's repo. Dependabot moves the pins
@@ -75,7 +81,7 @@ jobs:
       # and then going red when the upload breaks would be the same mistake with
       # extra steps.
       - id: codacy
-        if: env.CODACY_PROJECT_TOKEN != '' || env.CODACY_API_TOKEN != ''
+        if: env.HAS_CODACY_TOKEN != ''
         continue-on-error: true
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
