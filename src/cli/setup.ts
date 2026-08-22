@@ -1335,8 +1335,16 @@ function installVariant(args: {
   const { text, destination } = renderVariant({ canonical, harness, scope, version: opts.version, roots });
   const shown = friendlyPath(destination, scope, roots);
 
-  if (fs.existsSync(destination)) {
-    const existing = fs.readFileSync(destination, 'utf8');
+  // Read-and-decide, no exists probe: probe-then-read is a filesystem race
+  // (CodeQL js/file-system-race), and ENOENT already means "nothing here".
+  let existing: string | undefined;
+  try {
+    existing = fs.readFileSync(destination, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+
+  if (existing !== undefined) {
     // Normalised, so a CRLF checkout of a committed variant reads as unchanged
     // rather than as a rewrite of every line.
     if (lf(existing) === text) return { line: `unchanged ${harness.id.padEnd(11)} ${shown}` };
