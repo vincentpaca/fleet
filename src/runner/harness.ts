@@ -19,6 +19,16 @@ export type HarnessPlan = {
 // (#35's first run analyzed the wrong protocol from stale training data).
 const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite', 'WebSearch', 'WebFetch'];
 
+/**
+ * The output contract (issue #81), injected into every job's prompt by the
+ * runner so it holds on every repo — including one with no fleet playbook at
+ * all. Repo playbooks (like this repo's agents/dev.md) may add detail, but the
+ * load-bearing instruction is this one. Pinned verbatim by
+ * test/runner-harness.test.ts: rewording it is a deliberate contract change.
+ */
+export const OUTPUT_CONTRACT =
+  'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.';
+
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
 export function parseVersion(output: string): string | undefined {
   return output.match(/\d+\.\d+\.\d+/)?.[0];
@@ -80,7 +90,7 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion 
   const name = first.path.split('/').pop()?.replace(/\.md$/, '');
   if (!name) return undefined;
 
-  const prompt = JSON.stringify(`/${name} ${target}`);
+  const prompt = JSON.stringify(`/${name} ${target}\n\n${OUTPUT_CONTRACT}`);
   const tools = CLAUDE_ALLOWED_TOOLS.map((tool) => JSON.stringify(tool)).join(' ');
   return {
     cmd: `claude -p ${prompt} --output-format stream-json --verbose --allowedTools ${tools}`,
