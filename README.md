@@ -6,6 +6,14 @@ If you run something like `/dev-sprint TICKET-123` in Claude Code locally today,
 
 Everything runs in your account with your credentials. There is no hosted service and no third-party control plane.
 
+## Install
+
+```sh
+npm install -g github:<org>/fleet
+```
+
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. Fleet is not on the npm registry yet — see [Status](#status).
+
 ## What Fleet owns
 
 Fleet is a thin delegation layer. It owns exactly four things:
@@ -41,9 +49,10 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
 5. The job ends as a draft pull request (or a report with downloadable artifacts, for investigation work). A human merges it. Fleet never merges and never deploys.
 
-From an empty checkout that is the whole path:
+From a machine that has never seen Fleet, that is the whole path:
 
 ```sh
+npm install -g github:<org>/fleet
 fleet setup repo        # interview → .fleet/manifest.json (fleet init for the placeholder scaffold)
 fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
 <fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
@@ -77,7 +86,7 @@ Honest, per our own rules:
 
 - **The local loop is real and dogfooded.** Fleet develops itself: tickets on this repo are delegated to Fleet, run headless, and come back as PRs — including most of the features in this README. Process and Docker providers work end to end; park/resume, wall-clock caps, artifacts, and the cockpit are all live and tested.
 - **The AWS path is written but has never completed a real job.** An external review identified four concrete substrate defects (daemon reachability, capacity-provider launch, scale-to-zero vs. the daemon's own service, missing daemon image) — tracked as open issues, being fixed before the first live run. The Phase-1 exit scenario will land as a repeatable acceptance test, not a demo.
-- **Not yet published to npm** — deliberately, until the cloud path is exercised for real. The version you can't install is the version we won't overstate.
+- **Not on the npm registry yet** — deliberately, until the cloud path is exercised for real. The documented install is straight from the repo (`npm install -g github:<org>/fleet`), which ships exactly what a registry publish would (`test/packaging.test.ts` and `test/packaging-install.test.ts` gate it); the registry name is a later call.
 
 ## Using Fleet vs. building Fleet
 

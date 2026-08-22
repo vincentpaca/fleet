@@ -16,6 +16,7 @@ const packed: string[] = (
 ).map((f) => f.path);
 
 const MUST_SHIP = [
+  'src/cli/bin.mjs',
   'src/cli/main.ts',
   'src/daemon/main.ts',
   'src/runner/main.ts',
