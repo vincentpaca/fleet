@@ -4,14 +4,14 @@
 import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { validateManifest, validateWorkOrder, validateEvent } from "../validate.mjs";
 import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
-import { socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
+import { operatorTokenPath, socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
@@ -49,6 +49,14 @@ export type DaemonOptions = {
    * can reach the daemon even when bindHost is 0.0.0.0.
    */
   tcpHost?: string;
+  /**
+   * Operator secret required on every /jobs/* route of BOTH listeners (issue
+   * #133). Compared constant-time against the x-fleet-operator-token header.
+   * The daemon entrypoint loads-or-creates it at $FLEET_HOME/operator-token
+   * (mode 0600) via loadOrCreateOperatorToken. Undefined disables enforcement
+   * (direct class use in tests only — the real daemon always configures it).
+   */
+  operatorToken?: string;
   /** Long-poll window for follow/answer endpoints; default 25s. */
   longPollMs?: number;
   /**
@@ -126,6 +134,24 @@ function targetRung(workOrder: unknown): string {
   return "implemented";
 }
 
+/**
+ * Load the boot-generated operator secret, creating it on first boot (issue
+ * #133). Persisted at $FLEET_HOME/operator-token mode 0600 so the CLI (local,
+ * or remote over an SSM tunnel) can attach it to /jobs/* requests without the
+ * secret ever appearing in argv or env. An existing non-empty file wins so
+ * restarts don't invalidate tokens already held by cockpits and tunnels.
+ */
+export function loadOrCreateOperatorToken(home: string): string {
+  const path = operatorTokenPath(home);
+  if (existsSync(path)) {
+    const existing = readFileSync(path, "utf8").trim();
+    if (existing !== "") return existing;
+  }
+  const token = randomBytes(32).toString("base64url");
+  writeFileSync(path, `${token}\n`, { mode: 0o600 });
+  return token;
+}
+
 export class FleetDaemon {
   readonly registry: Registry;
   readonly #options: DaemonOptions;
@@ -135,6 +161,8 @@ export class FleetDaemon {
   readonly #bindHost: string;
   /** IP/host to advertise in daemonUrl to runner tasks. */
   readonly #tcpHost: string;
+  /** Operator secret gating /jobs/*; undefined = enforcement off (tests only). */
+  readonly #operatorToken: string | undefined;
   #unixServer: Server | null = null;
   #tcpServer: Server | null = null;
   #port: number | null = null;
@@ -154,6 +182,7 @@ export class FleetDaemon {
     this.#bindHost = options.bindHost ?? "127.0.0.1";
     // tcpHost defaults to bindHost so a simple `port: 0` test still works.
     this.#tcpHost = options.tcpHost ?? this.#bindHost;
+    this.#operatorToken = options.operatorToken;
     mkdirSync(options.home, { recursive: true });
     this.registry = new Registry(options.home);
   }
@@ -227,7 +256,14 @@ export class FleetDaemon {
     const parts = url.pathname.split("/").filter((part) => part.length > 0);
 
     // Operator: POST /jobs | GET /jobs | GET /jobs/:id | events/answer/cancel
+    // Every /jobs/* route requires the operator secret on BOTH listeners (issue
+    // #133): the TCP listener is reachable from job containers in remote
+    // deployments, so socket-permission trust would not hold there. /health
+    // stays open; /internal/* keeps its own per-job token.
     if (parts[0] === "jobs") {
+      if (!this.#operatorAuthorized(req)) {
+        return sendJson(res, 401, { error: "unauthorized" });
+      }
       if (parts.length === 1 && method === "POST") return this.#createJob(req, res);
       if (parts.length === 1 && method === "GET") {
         const jobs = this.registry
@@ -259,9 +295,10 @@ export class FleetDaemon {
     // Runner: POST /internal/jobs/:id/events | GET /internal/jobs/:id/answer
     //         POST /internal/jobs/:id/artifacts
     if (parts[0] === "internal" && parts[1] === "jobs" && parts.length === 4) {
+      // Unknown id and bad token answer identically (issue #133): a
+      // distinguishable 404 would let a token holder probe which job ids exist.
       const job = this.registry.getJob(parts[2]);
-      if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[2]}` });
-      if (!this.#runnerAuthorized(req, job)) {
+      if (!job || !this.#runnerAuthorized(req, job)) {
         return sendJson(res, 401, { error: "invalid runner token" });
       }
       if (parts[3] === "events" && method === "POST") return this.#intakeEvents(job, req, res);
@@ -276,6 +313,16 @@ export class FleetDaemon {
     }
 
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+  }
+
+  /** Constant-time check of the x-fleet-operator-token header against the boot secret. */
+  #operatorAuthorized(req: IncomingMessage): boolean {
+    if (this.#operatorToken === undefined) return true;
+    const presented = req.headers["x-fleet-operator-token"];
+    if (typeof presented !== "string") return false;
+    const a = Buffer.from(presented);
+    const b = Buffer.from(this.#operatorToken);
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   #runnerAuthorized(req: IncomingMessage, job: JobRecord): boolean {
