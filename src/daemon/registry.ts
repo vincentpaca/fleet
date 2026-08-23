@@ -537,11 +537,38 @@ export class Registry extends EventEmitter {
     );
   }
 
-  /** Find the answer event for a decision id, if any. */
+  /**
+   * Find the answer event for a decision id, if any. Only an answer recorded
+   * AFTER the decision event matches (issue #110): on park/resume the fresh
+   * runner seeds its counter past prior ids, but as a belt-and-braces guard
+   * against id reuse the seq comparison prevents a recycled d1 from picking up
+   * a stale answer from an earlier generation.
+   */
   findAnswer(id: string, decisionId: string): StoredEvent | undefined {
-    return this.#entry(id).events.find(
-      (event) => event.type === "answer" && event.decision === decisionId,
+    const events = this.#entry(id).events;
+    // Locate the LAST decision event with this id — if ids are unique across
+    // generations (the runner-side seed), there is only one; if they collide,
+    // the most recent decision is the one currently open.
+    let decisionSeq = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]!;
+      if (e.type === "decision" && e.id === decisionId) {
+        decisionSeq = e.seq;
+        break;
+      }
+    }
+    if (decisionSeq < 0) return undefined;
+    return events.find(
+      (event) =>
+        event.type === "answer" &&
+        event.decision === decisionId &&
+        event.seq > decisionSeq,
     );
+  }
+
+  /** Count of decision events in the job's event log (for re-entry seeding, #110). */
+  decisionCount(id: string): number {
+    return this.#entry(id).events.filter((event) => event.type === "decision").length;
   }
 
   /** Set the wall-clock limit for a job (called when the job is created). */

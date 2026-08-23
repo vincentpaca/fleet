@@ -30,6 +30,12 @@ export type LaunchSpec = {
    * wiping the out/ channel so the status-driven harness finds it immediately.
    */
   reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
+  /**
+   * Re-entry decision count (issue #110): the number of prior decisions in the
+   * job's event log, passed so the fresh runner seeds its counter past them and
+   * decision ids stay unique across park/resume generations.
+   */
+  reentryDecisionCount?: number;
 };
 
 export interface Provider {
@@ -113,6 +119,10 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     // Re-entry answer: runner writes this to out/answer-<id>.json after wiping out/.
     ...(spec.reentryAnswer !== undefined
       ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
+      : {}),
+    // Re-entry decision seed: keep ids unique across generations (issue #110).
+    ...(spec.reentryDecisionCount !== undefined
+      ? { FLEET_REENTRY_DECISION_COUNT: String(spec.reentryDecisionCount) }
       : {}),
   };
 }

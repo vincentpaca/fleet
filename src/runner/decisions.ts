@@ -31,7 +31,12 @@ export type Answer = { option?: string; text?: string };
 type PausableMeter = { block(now?: number): void; resume(now?: number): void };
 
 export class DecisionWatcher {
-  /** Number of decisions raised so far (valid ones only). */
+  /**
+   * Number of decisions raised so far (valid ones only). Seeded past the
+   * highest existing decision id on re-entry (issue #110) so that ids stay
+   * unique across park/resume generations — a fresh runner's first decision
+   * must not recycle d1 and pick up the old answer from the daemon's log.
+   */
   count = 0;
   readonly intervalMs: number;
   private readonly sink: EventSink;
@@ -56,6 +61,8 @@ export class DecisionWatcher {
     wallClock?: WallClockTimer;
     idle?: IdleTimer;
     blockHotMs?: number;
+    /** Seed the decision counter (e.g. past the highest prior id on re-entry). */
+    decisionSeed?: number;
   }) {
     this.sink = opts.sink;
     this.outDir = join(opts.workspace, '.fleet', 'out');
@@ -65,6 +72,7 @@ export class DecisionWatcher {
       (meter): meter is PausableMeter => meter !== undefined,
     );
     this.blockHotMs = opts.blockHotMs;
+    if (opts.decisionSeed !== undefined) this.count = opts.decisionSeed;
     let resolve!: (id: string) => void;
     this.parked = new Promise<string>((r) => { resolve = r; });
     this.parkResolve = resolve;

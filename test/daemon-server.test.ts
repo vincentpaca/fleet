@@ -982,3 +982,95 @@ test("lastActivity: present after think/log event; absent for queued-never-ran j
   const updatedActivity = updated.lastActivity as { text: string } | undefined;
   assert.equal(updatedActivity?.text, "ran npm test", "lastActivity updates to latest log event");
 });
+
+// --- Issue #110: decision id recycling after park/resume ---
+
+test("re-entry: new runner's decision does not receive the previous question's answer (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Generation 1: running → decision(d1) → parked.
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Operator answers d1 → daemon re-launches with reentryAnswer + decision count seed.
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+  assert.equal(ctx.provider.launches.length, 2, "re-launch expected");
+  const relaunch = ctx.provider.launches[1]!;
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+  assert.equal(relaunch.reentryDecisionCount, 1, "re-launch must seed decision count past prior ids");
+
+  // Generation 2: the fresh runner's counter is seeded at 1, so its first
+  // decision is d2 — not a recycled d1.
+  const newToken = relaunch.runnerToken;
+  await runnerPost(ctx.sock, id, newToken, event(id, 0, { type: "state", state: "running" }));
+  const DECISION_2 = {
+    type: "decision",
+    id: "d2",
+    question: "How should we roll this out?",
+    options: [
+      { id: "gradual", label: "Gradual rollout", recommended: true },
+      { id: "big-bang", label: "Big bang" },
+    ],
+  };
+  const blocked2 = await runnerPost(ctx.sock, id, newToken, event(id, 1, DECISION_2));
+  assert.equal(blocked2.status, 200, blocked2.body);
+  assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "blocked");
+
+  // The runner long-polls for d2's answer. It must NOT receive d1's answer —
+  // findAnswer only matches an answer recorded after the d2 decision event,
+  // and no such answer exists yet. The poll should time out (204).
+  const poll = request({
+    socketPath: ctx.sock,
+    path: `/internal/jobs/${id}/answer?decision=d2`,
+    headers: { "x-fleet-runner-token": newToken },
+  });
+  const pollRes = await poll;
+  assert.equal(pollRes.status, 204, "d2 poll must time out — d1's answer must not leak");
+
+  // Now the operator answers d2 → the poll on a second request returns it.
+  const answered2 = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "big-bang" });
+  assert.equal(answered2.status, 200, answered2.body);
+
+  // Verify the answer event in the log is for d2, and d1's answer is distinct.
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>;
+  const answerEvents = events.filter((e) => e.type === "answer");
+  assert.equal(answerEvents.length, 2, "two answers in the log");
+  assert.equal(answerEvents[0]!.decision, "d1");
+  assert.equal(answerEvents[0]!.option, "flag");
+  assert.equal(answerEvents[1]!.decision, "d2");
+  assert.equal(answerEvents[1]!.option, "big-bang");
+
+  // Decision ids are unique across the whole log.
+  const decisionIds = events.filter((e) => e.type === "decision").map((e) => e.id);
+  assert.deepEqual(decisionIds, ["d1", "d2"], "decision ids must be unique across generations");
+});
+
+test("re-entry: happy path — the legitimate answer to the parked question still delivers (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Park on d1, answer it, re-enter.
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200);
+
+  // The reentryAnswer carries the correct decision id and answer — the new
+  // runner writes answer-d1.json and the harness picks it up immediately.
+  const relaunch = ctx.provider.launches[1]!;
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+  assert.equal(relaunch.reentryAnswer?.answer.option, "flag");
+
+  // The answer event for d1 is in the log.
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>;
+  const d1Answer = events.find((e) => e.type === "answer" && e.decision === "d1");
+  assert.ok(d1Answer, "d1 answer event must be in the log");
+  assert.equal(d1Answer!.option, "flag");
+});

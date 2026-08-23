@@ -231,3 +231,39 @@ test('block_hot: watcher.parked does NOT fire when answer arrives before the hot
     await daemon.close();
   }
 });
+
+// --- Issue #110: decision id seeding on re-entry ---
+
+test('decisionSeed: watcher starts counting past the seed so ids stay unique across generations', async () => {
+  const token = 'test-token-seed';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-dec-'));
+  const outDir = join(workspace, '.fleet', 'out');
+  mkdirSync(outDir, { recursive: true });
+
+  const sink = new EventSink({ jobId: 'job-seed', daemonUrl: daemon.url, token });
+  // Seed at 1 — simulates a re-entry after one prior decision (d1).
+  const watcher = new DecisionWatcher({ workspace, sink, intervalMs: 25, decisionSeed: 1 });
+  watcher.start();
+  try {
+    daemon.answer('d2', { option: 's3' });
+
+    writeFileSync(join(outDir, 'decision.json'), JSON.stringify(VALID_DECISION));
+    await until(() => existsSync(join(outDir, 'answer-d2.json')));
+
+    // The first decision in this generation is d2, not a recycled d1.
+    assert.equal(watcher.count, 2);
+    assert.deepEqual(
+      daemon.events.filter((e) => e.type === 'decision').map((e) => e.id),
+      ['d2'],
+    );
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(outDir, 'answer-d2.json'), 'utf8')),
+      { option: 's3' },
+    );
+  } finally {
+    await watcher.stop();
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});

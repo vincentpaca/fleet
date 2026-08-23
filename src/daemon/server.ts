@@ -597,6 +597,8 @@ export class FleetDaemon {
           workOrder: job.workOrder,
           resources,
           reentryAnswer: { decisionId: decision.id, answer: reAnswer },
+          // Seed the new runner's decision counter past prior ids (issue #110).
+          reentryDecisionCount: this.registry.decisionCount(job.id),
         });
         const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
         return sendJson(res, 200, { job: publicJob(updated) });

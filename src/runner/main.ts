@@ -68,6 +68,12 @@ async function main(): Promise<void> {
       // Ignore malformed env; proceed without pre-materialised answer.
     }
   }
+  // Re-entry decision seed (issue #110): the daemon passes the count of prior
+  // decisions so the fresh runner's ids stay unique across park/resume —
+  // without this the first new decision would be d1 again and collide with the
+  // old d1 answer still in the daemon's event log.
+  const decisionSeed = parseInt(process.env.FLEET_REENTRY_DECISION_COUNT ?? '', 10);
+  const reentryDecisionSeed = Number.isInteger(decisionSeed) && decisionSeed > 0 ? decisionSeed : undefined;
   // Event delivery backpressure (#109): when the sink's bounded buffer is
   // near-full, pause the harness stdout reader instead of queueing without
   // bound; resume below the low watermark. The hook is wired to the
@@ -249,7 +255,7 @@ async function main(): Promise<void> {
   const idleLabel = typeof limits.idle === 'string' ? limits.idle : `${toMinutes(idleMs)}m`;
   const idle = new IdleTimer(idleMs, startedAt);
 
-  const watcher = new DecisionWatcher({ workspace, sink, wallClock, idle, blockHotMs });
+  const watcher = new DecisionWatcher({ workspace, sink, wallClock, idle, blockHotMs, decisionSeed: reentryDecisionSeed });
   watcher.start();
 
   // The harness child gets NO runner-scoped FLEET_* env: nested fleet

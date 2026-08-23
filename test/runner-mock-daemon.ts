@@ -88,11 +88,34 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
     }
 
     if (req.method === 'GET' && /^\/internal\/jobs\/[^/]+\/answer$/.test(url.pathname)) {
-      const decision = url.searchParams.get('decision') ?? '';
-      const answer = answers.get(decision);
+      const decisionId = url.searchParams.get('decision') ?? '';
+      // Match the real Registry.findAnswer (#110): only an answer recorded
+      // AFTER the decision event with the same id counts. Scanning the event
+      // log (not just a Map) prevents the mock from masking id-recycling bugs.
+      let decisionSeq = -1;
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]!;
+        if (e.type === 'decision' && e.id === decisionId) {
+          decisionSeq = e.seq as number;
+          break;
+        }
+      }
+      const logAnswer = decisionSeq >= 0
+        ? events.find(
+            (e) => e.type === 'answer' && e.decision === decisionId && (e.seq as number) > decisionSeq,
+          )
+        : undefined;
+      // Fall back to staged answers (set via mock.answer()) for tests that
+      // don't post answer events through the operator endpoint.
+      const answer = logAnswer
+        ? { option: logAnswer.option as string | undefined, text: logAnswer.text as string | undefined }
+        : answers.get(decisionId);
       if (answer) {
+        const body: Record<string, unknown> = {};
+        if (answer.option !== undefined) body.option = answer.option;
+        if (answer.text !== undefined) body.text = answer.text;
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(answer));
+        res.end(JSON.stringify(body));
       } else {
         // Real daemon holds up to 25s; the mock returns an empty cycle
         // immediately and lets the runner re-poll.
