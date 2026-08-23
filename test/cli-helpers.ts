@@ -15,7 +15,15 @@ export function runCli(
   opts: { cwd?: string; env?: Record<string, string | undefined>; stdin?: string } = {},
 ): Promise<CliResult> {
   const { promise, resolve, reject } = Promise.withResolvers<CliResult>();
-  const env: Record<string, string | undefined> = { ...process.env, FLEET_DAEMON_URL: undefined, ...opts.env };
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    FLEET_DAEMON_URL: undefined,
+    // Tests own their state (#136): default FLEET_HOME to a fresh dir unless
+    // the caller pins one — same structural isolation as the URL scrub above
+    // and the cwd choice below, so no runCli call can ever touch ~/.fleet.
+    FLEET_HOME: opts.env?.FLEET_HOME ?? makeTempDir('fleet-cli-home-'),
+    ...opts.env,
+  };
   const child = spawn(process.execPath, [CLI, ...args], {
     // Never inherit the checkout as cwd: daemon resolution scans
     // .fleet/infra/*/fleet-config.json under cwd (#15), so a test run from a
