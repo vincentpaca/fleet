@@ -11,9 +11,15 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // Integration against the real npm CLI: the packing rules live there, so a
 // mocked or reimplemented check would test our assumptions, not the truth.
-const packed: string[] = (
-  JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: root, encoding: 'utf8' }))[0].files as Array<{ path: string }>
-).map((f) => f.path);
+// `npm pack --json` returns an array on npm <= 11 and an object keyed by
+// package name on npm >= 12; accept both so the gate tracks npm's truth on
+// either version.
+const packReport = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: root, encoding: 'utf8' })) as
+  | Array<{ files: Array<{ path: string }> }>
+  | Record<string, { files: Array<{ path: string }> }>;
+const packed: string[] = (Array.isArray(packReport) ? packReport : Object.values(packReport))[0].files.map(
+  (f) => f.path,
+);
 
 const MUST_SHIP = [
   'src/cli/bin.mjs',

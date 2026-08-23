@@ -26,9 +26,13 @@ const prefix = fs.mkdtempSync(join(os.tmpdir(), 'fleet-install-'));
 
 // Real npm produces the artifact; a hand-copied tree would test our
 // assumptions about packing, not the truth.
-const packed = JSON.parse(
+// `npm pack --json` returns an array on npm <= 11 and an object keyed by
+// package name on npm >= 12; accept both so the gate tracks npm's truth on
+// either version.
+const packReport = JSON.parse(
   execFileSync('npm', ['pack', '--json', '--pack-destination', prefix], { cwd: root, encoding: 'utf8' }),
-) as Array<{ filename: string }>;
+) as Array<{ filename: string }> | Record<string, { filename: string }>;
+const packed = (Array.isArray(packReport) ? packReport : Object.values(packReport)) as Array<{ filename: string }>;
 const tarball = join(prefix, packed[0].filename);
 
 const pkgDir = join(prefix, 'node_modules', 'fleet');

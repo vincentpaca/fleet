@@ -6,8 +6,8 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 
 - Node ≥ 23.6, no build step: `.ts` runs directly via type stripping. **Erasable syntax only** — no enums, no namespaces, no parameter properties. If `node --test` can't run it, it's wrong.
 - `npm test` = full suite. Focused: `node --test test/<area>-*.test.ts` (areas: `daemon-`, `runner-`, `cli-`, plus `gate`, `e2e-delegate`, `harness-mirrors`, `cloud-agnostic`, `infra-aws`, `packaging`, `sanitized`, `analyzer-scope`). Optional: `FLEET_DEMO_HISTORY=<path> npm test` round-trips an external history file. `FLEET_HARNESS_CORPUS=<path> npm test` replays a captured real harness stream through the translator. Both point outside the repo — external data is never vendored (`docs/decisions.md#d10`).
-- **Zero new runtime dependencies.** Node builtins + the existing `ajv`. Shelling out to `git`, `gh`, `docker`, `aws` is fine.
-- Terraform: `terraform fmt` clean; validate via the unit's `examples/basic`; never add a resource with an ingress rule (AWS EFS mount targets are the one SG-referenced exception, documented in `infra/aws/main.tf`).
+- **Zero new runtime dependencies.** Node builtins + the existing `ajv`/`ajv-formats`. Shelling out to `git`, `gh`, `docker`, `aws` is fine.
+- Terraform: `terraform fmt` clean; validate via the unit's `examples/basic`; no inbound from outside the VPC — intra-VPC SG-referenced ingress is allowed where documented inline (`infra/aws/main.tf`), enforced by `test/infra-aws.test.ts`.
 - **Every infra change runs the plan smoke by hand** — `terraform -chdir=infra/<cloud> init -backend=false && terraform -chdir=infra/<cloud> test` (terraform ≥ 1.7, no credentials: the unit's `tests/*.tftest.hcl` mock the provider). fmt and validate pass values the provider rejects at plan; #9 paid for four applies to find that out. CI's terraform job does not run it yet — wiring it needs a `.github/workflows/` edit, which a job token cannot push (#48). API-only constraints, which no plan reaches, are pinned in `test/infra-aws.test.ts`.
 
 ## Invariants that break if you're not looking

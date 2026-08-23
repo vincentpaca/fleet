@@ -59,6 +59,30 @@ function descriptions(body: string): string[] {
   );
 }
 
+/**
+ * Every `ingress {` block in one `.tf` text whose rule admits traffic without
+ * naming a Fleet-created security group as its source. The enforced invariant
+ * (AGENTS.md) is not "no ingress" — it is "no inbound from outside the VPC":
+ * an intra-VPC rule lists `security_groups = [aws_security_group.<name>.id]`,
+ * while a `cidr_blocks` rule is reachable from anywhere its route table says,
+ * and a rule with neither field parses as worse. Pure over its input so the
+ * self-test can pin it against planted fixtures.
+ */
+const INGRESS_BLOCK = /^\s*ingress\s*\{/gm;
+const SG_REF = /aws_security_group\.[A-Za-z0-9_]+\.id/;
+
+export function unguardedIngresses(text: string): string[] {
+  const offenders: string[] = [];
+  for (const match of text.matchAll(INGRESS_BLOCK)) {
+    const body = braceBlock(text, text.indexOf('{', match.index));
+    const sources = /^\s*security_groups\s*=\s*\[([^\]]*)\]/m.exec(body);
+    if (!sources || !SG_REF.test(sources[1])) {
+      offenders.push(body.replace(/\s+/g, ' ').trim());
+    }
+  }
+  return offenders;
+}
+
 test('every security-group description is a string the AWS API accepts', () => {
   const offenders: string[] = [];
   let checked = 0;
@@ -120,5 +144,60 @@ test('the description pin rejects what AWS rejected', () => {
     'punctuation the API allows: ._-:/()#,@[]+=&;{}!$*',
   ]) {
     assert.equal(AWS_SG_DESCRIPTION.test(accepted), true, `should be accepted: ${JSON.stringify(accepted)}`);
+  }
+});
+
+test('every ingress block sources its traffic from a Fleet security group', () => {
+  // The enforced form of AGENTS.md's VPC invariant: the unit ships two
+  // intra-VPC ingress blocks (instances SG → daemon SG, instances + daemon
+  // SGs → EFS SG), both documented inline in infra/aws/main.tf. A third —
+  // or a loosening of these two to cidr_blocks — fails here.
+  const offenders: string[] = [];
+  let checked = 0;
+
+  for (const unit of readdirSync(INFRA)) {
+    const unitDir = join(INFRA, unit);
+    if (!statSync(unitDir).isDirectory()) continue;
+
+    for (const name of readdirSync(unitDir)) {
+      if (!name.endsWith('.tf')) continue;
+      const text = readFileSync(join(unitDir, name), 'utf8');
+      checked += [...text.matchAll(INGRESS_BLOCK)].length;
+      for (const body of unguardedIngresses(text)) {
+        offenders.push(`infra/${unit}/${name}: ${body.slice(0, 120)}`);
+      }
+    }
+  }
+
+  assert.deepStrictEqual(
+    offenders,
+    [],
+    `ingress rules with no aws_security_group.<name>.id source (CIDR-based or source-less):\n${offenders.join('\n')}`,
+  );
+  // The unit's two shipped blocks must have been scanned, not zero.
+  assert.ok(checked >= 2, `only ${checked} ingress blocks found — the scan is looking in the wrong place`);
+});
+
+test('the ingress gate rejects CIDR-based, variable-sourced, and source-less rules', () => {
+  // Same discipline as the description pin: untested, the matcher can be
+  // widened to nothing and stay green. Exercise it against each shape of
+  // violation the invariant bans.
+  const block = (source: string): string =>
+    `resource "aws_security_group" "acme" {\n  ingress {\n${source}  }\n}`;
+  const sg = (source: string): string => block(`    ${source}\n`);
+
+  for (const rejected of [
+    sg('description = "http"\n    from_port   = 80\n    protocol    = "tcp"\n    cidr_blocks = ["0.0.0.0/0"]'),
+    sg('from_port = 2049\n    to_port   = 2049\n    protocol  = "tcp"'),
+    sg('security_groups = [var.external_sg_id]'), // referenced, but not a Fleet-created SG
+  ]) {
+    assert.deepEqual(unguardedIngresses(rejected).length, 1, `should be rejected: ${JSON.stringify(rejected)}`);
+  }
+
+  for (const accepted of [
+    sg('security_groups = [aws_security_group.instances.id]'),
+    sg('security_groups = [aws_security_group.instances.id, aws_security_group.daemon.id]'),
+  ]) {
+    assert.deepEqual(unguardedIngresses(accepted), [], `should be accepted: ${JSON.stringify(accepted)}`);
   }
 });
