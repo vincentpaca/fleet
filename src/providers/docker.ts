@@ -4,7 +4,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { LaunchSpec, Provider } from "./provider.ts";
-import { runnerEnv, materializationEnv } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, materializationEnv } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -56,6 +56,12 @@ export class DockerProvider implements Provider {
   }
 
   async terminate(handle: string): Promise<void> {
-    await run("docker", ["rm", "-f", handle]);
+    try {
+      await run("docker", ["rm", "-f", handle]);
+    } catch (error) {
+      // Idempotent termination (#122): `rm -f` exits non-zero when the
+      // container is already gone; cancel must still succeed.
+      if (!isMissingResourceError(error)) throw error;
+    }
   }
 }

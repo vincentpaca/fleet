@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
 import {
+  AWS_CLI_TIMEOUT_MS,
+  ECS_RUN_TASK_TIMEOUT_MS,
+  ECS_STOP_TASK_TIMEOUT_MS,
   EcsProvider,
+  awsCli,
   ecsConfigFromEnv,
   ecsConfigFromFleetConfig,
   parseFleetConfigSsmResponse,
@@ -19,7 +23,7 @@ import {
 } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
-import type { LaunchSpec } from "../src/providers/provider.ts";
+import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, op, tempHome, until } from "./daemon-helpers.ts";
@@ -991,4 +995,154 @@ test("ecsTunnelOpener resolves the current task on every call", async () => {
   assert.equal(calls.length, 4, "each open re-lists and re-describes");
   // describe-tasks must ask about the task list-tasks just returned.
   assert.equal(calls[3][calls[3].indexOf("--tasks") + 1], taskArns[1]);
+});
+
+// ---------- CLI budgets + terminate idempotency (#122) ------------------------
+// A wedged `aws` CLI once hung the daemon's launch and cancel paths forever.
+// The budgets are finite constants pinned here (the repo's API-only-constraint
+// convention: the value ships as a literal, so drift is a visible test edit),
+// and terminate-of-missing is success on every provider.
+
+const ECS_CONFIG = {
+  cluster: "fleet-cluster",
+  taskDefinition: "fleet-runner:3",
+  containerName: "runner",
+  subnets: [] as string[],
+  securityGroups: [] as string[],
+  launchType: "EC2" as const,
+  assignPublicIp: "DISABLED" as const,
+};
+
+function ecsWith(aws: CloudCliRunner): EcsProvider {
+  return new EcsProvider(ECS_CONFIG, { aws });
+}
+
+/** A `docker` shim on PATH that fails like the real daemon does. */
+function fakeDockerBin(stderr: string): string {
+  const bin = mkdtempSync(join(tmpdir(), "fleet-fake-docker-"));
+  const escaped = stderr.replaceAll("'", "'\\''");
+  writeFileSync(
+    join(bin, "docker"),
+    `#!/bin/sh\necho '${escaped}' >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("ECS CLI budgets are finite, larger than the tunnel budget, and pinned (#122)", () => {
+  assert.equal(ECS_RUN_TASK_TIMEOUT_MS, 120_000);
+  assert.equal(ECS_STOP_TASK_TIMEOUT_MS, 30_000);
+  assert.ok(ECS_RUN_TASK_TIMEOUT_MS > AWS_CLI_TIMEOUT_MS);
+});
+
+test("dispatch fails within the run-task budget when aws never returns (#122)", async (t) => {
+  // IMDS stall / network blackhole: the CLI never answers. The budget must
+  // reach the runner (so the real child is killed, not left holding the event
+  // loop) and the launch promise must settle with a clean error either way.
+  const seen: Array<number | undefined> = [];
+  const wedged = async (args: string[], timeoutMs?: number): Promise<string> => {
+    seen.push(timeoutMs);
+    void args;
+    return new Promise<string>(() => {});
+  };
+  const provider = ecsWith(wedged);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settled = assert.rejects(provider.launch(SPEC), /exceeded its .* budget/);
+  t.mock.timers.tick(ECS_RUN_TASK_TIMEOUT_MS);
+  await settled;
+  assert.equal(seen[0], ECS_RUN_TASK_TIMEOUT_MS, "budget must be forwarded so the child is killed");
+});
+
+test("cancel fails within the stop-task budget when aws never returns (#122)", async (t) => {
+  const wedged = async (): Promise<string> => new Promise<string>(() => {});
+  const provider = ecsWith(wedged);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settled = assert.rejects(provider.terminate("arn:aws:ecs:us-east-1:1:task/fleet/t"), /exceeded its .* budget/);
+  // Both the attempt and its one bounded retry live under the budget. The
+  // rejection from the first timer propagates through Promise.race → finally →
+  // terminate's catch → the second #cli call, which schedules its own timer.
+  // That chain needs several microtask turns before the second tick can fire it.
+  t.mock.timers.tick(ECS_STOP_TASK_TIMEOUT_MS);
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  t.mock.timers.tick(ECS_STOP_TASK_TIMEOUT_MS);
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  await settled;
+});
+
+test("the default aws runner kills the CLI child at the caller's budget (#122)", async (t) => {
+  // An unkilled child keeps the event loop alive long after the caller gave
+  // up — the reason the tunnel path has AWS_CLI_TIMEOUT_MS. The kill must
+  // apply at whatever budget the caller passes, not only the tunnel's.
+  const bin = mkdtempSync(join(tmpdir(), "fleet-fake-aws-"));
+  writeFileSync(join(bin, "aws"), "#!/bin/sh\nsleep 30\n", { mode: 0o755 });
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  const start = Date.now();
+  await assert.rejects(awsCli(["ecs", "run-task"], 300), /was killed|timed out|failed/i);
+  assert.ok(Date.now() - start < 10_000, "the child must die at the budget, not after sleep 30");
+});
+
+test("stop-task treats TaskNotFoundException as success and does not retry (#122)", async () => {
+  const calls: string[][] = [];
+  const provider = ecsWith(async (args) => {
+    calls.push(args);
+    throw new Error("An error occurred (TaskNotFoundException) when calling the StopTask operation");
+  });
+  await provider.terminate("arn:aws:ecs:us-east-1:1:task/fleet/gone");
+  assert.equal(calls.length, 1, "not-found is terminal success, not a transient failure");
+  assert.equal(calls[0][calls[0].indexOf("--task") + 1], "arn:aws:ecs:us-east-1:1:task/fleet/gone");
+  assert.equal(calls[0][calls[0].indexOf("--reason") + 1], "fleet-cancel");
+});
+
+test("stop-task treats an already-stopped task as success (#122)", async () => {
+  const provider = ecsWith(async () => {
+    throw new Error("task arn:aws:ecs:us-east-1:1:task/fleet/t is already stopped");
+  });
+  await provider.terminate("arn:aws:ecs:us-east-1:1:task/fleet/t");
+});
+
+test("one transient stop-task failure is retried before the cancel succeeds (#122)", async () => {
+  let attempts = 0;
+  const provider = ecsWith(async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("socket hang up");
+    return "{}";
+  });
+  await provider.terminate("arn:aws:ecs:us-east-1:1:task/fleet/t");
+  assert.equal(attempts, 2, "exactly one bounded retry");
+});
+
+test("a stop-task failure that survives its retry surfaces instead of stranding the task (#122)", async () => {
+  let attempts = 0;
+  const provider = ecsWith(async () => {
+    attempts++;
+    throw new Error("RequestThrottled");
+  });
+  await assert.rejects(provider.terminate("arn:aws:ecs:us-east-1:1:task/fleet/t"), /RequestThrottled/);
+  assert.equal(attempts, 2);
+});
+
+test("docker terminate treats a missing container as success (#122)", async (t) => {
+  const bin = fakeDockerBin("Error response from daemon: No such container: fleet-job-abc123");
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  // `docker rm -f` exits non-zero when the container is already gone; cancel
+  // must still succeed — termination is idempotent by contract.
+  await new DockerProvider().terminate("abc123");
+});
+
+test("docker terminate still surfaces real failures (#122)", async (t) => {
+  const bin = fakeDockerBin("Cannot connect to the Docker daemon at unix:///var/run/docker.sock");
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  await assert.rejects(new DockerProvider().terminate("abc123"), /daemon/);
 });
