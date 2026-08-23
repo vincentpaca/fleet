@@ -729,8 +729,11 @@ export async function cancelJob(
 
 // ── Live follow ───────────────────────────────────────────────────────────────
 
-/** Long-poll timeout: the daemon holds a `follow=1` read open, so this is not a stall. */
-const FOLLOW_TIMEOUT_MS = 30_000;
+/**
+ * Long-poll timeout: the daemon holds a `follow=1` read open, so this is not a
+ * stall. Must exceed the daemon's long-poll window (exported so a test pins it).
+ */
+export const FOLLOW_TIMEOUT_MS = 30_000;
 
 /** Pause before reopening a follow that failed or returned at once, so nothing is hammered. */
 const FOLLOW_RETRY_MS = 1_000;

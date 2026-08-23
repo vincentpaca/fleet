@@ -109,6 +109,14 @@ function defaultGhRunner(): import("./verify.ts").GhRunner {
     execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
+/**
+ * Default long-poll window for follow/answer endpoints. Exported so tests can
+ * pin every client-side timeout above it: a healthy long-poll transfers no
+ * bytes for this whole window, and an idle timeout at or below it would
+ * destroy the request mid-poll instead of letting the daemon answer.
+ */
+export const DEFAULT_LONG_POLL_MS = 25_000;
+
 /** Target rung from a work order already validated at job creation. */
 function targetRung(workOrder: unknown): string {
   if (workOrder && typeof workOrder === "object" && "finish" in workOrder) {
@@ -141,7 +149,7 @@ export class FleetDaemon {
 
   constructor(options: DaemonOptions) {
     this.#options = options;
-    this.#longPollMs = options.longPollMs ?? 25_000;
+    this.#longPollMs = options.longPollMs ?? DEFAULT_LONG_POLL_MS;
     this.#sockPath = socketPath(options.home);
     this.#bindHost = options.bindHost ?? "127.0.0.1";
     // tcpHost defaults to bindHost so a simple `port: 0` test still works.
