@@ -71,7 +71,15 @@ export class DecisionWatcher {
   }
 
   start(): void {
-    this.loop = this.run();
+    // The loop must never become an orphaned rejection (issue #109): a
+    // crash is recorded to stderr and the watcher winds down instead of
+    // killing the whole runner at rejection time.
+    this.loop = this.run().catch((err) => {
+      this.stopped = true;
+      console.error(
+        `runner: decision watcher crashed: ${String(err instanceof Error ? err.message : err)}`,
+      );
+    });
   }
 
   /** Stop watching; resolves when the loop has fully wound down. */
