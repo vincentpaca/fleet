@@ -28,3 +28,8 @@ export const ARTIFACT_PER_FILE_CAP = 10 * 1024 * 1024; // 10 MB
 
 /** Total artifact size cap per job, enforced by daemon at intake. */
 export const ARTIFACT_TOTAL_CAP = 100 * 1024 * 1024;   // 100 MB
+
+/** Boot-generated operator secret: $FLEET_HOME/operator-token (mode 0600). */
+export function operatorTokenPath(home: string): string {
+  return join(home, "operator-token");
+}

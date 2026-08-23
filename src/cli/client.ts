@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fleetHome, operatorTokenPath } from '../shared/home.ts';
 
 import { request as httpRequest } from '../shared/http.ts';
 
@@ -37,6 +38,27 @@ export type RequestOptions = {
 export type Target =
   | { kind: 'socket'; socketPath: string }
   | { kind: 'tcp'; host: string; port: number; basePath: string };
+
+/**
+ * The boot-generated operator secret gating /jobs/* (issue #133), read once
+ * per process from $FLEET_HOME/operator-token. Undefined when the file is
+ * absent — socket-only deployments from before the secret existed, and tests
+ * against daemons constructed without operatorToken, keep working.
+ */
+const operatorTokenCache = new Map<string, string | undefined>();
+export function readOperatorToken(env: Record<string, string | undefined> = process.env): string | undefined {
+  const tokenPath = operatorTokenPath(fleetHome(env));
+  if (operatorTokenCache.has(tokenPath)) return operatorTokenCache.get(tokenPath);
+  let token: string | undefined;
+  try {
+    const raw = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (raw !== '') token = raw;
+  } catch {
+    // No token file: nothing to attach.
+  }
+  operatorTokenCache.set(tokenPath, token);
+  return token;
+}
 
 /** One captured deployment description: the file it came from, and its contents. */
 export type FleetConfigFile = { path: string; config: Record<string, unknown> };
@@ -163,6 +185,12 @@ export async function request(
 ): Promise<DaemonResponse> {
   const target = daemonTarget(opts.env ?? process.env, { cwd: opts.cwd });
   const payload = body === undefined ? undefined : JSON.stringify(body);
+  // /jobs/* requires the operator secret (issue #133); attaching it to every
+  // request is harmless for /health and /internal/*, which ignore it.
+  const token = readOperatorToken(opts.env ?? process.env);
+  const authHeaders: Record<string, string> = token !== undefined
+    ? { 'x-fleet-operator-token': token }
+    : {};
   const res = await httpRequest({
     method,
     path: target.kind === 'tcp' ? `${target.basePath}${reqPath}` : reqPath,
@@ -174,11 +202,10 @@ export async function request(
       ...(payload === undefined
         ? {}
         : { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) }),
+      ...authHeaders,
       ...opts.headers,
     },
     body: payload,
-    // No timeoutMs here on purpose: the shared client applies its default, so
-    // a caller that forgets one cannot hang forever either.
     timeoutMs: opts.timeoutMs,
     signal: opts.signal,
     onLine: opts.onLine,

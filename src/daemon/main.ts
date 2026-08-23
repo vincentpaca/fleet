@@ -10,7 +10,7 @@
 // per-request — see test/daemon-boot-log.test.ts.
 import { mkdirSync } from "node:fs";
 import { fleetHome } from "../shared/home.ts";
-import { FleetDaemon } from "./server.ts";
+import { loadOrCreateOperatorToken, FleetDaemon } from "./server.ts";
 import { ProcessProvider } from "../providers/process.ts";
 import { DockerProvider } from "../providers/docker.ts";
 import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm } from "../providers/ecs.ts";
@@ -108,12 +108,17 @@ if (port !== undefined) {
 }
 if (!tcpHost) tcpHost = "127.0.0.1";
 
+// Operator secret for /jobs/* (issue #133): generated on first boot,
+// persisted 0600 at $FLEET_HOME/operator-token, read by the CLI over the
+// socket and over an SSM tunnel alike. Every real daemon enforces it —
+// there is no credential-free deployment of the /jobs/* surface.
 const daemon = new FleetDaemon({
   home,
   provider: await buildProvider(choice, home),
   port,
   bindHost,
   tcpHost,
+  operatorToken: loadOrCreateOperatorToken(home),
 });
 
 const { socketPath: sock, port: boundPort } = await daemon.start();
