@@ -7,14 +7,18 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   writeFileSync,
   appendFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
+import { hostname } from "node:os";
 import { jobDir, daemonLockPath } from "../src/shared/home.ts";
-import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost } from "./daemon-helpers.ts";
+import { STALE_AFTER_MS } from "../src/daemon/lock.ts";
+import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost, until } from "./daemon-helpers.ts";
 import type { LaunchSpec, Provider } from "../src/providers/provider.ts";
 
 const LONG_POLL_MS = 300;
@@ -133,87 +137,193 @@ test("garbage job.json quarantines the job", async (t) => {
   assert.ok(existsSync(join(home, "jobs", `${id}.corrupt`)));
 });
 
+test("a mid-file-corrupt events.jsonl quarantines that job; other jobs load", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id: goodId, token: goodToken } = await createJob(ctx);
+  await runnerPost(ctx.sock, goodId, goodToken, event(goodId, 0, { type: "state", state: "running" }));
+  const { id: badId, token: badToken } = await createJob(ctx);
+  await runnerPost(ctx.sock, badId, badToken, event(badId, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, badId, badToken, event(badId, 1, { type: "think", text: "second" }));
+  await ctx.daemon.stop();
+
+  // Corruption in the middle of the log, not a torn tail: the journal is the
+  // source of truth (D15), so a job whose journal cannot be read whole must not
+  // be served — but it must not take the other jobs down with it either.
+  const badPath = join(jobDir(home, badId), "events.jsonl");
+  const lines = readFileSync(badPath, "utf8").split("\n");
+  lines[1] = "{ this is not json";
+  writeFileSync(badPath, lines.join("\n"));
+
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+
+  assert.equal(jobOf((await op(ctx2.sock, "GET", `/jobs/${goodId}`)).json).state, "running");
+  assert.equal((await op(ctx2.sock, "GET", `/jobs/${badId}`)).status, 404);
+  assert.ok(existsSync(join(home, "jobs", `${badId}.corrupt`)));
+});
+
+test("a quarantined job dir is not re-quarantined on the next boot", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id } = await createJob(ctx);
+  await ctx.daemon.stop();
+  writeFileSync(join(jobDir(home, id), "job.json"), "");
+
+  const ctx2 = await startDaemon(home);
+  await ctx2.daemon.stop();
+  assert.ok(existsSync(join(home, "jobs", `${id}.corrupt`)));
+
+  // A quarantine dir still holds the corrupt job.json that caused it. Loading
+  // it again renames it again — `<id>.corrupt.corrupt`, then `.corrupt` once
+  // more every boot forever, and each pass churns the EFS the daemon boots from.
+  const ctx3 = await startDaemon(home);
+  t.after(() => ctx3.daemon.stop());
+  assert.deepEqual(
+    readdirSync(join(home, "jobs")).sort(),
+    [`${id}.corrupt`],
+    "the quarantine must be left exactly as it was",
+  );
+});
+
 // --- #112: Single-writer lock -----------------------------------------------
 
-test("second daemon against a live home refuses to start", async (t) => {
+test("a second daemon refuses the home before it writes anything into it", async (t) => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   t.after(() => ctx.daemon.stop());
+  const { id } = await createJob(ctx);
 
-  // A second daemon on the same home must refuse.
-  const provider2 = new StubProvider();
-  const daemon2 = new FleetDaemon({ home, provider: provider2, longPollMs: LONG_POLL_MS });
-  await assert.rejects(
-    () => daemon2.start(),
-    /daemon already running|daemon lock/,
+  // Tear the live daemon's job.json. A second daemon that got as far as loading
+  // would quarantine this dir — inside a home it does not own.
+  writeFileSync(join(jobDir(home, id), "job.json"), "");
+
+  // The refusal must land at construction: loading the registry quarantines
+  // torn dirs and reconciliation rewrites job.json, so a lock taken later
+  // (in start()) would refuse only after the damage was done.
+  assert.throws(
+    () => new FleetDaemon({ home, provider: new StubProvider(), longPollMs: LONG_POLL_MS }),
+    /another daemon holds/,
+  );
+  assert.ok(
+    !existsSync(join(home, "jobs", `${id}.corrupt`)),
+    "the refused daemon must not have quarantined a job in a home it does not own",
   );
 });
 
 test("stale lock from a dead daemon does not block restart", async (t) => {
   const home = tempHome();
 
-  // Simulate a stale lock: write a PID that is definitely not alive.
-  // PID 999999 is extremely unlikely to exist.
-  const lockPath = daemonLockPath(home);
+  // A crashed daemon's lock: well-formed, but its heartbeat stopped long ago.
+  // Deliberately carrying THIS process's pid — on ECS the daemon is pid 1 of
+  // its task and the replacement task is pid 1 too, so a liveness test that
+  // asks "is that pid alive?" answers yes about itself and never lets the
+  // daemon boot again. Staleness is the clock, not the pid.
   mkdirSync(home, { recursive: true });
-  writeFileSync(lockPath, "999999\n");
+  writeFileSync(
+    daemonLockPath(home),
+    JSON.stringify({
+      pid: process.pid,
+      host: hostname(),
+      startedAt: new Date(Date.now() - 3_600_000).toISOString(),
+      updatedAt: Date.now() - (STALE_AFTER_MS + 1_000),
+    }),
+  );
 
-  // Starting a daemon must reclaim the stale lock, not refuse.
   const ctx = await startDaemon(home);
   t.after(() => ctx.daemon.stop());
 
-  // The daemon started successfully and serves.
   const res = await op(ctx.sock, "GET", "/jobs");
   assert.equal(res.status, 200);
+});
+
+test("a torn lock file does not block boot", async (t) => {
+  const home = tempHome();
+  mkdirSync(home, { recursive: true });
+  // Half a write. A lock nobody can read names no holder, and refusing on it
+  // would be one torn file bricking the daemon — the bug #112 is about.
+  writeFileSync(daemonLockPath(home), '{"pid": 12');
+
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  assert.equal((await op(ctx.sock, "GET", "/jobs")).status, 200);
 });
 
 test("lock is released on stop, allowing a subsequent daemon", async () => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   await ctx.daemon.stop();
+  assert.ok(!existsSync(daemonLockPath(home)), "stop must release the lock");
 
-  // Lock file should be cleaned up (or at least not block).
   const ctx2 = await startDaemon(home);
+  assert.ok(existsSync(daemonLockPath(home)), "the next daemon claims it");
   await ctx2.daemon.stop();
-  // No throw = success.
 });
 
 // --- #113: Append-before-seq (crash safety) ---------------------------------
 
-test("fault-injected crash between append and seq-record: event is present after restart", async (t) => {
+test("a retry after a crash between append and seq-record is deduped, not appended twice", async (t) => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   const { id, token } = await createJob(ctx);
   await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
-
-  // The runner sends a settle event (seq 1). The daemon appends it to the
-  // journal before recording the seq. We simulate a crash AFTER the append
-  // but BEFORE the seq-record by directly checking the journal.
   await runnerPost(ctx.sock, id, token, event(id, 1, SETTLE));
-
-  // Simulate: crash after append, before seq-record would mean:
-  // job.json has lastRunnerSeq=0 but journal has the settle event.
-  // We manually corrupt job.json to simulate this.
   await ctx.daemon.stop();
+
+  // Reconstruct the on-disk state that a crash in the append-before-seq window
+  // leaves behind: the journal holds seq 1, job.json never got to record it.
+  // This state is only reachable BECAUSE the append moved first — under the old
+  // ordering the event would simply be gone, which is the bug.
   const recordPath = join(jobDir(home, id), "job.json");
   const raw = JSON.parse(readFileSync(recordPath, "utf8"));
-  raw.lastRunnerSeq = 0; // pretend the seq-record didn't happen
+  raw.lastRunnerSeq = 0;
   writeFileSync(recordPath, JSON.stringify(raw, null, 2));
 
-  // On restart, the journal has the settle event. The event is NOT lost —
-  // it's in the journal. The reconciler detects the disagreement (journal
-  // says running but card says running with stale seq) and repairs.
   const ctx2 = await startDaemon(home);
   t.after(() => ctx2.daemon.stop());
 
-  const events = parseNdjson(
+  // The runner never saw a response, so it retries seq 1 verbatim. The daemon
+  // must recognise its own stored copy. The retried seq is ABOVE the recorded
+  // lastRunnerSeq — a dedup check gated on `seq <= lastRunnerSeq` never runs
+  // here and the settle lands a second time.
+  const retry = await runnerPost(ctx2.sock, id, token, event(id, 1, SETTLE));
+  assert.equal(retry.status, 200, retry.body);
+  assert.ok(JSON.parse(retry.body).deduped, `retry must be deduped; got ${retry.body}`);
+
+  const settles = (parseNdjson(
     readFileSync(join(jobDir(home, id), "events.jsonl"), "utf8"),
-  ) as { type: string; state?: string }[];
-  // The settle event is present in the journal.
-  assert.ok(
-    events.some((e) => e.type === "settle"),
-    "settle event must be present in the journal after restart",
-  );
+  ) as { type: string }[]).filter((e) => e.type === "settle");
+  assert.equal(settles.length, 1, "the settle must appear exactly once in the journal");
+});
+
+test("a re-entered runner's seq 0 is not deduped against the previous generation's", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Generation 1 parks. Its first event is `state running` at claimed seq 0.
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, {
+    type: "decision",
+    id: "d1",
+    question: "Proceed?",
+    options: [{ id: "go", label: "Go", recommended: true }, { id: "stop", label: "Stop" }],
+  }));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "go" });
+  assert.equal(answered.status, 200, answered.body);
+
+  // Generation 2 starts its own seq at 0, and its first event is byte-identical
+  // to generation 1's. Dedup must be scoped to the current generation or the
+  // fresh runner's `running` is swallowed as a duplicate and the job never
+  // leaves blocked.
+  const relaunch = ctx.provider.launches.at(-1)!;
+  const res = await runnerPost(ctx.sock, id, relaunch.runnerToken, event(id, 0, { type: "state", state: "running" }));
+  assert.equal(res.status, 200, res.body);
+  assert.equal(JSON.parse(res.body).deduped, undefined, "generation 2's first event is not a duplicate");
+  assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "running");
 });
 
 test("retried duplicate event with same payload gets 200 deduped", async (t) => {
@@ -251,6 +361,34 @@ test("reused seq with different content gets 422", async (t) => {
   assert.equal(res2.status, 422);
 });
 
+test("a reused seq whose difference is nested inside the payload gets 422", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+
+  const first = await runnerPost(ctx.sock, id, token, event(id, 1, {
+    ...SETTLE,
+    report: { status: "READY", next_action: "open the PR" },
+  }));
+  assert.equal(first.status, 200, first.body);
+
+  // Same type, same top-level keys — a different report. Comparing only the
+  // key names (or only the top level) calls these two events identical and
+  // silently drops the second, which is the opposite of the contract: dedup
+  // means "I already have exactly this", never "I'll ignore whatever this is".
+  const conflicting = await runnerPost(ctx.sock, id, token, event(id, 1, {
+    ...SETTLE,
+    report: { status: "PARTIAL", next_action: "something else entirely" },
+  }));
+  assert.equal(conflicting.status, 422, conflicting.body);
+
+  const settles = ctx.daemon.registry.eventsAfter(id, -1).filter((e) => e.type === "settle");
+  assert.equal(settles.length, 1);
+  assert.deepEqual(settles[0]!.report, { status: "READY", next_action: "open the PR" });
+});
+
 // --- #113: Log-authoritative reconciliation ---------------------------------
 
 test("record/journal disagreement reconciles at boot via effects replay", async (t) => {
@@ -279,25 +417,88 @@ test("record/journal disagreement reconciles at boot via effects replay", async 
   assert.equal(job.state, "done", "reconciliation must repair the card to match the journal");
 });
 
-test("reconciliation of historic illegal sequences does not crash", async (t) => {
+test("reconciliation of a journal with historic illegal sequences neither crashes nor invents state", async (t) => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   const { id, token } = await createJob(ctx);
   await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
   await runnerPost(ctx.sock, id, token, event(id, 1, SETTLE));
   await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "done" }));
-  // Manually append an illegal "done → cancelled" sequence (historic bug).
-  const eventsPath = join(jobDir(home, id), "events.jsonl");
-  appendFileSync(eventsPath, JSON.stringify({ job: id, seq: 3, type: "state", state: "cancelled", reason: "historic-bug" }) + "\n");
+  // The sequence these very bugs produced in live journals: a backstop cancel
+  // appended after the runner had already settled done.
+  appendFileSync(
+    join(jobDir(home, id), "events.jsonl"),
+    JSON.stringify({ job: id, seq: 3, type: "state", state: "cancelled", reason: "historic-bug" }) + "\n",
+  );
   await ctx.daemon.stop();
 
-  // Boot must not crash on the illegal sequence.
+  // Force the card non-terminal so the reconciler actually runs: a terminal
+  // card short-circuits (#118 — settled journals are not re-read), so leaving
+  // it at `done` would assert nothing about the replay at all.
+  const recordPath = join(jobDir(home, id), "job.json");
+  const raw = JSON.parse(readFileSync(recordPath, "utf8"));
+  raw.state = "running";
+  delete raw.settle;
+  delete raw.doneCheck;
+  writeFileSync(recordPath, JSON.stringify(raw, null, 2));
+
   const ctx2 = await startDaemon(home);
   t.after(() => ctx2.daemon.stop());
 
-  // The job loaded without crashing.
-  const res = await op(ctx2.sock, "GET", `/jobs/${id}`);
-  assert.equal(res.status, 200);
+  const job = jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json);
+  // The replay follows the journal to its end and stops there. It does not
+  // refuse the illegal step, and it does not invent a state no event recorded.
+  assert.equal(job.state, "cancelled");
+  assert.equal(job.reason, "historic-bug");
+});
+
+test("boot reconciliation does not re-fire the outward effects of replayed events", async (t) => {
+  const home = tempHome();
+  const notified: string[] = [];
+  const webhook = createServer((req, res) => {
+    notified.push(req.url ?? "");
+    res.writeHead(200).end("{}");
+  });
+  const listening = Promise.withResolvers<void>();
+  webhook.listen(0, "127.0.0.1", () => listening.resolve());
+  await listening.promise;
+  const addr = webhook.address() as { port: number };
+  const notifyWebhooks = [`http://127.0.0.1:${addr.port}/notify`];
+  t.after(() => new Promise<void>((r) => webhook.close(() => r())));
+
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({ home, provider, longPollMs: LONG_POLL_MS, notifyWebhooks });
+  const { socketPath: sock } = await daemon.start();
+  const ctx: Ctx = { daemon, sock, provider, home };
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(sock, id, token, event(id, 1, {
+    type: "decision",
+    id: "d1",
+    question: "Proceed?",
+    options: [{ id: "go", label: "Go", recommended: true }, { id: "stop", label: "Stop" }],
+  }));
+  await until(() => notified.length === 1);
+  await daemon.stop();
+
+  // Disagree the card with the journal so the reconciler replays.
+  const recordPath = join(jobDir(home, id), "job.json");
+  const raw = JSON.parse(readFileSync(recordPath, "utf8"));
+  raw.state = "running";
+  writeFileSync(recordPath, JSON.stringify(raw, null, 2));
+
+  const provider2 = new StubProvider();
+  const daemon2 = new FleetDaemon({ home, provider: provider2, longPollMs: LONG_POLL_MS, notifyWebhooks });
+  const { socketPath: sock2 } = await daemon2.start();
+  t.after(() => daemon2.stop());
+
+  assert.equal(jobOf((await op(sock2, "GET", `/jobs/${id}`)).json).state, "blocked");
+  // Replaying the real effects function must replay the DERIVATION only. An
+  // operator paged again for every historic decision on every daemon restart
+  // is a worse bug than the one reconciliation fixes.
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(notified.length, 1, `boot must not re-notify; got ${notified.length} notifications`);
 });
 
 // --- #113: Cancel recheck ---------------------------------------------------
@@ -384,6 +585,37 @@ test("one job.json persist per intake event (verified by write counting)", async
     `expected exactly 1 job.json persist per intake event, got ${writes}`,
   );
 });
+test("one job.json persist per intake event, including the events that used to write six", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Each of these used to fan out to several separate serialize+write+rename
+  // cycles inside one intake (setLastRunnerSeq, appendEvent, clearMarker,
+  // updateJob, wallClock*, setOpenDecision, setDecisionBlockedAt). On EFS every
+  // one is a network round trip. The count is the checkpoint: a new persist
+  // call site inside intake fails here rather than showing up as latency.
+  const cases: [string, Record<string, unknown>][] = [
+    ["state", { type: "state", state: "running" }],
+    ["think", { type: "think", text: "hello" }],
+    ["decision", {
+      type: "decision",
+      id: "d1",
+      question: "Proceed?",
+      options: [{ id: "go", label: "Go", recommended: true }, { id: "stop", label: "Stop" }],
+    }],
+  ];
+  let seq = 0;
+  for (const [what, payload] of cases) {
+    const before = ctx.daemon.registry.persistCount();
+    const res = await runnerPost(ctx.sock, id, token, event(id, seq++, payload));
+    assert.equal(res.status, 200, res.body);
+    const writes = ctx.daemon.registry.persistCount() - before;
+    assert.equal(writes, 1, `${what}: expected 1 job.json write per intake event, got ${writes}`);
+  }
+});
+
 // --- #113: runnerSeq stored on events ---------------------------------------
 
 test("runnerSeq is stored on appended events for dedup", async (t) => {

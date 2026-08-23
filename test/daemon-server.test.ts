@@ -175,16 +175,19 @@ test("runner intake: bad token 401, schema violation / wrong job / bad seq / ill
   assert.equal(ok.status, 200, ok.body);
   assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "running");
 
-  // Replayed seq rejected
+  // Replayed seq carrying different content rejected — named for what it is
+  // (#113's tripwire), not as an ordering complaint.
   const replay = await runnerPost(ctx.sock, id, token, event(id, 0, { type: "think", text: "again" }));
   assert.equal(replay.status, 422);
-  assert.match(replay.body, /monotonically increasing/);
+  assert.match(replay.body, /already recorded with different content/);
 
-  // Lower seq rejected even after a gap
+  // Lower seq rejected even after a gap. Seq 4 was never recorded, so there is
+  // nothing to compare it against and the ordering rule is what refuses it.
   const gap = await runnerPost(ctx.sock, id, token, event(id, 7, { type: "think", text: "gap ok" }));
   assert.equal(gap.status, 200);
   const lower = await runnerPost(ctx.sock, id, token, event(id, 4, { type: "think", text: "backwards" }));
   assert.equal(lower.status, 422);
+  assert.match(lower.body, /monotonically increasing/);
 
   // Runners may never post answers
   const answer = await runnerPost(ctx.sock, id, token, event(id, 8, { type: "answer", decision: "d1", by: "runner" }));

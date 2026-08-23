@@ -14,7 +14,8 @@ import { newId, newRunnerToken } from "../shared/ids.ts";
 import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
-import type { JobRecord, StoredEvent } from "./registry.ts";
+import { HomeLock } from "./lock.ts";
+import type { EffectsMode, JobRecord, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
 import type { JobState, Marker } from "./state.ts";
 import { verifyRung } from "./verify.ts";
@@ -127,6 +128,23 @@ function defaultGhRunner(): import("./verify.ts").GhRunner {
 }
 
 /**
+ * Deterministic JSON for deep equality: object keys sorted at every depth.
+ *
+ * Not `JSON.stringify(value, Object.keys(value).sort())` — an array second
+ * argument is a property allowlist applied recursively, so that shape silently
+ * erases every nested field whose key does not also appear at the top level,
+ * and two events differing only inside `report` compare equal.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
+}
+
+/**
  * Default long-poll window for follow/answer endpoints. Exported so tests can
  * pin every client-side timeout above it: a healthy long-poll transfers no
  * bytes for this whole window, and an idle timeout at or below it would
@@ -184,6 +202,9 @@ export class FleetDaemon {
    */
   readonly #backstopping = new Set<string>();
 
+  /** Single-writer claim on $FLEET_HOME; held for the daemon's whole life. */
+  readonly #lock: HomeLock;
+
   constructor(options: DaemonOptions) {
     this.#options = options;
     this.#longPollMs = options.longPollMs ?? DEFAULT_LONG_POLL_MS;
@@ -193,12 +214,23 @@ export class FleetDaemon {
     this.#tcpHost = options.tcpHost ?? this.#bindHost;
     this.#operatorToken = options.operatorToken;
     mkdirSync(options.home, { recursive: true });
-    this.registry = new Registry(options.home);
-    // Wire the effects function so the registry can replay events at boot
-    // for log-authoritative reconciliation (issue #113).
-    this.registry.setApplyEffectsFn((job, event) => this.#applyEffects(job, event));
-    // Reconcile any non-terminal jobs whose card disagrees with the journal.
-    this.registry.reconcileAll();
+    // Claim the home BEFORE the registry opens it (issue #112). Loading is not
+    // read-only — it quarantines torn job dirs and reconciliation rewrites
+    // job.json — so a lock taken later in start() would refuse only after this
+    // process had already written into a live daemon's home.
+    this.#lock = new HomeLock(options.home, daemonLockPath(options.home));
+    this.#lock.acquire();
+    try {
+      this.registry = new Registry(options.home);
+      // Wire the effects function so the registry can replay events at boot
+      // for log-authoritative reconciliation (issue #113).
+      this.registry.setApplyEffectsFn((job, event, mode) => this.#applyEffects(job, event, mode));
+      // Reconcile any non-terminal jobs whose card disagrees with the journal.
+      this.registry.reconcileAll();
+    } catch (error) {
+      this.#lock.release();
+      throw error;
+    }
   }
   /** URL the runner uses to reach this daemon (TCP preferred when enabled). */
   get daemonUrl(): string {
@@ -211,10 +243,8 @@ export class FleetDaemon {
   }
 
   async start(): Promise<{ socketPath: string; port: number | null }> {
-    // Single-writer lock (issue #112): O_EXCL pidfile on $FLEET_HOME/daemon.lock.
-    // A second daemon against the same home refuses; a stale lock from a dead
-    // daemon (PID no longer alive) is reclaimed.
-    this.#acquireLock();
+    // The home was claimed in the constructor (issue #112) — by the time the
+    // socket is unlinked, no other daemon can be serving from this home.
     if (existsSync(this.#sockPath)) unlinkSync(this.#sockPath);
     const handler = (req: IncomingMessage, res: ServerResponse) => {
       this.#route(req, res).catch((error: unknown) => {
@@ -265,66 +295,9 @@ export class FleetDaemon {
     this.#unixServer = null;
     this.#tcpServer = null;
     this.#port = null;
-    this.#releaseLock();
-  }
-  /**
-   * Acquire the single-writer lock (issue #112). Uses O_EXCL to create a
-   * pidfile atomically; if it already exists, checks whether the PID inside
-   * is still alive. A live PID refuses (another daemon owns the home); a dead
-   * PID is reclaimed (stale lock from a crashed daemon). Throws on refusal.
-   */
-  #acquireLock(): void {
-    const lockPath = daemonLockPath(this.#options.home);
-    const pid = process.pid;
-    try {
-      // O_EXCL: atomically create-or-fail. If this succeeds, we own the lock.
-      // Write our PID so a later contender can check staleness.
-      writeFileSync(lockPath, `${pid}\n`, { flag: "wx", mode: 0o600 });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      // Lock file exists — check if the holding PID is alive.
-      let existingPid: number | null = null;
-      try {
-        const content = readFileSync(lockPath, "utf8").trim();
-        existingPid = Number(content);
-        if (!Number.isInteger(existingPid) || existingPid <= 0) existingPid = null;
-      } catch {
-        // Can't read the lock file (permissions, race). Refuse to be safe.
-        throw new Error(`fleet: daemon lock held by another process (cannot read ${lockPath})`);
-      }
-      if (existingPid !== null && this.#pidAlive(existingPid)) {
-        throw new Error(`fleet: daemon already running (pid ${existingPid}) on ${this.#options.home}`);
-      }
-      // Stale lock: the PID is dead. Reclaim by overwriting with our PID.
-      writeFileSync(lockPath, `${pid}\n`, { mode: 0o600 });
-    }
+    this.#lock.release();
   }
 
-  /** Release the single-writer lock if we hold it. */
-  #releaseLock(): void {
-    const lockPath = daemonLockPath(this.#options.home);
-    try {
-      // Only remove if our PID is in the file (don't steal a live daemon's lock).
-      if (existsSync(lockPath)) {
-        const content = readFileSync(lockPath, "utf8").trim();
-        if (content === String(process.pid)) {
-          unlinkSync(lockPath);
-        }
-      }
-    } catch {
-      // Best-effort cleanup; a leftover lock file is reclaimed on next boot.
-    }
-  }
-
-  /** Check whether a PID is alive (0 signal = existence check). */
-  #pidAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
   async #route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://fleet.invalid");
     const method = req.method ?? "GET";
@@ -737,11 +710,12 @@ export class FleetDaemon {
    * Ordering (issue #113): appendEvent runs BEFORE setLastRunnerSeq — the
    * journal is the source of truth and must be durable before any derived
    * state. A crash between append and seq-record produces a retried duplicate
-   * (safe to dedupe) rather than a permanently lost event.
+   * (deduped below) rather than a permanently lost event.
    *
    * Dedup-by-content: a retried seq whose payload matches the stored event →
    * `{deduped: true}`. A reused seq with different content → 422 (the
-   * tripwire that keeps orphan runners and seq bugs loud).
+   * tripwire that keeps orphan runners and seq bugs loud). The lookup is bounded
+   * to the current runner generation — see `runnerSeqEpoch`.
    *
    * Coalescing: all job.json writes during applyEffects are batched into one
    * flushPersist at the end — one snapshot write per intake event.
@@ -756,15 +730,29 @@ export class FleetDaemon {
       return { status: 422, errors: [`event.job "${event.job}" does not match job ${job.id}`] };
     }
 
-    // Dedup-by-content (issue #113): a retried seq that already has a stored
-    // event is either a benign duplicate (same payload → 200 deduped) or a
-    // real conflict (different payload → 422). Never dedupe on seq alone.
+    // Dedup-by-content (issue #113): a claimed seq this generation has already
+    // stored is either a benign retry (same payload → 200 deduped) or a real
+    // conflict (different payload → 422). Never dedupe on seq alone.
+    //
+    // Checked BEFORE the monotonic-seq guard, not inside it. Append-before-seq
+    // opens exactly one crash window — appended, seq not yet recorded — and in
+    // it the retried seq is *above* lastRunnerSeq. Gating dedup on
+    // `seq <= lastRunnerSeq` makes it unreachable in the only window the
+    // reordering creates, and the retry lands as a second copy of an event the
+    // journal already holds: double settle, effects applied twice.
+    const existing = this.registry.findEventByRunnerSeq(job.id, event.seq);
+    if (existing) {
+      if (this.#eventsMatch(existing, event)) return { deduped: true };
+      return {
+        status: 422,
+        errors: [
+          `seq ${event.seq} already recorded with different content ` +
+          `(log seq ${existing.seq}, type "${existing.type}")`,
+        ],
+      };
+    }
     const lastRunnerSeq = this.registry.lastRunnerSeq(job.id);
     if (lastRunnerSeq !== null && event.seq <= lastRunnerSeq) {
-      const existing = this.registry.findEventByRunnerSeq(job.id, event.seq);
-      if (existing && this.#eventsMatch(existing, event)) {
-        return { deduped: true };
-      }
       return {
         status: 422,
         errors: [`seq must be monotonically increasing: got ${event.seq} after ${lastRunnerSeq}`],
@@ -817,30 +805,42 @@ export class FleetDaemon {
       this.registry.appendEvent(job.id, payload);
       // Record the runner's claimed seq AFTER the journal append (issue #113).
       this.registry.setLastRunnerSeq(job.id, event.seq);
-      this.#applyEffects(job, event);
+      this.#applyEffects(job, event, "intake");
     } finally {
       this.registry.endBatch(job.id);
     }
     return null;
   }
 
-  /** Compare a stored event against a claimed event for dedup-by-content. */
+  /**
+   * Compare a stored event against a claimed one for dedup-by-content.
+   *
+   * Everything but the bookkeeping is compared, all the way down: `seq` is the
+   * daemon's and differs by construction, `runnerSeq` is how the stored event
+   * was found, and `at` is stamped per append. A shallow or key-name-only
+   * comparison would be worse than none — dedup would swallow a settle whose
+   * report changed, and the mismatch-422 tripwire is the whole point.
+   */
   #eventsMatch(stored: StoredEvent, claimed: StoredEvent): boolean {
-    // Compare the meaningful payload fields, ignoring daemon-assigned seq,
-    // the runnerSeq dedup field, and the daemon-stamped `at`. The runner's
-    // claimed seq is the same (that's how we found the stored event); the
-    // daemon's log seq differs by construction. Sort keys for stable
-    // comparison regardless of insertion order.
     const strip = (e: StoredEvent) => {
       const { seq, runnerSeq, at, ...rest } = e;
       return rest;
     };
-    const canon = (o: Record<string, unknown>) =>
-      JSON.stringify(o, Object.keys(o).sort());
-    return canon(strip(stored)) === canon(strip(claimed));
+    return stableStringify(strip(stored)) === stableStringify(strip(claimed));
   }
 
-  #applyEffects(job: JobRecord, event: StoredEvent): void {
+  /**
+   * Apply an event's effects to the record.
+   *
+   * `mode` is `"intake"` for a live event and `"replay"` for boot
+   * reconciliation. The record derivation is identical in both — that is the
+   * point of one function — but the outward-facing effects run on intake only:
+   * replaying them would re-notify operators about every historic decision,
+   * block the constructor on a synchronous `gh`, and terminate containers at
+   * boot. Every suppressed effect is either already done or belongs to a live
+   * event that will arrive again.
+   */
+  #applyEffects(job: JobRecord, event: StoredEvent, mode: EffectsMode = "intake"): void {
     if (event.type === "state") {
       // Schema-validated at intake.
       const nextState = event.state as JobState;
@@ -855,16 +855,26 @@ export class FleetDaemon {
         this.registry.updateJob(job.id, { state: nextState, ...reason });
       }
       // Wall-clock tracking: running = active, blocked/terminal = inactive.
-      if (nextState === "running") {
-        this.registry.wallClockBecameActive(job.id);
-      } else if (nextState === "blocked" || isTerminal(nextState)) {
-        this.registry.wallClockBecameInactive(job.id);
+      // Not replayed: these read the daemon clock, so a replay would collapse
+      // every recorded segment to zero length and hand the job a fresh budget.
+      // Wall-clock accounting is the one thing the journal cannot rebuild
+      // (D15's accepted cost); the snapshot's value stands.
+      if (mode === "intake") {
+        if (nextState === "running") {
+          this.registry.wallClockBecameActive(job.id);
+        } else if (nextState === "blocked" || isTerminal(nextState)) {
+          this.registry.wallClockBecameInactive(job.id);
+        }
       }
       if (isTerminal(nextState)) {
         // Settle rides ahead of the terminal state event; verify the target
         // rung — locally for lower rungs, via gh for upper rungs.
         const target = targetRung(job.workOrder);
-        const ghRunner = defaultGhRunner();
+        // On replay, no gh: verifyRung records "unverified: requires gh" for the
+        // upper rungs instead of shelling out synchronously inside the
+        // constructor. An honest unverified beats a boot that blocks on the
+        // network, and the operator can re-check.
+        const ghRunner = mode === "intake" ? defaultGhRunner() : undefined;
         const doneCheck = verifyRung(job.settle, target, { ghRunner });
         this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
         // Reap the stopped container on clean settle (#120): exited containers
@@ -880,7 +890,7 @@ export class FleetDaemon {
                 typeof e.text === "string" &&
                 e.text.startsWith(RETAINED_WORKSPACE_NOTE_PREFIX),
             );
-          if (!retained) {
+          if (!retained && mode === "intake") {
             this.#options.provider
               .terminate(job.handle)
               .catch(() => {});
@@ -899,12 +909,15 @@ export class FleetDaemon {
       });
       this.registry.updateJob(job.id, { state: "blocked" });
       // Record when this decision first arrived — the decision_timeout clock
-      // starts here (regardless of whether the job is hot or parked).
-      this.registry.setDecisionBlockedAt(job.id, Date.now());
+      // starts here (regardless of whether the job is hot or parked). On replay
+      // the event's own timestamp is the honest answer: dating a two-day-old
+      // decision to boot time would silently restart the operator's clock.
+      const blockedAt = mode === "intake" ? Date.now() : Date.parse(String(event.at ?? ""));
+      this.registry.setDecisionBlockedAt(job.id, Number.isFinite(blockedAt) ? blockedAt : Date.now());
       // The job is now waiting for an operator answer — operator wait time is
       // excluded from the wall-clock budget, same as the runner-side behaviour.
-      this.registry.wallClockBecameInactive(job.id);
-      this.#notify(job.id, decision.question);
+      if (mode === "intake") this.registry.wallClockBecameInactive(job.id);
+      if (mode === "intake") this.#notify(job.id, decision.question);
       return;
     }
     if (event.type === "settle") {
