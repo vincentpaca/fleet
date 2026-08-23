@@ -20,6 +20,14 @@ import type { JobState, Marker } from "./state.ts";
 import { verifyRung } from "./verify.ts";
 import type { Provider } from "../providers/provider.ts";
 
+/**
+ * Prefix of the log note the runner posts when a work push failed and the
+ * workspace is retained (issue #38). The daemon uses it to suppress the
+ * clean-settle container reap: a retained workspace keeps its stopped
+ * container so `fleet resume-push` can retry the push from inside it.
+ */
+const RETAINED_WORKSPACE_NOTE_PREFIX = "workspace retained at";
+
 /** Blocked-first ordering: anything waiting on the operator sorts first. */
 export const RANK: Record<JobState, number> = {
   blocked: 0,
@@ -727,6 +735,25 @@ export class FleetDaemon {
         const ghRunner = defaultGhRunner();
         const doneCheck = verifyRung(job.settle, target, { ghRunner });
         this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
+        // Reap the stopped container on clean settle (#120): exited containers
+        // pile up forever without this. Skip jobs whose workspace the runner
+        // retained after a failed push — they keep their container so the
+        // operator can retry the push from inside it via `fleet resume-push`.
+        if (job.handle !== undefined) {
+          const retained = this.registry
+            .eventsAfter(job.id, -1)
+            .some(
+              (e) =>
+                e.type === "log" &&
+                typeof e.text === "string" &&
+                e.text.startsWith(RETAINED_WORKSPACE_NOTE_PREFIX),
+            );
+          if (!retained) {
+            this.#options.provider
+              .terminate(job.handle)
+              .catch(() => {});
+          }
+        }
       }
       return;
     }

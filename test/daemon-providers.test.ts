@@ -1146,3 +1146,265 @@ test("docker terminate still surfaces real failures (#122)", async (t) => {
   });
   await assert.rejects(new DockerProvider().terminate("abc123"), /daemon/);
 });
+// --- Docker lifecycle: rm-before-run + reap on clean settle (#120) ------------
+
+/** Prefix of the retain note the real runner composes (src/runner/settle.ts). */
+const RETAINED_WORKSPACE_NOTE = "workspace retained at";
+
+// Stub docker binary: records every invocation's argv (one space-joined line
+// per call) to $FLEET_STUB_DOCKER_LOG, answers `run` with a unique fake
+// container id, and — for the daemon round-trips below — execs the container
+// command with the `-e KEY=VALUE` pairs exported, like a real `docker run`.
+const STUB_DOCKER = `#!/bin/sh
+printf '%s\\n' "$*" >> "$FLEET_STUB_DOCKER_LOG"
+case "$1" in
+  rm) exit 0 ;;
+  run)
+    n=$(cat "$FLEET_STUB_DOCKER_LOG.n" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$FLEET_STUB_DOCKER_LOG.n"
+    printf 'deadbeef%012d\\n' "$n"
+    shift
+    detached=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -e) export "\${2%%=*}=\${2#*=}"; shift 2 ;;
+        --name|--label|--cpus|--memory) shift 2 ;;
+        -d) detached=1; shift ;;
+        *) break ;;
+      esac
+    done
+    shift # image
+    if [ $# -gt 0 ]; then
+      if [ "$detached" = 1 ]; then
+        nohup "$@" >/dev/null 2>&1 &
+      else exec "$@"; fi
+    fi
+    ;;
+esac
+`;
+
+/** Put the stub docker first on PATH for this test; returns the argv log path. */
+function stubDockerOnPath(t: { after: (fn: () => void | Promise<void>) => void }): string {
+  const dir = mkdtempSync(join(tmpdir(), "fleet-stub-docker-"));
+  const log = join(dir, "docker-argv.log");
+  writeFileSync(join(dir, "docker"), STUB_DOCKER, { mode: 0o755 });
+  const prevPath = process.env.PATH;
+  const prevLog = process.env.FLEET_STUB_DOCKER_LOG;
+  process.env.PATH = `${dir}:${prevPath}`;
+  process.env.FLEET_STUB_DOCKER_LOG = log;
+  t.after(() => {
+    process.env.PATH = prevPath;
+    if (prevLog === undefined) delete process.env.FLEET_STUB_DOCKER_LOG;
+    else process.env.FLEET_STUB_DOCKER_LOG = prevLog;
+  });
+  return log;
+}
+
+function argvCalls(log: string): string[][] {
+  if (!existsSync(log)) return [];
+  return readFileSync(log, "utf8")
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => line.split(" "));
+}
+
+// Narrow a daemon JSON response down to its job record (runtime-checked).
+type JobView = { id: string; state: string };
+
+function jobOf(payload: unknown): JobView {
+  if (typeof payload !== "object" || payload === null || !("job" in payload)) {
+    throw new Error(`unexpected daemon response: ${JSON.stringify(payload)}`);
+  }
+  // Runtime shape checked above; JobRecord's public fields are all we read.
+  const { job } = payload as { job: JobView };
+  return job;
+}
+
+test("DockerProvider.launch removes any stale fleet-<jobId> container before run", async (t) => {
+  const log = stubDockerOnPath(t);
+  const provider = new DockerProvider();
+  await provider.launch({ ...SPEC });
+
+  const calls = argvCalls(log);
+  // A parked job's exited container still owns the name; without the removal
+  // the re-entry `docker run --name fleet-<jobId>` fails "already in use".
+  assert.deepEqual(calls[0], ["rm", "-f", `fleet-${SPEC.jobId}`]);
+  assert.equal(calls[1]?.[0], "run");
+  assert.deepEqual(calls[1]?.slice(0, 4), ["run", "-d", "--name", `fleet-${SPEC.jobId}`]);
+});
+
+// Fake runner behind the stub docker: raises a decision, parks, and exits.
+// On re-entry (reentry answer present in the env) it resumes and settles.
+const DOCKER_PARK_RUNNER = `
+const base = process.env.FLEET_DAEMON_URL;
+const job = process.env.FLEET_JOB_ID;
+const token = process.env.FLEET_RUNNER_TOKEN;
+const headers = { "content-type": "application/json", "x-fleet-runner-token": token };
+let seq = 0;
+const post = async (ev) => {
+  const res = await fetch(base + "/internal/jobs/" + job + "/events", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ job, seq: seq++, ...ev }),
+  });
+  if (!res.ok) throw new Error("post failed: " + res.status + " " + (await res.text()));
+};
+await post({ type: "state", state: "running" });
+if (process.env.FLEET_REENTRY_ANSWER_JSON === undefined) {
+  await post({
+    type: "decision",
+    id: "d1",
+    question: "Proceed with the cutover?",
+    options: [
+      { id: "go", label: "Proceed", recommended: true },
+      { id: "hold", label: "Hold" },
+    ],
+  });
+  await post({ type: "state", state: "blocked", marker: "parked" });
+} else {
+  await post({ type: "think", text: "resumed after operator answer" });
+  await post({
+    type: "settle",
+    rung: "implemented",
+    minutes: 1,
+    outcome: { produced: [], findings: 0, decisions: 1 },
+  });
+  await post({ type: "state", state: "done" });
+}
+`;
+
+test("docker park -> answer -> resume launches cleanly and reaps on settle", async (t) => {
+  const log = stubDockerOnPath(t);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "park-runner.mjs");
+  writeFileSync(runnerPath, DOCKER_PARK_RUNNER);
+
+  const provider = new DockerProvider({
+    runnerCmd: [process.execPath, runnerPath],
+    defaultImage: "node:22",
+  });
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0, longPollMs: 400 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const created = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(created.status, 201, created.body);
+  const { id } = jobOf(created.json);
+  const name = `fleet-${id}`;
+
+  const state = async () => jobOf((await op(sock, "GET", `/jobs/${id}`)).json).state;
+
+  // Launch #1: the pre-run removal must precede the run (the fix under test).
+  await until(() => argvCalls(log).length >= 2, 10_000);
+  let calls = argvCalls(log);
+  assert.deepEqual(calls[0], ["rm", "-f", name]);
+  assert.deepEqual(calls[1]?.slice(0, 4), ["run", "-d", "--name", name]);
+
+  await until(async () => (await state()) === "blocked", 10_000);
+  const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "go" });
+  assert.equal(answered.status, 200, answered.body);
+
+  // Launch #2 (re-entry): the exited pre-park container was removed again.
+  await until(() => argvCalls(log).length >= 4, 10_000);
+  calls = argvCalls(log);
+  assert.deepEqual(calls[2], ["rm", "-f", name]);
+  assert.deepEqual(calls[3]?.slice(0, 4), ["run", "-d", "--name", name]);
+
+  await until(async () => (await state()) === "done", 10_000);
+
+  // Reap on clean settle: the exited re-entry container must be removed.
+  await until(
+    () => argvCalls(log).some((c) => c[0] === "rm" && c[2] === "deadbeef000000000002"),
+    10_000,
+  );
+});
+
+// Fake runner behind the stub docker: settles straight through. When the
+// operator env carries FLEET_TEST_RETAIN=1 it first posts the exact note the
+// real runner composes (via composeSettle) when a work push failed.
+const DOCKER_SETTLE_RUNNER = `
+const base = process.env.FLEET_DAEMON_URL;
+const job = process.env.FLEET_JOB_ID;
+const token = process.env.FLEET_RUNNER_TOKEN;
+const headers = { "content-type": "application/json", "x-fleet-runner-token": token };
+let seq = 0;
+const post = async (ev) => {
+  const res = await fetch(base + "/internal/jobs/" + job + "/events", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ job, seq: seq++, ...ev }),
+  });
+  if (!res.ok) throw new Error("post failed: " + res.status + " " + (await res.text()));
+};
+await post({ type: "state", state: "running" });
+if (process.env.FLEET_TEST_RETAIN === "1") {
+  await post({
+    type: "log",
+    who: "runner",
+    text: ${JSON.stringify(RETAINED_WORKSPACE_NOTE)} + "evidence-copy-for-manual-inspection (work push failed)",
+  });
+}
+await post({
+  type: "settle",
+  rung: "implemented",
+  minutes: 1,
+  outcome: { produced: [], findings: 0, decisions: 0 },
+});
+await post({ type: "state", state: "done" });
+`;
+
+test("cleanly settled docker job is reaped; retained-workspace container is not", async (t) => {
+  const log = stubDockerOnPath(t);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "settle-runner.mjs");
+  writeFileSync(runnerPath, DOCKER_SETTLE_RUNNER);
+
+  const provider = new DockerProvider({
+    runnerCmd: [process.execPath, runnerPath],
+    defaultImage: "node:22",
+  });
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0, longPollMs: 400 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const createJob = async (env?: Record<string, string>) => {
+    const created = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST, ...(env ? { env } : {}) });
+    assert.equal(created.status, 201, created.body);
+    return jobOf(created.json).id;
+  };
+  const state = async (id: string) => jobOf((await op(sock, "GET", `/jobs/${id}`)).json).state;
+
+  // Retained first so its fake container id sorts before the control's.
+  const retainedId = await createJob({ FLEET_TEST_RETAIN: "1" });
+  const controlId = await createJob();
+  await until(async () => (await state(retainedId)) === "done", 10_000);
+  await until(async () => (await state(controlId)) === "done", 10_000);
+
+  // The guard condition must actually have been exercised: the retain note
+  // rides in the retained job's event log ahead of the terminal state.
+  const events = parseNdjson((await op(sock, "GET", `/jobs/${retainedId}/events`)).body);
+  const noted = events.some(
+    (event) =>
+      typeof event === "object" && event !== null && "type" in event && event.type === "log" &&
+      "text" in event && typeof event.text === "string" && event.text.startsWith(RETAINED_WORKSPACE_NOTE),
+  );
+  assert.ok(noted, "retain note must precede settle");
+
+  // Deterministic completion signal: wait until the CONTROL job (no retain
+  // note) has been reaped — by then the retained job's terminal effects have
+  // long since run, so absence of its reap is not a race.
+  await until(
+    () => argvCalls(log).some((c) => c[0] === "rm" && c[2] === "deadbeef000000000002"),
+    10_000,
+  );
+
+  // The cleanly settled control container was removed...
+  assert.ok(argvCalls(log).some((c) => c[0] === "rm" && c[2] === "deadbeef000000000002"));
+  // ...while the retained workspace kept its stopped container.
+  assert.equal(
+    argvCalls(log).filter((c) => c[0] === "rm" && c[2] === "deadbeef000000000001").length,
+    0,
+    "a retained workspace keeps its stopped container",
+  );
+});

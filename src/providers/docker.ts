@@ -49,6 +49,11 @@ export class DockerProvider implements Provider {
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {
+    // Remove any stale container from a prior run (parked-then-resumed, crashed
+    // re-entry) before launching: `docker run --name fleet-<jobId>` fails with
+    // "already in use" when the old container still owns the name. `rm -f`
+    // succeeds even when no container exists, so there is no race to guard.
+    await run("docker", ["rm", "-f", `fleet-${spec.jobId}`]);
     const { stdout } = await run("docker", this.buildRunArgs(spec));
     const containerId = stdout.trim();
     if (containerId.length === 0) throw new Error("docker run returned no container id");
