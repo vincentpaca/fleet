@@ -35,6 +35,16 @@ export type LaunchSpec = {
 export interface Provider {
   readonly name: string;
   launch(spec: LaunchSpec): Promise<{ handle: string }>;
+  /**
+   * Stop the sandbox named by `handle`.
+   *
+   * Termination is idempotent (#122): a sandbox that is already gone resolves
+   * successfully instead of throwing. Cancel and the crash backstops are
+   * Fleet's structural spend control — their correctness must not depend on
+   * the substrate — so "not found" from docker or ECS counts as success
+   * (`isMissingResourceError`). Transient substrate failures may be retried
+   * once, bounded, before surfacing.
+   */
   terminate(handle: string): Promise<void>;
   /**
    * Optional: validate that the requested resources fit within the offered capacity.
@@ -71,9 +81,26 @@ export type TunnelOpener = (localPort: number) => Promise<TunnelEndpoint>;
 /**
  * Shells out to a cloud's own CLI and returns stdout. Every provider that talks
  * to its cloud by shelling out takes one of these, so tests can drive the real
- * command construction without the cloud.
+ * command construction without the cloud. Callers doing real work pass the
+ * call's kill budget as `timeoutMs`; the default runner kills the child process
+ * at it, so a wedged CLI can neither hang the caller nor keep the event loop
+ * alive long after the caller has given up.
  */
-export type CloudCliRunner = (args: string[]) => Promise<string>;
+export type CloudCliRunner = (args: string[], timeoutMs?: number) => Promise<string>;
+
+/**
+ * Whether a terminate() failure means the sandbox was already gone (#122).
+ * Termination is idempotent by contract, so providers treat these as success:
+ * `docker rm -f` names the container on stderr; the ECS API raises
+ * TaskNotFoundException or reports the task already stopped. Matches both the
+ * error message and any captured stderr, because execFile reports the child's
+ * output separately from its message.
+ */
+export function isMissingResourceError(error: unknown): boolean {
+  const err = error as { message?: unknown; stderr?: unknown };
+  const text = `${String(err?.message ?? "")} ${typeof err?.stderr === "string" ? err.stderr : ""}`;
+  return /No such container|TaskNotFoundException|already stopped/i.test(text);
+}
 
 /** FLEET_* env every provider injects into the sandbox. */
 export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, string> {

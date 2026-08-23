@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { CloudCliRunner, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
-import { runnerEnv, materializationEnv } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, materializationEnv } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -302,9 +302,22 @@ export function buildPortForwardArgs(target: string, remotePort: number, localPo
  */
 export const AWS_CLI_TIMEOUT_MS = 10_000;
 
-/** Shell out to `aws` and return stdout. Injectable so the opener is testable without AWS. */
-export const awsCli: CloudCliRunner = async (args) =>
-  (await run("aws", args, { timeout: AWS_CLI_TIMEOUT_MS })).stdout;
+/**
+ * Dispatch and cancel budgets (#122): `run-task` provisions capacity, so it
+ * earns a larger budget than the tunnel path above — but finite, so a wedged
+ * CLI settles the daemon's launch or cancel path into its error handling
+ * instead of hanging it forever. Pinned by test/daemon-providers.test.ts.
+ */
+export const ECS_RUN_TASK_TIMEOUT_MS = 120_000;
+export const ECS_STOP_TASK_TIMEOUT_MS = 30_000;
+
+/**
+ * Shell out to `aws` and return stdout, killing the child at `timeoutMs`
+ * (default: the tunnel-path budget). Injectable so callers are testable
+ * without AWS.
+ */
+export const awsCli: CloudCliRunner = async (args, timeoutMs = AWS_CLI_TIMEOUT_MS) =>
+  (await run("aws", args, { timeout: timeoutMs })).stdout;
 
 /**
  * Tunnel opener for an ECS deployment: list the service's running task, read the
@@ -326,12 +339,20 @@ export function ecsTunnelOpener(access: EcsDaemonAccess, aws: CloudCliRunner = a
 
 const CONTAINER_WORKSPACE = "/workspace";
 
+/** EcsProvider construction options. */
+export type EcsProviderOptions = {
+  /** Shell-out to `aws`; defaults to the budget-killing awsCli. Injectable for tests. */
+  aws?: CloudCliRunner;
+};
+
 export class EcsProvider implements Provider {
   readonly name = "ecs";
   readonly config: EcsConfig;
+  readonly #aws: CloudCliRunner;
 
-  constructor(config: EcsConfig) {
+  constructor(config: EcsConfig, options: EcsProviderOptions = {}) {
     this.config = config;
+    this.#aws = options.aws ?? awsCli;
   }
 
   /** argv after `aws` — pure function, unit-tested without AWS. */
@@ -400,18 +421,28 @@ export class EcsProvider implements Provider {
     checkResourceFit(resources, this.config.capacityTiers);
   }
 
-  async launch(spec: LaunchSpec): Promise<{ handle: string }> {
-    const { stdout } = await run("aws", this.buildRunTaskArgs(spec));
-    const result = JSON.parse(stdout) as { tasks?: { taskArn?: string }[]; failures?: unknown[] };
-    const taskArn = result.tasks?.[0]?.taskArn;
-    if (!taskArn) {
-      throw new Error(`ecs run-task launched no task: ${JSON.stringify(result.failures ?? result)}`);
+  /**
+   * Run one `aws` call under its phase budget (#122): the deadline races the
+   * CLI so the daemon's launch/cancel path settles either way, and the same
+   * value is passed down so the real child process is killed rather than left
+   * holding the event loop after the caller has given up.
+   */
+  async #cli(args: string[], budgetMs: number): Promise<string> {
+    const { promise, reject } = Promise.withResolvers<never>();
+    const timer = setTimeout(
+      () => reject(new Error(`aws ${args[0]} ${args[1]} exceeded its ${budgetMs}ms budget`)),
+      budgetMs,
+    );
+    try {
+      return await Promise.race([this.#aws(args, budgetMs), promise]);
+    } finally {
+      clearTimeout(timer);
     }
-    return { handle: taskArn };
   }
 
-  async terminate(handle: string): Promise<void> {
-    await run("aws", [
+  /** argv after `aws` for stopping one task — pure function, unit-tested without AWS. */
+  buildStopTaskArgs(handle: string): string[] {
+    return [
       "ecs",
       "stop-task",
       "--cluster",
@@ -422,6 +453,33 @@ export class EcsProvider implements Provider {
       "fleet-cancel",
       "--output",
       "json",
-    ]);
+    ];
+  }
+
+  async launch(spec: LaunchSpec): Promise<{ handle: string }> {
+    const stdout = await this.#cli(this.buildRunTaskArgs(spec), ECS_RUN_TASK_TIMEOUT_MS);
+    const result = JSON.parse(stdout) as { tasks?: { taskArn?: string }[]; failures?: unknown[] };
+    const taskArn = result.tasks?.[0]?.taskArn;
+    if (!taskArn) {
+      throw new Error(`ecs run-task launched no task: ${JSON.stringify(result.failures ?? result)}`);
+    }
+    return { handle: taskArn };
+  }
+
+  async terminate(handle: string): Promise<void> {
+    // One bounded retry (#122): a transient stop-task failure must not mark a
+    // job cancelled while its task keeps running. Not-found is success —
+    // termination is idempotent by the Provider contract.
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await this.#cli(this.buildStopTaskArgs(handle), ECS_STOP_TASK_TIMEOUT_MS);
+        return;
+      } catch (error) {
+        if (isMissingResourceError(error)) return;
+        lastError = error;
+      }
+    }
+    throw lastError;
   }
 }
