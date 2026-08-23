@@ -90,7 +90,7 @@ you publish elsewhere.
 ## Inputs
 
 | Name | Type | Default | Description |
-|------|------|---------|-------------|
+| ------ | ------ | --------- | ------------- |
 | `name` | `string` | `"fleet"` | Prefix for every resource name. |
 | `tags` | `map(string)` | `{}` | Extra tags for all taggable resources. |
 | `vpc_id` | `string` | `null` | Existing VPC to reuse; `null` creates a dedicated VPC. |
@@ -111,7 +111,7 @@ you publish elsewhere.
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ------ | ------------- |
 | `cluster_arn` / `cluster_name` | The ECS cluster. |
 | `daemon_service_name` | The daemon ECS service. |
 | `runner_repository_url` | ECR URL for the fleet runner image. |

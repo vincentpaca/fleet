@@ -53,7 +53,7 @@ Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
 ## The contracts
 
 | Contract | Schema | Consumed by |
-|---|---|---|
+| --- | --- | --- |
 | Manifest — what a sandbox needs to be this repo's environment | `schemas/manifest.schema.json` | CLI (lint, delegate), daemon (dispatch validation), runner (gate, harness command) |
 | Work order — what one dispatch says: mode, target, permissions, finish line | `schemas/work-order.schema.json` | CLI (built from `presets/modes.json` + flags), daemon |
 | Events — what a running job emits | `schemas/events.schema.json` | runner (emits), daemon (validates at intake), CLI and any UI (render) |
