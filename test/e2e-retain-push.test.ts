@@ -113,7 +113,10 @@ async function dispatch(r: Rig, target: string): Promise<string> {
   const delegated = await r.fleet(['delegate', target, '--mode', 'implement', '--finish', 'implemented']);
   const jobId = delegated.stdout.trim().split(/\s+/).find((w) => w.startsWith('job-'));
   assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
-  const deadline = Date.now() + 30_000;
+  // Generous on purpose: this loop polls and exits early, so a big budget only
+  // matters when the machine is loaded (full suite in parallel) — exactly when
+  // the old 30s lost. See issue #130.
+  const deadline = Date.now() + 120_000;
   for (;;) {
     const { stdout } = await r.fleet(['status', jobId]);
     if (/\b(done|cancelled)\b/i.test(stdout)) return jobId;

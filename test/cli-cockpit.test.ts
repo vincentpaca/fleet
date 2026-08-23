@@ -690,8 +690,11 @@ test('a dispatch the CLI would refuse is refused in the cockpit too, and says wh
   // And it stays put. This daemon answers no /health, so the tunnel check is
   // failing in the same seconds — background notices must not talk over what the
   // operator just did, or a refused command reads as an unrelated port message.
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  assert.match(cockpit.frame(), /unknown mode "conquer"/, 'the refusal is still the thing on screen');
+  // No fixed sleep: wait for the first tunnel probe to settle (the header strip
+  // stops saying "tunnel:…"), so any notice it could post has had its chance,
+  // then judge the refusal on the settled frame.
+  await noLongerShows(cockpit, 'tunnel:…');
+  await nowShows(cockpit, 'unknown mode "conquer"', 'the refusal is still the thing on screen');
   assert.doesNotMatch(cockpit.frame(), /accepts connections/, 'the tunnel note waited its turn');
   // The cockpit survives it: a refused command is a notice, not an exit.
   assert.match(cockpit.frame(), /› _/, 'and the line is ready for the next command');
