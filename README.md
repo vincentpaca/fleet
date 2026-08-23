@@ -1,4 +1,5 @@
 # Fleet
+
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/771617780d6943a18b5acc2d0125536c)](https://app.codacy.com/gh/vincentpaca/fleet/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 [![Codacy Badge](https://app.codacy.com/project/badge/Coverage/771617780d6943a18b5acc2d0125536c)](https://app.codacy.com/gh/vincentpaca/fleet/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
 
@@ -98,7 +99,7 @@ Users consume three things: the npm package (CLI, daemon, runner, schemas), a Te
 
 Start with [AGENTS.md](AGENTS.md) — build/test mechanics, the invariants that break if you're not looking, the delivery standard for commits and PRs. The deeper context: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way — settled calls are reopened with a human, not relitigated in code), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs and must carry acceptance criteria before the pickup gate lets anyone — human or agent — start them.
 
-```
+```sh
 npm install
 npm test
 ```
@@ -109,4 +110,4 @@ Rules the schemas enforce, because prose rules get ignored: every command names 
 
 Fleet is **source-available** under the [PolyForm Shield License 1.0.0](LICENSE.md): use it, modify it, self-host it — commercially included — and contribute back. The one thing the license forbids is offering a product or service that competes with Fleet. It is not an OSI open-source license, deliberately; the same terms protect [AutoGPT's platform](https://github.com/Significant-Gravitas/AutoGPT) and [Micro](https://m3o.org/company/licensing.html).
 
-Required Notice: Copyright © 2026 the Fleet maintainers (github.com/<org>/fleet)
+Required Notice: Copyright © 2026 the Fleet maintainers (`github.com/<org>/fleet`)

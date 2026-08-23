@@ -16,6 +16,7 @@ reach zero instances when the cluster is idle, and scale back out when a new job
 **Access model: SSM only.** No security group accepts inbound traffic from the public
 internet. Operators reach the daemon HTTP API via an SSM port-forward, which `fleet connect`
 opens and holds (the `connect_hint` output is the same thing by hand). Intra-VPC ingress rules:
+
 - Runner tasks (instances SG) → daemon TCP port
 - Daemon + instances → EFS NFS port (2049)
 
@@ -161,7 +162,7 @@ smoke, API-shaped goes in the suite.
   worker ASG can reach zero while the daemon stays up. Runner tasks reach the daemon on
   `daemon_tcp_port` (default 9000) through the daemon security group; no inbound rule
   opens a path from outside the VPC.
-- The daemon logs four `fleet daemon: ` lines at boot to its log group — `FLEET_HOME`,
+- The daemon logs four `fleet daemon:`-prefixed lines at boot to its log group — `FLEET_HOME`,
   provider, config source (the fleet-config SSM parameter name, never its contents), and
   the listen address. The last line is the one that says it is up: a task stream with the
   first three and no `listening on` is stuck before bind, so read the stream before
