@@ -1146,6 +1146,33 @@ test("docker terminate still surfaces real failures (#122)", async (t) => {
   });
   await assert.rejects(new DockerProvider().terminate("abc123"), /daemon/);
 });
+test("docker terminate stops the container before removing it (#111)", async (t) => {
+  const log = stubDockerOnPath(t);
+  await new DockerProvider().terminate("abc123");
+
+  // `rm -f` is SIGKILL with no grace: on its own, the runner's cancel teardown
+  // never receives a signal, so a cancelled job's uncommitted work is gone.
+  // `stop -t` is what buys the teardown its SIGTERM and its window to push.
+  const calls = argvCalls(log);
+  assert.equal(calls[0]?.[0], "stop", `expected a stop first; got ${JSON.stringify(calls)}`);
+  assert.equal(calls[0]?.[1], "-t");
+  assert.ok(Number(calls[0]?.[2]) > 8, "the grace must outlast the runner's cancel deadline");
+  assert.equal(calls[0]?.[3], "abc123");
+  assert.deepEqual(calls[1], ["rm", "-f", "abc123"]);
+});
+
+test("docker terminate removes the container even when the stop fails (#111)", async (t) => {
+  // The reaper (#120) calls terminate on a container that has already exited,
+  // where `stop` has nothing to do. A stop failure must never block the removal.
+  const bin = fakeDockerBin("Error response from daemon: No such container: abc123");
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  await new DockerProvider().terminate("abc123");
+});
+
 // --- Docker lifecycle: rm-before-run + reap on clean settle (#120) ------------
 
 /** Prefix of the retain note the real runner composes (src/runner/settle.ts). */

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -261,6 +261,46 @@ test('decisionSeed: watcher starts counting past the seed so ids stay unique acr
       JSON.parse(readFileSync(join(outDir, 'answer-d2.json'), 'utf8')),
       { option: 's3' },
     );
+  } finally {
+    await watcher.stop();
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('a decision file replaced while an answer was pending is not deleted unseen (#111)', async () => {
+  const token = 'test-token-replace';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-dec-'));
+  const outDir = join(workspace, '.fleet', 'out');
+  mkdirSync(outDir, { recursive: true });
+  const decisionPath = join(outDir, 'decision.json');
+
+  const sink = new EventSink({ jobId: 'job-dec-replace', daemonUrl: daemon.url, token });
+  const watcher = new DecisionWatcher({ workspace, sink, intervalMs: 25 });
+  watcher.start();
+  try {
+    writeFileSync(decisionPath, JSON.stringify(VALID_DECISION));
+    await until(() => daemon.events.some((e) => e.type === 'decision' && e.id === 'd1'));
+
+    // While d1's answer is still pending, the harness stages a second question
+    // over the same path — the documented write-via-rename contract, used by a
+    // harness that does not wait for the answer file before asking again.
+    const second = { ...VALID_DECISION, question: 'A second question, staged while d1 waited' };
+    writeFileSync(`${decisionPath}.tmp`, JSON.stringify(second));
+    renameSync(`${decisionPath}.tmp`, decisionPath);
+
+    daemon.answer('d1', { option: 's3' });
+    await until(() => existsSync(join(outDir, 'answer-d1.json')));
+
+    // An unconditional delete after the answer lands drops the staged question
+    // on the floor: the harness waits forever for an answer to a question the
+    // daemon was never told about.
+    daemon.answer('d2', { option: 'efs' });
+    await until(() => existsSync(join(outDir, 'answer-d2.json')));
+    const raised = daemon.events.filter((e) => e.type === 'decision');
+    assert.deepEqual(raised.map((e) => e.id), ['d1', 'd2']);
+    assert.equal(raised[1]!.question, second.question);
   } finally {
     await watcher.stop();
     rmSync(workspace, { recursive: true, force: true });

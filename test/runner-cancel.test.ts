@@ -29,7 +29,17 @@ const cancelHarness = fileURLToPath(new URL('../fixtures/cancel-harness.mjs', im
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 
-async function waitFor(done: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
+/**
+ * 45s, not 15s. These cases spawn a real runner that clones a bare remote,
+ * runs the pickup gate, and boots two cold node processes before anything
+ * heartbeats — and they run alongside the whole suite, on a machine whose cores
+ * are already committed. At 15s the setup raced the deadline and the failure
+ * read "the harness never beat", which says nothing about the teardown the test
+ * exists to check (the same trap #130 documented for the stall sweeps). The
+ * threshold is irrelevant to the path under test; the headroom is not — every
+ * assertion about what the teardown did stays bounded on its own.
+ */
+async function waitFor(done: () => boolean, what: string, timeoutMs = 45_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!done()) {
     assert.ok(Date.now() < deadline, `timed out after ${timeoutMs}ms waiting for ${what}`);
@@ -60,7 +70,11 @@ function makeRemote(): string {
   return bare;
 }
 
-function writeWorkspace(limits: Record<string, string>, target = '111'): string {
+function writeWorkspace(
+  limits: Record<string, string>,
+  target = '111',
+  pickup = 'node -e "process.exit(0)"',
+): string {
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-cancel-'));
   mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
   writeFileSync(
@@ -73,7 +87,7 @@ function writeWorkspace(limits: Record<string, string>, target = '111'): string 
         cli: 'claude-code',
         commands: [{ path: '.claude/commands/dev.md', critic: 'code-reviewer' }],
       },
-      gates: { pickup: 'node -e "process.exit(0)"' },
+      gates: { pickup },
       limits,
     }),
   );
@@ -123,10 +137,13 @@ test('cancel: SIGTERM during an active run kills the SIGTERM-trapping tree, push
     FLEET_GIT_NAME: 'Operator One',
     FLEET_GIT_EMAIL: 'op@example.com',
     FLEET_HARNESS_CMD: `node ${cancelHarness}`,
-    FLEET_WALL_CLOCK_GRACE_MS: '500',
-    // Tight cancel deadline so the test is bounded; the teardown must
-    // complete (kill + WIP push + settle) inside this window.
-    FLEET_CANCEL_DEADLINE_MS: '3000',
+    // Deliberately NOT setting FLEET_WALL_CLOCK_GRACE_MS or
+    // FLEET_CANCEL_DEADLINE_MS. endHarness and drainOutput default to the
+    // wall-clock grace (30s in production), and a test that shrinks it to 500ms
+    // proves the teardown works only in a configuration no deployment runs:
+    // with the real grace, killing a SIGTERM-trapping harness consumed the
+    // whole cancel budget and the push and settle never happened. Production
+    // values, or this checks nothing.
   });
   try {
     // Prove the tree is up and beating BEFORE the cancel.
@@ -142,7 +159,9 @@ test('cancel: SIGTERM during an active run kills the SIGTERM-trapping tree, push
     // The runner must exit within a bounded time — not hang forever.
     const outcome = await Promise.race([
       exitCode.then((code) => `exit ${code}`),
-      sleep(15_000).then(() => 'still running'),
+      // Above the 20s cancel deadline: what is under test is that the teardown
+      // completes and exits, not how close to its own ceiling it runs.
+      sleep(40_000).then(() => 'still running'),
     ]);
     assert.equal(outcome, 'exit 1', 'the cancel path must terminate the runner within a deadline');
 
@@ -317,5 +336,97 @@ test('cancel: watcher.stop() aborts a long-poll even when the daemon holds the c
     }
     rmSync(workspace, { recursive: true, force: true });
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+// --- 5: a hung pickup gate is bounded, and SIGTERM-proof ---------------------
+
+test('cancel: a pickup gate that hangs and ignores SIGTERM is killed and reported, not left to wedge the runner', async () => {
+  const token = 'cancel-token-5';
+  const daemon = await startMockDaemon({ token });
+  // The gate traps SIGTERM and never exits. spawnSync's default killSignal is
+  // SIGTERM, so on the timeout it kills nothing and keeps blocking — the event
+  // loop stays wedged and only the daemon's stall backstop eventually reaps the
+  // job, minutes later, with no runner-side diagnosis at all.
+  const workspace = writeWorkspace(
+    { idle: '60s' },
+    '111',
+    `node -e "process.on('SIGTERM', () => {}); setInterval(() => {}, 50)"`,
+  );
+  try {
+    const started = Date.now();
+    const code = await spawnRunner({
+      FLEET_JOB_ID: 'job-cancel-gate',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_WALL_CLOCK_GRACE_MS: '500',
+      FLEET_GATE_TIMEOUT_MS: '1500',
+    }).exitCode;
+    const elapsed = Date.now() - started;
+
+    assert.equal(code, 1);
+    assert.ok(elapsed < 12_000, `the gate must be bounded; the runner took ${elapsed}ms`);
+
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle, 'a hung gate must still settle so the operator gets a next action');
+    assert.match(
+      JSON.stringify(settle.report),
+      /pickup gate timed out/,
+      `the settle must name the gate as the cause; got ${JSON.stringify(settle.report)}`,
+    );
+    const last = daemon.events.at(-1);
+    assert.equal(last?.state, 'cancelled');
+    assert.equal(last?.reason, 'pickup-gate');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+// --- 6: the deadline is real — a teardown that cannot finish still exits -----
+
+test('cancel: when the deadline expires the tree is killed and the runner exits anyway', async () => {
+  const token = 'cancel-token-6';
+  const daemon = await startMockDaemon({ token });
+  const workspace = writeWorkspace({ idle: '60s' });
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-cancel-deadline',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_HARNESS_CMD: `node ${cancelHarness}`,
+    // Smaller than the SIGTERM grace the harness will sit through, so the
+    // teardown cannot possibly finish. The point of the deadline is that this
+    // still ends: a cancelled runner that hangs is the zombie #111 is about,
+    // and on the process provider nothing else is coming to kill it.
+    FLEET_CANCEL_DEADLINE_MS: '600',
+  });
+  try {
+    await waitFor(
+      () => heartbeat(workspace, 'harness') !== '' && heartbeat(workspace, 'child') !== '',
+      'the harness and its child to beat at least once',
+    );
+    assert.ok(child.pid !== undefined);
+    process.kill(child.pid, 'SIGTERM');
+
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(15_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 1');
+
+    // And the tree went with it — the deadline branch escalates to SIGKILL.
+    const before = { harness: heartbeat(workspace, 'harness'), child: heartbeat(workspace, 'child') };
+    await sleep(1_000);
+    assert.equal(heartbeat(workspace, 'harness'), before.harness, 'harness survived the deadline kill');
+    assert.equal(heartbeat(workspace, 'child'), before.child, 'child survived the deadline kill');
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
   }
 });
