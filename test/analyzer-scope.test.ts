@@ -6,7 +6,7 @@
 // out of scope?".
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -67,15 +67,28 @@ const CODACY_EXCLUSIONS = [
   'agents/**',
   '.claude/**',
   'LICENSE.md',
+  '.fleet/manifest.json',
+  '.fleet/.gitignore',
 ];
 
 // The pinned list above is only as good as the claim that none of it is code.
-// Every entry beyond the build harness is prose or vendored licence text; that
-// is the line the list is allowed to hold. .fleet/ is BUILD side too and stays
-// in scope, because gate.mjs and setup.sh execute. Spelled out as its own
-// assertion so that adding `src/**` to both this file and .codacy.yaml — the
-// one-diff way to silence the scanner — still fails.
-const CODE_BEARING = ['src/', 'schemas/', 'presets/', 'examples/', 'integrations/', 'images/', 'infra/', '.fleet/', 'docs/'];
+// Every entry beyond the build harness is prose, vendored licence text, or
+// declarative config; that is the line the list is allowed to hold. Spelled out
+// as its own assertion so that adding `src/**` to both this file and
+// .codacy.yaml — the one-diff way to silence the scanner — still fails.
+const CODE_BEARING = ['src/', 'schemas/', 'presets/', 'examples/', 'integrations/', 'images/', 'infra/', 'docs/'];
+
+// .fleet/ is the awkward one: BUILD side and mostly config, so its manifest and
+// .gitignore are excluded above — but gate.mjs decides whether a dispatch is
+// ready to pick up, and setup.sh runs inside the sandbox. A prefix rule cannot
+// express "the config but not the code", so the two executables are named. The
+// move this catches is a later `.fleet/**` that quietly swallows both.
+const MUST_STAY_SCANNED = ['.fleet/gate.mjs', '.fleet/setup.sh'];
+
+/** Does an exclude_paths entry (a literal path, or a `dir/**` glob) cover this file? */
+function covers(entry: string, file: string): boolean {
+  return entry === file || (entry.endsWith('/**') && file.startsWith(entry.slice(0, -2)));
+}
 
 // Coverage has the same shape of hole as the analyzers, with a louder incentive
 // behind it: a threshold someone has to meet is one `--test-coverage-exclude`
@@ -115,6 +128,18 @@ test('no Codacy exclusion reaches into a tree that carries code', () => {
       !reaches,
       `Codacy exclusion \`${entry}\` reaches into ${reaches} — that tree ships or runs; ` +
         'silencing an analyzer over it is a human call, not a config edit',
+    );
+  }
+});
+
+test('the executables under .fleet/ stay in Codacy scope', () => {
+  const excluded = listAfter(readFileSync(join(root, '.codacy.yaml'), 'utf8'), 'exclude_paths');
+  for (const file of MUST_STAY_SCANNED) {
+    assert.ok(existsSync(join(root, file)), `${file} is gone — retire it from MUST_STAY_SCANNED too`);
+    const swallowed = excluded.find((entry) => covers(entry, file));
+    assert.ok(
+      !swallowed,
+      `Codacy exclusion \`${swallowed}\` takes ${file} out of scope — it executes, so that is a human call`,
     );
   }
 });

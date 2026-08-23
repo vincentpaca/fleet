@@ -33,11 +33,16 @@
 #                         must stay unfixed: editing a standard license to
 #                         please a linter changes the licence document.
 #
-# Deliberately NOT excluded, though it is BUILD side: .fleet/**. It holds
-# gate.mjs and setup.sh — executable code that runs against GitHub issue data
-# and inside the sandbox. Prose files get excluded here; code does not.
-# docs/**, README.md and infra/**/README.md stay in scope too: those are shipped
-# and a human reads them.
+#   .fleet/manifest.json  This repo's own Fleet config, and .fleet/.gitignore
+#   .fleet/.gitignore     with it. Declarative data — schemas/ already validates
+#                         the manifest, which is the check that matters.
+#
+# .fleet/ is NOT excluded as a tree, deliberately. gate.mjs is 241 lines of Node
+# that shells out to `gh` and parses issue bodies, and setup.sh runs inside the
+# sandbox. Both stay scanned, and test/analyzer-scope.test.ts pins them so a
+# later `.fleet/**` sweep has to take them out loudly. Config gets excluded
+# here; code does not. docs/**, README.md and infra/**/README.md stay in scope
+# for the same reason — those are shipped and a human reads them.
 exclude_paths:
   - 'test/**'
   - 'fixtures/**'
@@ -47,3 +52,5 @@ exclude_paths:
   - 'agents/**'
   - '.claude/**'
   - 'LICENSE.md'
+  - '.fleet/manifest.json'
+  - '.fleet/.gitignore'
