@@ -1,9 +1,12 @@
 // Fleet daemon HTTP client: unix socket ($FLEET_HOME/daemon.sock) or FLEET_DAEMON_URL.
-// node:http because fetch() cannot speak unix sockets.
-import http from 'node:http';
+// A thin layer over ../shared/http.ts — the one http.request wrapper in the
+// codebase, with connection pooling disabled there (a kept-alive socket to a
+// restarted daemon's stale unix socket would EPIPE).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+import { request as httpRequest } from '../shared/http.ts';
 
 export type DaemonResponse = {
   status: number;
@@ -27,6 +30,8 @@ export type RequestOptions = {
    * otherwise the socket outlives the reason for it.
    */
   signal?: AbortSignal;
+  /** Extra request headers merged over the built-ins; caller keys win. */
+  headers?: Record<string, string>;
 };
 
 export type Target =
@@ -150,7 +155,7 @@ export async function daemonHealthy(
   }
 }
 
-export function request(
+export async function request(
   method: string,
   reqPath: string,
   body?: unknown,
@@ -158,56 +163,31 @@ export function request(
 ): Promise<DaemonResponse> {
   const target = daemonTarget(opts.env ?? process.env, { cwd: opts.cwd });
   const payload = body === undefined ? undefined : JSON.stringify(body);
-  const requestOptions: http.RequestOptions = {
+  const res = await httpRequest({
     method,
     path: target.kind === 'tcp' ? `${target.basePath}${reqPath}` : reqPath,
-    headers: payload === undefined
-      ? { accept: 'application/json' }
-      : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+    ...(target.kind === 'tcp'
+      ? { host: target.host, port: target.port }
+      : { socketPath: target.socketPath }),
+    headers: {
+      accept: 'application/json',
+      ...(payload === undefined
+        ? {}
+        : { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) }),
+      ...opts.headers,
+    },
+    body: payload,
+    // No timeoutMs here on purpose: the shared client applies its default, so
+    // a caller that forgets one cannot hang forever either.
+    timeoutMs: opts.timeoutMs,
     signal: opts.signal,
-  };
-  if (target.kind === 'tcp') {
-    requestOptions.host = target.host;
-    requestOptions.port = target.port;
-  } else {
-    requestOptions.socketPath = target.socketPath;
+    onLine: opts.onLine,
+  });
+  let json: unknown;
+  try {
+    json = res.body === '' ? undefined : JSON.parse(res.body);
+  } catch {
+    json = undefined; // non-JSON body (e.g. an ndjson dump); caller reads body directly
   }
-
-  const { promise, resolve, reject } = Promise.withResolvers<DaemonResponse>();
-  const req = http.request(requestOptions, (res) => {
-    let full = '';
-    let pending = '';
-    res.setEncoding('utf8');
-    res.on('data', (chunk: string) => {
-      full += chunk;
-      if (!opts.onLine) return;
-      pending += chunk;
-      let nl = pending.indexOf('\n');
-      while (nl !== -1) {
-        const line = pending.slice(0, nl).trim();
-        pending = pending.slice(nl + 1);
-        if (line !== '') opts.onLine(line);
-        nl = pending.indexOf('\n');
-      }
-    });
-    res.on('end', () => {
-      const tail = pending.trim();
-      if (opts.onLine && tail !== '') opts.onLine(tail);
-      let json: unknown;
-      try {
-        json = full === '' ? undefined : JSON.parse(full);
-      } catch {
-        json = undefined;
-      }
-      resolve({ status: res.statusCode ?? 0, body: full, json });
-    });
-    res.on('error', reject);
-  });
-  req.setTimeout(opts.timeoutMs ?? 60_000, () => {
-    req.destroy(new Error('daemon request timed out'));
-  });
-  req.on('error', reject);
-  if (payload !== undefined) req.write(payload);
-  req.end();
-  return promise;
+  return { status: res.status, body: res.body, json };
 }
