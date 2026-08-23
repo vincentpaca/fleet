@@ -67,8 +67,9 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
         const { ok, errors } = validateEvent(event);
         const seq = (event as PostedEvent).seq;
         if (!ok || typeof seq !== 'number' || seq <= lastSeq) {
-          rejected.push({ event, errors: ok ? ['seq not monotonic'] : errors });
-          res.writeHead(422).end(JSON.stringify({ errors }));
+          const rejectErrors = ok ? [`seq must be monotonically increasing: got ${seq} after ${lastSeq}`] : errors;
+          rejected.push({ event, errors: rejectErrors });
+          res.writeHead(422).end(JSON.stringify({ errors: rejectErrors }));
           return;
         }
         lastSeq = seq;

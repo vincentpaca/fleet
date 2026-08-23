@@ -9,10 +9,16 @@
  * cancelled reason "pickup-gate" → exit) → spawn harness → translate
  * stream-json stdout to events → settle → state done (or settle partial +
  * state cancelled reason "harness-exit" on nonzero harness exit).
+ *
+ * Stream events are fire-and-forget into the sink's bounded retry queue
+ * (issue #109): emit() cannot reject, the stdout reader pauses when the
+ * buffer is near-full, and sink.flush() drains before settle/park. Dropped
+ * events are counted and surface in the settle notes.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createWriteStream, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -62,8 +68,19 @@ async function main(): Promise<void> {
       // Ignore malformed env; proceed without pre-materialised answer.
     }
   }
-
-  const sink = new EventSink({ jobId, daemonUrl, token });
+  // Event delivery backpressure (#109): when the sink's bounded buffer is
+  // near-full, pause the harness stdout reader instead of queueing without
+  // bound; resume below the low watermark. The hook is wired to the
+  // readline interface once it exists.
+  const EVENT_PAUSE_AT = 128;
+  const EVENT_RESUME_AT = 32;
+  let manageBackpressure: (() => void) | undefined;
+  const sink = new EventSink({
+    jobId,
+    daemonUrl,
+    token,
+    onDepth: () => manageBackpressure?.(),
+  });
   await sink.emit({ type: 'state', state: 'running' });
 
   let manifest: Record<string, unknown>;
@@ -242,6 +259,9 @@ async function main(): Promise<void> {
   // FLEET_STREAM_CAPTURE polluted a calibration fixture; FLEET_GIT_URL made
   // nested test-runners attempt real clones.
   const capture = process.env.FLEET_STREAM_CAPTURE;
+  // Lazily-opened append stream for FLEET_STREAM_CAPTURE (#109 minor):
+  // one buffered writer instead of a synchronous append per line.
+  let captureStream: WriteStream | undefined;
   const childEnv = {
     ...(plan.env ?? {}),
     ...Object.fromEntries(
@@ -276,8 +296,26 @@ async function main(): Promise<void> {
     if (stderrTail.length > 20) stderrTail.shift();
   });
 
-  const emits: Promise<unknown>[] = [];
+  // Fire-and-forget stream delivery (#109): emit() cannot reject, but every
+  // pushed emit still gets a .catch so an unexpected failure is recorded to
+  // stderr — never an orphaned rejection. Ordering and completion are the
+  // sink's business; the runner awaits sink.flush() before settling.
+  const forget = (pending: Promise<unknown>): void => {
+    pending.catch((err) => {
+      console.error(`runner: event emit rejected: ${String(err instanceof Error ? err.message : err)}`);
+    });
+  };
   const lines = createInterface({ input: child.stdout });
+  let outputPaused = false;
+  manageBackpressure = () => {
+    if (!outputPaused && sink.depth >= EVENT_PAUSE_AT) {
+      outputPaused = true;
+      lines.pause();
+    } else if (outputPaused && sink.depth <= EVENT_RESUME_AT) {
+      outputPaused = false;
+      lines.resume();
+    }
+  };
   // Liveness coalescing (#50). The translator drops the harness's own
   // heartbeats, so a job inside one long tool call is alive on stdout and
   // silent on the event stream — and the daemon's backstop only sees the
@@ -290,7 +328,10 @@ async function main(): Promise<void> {
     // Any output line is proof of life, translatable or not: the stall clock
     // measures silence on the harness's own stream, not event throughput.
     idle.touch();
-    if (capture) appendFileSync(capture, line + '\n');
+    if (capture) {
+      captureStream ??= createWriteStream(capture, { flags: 'a' });
+      captureStream.write(line + '\n');
+    }
     const translated = translateLine(line);
     if (translated.length === 0) {
       // The translator dropped this line. Coalesce: one heartbeat per window,
@@ -298,7 +339,7 @@ async function main(): Promise<void> {
       const now = Date.now();
       if (now - lastEmitAt >= heartbeatWindow) {
         lastEmitAt = now;
-        emits.push(sink.emit({
+        forget(sink.emit({
           type: 'log',
           who: 'runner',
           text: `harness working — ${toMinutes(now - startedAt)}m elapsed, no reportable output`,
@@ -311,8 +352,8 @@ async function main(): Promise<void> {
     // trigger a heartbeat one line before the settle.
     const bodies = translated.filter((item) => item.type !== 'result');
     lastEmitAt = Date.now();
-    if (bodies.length === 1) emits.push(sink.emit(bodies[0]));
-    else if (bodies.length > 1) emits.push(sink.emitBatch(bodies));
+    if (bodies.length === 1) forget(sink.emit(bodies[0]));
+    else if (bodies.length > 1) forget(sink.emitBatch(bodies));
   });
 
   const exit = Promise.withResolvers<number>();
@@ -381,6 +422,14 @@ async function main(): Promise<void> {
     });
   };
 
+  /** Close the FLEET_STREAM_CAPTURE writer so buffered lines hit disk. */
+  const endCapture = (): Promise<void> => {
+    if (captureStream === undefined) return Promise.resolve();
+    const stream = captureStream;
+    captureStream = undefined;
+    return new Promise<void>((resolve) => stream.end(resolve));
+  };
+
   // Park signal: resolves with the decision id when block_hot fires.
   // Silently never resolves if blockHotMs is not set.
   const parkPromise = watcher.parked.then(
@@ -416,7 +465,8 @@ async function main(): Promise<void> {
     // The harness is still running (waiting for its answer); terminate it now.
     await endHarness();
     await drainOutput();
-    await Promise.all(emits);
+    await sink.flush();
+    await endCapture();
     await watcher.stop(); // already stopped internally; awaits the loop wind-down
 
     if (gitUrl && branch) {
@@ -473,7 +523,8 @@ async function main(): Promise<void> {
   }
 
   await drainOutput();
-  await Promise.all(emits);
+  await sink.flush();
+  await endCapture();
   await watcher.stop();
 
   // Deliver the work (#2): commit and push whatever the harness produced —
@@ -600,6 +651,7 @@ async function main(): Promise<void> {
     startedAt,
     decisions: watcher.count,
     workspace,
+    ...(sink.dropped > 0 ? { droppedEvents: sink.dropped } : {}),
     produced: artifactProduced,
     workPushed,
     ...(settleRung !== undefined ? { rung: settleRung } : {}),

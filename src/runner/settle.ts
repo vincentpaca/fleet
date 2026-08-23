@@ -49,12 +49,24 @@ export function composeSettle(opts: {
    * a settle note — and therefore into the event log.
    */
   retainedWorkspace?: string;
+  /**
+   * Cumulative count of events dropped by the runner's delivery sink
+   * (issue #109): exhausted retries or buffer shedding. Any nonzero count
+   * becomes a settle note so transcript gaps are visible to the operator.
+   */
+  droppedEvents?: number;
 }): SettleComposition {
   const notes: string[] = [];
   if (opts.retainedWorkspace !== undefined) {
     notes.push(
       `workspace retained at ${opts.retainedWorkspace} (work push failed) — ` +
       `retry the push with: fleet resume-push ${opts.jobId}`,
+    );
+  }
+  if ((opts.droppedEvents ?? 0) > 0) {
+    notes.push(
+      `${opts.droppedEvents} event(s) dropped during the run: event delivery ` +
+      `failed or the event buffer overflowed — the transcript has gaps`,
     );
   }
   const minutes = toMinutes(Date.now() - opts.startedAt);
