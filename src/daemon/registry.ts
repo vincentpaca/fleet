@@ -16,11 +16,14 @@ import { join } from "node:path";
 import { validateEvent } from "../validate.mjs";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { jobDir } from "../shared/home.ts";
+import { isTerminal } from "./state.ts";
 import type { JobState, Marker } from "./state.ts";
 
 export type StoredEvent = {
   job: string;
   seq: number;
+  /** The runner's claimed seq, stored on the event for dedup-by-content. */
+  runnerSeq?: number;
   at?: string;
   type: string;
   [key: string]: unknown;
@@ -91,11 +94,20 @@ type JobEntry = {
   internal: JobInternal;
   events: StoredEvent[];
   lastSeq: number;
+  /** True when in-memory state diverged from job.json but the persist is deferred (coalescing). */
+  dirty: boolean;
 };
 
 export class Registry extends EventEmitter {
   readonly home: string;
   #jobs = new Map<string, JobEntry>();
+  /**
+   * When true, persist-calling methods (updateJob, clearMarker, wallClock*, …)
+   * defer the write and only set `entry.dirty`. The caller is responsible for
+   * calling `flushPersist` once the batch is done. This lets `#intakeOne`
+   * coalesce 3–6 separate job.json writes into one.
+   */
+  #batching = false;
 
   constructor(home: string) {
     super();
@@ -104,13 +116,59 @@ export class Registry extends EventEmitter {
     this.#loadAll();
   }
 
+  /**
+   * Run boot reconciliation for all loaded non-terminal jobs. Must be called
+   * after `setApplyEffectsFn` — the reconciler replays through the real
+   * effects function, and that callback is set by the daemon after construction.
+   */
+  reconcileAll(): void {
+    for (const [id, entry] of this.#jobs) {
+      this.#reconcile(id, entry);
+    }
+  }
+
+  /**
+   * Callback set by the daemon to replay event effects on a record. The
+   * reconciler uses the same effects function intake uses — not a parallel
+   * reimplementation — so the two paths can never drift.
+   */
+  #applyEffectsFn: ((job: JobRecord, event: StoredEvent) => void) | null = null;
+
+  /** Set the effects callback used for boot reconciliation. */
+  setApplyEffectsFn(fn: (job: JobRecord, event: StoredEvent) => void): void {
+    this.#applyEffectsFn = fn;
+  }
+
   #loadAll(): void {
     const jobsRoot = join(this.home, "jobs");
     if (!existsSync(jobsRoot)) return;
     for (const id of readdirSync(jobsRoot).sort()) {
-      const recordPath = join(jobsRoot, id, "job.json");
+      const dir = join(jobsRoot, id);
+      const recordPath = join(dir, "job.json");
       if (!existsSync(recordPath)) continue;
-      const raw = JSON.parse(readFileSync(recordPath, "utf8")) as JobRecord & JobInternal;
+
+      // Tolerant boot: a torn or empty job.json (host crash mid-rename) must
+      // not brick the daemon. Quarantine the corrupt job and keep loading the
+      // rest — one bad file never crash-loops the whole process.
+      let raw: JobRecord & JobInternal;
+      try {
+        const text = readFileSync(recordPath, "utf8");
+        if (text.trim().length === 0) throw new Error("job.json is empty");
+        raw = JSON.parse(text) as JobRecord & JobInternal;
+        if (typeof raw.id !== "string" || typeof raw.state !== "string") {
+          throw new Error("job.json missing required fields");
+        }
+      } catch (err) {
+        const corruptPath = join(jobsRoot, `${id}.corrupt`);
+        console.error(`fleet: quarantining corrupt job ${id}: ${String(err)}`);
+        try {
+          renameSync(dir, corruptPath);
+        } catch (renameErr) {
+          console.error(`fleet: failed to quarantine ${id}: ${String(renameErr)}`);
+        }
+        continue;
+      }
+
       const {
         lastRunnerSeq, openDecision,
         wallClockMs, wallClockActiveMs, wallClockActiveSince,
@@ -119,12 +177,26 @@ export class Registry extends EventEmitter {
         launchManifest, launchEnv, launchSync, launchImage,
         ...record
       } = raw;
-      const eventsPath = join(jobsRoot, id, "events.jsonl");
-      const events = existsSync(eventsPath)
-        ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
-        : [];
+      const eventsPath = join(dir, "events.jsonl");
+      let events: StoredEvent[];
+      try {
+        events = existsSync(eventsPath)
+          ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
+          : [];
+      } catch (err) {
+ // The events log is corrupted beyond a truncated trailing line. Quarantine
+ // like a bad job.json — the job cannot be served safely with a broken log.
+        const corruptPath = join(jobsRoot, `${id}.corrupt`);
+        console.error(`fleet: quarantining job ${id} (events.jsonl corrupt): ${String(err)}`);
+        try {
+          renameSync(dir, corruptPath);
+        } catch (renameErr) {
+          console.error(`fleet: failed to quarantine ${id}: ${String(renameErr)}`);
+        }
+        continue;
+      }
       const lastSeq = events.length > 0 ? events[events.length - 1].seq : -1;
-      this.#jobs.set(id, {
+      const entry: JobEntry = {
         record,
         internal: {
           lastRunnerSeq: lastRunnerSeq ?? null,
@@ -143,17 +215,107 @@ export class Registry extends EventEmitter {
         },
         events,
         lastSeq,
-      });
+        dirty: false,
+      };
+      this.#jobs.set(id, entry);
+    }
+  }
+
+  /**
+   * Compare the card (job.json) against the journal's tail. If the last state
+   * event in the log disagrees with `record.state`, replay the effects of all
+   * events from the point of divergence. The journal is authoritative; the
+   * card is derived.
+   *
+   * Settled (done/cancelled) jobs are NOT reconciled — their journals are not
+   * re-read at boot (issue #118's cost requirement); the trusted snapshot wins.
+   */
+  #reconcile(id: string, entry: JobEntry): void {
+    if (isTerminal(entry.record.state)) return;
+    if (!this.#applyEffectsFn) return;
+    // Find the last state event in the journal.
+    let lastStateEvent: StoredEvent | null = null;
+    for (let i = entry.events.length - 1; i >= 0; i--) {
+      if (entry.events[i].type === "state") {
+        lastStateEvent = entry.events[i];
+        break;
+      }
+    }
+    if (!lastStateEvent) return;
+    const journalState = (lastStateEvent as { state: string }).state;
+    if (journalState === entry.record.state) return;
+
+    // Disagreement: the journal says the job is in a different state than the
+    // card. Replay from the beginning through the real effects function so the
+    // card converges with the journal. The effects function mutates the record
+    // in-place; we must not persist mid-replay (batching).
+    console.error(
+      `fleet: boot reconciliation — job ${id} card says ${entry.record.state} but journal says ${journalState}; replaying`,
+    );
+    // Reset the record to its pre-event state by replaying all events.
+    // The effects function re-derives state, settle, doneCheck, etc.
+    this.#batching = true;
+    try {
+      for (const event of entry.events) {
+        this.#applyEffectsFn(entry.record, event);
+      }
+      this.#writeJobJson(entry);
+    } finally {
+      this.#batching = false;
     }
   }
 
   #persist(entry: JobEntry): void {
+    if (this.#batching) {
+      entry.dirty = true;
+      return;
+    }
+    this.#writeJobJson(entry);
+  }
+
+  /** Write job.json to disk (tmp + rename). Callers must flush `entry.dirty`. */
+  #writeJobJson(entry: JobEntry): void {
     const dir = jobDir(this.home, entry.record.id);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "job.json");
     const payload = JSON.stringify({ ...entry.record, ...entry.internal }, null, 2);
     writeFileSync(`${path}.tmp`, payload);
     renameSync(`${path}.tmp`, path);
+    entry.dirty = false;
+    this.#persistCount++;
+  }
+
+  /** Number of job.json writes since construction (test instrumentation). */
+  #persistCount = 0;
+
+  /** Total job.json persist count since construction (test seam). */
+  persistCount(): number {
+    return this.#persistCount;
+  }
+
+  /**
+   * Persist deferred writes. Called once at the end of a batched intake to
+   * coalesce multiple in-memory mutations into a single job.json write.
+   */
+  flushPersist(id: string): void {
+    const entry = this.#entry(id);
+    if (!entry.dirty) return;
+    this.#writeJobJson(entry);
+  }
+
+  /**
+   * Begin a batch: subsequent persist-calling methods defer job.json writes
+   * until `endBatch` flushes them. The journal (events.jsonl) is still
+   * appended immediately — it is the source of truth and must be durable.
+   */
+  beginBatch(): void {
+    this.#batching = true;
+  }
+
+  /** End a batch and flush the deferred job.json write for the given job. */
+  endBatch(id: string): void {
+    this.#batching = false;
+    this.flushPersist(id);
   }
 
   createJob(record: JobRecord): void {
@@ -177,6 +339,7 @@ export class Registry extends EventEmitter {
       },
       events: [],
       lastSeq: -1,
+      dirty: false,
     };
     this.#jobs.set(record.id, entry);
     this.#persist(entry);
@@ -265,6 +428,18 @@ export class Registry extends EventEmitter {
 
   eventsAfter(id: string, after: number): StoredEvent[] {
     return this.#entry(id).events.filter((event) => event.seq > after);
+  }
+
+  /**
+   * Find the stored event that was logged with a given runner-claimed seq.
+   * Used by intake's dedup-by-content check: a retried event whose payload
+   * matches the stored event is acknowledged as a duplicate rather than
+   * rejected. The runner's claimed seq is stored on the event as `runnerSeq`.
+   */
+  findEventByRunnerSeq(id: string, runnerSeq: number): StoredEvent | undefined {
+    return this.#entry(id).events.find(
+      (event) => event.runnerSeq === runnerSeq,
+    );
   }
 
   /** Find the answer event for a decision id, if any. */

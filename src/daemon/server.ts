@@ -11,7 +11,7 @@ import { validateManifest, validateWorkOrder, validateEvent } from "../validate.
 import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
-import { operatorTokenPath, socketPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
+import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import type { JobRecord, StoredEvent } from "./registry.ts";
@@ -95,6 +95,7 @@ export type DaemonOptions = {
 };
 
 type IntakeError = { status: number; errors: unknown[] };
+type IntakeResult = IntakeError | { deduped: true } | null;
 
 /** Wire shape for operator responses: the runner token never leaves the daemon. */
 function publicJob(record: JobRecord): Omit<JobRecord, "runnerToken"> {
@@ -193,8 +194,12 @@ export class FleetDaemon {
     this.#operatorToken = options.operatorToken;
     mkdirSync(options.home, { recursive: true });
     this.registry = new Registry(options.home);
+    // Wire the effects function so the registry can replay events at boot
+    // for log-authoritative reconciliation (issue #113).
+    this.registry.setApplyEffectsFn((job, event) => this.#applyEffects(job, event));
+    // Reconcile any non-terminal jobs whose card disagrees with the journal.
+    this.registry.reconcileAll();
   }
-
   /** URL the runner uses to reach this daemon (TCP preferred when enabled). */
   get daemonUrl(): string {
     if (this.#port !== null) return `http://${this.#tcpHost}:${this.#port}`;
@@ -206,6 +211,10 @@ export class FleetDaemon {
   }
 
   async start(): Promise<{ socketPath: string; port: number | null }> {
+    // Single-writer lock (issue #112): O_EXCL pidfile on $FLEET_HOME/daemon.lock.
+    // A second daemon against the same home refuses; a stale lock from a dead
+    // daemon (PID no longer alive) is reclaimed.
+    this.#acquireLock();
     if (existsSync(this.#sockPath)) unlinkSync(this.#sockPath);
     const handler = (req: IncomingMessage, res: ServerResponse) => {
       this.#route(req, res).catch((error: unknown) => {
@@ -256,8 +265,66 @@ export class FleetDaemon {
     this.#unixServer = null;
     this.#tcpServer = null;
     this.#port = null;
+    this.#releaseLock();
+  }
+  /**
+   * Acquire the single-writer lock (issue #112). Uses O_EXCL to create a
+   * pidfile atomically; if it already exists, checks whether the PID inside
+   * is still alive. A live PID refuses (another daemon owns the home); a dead
+   * PID is reclaimed (stale lock from a crashed daemon). Throws on refusal.
+   */
+  #acquireLock(): void {
+    const lockPath = daemonLockPath(this.#options.home);
+    const pid = process.pid;
+    try {
+      // O_EXCL: atomically create-or-fail. If this succeeds, we own the lock.
+      // Write our PID so a later contender can check staleness.
+      writeFileSync(lockPath, `${pid}\n`, { flag: "wx", mode: 0o600 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      // Lock file exists — check if the holding PID is alive.
+      let existingPid: number | null = null;
+      try {
+        const content = readFileSync(lockPath, "utf8").trim();
+        existingPid = Number(content);
+        if (!Number.isInteger(existingPid) || existingPid <= 0) existingPid = null;
+      } catch {
+        // Can't read the lock file (permissions, race). Refuse to be safe.
+        throw new Error(`fleet: daemon lock held by another process (cannot read ${lockPath})`);
+      }
+      if (existingPid !== null && this.#pidAlive(existingPid)) {
+        throw new Error(`fleet: daemon already running (pid ${existingPid}) on ${this.#options.home}`);
+      }
+      // Stale lock: the PID is dead. Reclaim by overwriting with our PID.
+      writeFileSync(lockPath, `${pid}\n`, { mode: 0o600 });
+    }
   }
 
+  /** Release the single-writer lock if we hold it. */
+  #releaseLock(): void {
+    const lockPath = daemonLockPath(this.#options.home);
+    try {
+      // Only remove if our PID is in the file (don't steal a live daemon's lock).
+      if (existsSync(lockPath)) {
+        const content = readFileSync(lockPath, "utf8").trim();
+        if (content === String(process.pid)) {
+          unlinkSync(lockPath);
+        }
+      }
+    } catch {
+      // Best-effort cleanup; a leftover lock file is reclaimed on next boot.
+    }
+  }
+
+  /** Check whether a PID is alive (0 signal = existence check). */
+  #pidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   async #route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://fleet.invalid");
     const method = req.method ?? "GET";
@@ -616,6 +683,14 @@ export class FleetDaemon {
         });
       }
     }
+    // Re-check after async terminate (issue #113): a done/settle event may
+    // have landed during the await. Copy #cancelFromBackstop's guard — a
+    // done event landing during provider.terminate must not be overwritten
+    // with cancelled.
+    const afterTerminate = this.registry.getJob(job.id);
+    if (!afterTerminate || isTerminal(afterTerminate.state)) {
+      return sendJson(res, 409, { error: `job already ${afterTerminate?.state ?? "gone"}` });
+    }
     this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "operator-cancel" });
     this.registry.setOpenDecision(job.id, null);
     this.registry.setDecisionBlockedAt(job.id, null);
@@ -639,18 +714,39 @@ export class FleetDaemon {
     if (claimedEvents.length === 0) return sendJson(res, 400, { error: "empty event batch" });
 
     let appended = 0;
+    let deduped = 0;
     for (const claimed of claimedEvents) {
-      const failure = this.#intakeOne(job, claimed);
-      if (failure) {
-        return sendJson(res, failure.status, { errors: failure.errors, appended });
+      const result = this.#intakeOne(job, claimed);
+      if (result && "status" in result) {
+        return sendJson(res, result.status, { errors: result.errors, appended });
       }
-      appended += 1;
+      if (result && "deduped" in result) {
+        deduped += 1;
+      } else {
+        appended += 1;
+      }
     }
-    return sendJson(res, 200, { appended });
+    return sendJson(res, 200, { appended, ...(deduped > 0 ? { deduped } : {}) });
   }
 
-  /** Validate and apply a single runner event. Returns an error instead of appending on any violation. */
-  #intakeOne(job: JobRecord, claimed: unknown): IntakeError | null {
+  /**
+   * Validate and apply a single runner event. Returns an error on violation,
+   * `{deduped: true}` when a retried event is acknowledged as a duplicate,
+   * or null on success.
+   *
+   * Ordering (issue #113): appendEvent runs BEFORE setLastRunnerSeq — the
+   * journal is the source of truth and must be durable before any derived
+   * state. A crash between append and seq-record produces a retried duplicate
+   * (safe to dedupe) rather than a permanently lost event.
+   *
+   * Dedup-by-content: a retried seq whose payload matches the stored event →
+   * `{deduped: true}`. A reused seq with different content → 422 (the
+   * tripwire that keeps orphan runners and seq bugs loud).
+   *
+   * Coalescing: all job.json writes during applyEffects are batched into one
+   * flushPersist at the end — one snapshot write per intake event.
+   */
+  #intakeOne(job: JobRecord, claimed: unknown): IntakeResult {
     const { ok, errors } = validateEvent(claimed);
     if (!ok) return { status: 422, errors };
     // Schema-validated just above: claimed carries job/seq/type plus per-type fields.
@@ -659,8 +755,16 @@ export class FleetDaemon {
     if (event.job !== job.id) {
       return { status: 422, errors: [`event.job "${event.job}" does not match job ${job.id}`] };
     }
+
+    // Dedup-by-content (issue #113): a retried seq that already has a stored
+    // event is either a benign duplicate (same payload → 200 deduped) or a
+    // real conflict (different payload → 422). Never dedupe on seq alone.
     const lastRunnerSeq = this.registry.lastRunnerSeq(job.id);
     if (lastRunnerSeq !== null && event.seq <= lastRunnerSeq) {
+      const existing = this.registry.findEventByRunnerSeq(job.id, event.seq);
+      if (existing && this.#eventsMatch(existing, event)) {
+        return { deduped: true };
+      }
       return {
         status: 422,
         errors: [`seq must be monotonically increasing: got ${event.seq} after ${lastRunnerSeq}`],
@@ -699,13 +803,41 @@ export class FleetDaemon {
       };
     }
 
-    // Accepted: record the runner's claimed seq, then append with the
-    // authoritative log seq (daemon-appended events share the sequence).
-    this.registry.setLastRunnerSeq(job.id, event.seq);
+    // Accepted. Append to the journal FIRST (issue #113: append-before-seq).
+    // The journal is the source of truth; if we crash after this but before
+    // recording the seq, the retry is safely deduped by content.
     const { job: _job, seq: _seq, ...payload } = event;
-    this.registry.appendEvent(job.id, payload);
-    this.#applyEffects(job, event);
+    // Stamp the runner's claimed seq on the stored event for dedup lookups.
+    payload.runnerSeq = event.seq;
+
+    // Batch: coalesce all job.json writes from appendEvent + applyEffects
+    // into one persist at the end.
+    this.registry.beginBatch();
+    try {
+      this.registry.appendEvent(job.id, payload);
+      // Record the runner's claimed seq AFTER the journal append (issue #113).
+      this.registry.setLastRunnerSeq(job.id, event.seq);
+      this.#applyEffects(job, event);
+    } finally {
+      this.registry.endBatch(job.id);
+    }
     return null;
+  }
+
+  /** Compare a stored event against a claimed event for dedup-by-content. */
+  #eventsMatch(stored: StoredEvent, claimed: StoredEvent): boolean {
+    // Compare the meaningful payload fields, ignoring daemon-assigned seq,
+    // the runnerSeq dedup field, and the daemon-stamped `at`. The runner's
+    // claimed seq is the same (that's how we found the stored event); the
+    // daemon's log seq differs by construction. Sort keys for stable
+    // comparison regardless of insertion order.
+    const strip = (e: StoredEvent) => {
+      const { seq, runnerSeq, at, ...rest } = e;
+      return rest;
+    };
+    const canon = (o: Record<string, unknown>) =>
+      JSON.stringify(o, Object.keys(o).sort());
+    return canon(strip(stored)) === canon(strip(claimed));
   }
 
   #applyEffects(job: JobRecord, event: StoredEvent): void {

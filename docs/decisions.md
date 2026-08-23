@@ -72,3 +72,11 @@ Accepting that is not the same as accepting the boundary is unguarded. What actu
 - Artifacts are the files the collector walked out of `.fleet/out/artifacts/`, sized by the bytes read, under a per-file and a total cap.
 
 This decision expires if any of four things changes: the daemon becomes reachable from outside the operator's own network path; artifact paths start coming from a work order or an event instead of the directory walk; the answer written to `.fleet/out/` starts being consumed as anything but data; or a job's files start arriving from a source the operator did not name. Any of those makes the queries right and this entry wrong.
+
+## D15 — The event journal is the single source of truth; job.json is a reconciled snapshot
+
+Per job, `events.jsonl` is authoritative. `job.json` exists for fast boot and O(1) listing — at load it is verified against the journal's tail and repaired by replaying the same effects function intake uses, and every repair is logged loudly. Intake appends to the journal before recording any derived state, and writes the snapshot exactly once per event — never mid-intake; the write-count test is the checkpoint. The runner's claimed seq is stored on the event, making intake idempotent by content: a retried seq whose payload matches the stored event is acknowledged as a duplicate; a reused seq with different content is rejected. Dedup means "I already have exactly this," never "I'll ignore whatever this is."
+
+Full event sourcing — `job.json` as a disposable cache rebuilt by replay — was considered and rejected: boot must not read settled jobs' journals (that cost grows with lifetime usage), so a trusted snapshot must exist; once it exists, reconciliation, not disposal, is the honest contract.
+
+Boot is tolerant of torn files (issue #112): a truncated final NDJSON line is dropped, a corrupt `job.json` is quarantined (renamed to `<id>.corrupt`), and the daemon loads the rest. A single-writer lock (`daemon.lock`, O_EXCL pidfile with stale-PID reclamation) prevents two daemons from sharing one home.

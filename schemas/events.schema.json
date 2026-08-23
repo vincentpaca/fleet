@@ -10,7 +10,8 @@
     "job": { "type": "string", "minLength": 1 },
     "seq": { "type": "integer", "minimum": 0, "description": "Monotonic per job; replay order." },
     "at": { "type": "string", "description": "Timestamp (ISO 8601) or date; optional on intermediate events." },
-    "type": { "enum": ["state", "phase", "progress", "pair", "agent", "think", "log", "decision", "answer", "settle"] }
+    "type": { "enum": ["state", "phase", "progress", "pair", "agent", "think", "log", "decision", "answer", "settle"] },
+    "runnerSeq": { "type": "integer", "minimum": 0, "description": "The runner's claimed seq for this event, stored by the daemon for dedup-by-content (issue #113). Optional and additive: existing journals validate untouched. Absent on daemon-originated events." }
   },
   "allOf": [
     {
