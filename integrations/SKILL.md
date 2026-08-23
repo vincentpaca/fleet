@@ -25,7 +25,7 @@ Two consequences worth knowing before you debug anything: the resolution reads t
 
 ## Dispatch
 
-```
+```sh
 fleet delegate <target> [--mode <assess|implement|investigate|followthrough|review|compare>] [--finish <rung>]
 ```
 
@@ -38,7 +38,7 @@ fleet delegate <target> [--mode <assess|implement|investigate|followthrough|revi
 
 Poll rather than block, so you stay responsive:
 
-```
+```sh
 fleet status <jobId>     # state: queued | running | blocked | done | cancelled
 fleet logs <jobId> --after <lastSeq>
 ```
@@ -55,10 +55,10 @@ A `decision` event carries: a question, two or more options with stable ids, exa
 2. NEVER answer yourself, never pick the recommendation silently, never let a timeout choose. This is the one thing Fleet's whole design exists to prevent, and the sandbox cannot reach the answer API to do it for you.
 3. Post the human's choice:
 
-```
-fleet answer <jobId> --option <id> [--text "supplement"]
-fleet answer <jobId> --text "free text answer"
-```
+   ```sh
+   fleet answer <jobId> --option <id> [--text "supplement"]
+   fleet answer <jobId> --text "free text answer"
+   ```
 
 4. Resume watching.
 
@@ -68,7 +68,7 @@ Report the settle event's status-first report to the human, leading with its `st
 
 If the settle's `produced[]` contains entries with `type: "file"`, the job delivered artifacts. List them to the human and offer to fetch them:
 
-```
+```sh
 fleet artifacts <jobId>               # list artifact paths and sizes
 fleet artifacts <jobId> get <path>    # stream artifact to stdout
 fleet artifacts <jobId> get <path> -o <dir>  # save to dir/<filename>

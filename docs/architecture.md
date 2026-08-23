@@ -4,7 +4,7 @@ How Fleet works, component by component. The JSON Schemas in `schemas/` are the 
 
 ## The pieces
 
-```
+```text
 your machine                      always-on (your AWS)            per job (your AWS)
 ------------                      --------------------            ------------------
 harness session or terminal       daemon (small ECS service)      container
@@ -25,7 +25,7 @@ harness session or terminal       daemon (small ECS service)      container
 
 Fleet containers use two image layers so the expensive base never rebuilds unnecessarily:
 
-```
+```text
 Layer 1 — runner base (Fleet publishes)
   fleet-runner:<harness-cli>-<cli_version>
   FROM node:22  +  harness CLI installed globally  +  Fleet runner source
@@ -53,7 +53,7 @@ Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
 ## The contracts
 
 | Contract | Schema | Consumed by |
-|---|---|---|
+| --- | --- | --- |
 | Manifest — what a sandbox needs to be this repo's environment | `schemas/manifest.schema.json` | CLI (lint, delegate), daemon (dispatch validation), runner (gate, harness command) |
 | Work order — what one dispatch says: mode, target, permissions, finish line | `schemas/work-order.schema.json` | CLI (built from `presets/modes.json` + flags), daemon |
 | Events — what a running job emits | `schemas/events.schema.json` | runner (emits), daemon (validates at intake), CLI and any UI (render) |
@@ -99,7 +99,6 @@ Invariant across all three: **watching is a view, never a lifeline.** Disconnect
 ## The finish line
 
 A work order names a target rung on the evidence ladder (`schemas/work-order.schema.json`, `$defs.rung`): inspected → implemented → focused-green → static-green → pushed → pr-open → ci-green → reviews-clear → mergeable → merge-ready → merged → deployed → runtime-accepted. The runner reports the rung actually reached; the daemon verifies claims mechanically where it can and records verified-vs-claimed. `merged` is always a human act. `deployed` and `runtime-accepted` exist on the ladder but cannot be targeted: Fleet never merges and never deploys, and jobs can never be granted those permissions (schema-invalid to request).
-
 
 ## The delivery model
 

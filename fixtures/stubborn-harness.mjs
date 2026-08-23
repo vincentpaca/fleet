@@ -10,8 +10,15 @@
 // Both processes tick a heartbeat file so a test can prove they actually
 // stopped: a pid check cannot, since a killed-but-unreaped process still
 // answers signal 0.
+//
+// The tick writes to a temp file and renames it, rather than writing the
+// heartbeat in place. writeFileSync truncates first, so a SIGKILL landing
+// between the truncate and the write leaves the heartbeat empty for good — and
+// this fixture exists to be SIGKILLed mid-tick. The test then read '' and
+// reported "the child never beat", blaming the fixture for the kill it was
+// asked to prove. rename is atomic: the file is never observed half-written.
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 process.on('SIGTERM', () => {});
@@ -27,7 +34,15 @@ line({ type: 'assistant', message: { content: [{ type: 'text', text: 'Working, a
 spawn(process.execPath, [
   '-e',
   `const fs = require('node:fs');` +
-  `setInterval(() => fs.writeFileSync(${JSON.stringify(beat('child'))}, String(Date.now())), 100);`,
+  `const f = ${JSON.stringify(beat('child'))};` +
+  `const tick = () => { fs.writeFileSync(f + '.tmp', String(Date.now())); fs.renameSync(f + '.tmp', f); };` +
+  `tick();` +
+  `setInterval(tick, 100);`,
 ], { stdio: ['ignore', 'inherit', 'inherit'] });
 
-setInterval(() => writeFileSync(beat('harness'), String(Date.now())), 100);
+const tick = () => {
+  writeFileSync(`${beat('harness')}.tmp`, String(Date.now()));
+  renameSync(`${beat('harness')}.tmp`, beat('harness'));
+};
+tick();
+setInterval(tick, 100);

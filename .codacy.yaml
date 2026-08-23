@@ -1,17 +1,56 @@
 ---
-# Codacy scope. Mirrors .github/codeql/codeql-config.yml — the build harness is
-# out of scope for both analyzers, for the same reason (see that file).
+# Codacy scope. Mirrors .github/codeql/codeql-config.yml for the build harness
+# (test/, fixtures/) — same trees, same reason (see that file). Codacy's list is
+# longer because it also lints prose and vendored text, which CodeQL does not.
 #
-# AGENTS.md is here because Codacy's gate is a plain count (issueThreshold: 0 —
-# any new issue fails the pull request), with no way to warn without blocking.
-# Codacy's Agentlinter reads AGENTS.md and reports prose opinions: sentence
-# length, bullets carrying several instructions, rules stated without an escape
-# hatch. Those are worth reading and are not merge blockers. Across four PRs,
-# Agentlinter and Lizard-on-test-files were the only things Codacy ever
-# reported here — nothing in src/, nothing security. Excluding this file is what
-# makes a threshold of zero mean "there is a problem in real code".
+# Codacy's gate is a plain count (issueThreshold: 0 — any new issue fails the
+# pull request), with no way to warn without blocking. So every path here is a
+# path where a finding could never be a merge blocker, and the exclusion is what
+# makes a threshold of zero mean "there is a problem in real code":
+#
+#   test/**, fixtures/**  The build harness. Never shipped
+#                         (test/packaging.test.ts owns that boundary), never fed
+#                         untrusted input. Lizard-on-test-files was one of only
+#                         two things Codacy ever reported in this repo.
+#
+#   node_modules/**       Vendored dependencies. Not ours to fix.
+#
+#   AGENTS.md, CLAUDE.md, The harness's own instruction files: rules, canonical
+#   agents/**, .claude/** playbooks, per-harness pointers (see the repository
+#                         map in AGENTS.md — one BUILD row, so one rule).
+#                         Agentlinter reads them and reports prose opinions:
+#                         sentence length, bullets carrying several
+#                         instructions, rules stated without an escape hatch.
+#                         Worth reading, never a blocker. Two of these files
+#                         also cannot be "fixed": CLAUDE.md is a single
+#                         `@AGENTS.md` import line, and the .claude/ pointers
+#                         are three-liners that test/harness-mirrors.test.ts
+#                         fails if they grow content — so a markdownlint
+#                         first-line-heading finding there has no legal fix.
+#
+#   LICENSE.md            PolyForm Shield 1.0.0, verbatim third-party text. Its
+#                         two bare-URL findings are real markdownlint hits and
+#                         must stay unfixed: editing a standard license to
+#                         please a linter changes the licence document.
+#
+#   .fleet/manifest.json  This repo's own Fleet config, and .fleet/.gitignore
+#   .fleet/.gitignore     with it. Declarative data — schemas/ already validates
+#                         the manifest, which is the check that matters.
+#
+# .fleet/ is NOT excluded as a tree, deliberately. gate.mjs is 241 lines of Node
+# that shells out to `gh` and parses issue bodies, and setup.sh runs inside the
+# sandbox. Both stay scanned, and test/analyzer-scope.test.ts pins them so a
+# later `.fleet/**` sweep has to take them out loudly. Config gets excluded
+# here; code does not. docs/**, README.md and infra/**/README.md stay in scope
+# for the same reason — those are shipped and a human reads them.
 exclude_paths:
   - 'test/**'
   - 'fixtures/**'
   - 'node_modules/**'
   - 'AGENTS.md'
+  - 'CLAUDE.md'
+  - 'agents/**'
+  - '.claude/**'
+  - 'LICENSE.md'
+  - '.fleet/manifest.json'
+  - '.fleet/.gitignore'
