@@ -566,9 +566,35 @@ export class Registry extends EventEmitter {
     );
   }
 
-  /** Count of decision events in the job's event log (for re-entry seeding, #110). */
-  decisionCount(id: string): number {
-    return this.#entry(id).events.filter((event) => event.type === "decision").length;
+  /**
+   * Seed for a re-entering runner's decision counter (#110): the highest
+   * ordinal already used by a `d<n>` id in the job's log, so the fresh runner's
+   * first id is the next unused one.
+   *
+   * Deliberately the maximum ordinal, not the number of decision events. Those
+   * are the same only while every decision the runner raised also reached the
+   * log; one rejected or dropped decision event and a count seeds *below* an id
+   * already in use, which is the collision this exists to prevent. Ids that are
+   * not `d<n>` (the schema allows any non-empty string) contribute their
+   * position instead, so an unusual id shape still moves the counter forward.
+   */
+  decisionSeed(id: string): number {
+    let seed = 0;
+    let seen = 0;
+    for (const event of this.#entry(id).events) {
+      if (event.type !== "decision") continue;
+      seen += 1;
+      const ordinal = /^d(\d+)$/.exec(String(event.id))?.[1];
+      seed = Math.max(seed, ordinal !== undefined ? Number(ordinal) : seen);
+    }
+    return seed;
+  }
+
+  /** True when a decision with this id is already in the job's log (#110). */
+  hasDecision(id: string, decisionId: string): boolean {
+    return this.#entry(id).events.some(
+      (event) => event.type === "decision" && event.id === decisionId,
+    );
   }
 
   /** Set the wall-clock limit for a job (called when the job is created). */

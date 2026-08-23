@@ -1001,7 +1001,7 @@ test("re-entry: new runner's decision does not receive the previous question's a
   assert.equal(ctx.provider.launches.length, 2, "re-launch expected");
   const relaunch = ctx.provider.launches[1]!;
   assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
-  assert.equal(relaunch.reentryDecisionCount, 1, "re-launch must seed decision count past prior ids");
+  assert.equal(relaunch.reentryDecisionSeed, 1, "re-launch must seed the counter past prior ids");
 
   // Generation 2: the fresh runner's counter is seeded at 1, so its first
   // decision is d2 — not a recycled d1.
@@ -1073,4 +1073,80 @@ test("re-entry: happy path — the legitimate answer to the parked question stil
   const d1Answer = events.find((e) => e.type === "answer" && e.decision === "d1");
   assert.ok(d1Answer, "d1 answer event must be in the log");
   assert.equal(d1Answer!.option, "flag");
+});
+
+test("re-entry: a recycled decision id is rejected, so no answer can be inherited (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+
+  // A runner that ignores the seed — an older build, or a harness numbering its
+  // own ids — raises a NEW question and calls it d1 again. The counter fix keeps
+  // the shipped runner off this path; the daemon has to refuse it anyway, or the
+  // answer a human gave to the first question is inherited by the second.
+  const newToken = ctx.provider.launches[1]!.runnerToken;
+  await runnerPost(ctx.sock, id, newToken, event(id, 0, { type: "state", state: "running" }));
+  const recycled = await runnerPost(ctx.sock, id, newToken, event(id, 1, {
+    ...DECISION,
+    question: "A completely different question",
+  }));
+  assert.equal(recycled.status, 422, recycled.body);
+  assert.match(recycled.body, /already used by this job/);
+
+  // The job stayed running: no second decision was opened, so there is nothing
+  // holding a stale answer.
+  assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "running");
+  const decisions = (parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>)
+    .filter((e) => e.type === "decision");
+  assert.equal(decisions.length, 1, "the recycled decision must not reach the log");
+});
+
+test("findAnswer ignores an answer recorded before its decision (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+  assert.ok(ctx.daemon.registry.findAnswer(id, "d1"), "the real answer resolves");
+
+  // Belt and braces behind the id-uniqueness rule: even handed a log where a
+  // decision id repeats — a journal written by an older daemon that allowed it —
+  // only an answer recorded AFTER the current decision may satisfy the poll.
+  // A first-match scan returns the previous generation's answer instantly.
+  ctx.daemon.registry.appendEvent(id, {
+    type: "decision",
+    id: "d1",
+    question: "A second question wearing the first one's id",
+    options: [{ id: "flag", label: "Flag", recommended: true }, { id: "skip", label: "Skip" }],
+  });
+  assert.equal(
+    ctx.daemon.registry.findAnswer(id, "d1"),
+    undefined,
+    "the earlier answer must not resolve the later decision",
+  );
+});
+
+test("the re-entry seed is the highest decision ordinal, not the decision count (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  // A journal that skips an ordinal: the runner raised d1 and d2, but only d2
+  // reached the log (a 422 on the first attempt, a dropped batch, an older
+  // build). There is one decision event carrying ordinal 2.
+  await runnerPost(ctx.sock, id, token, event(id, 1, { ...DECISION, id: "d2" }));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+
+  // Counting decision events gives 1, which seeds the fresh runner to emit d2 —
+  // the id already in the log, carrying an answer. The ordinal gives 2.
+  assert.equal(ctx.provider.launches[1]!.reentryDecisionSeed, 2);
 });

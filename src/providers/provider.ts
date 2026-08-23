@@ -31,11 +31,11 @@ export type LaunchSpec = {
    */
   reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
   /**
-   * Re-entry decision count (issue #110): the number of prior decisions in the
-   * job's event log, passed so the fresh runner seeds its counter past them and
-   * decision ids stay unique across park/resume generations.
+   * Re-entry decision seed (issue #110): the highest decision ordinal already
+   * used in the job's event log, passed so the fresh runner numbers from there
+   * and decision ids stay unique across park/resume generations.
    */
-  reentryDecisionCount?: number;
+  reentryDecisionSeed?: number;
 };
 
 export interface Provider {
@@ -121,8 +121,8 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
       ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
       : {}),
     // Re-entry decision seed: keep ids unique across generations (issue #110).
-    ...(spec.reentryDecisionCount !== undefined
-      ? { FLEET_REENTRY_DECISION_COUNT: String(spec.reentryDecisionCount) }
+    ...(spec.reentryDecisionSeed !== undefined
+      ? { FLEET_REENTRY_DECISION_SEED: String(spec.reentryDecisionSeed) }
       : {}),
   };
 }
