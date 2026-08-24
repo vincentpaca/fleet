@@ -597,6 +597,8 @@ export class FleetDaemon {
           workOrder: job.workOrder,
           resources,
           reentryAnswer: { decisionId: decision.id, answer: reAnswer },
+          // Seed the new runner's decision counter past prior ids (issue #110).
+          reentryDecisionSeed: this.registry.decisionSeed(job.id),
         });
         const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
         return sendJson(res, 200, { job: publicJob(updated) });
@@ -806,12 +808,26 @@ export class FleetDaemon {
     return null;
   }
 
-  /** Transition legality for a runner `decision` event. */
+  /** Transition legality and id uniqueness for a runner `decision` event. */
   #screenDecisionEvent(job: JobRecord, event: StoredEvent): IntakeError | null {
     if (!canTransition(job.state, "blocked")) {
       return {
         status: 422,
         errors: [`decision not accepted while ${job.state}: illegal transition ${job.state} -> blocked`],
+      };
+    }
+    // Decision ids are unique across a job's whole log (#110). Without this the
+    // uniqueness the re-entry seed buys is a convention, and a runner that
+    // recycles d1 — an old build, a harness numbering its own ids — silently
+    // inherits the answer a human gave to a different question. Rejecting is
+    // the loud failure; overwriting openDecision is the quiet one.
+    if (this.registry.hasDecision(job.id, String(event.id))) {
+      return {
+        status: 422,
+        errors: [
+          `decision id "${String(event.id)}" already used by this job; ` +
+          `ids must be unique across the whole log`,
+        ],
       };
     }
     return null;

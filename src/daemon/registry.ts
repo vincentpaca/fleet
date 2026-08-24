@@ -537,10 +537,63 @@ export class Registry extends EventEmitter {
     );
   }
 
-  /** Find the answer event for a decision id, if any. */
+  /**
+   * Find the answer event for a decision id, if any. Only an answer recorded
+   * AFTER the decision event matches (issue #110): on park/resume the fresh
+   * runner seeds its counter past prior ids, but as a belt-and-braces guard
+   * against id reuse the seq comparison prevents a recycled d1 from picking up
+   * a stale answer from an earlier generation.
+   */
   findAnswer(id: string, decisionId: string): StoredEvent | undefined {
-    return this.#entry(id).events.find(
-      (event) => event.type === "answer" && event.decision === decisionId,
+    const events = this.#entry(id).events;
+    // Locate the LAST decision event with this id — if ids are unique across
+    // generations (the runner-side seed), there is only one; if they collide,
+    // the most recent decision is the one currently open.
+    let decisionSeq = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]!;
+      if (e.type === "decision" && e.id === decisionId) {
+        decisionSeq = e.seq;
+        break;
+      }
+    }
+    if (decisionSeq < 0) return undefined;
+    return events.find(
+      (event) =>
+        event.type === "answer" &&
+        event.decision === decisionId &&
+        event.seq > decisionSeq,
+    );
+  }
+
+  /**
+   * Seed for a re-entering runner's decision counter (#110): the highest
+   * ordinal already used by a `d<n>` id in the job's log, so the fresh runner's
+   * first id is the next unused one.
+   *
+   * Deliberately the maximum ordinal, not the number of decision events. Those
+   * are the same only while every decision the runner raised also reached the
+   * log; one rejected or dropped decision event and a count seeds *below* an id
+   * already in use, which is the collision this exists to prevent. Ids that are
+   * not `d<n>` (the schema allows any non-empty string) contribute their
+   * position instead, so an unusual id shape still moves the counter forward.
+   */
+  decisionSeed(id: string): number {
+    let seed = 0;
+    let seen = 0;
+    for (const event of this.#entry(id).events) {
+      if (event.type !== "decision") continue;
+      seen += 1;
+      const ordinal = /^d(\d+)$/.exec(String(event.id))?.[1];
+      seed = Math.max(seed, ordinal !== undefined ? Number(ordinal) : seen);
+    }
+    return seed;
+  }
+
+  /** True when a decision with this id is already in the job's log (#110). */
+  hasDecision(id: string, decisionId: string): boolean {
+    return this.#entry(id).events.some(
+      (event) => event.type === "decision" && event.id === decisionId,
     );
   }
 

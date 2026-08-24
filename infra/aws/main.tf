@@ -555,6 +555,14 @@ resource "aws_ecs_task_definition" "runner" {
       cpu       = var.runner_cpu
       memory    = var.runner_memory
 
+      # Seconds between SIGTERM and SIGKILL when the daemon cancels a job
+      # (#111). The runner's cancel teardown kills the harness tree, pushes the
+      # work in progress and settles inside FLEET_CANCEL_DEADLINE_MS (20s); past
+      # this timeout ECS kills it mid-push and the uncommitted work is gone.
+      # Pinned rather than left to the ECS default so raising the runner's
+      # deadline cannot silently outgrow it.
+      stopTimeout = 30
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
