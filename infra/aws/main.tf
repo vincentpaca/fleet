@@ -445,17 +445,17 @@ resource "aws_launch_template" "instances" {
     name = aws_iam_instance_profile.instance.name
   }
 
-  # IMDSv2 is required; the hop limit stays at 2. Checkov CKV_AWS_341 wants 1,
-  # and 1 is the safer number — a container that can reach IMDS can assume the
-  # *instance* role, which is broader than any job's task role. But this line
-  # already says containers depend on it, so dropping it is a deployment change
-  # with a settled call behind it, not a lint fix. Reopen it with a human:
-  # if nothing in a job actually reads IMDS (task credentials come from the ECS
-  # credential endpoint at 169.254.170.2, which is not IMDS), this should be 1.
-  # See docs/decisions.md.
+  # IMDSv2 is required and the hop limit is 1, so a job's container cannot
+  # reach IMDS and assume the *instance* role — the escalation Fleet's
+  # permission split exists to prevent (#157, docs/decisions.md#d16). The old
+  # "containers need the instance role via IMDS" claim was checked and is
+  # false: nothing job-side reads IMDS. Task credentials come from the ECS
+  # credential endpoint at 169.254.170.2 (not IMDS, works at hop limit 1),
+  # image pulls use the execution role resolved by the ECS agent on the host,
+  # and ECS exec is the host's SSM agent. Pinned in test/infra-aws.test.ts.
   metadata_options {
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2 # containers need the instance role via IMDS
+    http_put_response_hop_limit = 1
   }
 
   user_data = base64encode(<<-EOT
@@ -621,6 +621,37 @@ resource "aws_efs_mount_target" "fleet_home" {
   security_groups = [aws_security_group.efs.id]
 }
 
+# The daemon container runs as uid 1000 (`USER node` in images/daemon/Dockerfile),
+# but EFS creates its filesystem root as root:root 0755 — unwritable at uid 1000.
+# The access point fixes ownership structurally: it roots the daemon's mount at
+# /fleet-home (created 1000:1000 on first mount) and forces every NFS request to
+# posix uid/gid 1000, so no by-hand chown is baked into any deploy path (#156,
+# docs/decisions.md#d16).
+#
+# Upgrading a deployment that predates this: state already written at the EFS
+# filesystem root is NOT visible through the access point until an operator
+# moves it into /fleet-home — see infra/aws/README.md.
+resource "aws_efs_access_point" "fleet_home" {
+  file_system_id = aws_efs_file_system.fleet_home.id
+
+  posix_user {
+    uid = 1000
+    gid = 1000
+  }
+
+  root_directory {
+    path = "/fleet-home"
+
+    creation_info {
+      owner_uid   = 1000
+      owner_gid   = 1000
+      permissions = "0755"
+    }
+  }
+
+  tags = merge(local.tags, { Name = "${var.name}-home" })
+}
+
 # --- CloudWatch logs -------------------------------------------------------------
 
 resource "aws_cloudwatch_log_group" "daemon" {
@@ -769,6 +800,12 @@ resource "aws_ecs_task_definition" "daemon" {
     efs_volume_configuration {
       file_system_id     = aws_efs_file_system.fleet_home.id
       transit_encryption = "ENABLED"
+
+      # The access point roots the mount at /fleet-home owned 1000:1000 and
+      # forces posix uid/gid 1000 — what lets the daemon container drop root.
+      authorization_config {
+        access_point_id = aws_efs_access_point.fleet_home.id
+      }
     }
   }
 

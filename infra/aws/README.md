@@ -87,6 +87,36 @@ docker run --privileged --rm tonistiigi/binfmt --install amd64
 `daemon_image` is still available if you would rather point the service at an image
 you publish elsewhere.
 
+## Upgrading an existing deployment: the EFS access point moves FLEET_HOME
+
+**If you deployed before the daemon dropped root (#156), applying this unit makes your
+existing daemon state invisible until you move it. Read this before you apply.**
+
+The daemon container now runs as uid 1000, and its EFS volume mounts through an
+access point (`aws_efs_access_point.fleet_home`) that roots the mount at
+`/fleet-home` inside the filesystem, owned `1000:1000`. Deployments that predate the
+access point wrote `FLEET_HOME` at the EFS filesystem root. That data is not deleted
+by the upgrade — but the access point does not show it: the upgraded daemon boots
+against an empty `/fleet-home` and starts fresh, with every existing job record still
+sitting at the root where the new mount cannot see it.
+
+The unit performs no data migration — moving live state is an operator's call, not a
+`terraform apply` side effect. To carry your state across:
+
+1. Scale the daemon service to zero so nothing writes during the move
+   (`aws ecs update-service --cluster <cluster> --service <name>-daemon --desired-count 0`).
+2. Mount the filesystem root *without* the access point from any host or task inside
+   the VPC (the mount targets accept NFS only from the instances and daemon security
+   groups — a container instance already in the cluster works).
+3. Move everything at the root into the access point's directory and hand it to the
+   daemon's uid: `mkdir -p /mnt/efs/fleet-home && mv /mnt/efs/<contents> /mnt/efs/fleet-home/`
+   then `chown -R 1000:1000 /mnt/efs/fleet-home`.
+4. Scale the daemon back to one. It boots on the moved state; `daemon.lock` from the
+   old task is reclaimed by the heartbeat logic, not by you.
+
+A fresh deployment needs none of this: the access point creates `/fleet-home` with
+the right ownership on first mount.
+
 ## Inputs
 
 | Name | Type | Default | Description |
