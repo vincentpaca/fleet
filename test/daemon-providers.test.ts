@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -391,7 +392,7 @@ test("ProcessProvider round-trips a fake runner: events, decision, answer, settl
   const created = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
   assert.equal(created.status, 201, created.body);
   const { id, handle } = (created.json as { job: { id: string; handle: string } }).job;
-  assert.match(handle, /^pid:\d+$/);
+  assert.match(handle, /^pid:\d+/);
 
   // The child process reaches the daemon over 127.0.0.1 and raises a decision.
   const state = async () =>
@@ -436,7 +437,7 @@ test("ProcessProvider.terminate kills the child and is idempotent", async () => 
 
   const provider = new ProcessProvider({ runnerPath, workspaceRoot });
   const { handle } = await provider.launch({ ...SPEC, daemonUrl: "http://127.0.0.1:1" });
-  const pid = Number(handle.replace("pid:", ""));
+  const pid = Number(/^pid:(\d+)/.exec(handle)![1]);
   assert.ok(pid > 0);
 
   await provider.terminate(handle);
@@ -552,6 +553,135 @@ test("ProcessProvider deletes the workspace and registers nothing without a reta
     10_000,
   );
   assert.ok(!existsSync(join(home, "retained")), "a delivered job leaves no retained record");
+});
+
+// --- Daemon-restart recovery + pid-identity (#123) -----------------------------
+// The exit handler that disposes of a workspace lives in the daemon; the runner
+// deliberately survives daemon death. These tests launch through a separate
+// process that exits immediately (fixtures/orphan-launcher.mjs) so the exit
+// handler is genuinely gone — exactly what a daemon restart leaves behind.
+
+const ORPHAN_LAUNCHER = join(import.meta.dirname, "..", "fixtures", "orphan-launcher.mjs");
+
+/** Launch jobId via the fixture; returns the printed handle. */
+function launchOrphan(home: string, workspaceRoot: string, runnerPath: string, jobId: string): string {
+  return execFileSync(
+    process.execPath,
+    [ORPHAN_LAUNCHER, home, workspaceRoot, runnerPath, jobId],
+    { encoding: "utf8" },
+  ).trim();
+}
+
+// Runner that outlives the launching daemon: waits for <workspaceRoot>/release,
+// then leaves a retain request (its push failed) and exits.
+const ORPHAN_RETAIN_RUNNER = `
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const release = join(process.env.FLEET_WORKSPACE, '..', 'release');
+while (!existsSync(release)) await new Promise((r) => setTimeout(r, 25));
+writeFileSync(join(process.env.FLEET_WORKSPACE, '.fleet', 'out', 'retain-workspace.json'), JSON.stringify({
+  jobId: process.env.FLEET_JOB_ID,
+  branch: 'fleet/APP-123-' + process.env.FLEET_JOB_ID,
+  reason: 'fatal: could not read from remote repository',
+  at: '2026-08-24T10:00:00.000Z',
+}));
+`;
+
+test("recover() registers a retain request orphaned by a daemon restart, once the runner exits", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "orphan-retain-runner.mjs");
+  writeFileSync(runnerPath, ORPHAN_RETAIN_RUNNER);
+  const home = tempHome();
+  const jobId = "job-orphan1";
+
+  const handle = launchOrphan(home, workspaceRoot, runnerPath, jobId);
+  assert.match(handle, /^pid:\d+/);
+  const workspaces = () =>
+    readdirSync(workspaceRoot).filter((name) => name.startsWith(`fleet-${jobId}-`));
+  assert.equal(workspaces().length, 1, "the runner survived the daemon, workspace and all");
+
+  // Restarted daemon: a fresh provider sweeps. The runner is still alive
+  // (waiting on the release file), so its workspace must be left alone.
+  const provider = new ProcessProvider({ workspaceRoot, home, sweepPollMs: 50 });
+  provider.recover();
+  assert.equal(workspaces().length, 1, "recover must not touch a live runner's workspace");
+  const recordPath = join(home, "retained", `${jobId}.json`);
+  assert.ok(!existsSync(recordPath), "nothing is retained while the runner still runs");
+
+  // The runner fails its push and exits with no exit handler anywhere to see
+  // it. Without the sweep this is the #38 leak: only copy of the work, and
+  // doctor never hears about it.
+  writeFileSync(join(workspaceRoot, "release"), "");
+  await until(() => existsSync(recordPath), 10_000);
+  const record = JSON.parse(readFileSync(recordPath, "utf8")) as Record<string, unknown>;
+  assert.equal(record.jobId, jobId);
+  assert.equal(record.workspace, join(workspaceRoot, workspaces()[0]));
+  assert.match(String(record.reason), /could not read from remote/);
+  assert.equal(workspaces().length, 1, "the workspace must survive: it is the only copy of the work");
+  // The runner record is spent once the disposition ran.
+  await until(() => !existsSync(join(home, "runners", `${jobId}.json`)), 10_000);
+});
+
+test("recover() deletes the workspace of a clean-exit runner orphaned by a daemon restart", async () => {
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  const runnerPath = join(workspaceRoot, "quiet-runner.mjs");
+  writeFileSync(runnerPath, "process.exit(0);\n");
+  const home = tempHome();
+  const jobId = "job-orphan2";
+
+  const handle = launchOrphan(home, workspaceRoot, runnerPath, jobId);
+  const pid = Number(/^pid:(\d+)/.exec(handle)![1]);
+  await until(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  const workspaces = () =>
+    readdirSync(workspaceRoot).filter((name) => name.startsWith(`fleet-${jobId}-`));
+  assert.equal(workspaces().length, 1, "the leak: no exit handler survived to delete this");
+
+  const provider = new ProcessProvider({ workspaceRoot, home, sweepPollMs: 50 });
+  provider.recover();
+  assert.equal(workspaces().length, 0, "recover must delete a delivered orphan's workspace");
+  assert.ok(!existsSync(join(home, "retained")), "a delivered job leaves no retained record");
+  assert.ok(!existsSync(join(home, "runners", `${jobId}.json`)), "the runner record is spent");
+});
+
+test("terminate does not signal a pid whose recorded identity no longer matches", async () => {
+  // The recycled-pid hazard: a handle persisted before a daemon restart names
+  // a pid the OS has since given to an unrelated process. The start-time check
+  // must turn the SIGTERM into a no-op.
+  const bystander = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000);"], { stdio: "ignore" });
+  await new Promise((resolve, reject) => {
+    bystander.once("spawn", resolve);
+    bystander.once("error", reject);
+  });
+  try {
+    const provider = new ProcessProvider({
+      workspaceRoot: mkdtempSync(join(tmpdir(), "fleet-ws-")),
+      home: tempHome(),
+    });
+    await provider.terminate(`pid:${bystander.pid}:Mon Jan  1 00:00:00 2001`);
+    // Give a wrongly-delivered SIGTERM time to land before asserting.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(bystander.exitCode, null, "terminate signalled an unrelated process");
+    assert.equal(bystander.signalCode, null, "terminate signalled an unrelated process");
+  } finally {
+    bystander.kill("SIGKILL");
+  }
+});
+
+test("terminate treats a dead pid with a recorded start time as already gone", async () => {
+  const provider = new ProcessProvider({
+    workspaceRoot: mkdtempSync(join(tmpdir(), "fleet-ws-")),
+    home: tempHome(),
+  });
+  // No process can answer for this pid; identity cannot match, so terminate
+  // must resolve without signalling or throwing.
+  await provider.terminate("pid:999999999:Mon Jan  1 00:00:00 2001");
 });
 
 // --- Resource request / capacity-fit tests ------------------------------------
