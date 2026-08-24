@@ -59,6 +59,24 @@ const LAUNCH_FILE = "launch.json";
  */
 const LAUNCH_SPLIT_VERSION = 1;
 
+/**
+ * The only keys read out of launch.json. An allowlist, not a convenience: the
+ * file is merged over the card, so any other key that parsed would be persisted
+ * and served — see #readLaunchFile.
+ */
+const LAUNCH_KEYS = [
+  "workOrder", "launchManifest", "launchEnv", "launchSync", "launchImage",
+] as const;
+
+/**
+ * What the loader concluded about a job's write-once half: the fields to merge,
+ * and whether a migration write is owed. A named type, not an inline one, on
+ * purpose — Lizard parses TypeScript as C, and braces in a return-type
+ * annotation read as a function body opening, so it mis-measures the function
+ * and everything after it as one 90-line block.
+ */
+type LaunchHalf = { fields: Partial<LaunchFile>; migrate: boolean };
+
 type LaunchFile = {
   workOrder: unknown;
   launchManifest: unknown;
@@ -339,23 +357,8 @@ export class Registry extends EventEmitter {
       return null;
     }
 
-    // The write-once half. Three cases, and they must not be confused:
-    //  - launch.json readable            → it wins; job.json no longer holds these
-    //  - absent, and job.json unmarked   → a pre-split job; migrate it (below)
-    //  - absent or torn, and job.json marked → the launch half is gone
-    const launch = this.#readLaunchFile(dir);
-    const legacy = (raw.launchSplit ?? 0) < LAUNCH_SPLIT_VERSION;
-    if (launch === null && !legacy) {
-      // job.json says a launch.json was written, and it is not readable now.
-      // Not fatal (the journal is intact, the job serves and settles) but the
-      // job can never re-enter, so it must not pass silently.
-      console.error(
-        `fleet: job ${id} has no readable ${LAUNCH_FILE}; its launch data is lost ` +
-        `and it cannot be re-launched after parking`,
-      );
-      this.#launchLost.push(id);
-    }
-    const merged = { ...raw, ...(launch ?? {}) } as JobRecord & JobInternal;
+    const launch = this.#resolveLaunchHalf(id, dir, raw);
+    const merged = { ...raw, ...launch.fields } as JobRecord & JobInternal;
     const entry: JobEntry = {
       record: publicFields(merged),
       internal: internalFields(merged),
@@ -363,7 +366,7 @@ export class Registry extends EventEmitter {
       lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
       dirty: false,
     };
-    if (launch === null && legacy) {
+    if (launch.migrate) {
       // Migrate now, not later. The next event rewrites job.json WITHOUT these
       // fields, so a legacy job that is read but not migrated loses its launch
       // half on its first event and has it in neither file after that.
@@ -371,6 +374,31 @@ export class Registry extends EventEmitter {
       this.#writeLaunchJson(entry);
     }
     return entry;
+  }
+
+  /**
+   * Decide what the write-once half of a job is, from the two files. Three
+   * cases, and confusing them is how the launch data gets lost:
+   *
+   *  - launch.json readable                → it wins; job.json no longer holds these
+   *  - absent, and job.json unmarked       → a pre-split job; migrate it
+   *  - absent or torn, and job.json marked → the launch half is gone
+   *
+   * Returns the fields to merge and whether a migration write is owed.
+   */
+  #resolveLaunchHalf(id: string, dir: string, raw: JobRecord & JobInternal): LaunchHalf {
+    const launch = this.#readLaunchFile(dir);
+    if (launch !== null) return { fields: launch, migrate: false };
+    if ((raw.launchSplit ?? 0) < LAUNCH_SPLIT_VERSION) return { fields: {}, migrate: true };
+    // job.json says a launch.json was written, and it is not readable now. Not
+    // fatal (the journal is intact, the job serves and settles) but the job can
+    // never re-enter, so it must not pass silently.
+    console.error(
+      `fleet: job ${id} has no readable ${LAUNCH_FILE}; its launch data is lost ` +
+      `and it cannot be re-launched after parking`,
+    );
+    this.#launchLost.push(id);
+    return { fields: {}, migrate: false };
   }
 
   /** Jobs whose launch.json was marked-but-unreadable at load (see #loadAll). */
@@ -402,13 +430,11 @@ export class Registry extends EventEmitter {
       console.error(`fleet: ${path} unreadable: ${String(err)}`);
       return null;
     }
-    const picked: Partial<LaunchFile> = {};
-    if ("workOrder" in parsed) picked.workOrder = parsed.workOrder;
-    if ("launchManifest" in parsed) picked.launchManifest = parsed.launchManifest;
-    if ("launchEnv" in parsed) picked.launchEnv = parsed.launchEnv as Record<string, string>;
-    if ("launchSync" in parsed) picked.launchSync = parsed.launchSync as Record<string, string>;
-    if ("launchImage" in parsed) picked.launchImage = parsed.launchImage as string | undefined;
-    return picked;
+    const picked: Record<string, unknown> = {};
+    for (const key of LAUNCH_KEYS) {
+      if (key in parsed) picked[key] = parsed[key];
+    }
+    return picked as Partial<LaunchFile>;
   }
 
   /**
