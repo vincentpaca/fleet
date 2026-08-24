@@ -78,6 +78,7 @@ export interface Provider {
    * runs on the host, where no image applies by construction).
    */
   checkImageOverride?(image: string): void;
+  /**
    * Optional: settle whatever a previous daemon's death left behind (#123).
    * Called once by the daemon entrypoint after it starts serving. The process
    * provider re-runs workspace disposition for runners whose exit handler
