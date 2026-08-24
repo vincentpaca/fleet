@@ -67,6 +67,15 @@ export class DockerProvider implements Provider {
     return { handle: containerId };
   }
 
+  /**
+   * Containers are launched under a deterministic name (see buildRunArgs), so
+   * a handle lost to a daemon crash is derivable (#115): `docker stop`/`rm`
+   * accept the name as readily as the id.
+   */
+  deriveHandle(jobId: string): string {
+    return `fleet-${jobId}`;
+  }
+
   async terminate(handle: string): Promise<void> {
     // Stop before remove (#111). `docker rm -f` is SIGKILL with no grace: the
     // runner's cancel teardown — kill the harness tree, push the WIP, settle —
