@@ -178,13 +178,32 @@ async function main(): Promise<void> {
   // Bracket the gate with events. It is a blocking spawnSync that emits
   // nothing, and the daemon's stall backstop (#39) reads silence on the event
   // stream: an unannounced gate looks exactly like a wedged runner.
+  // The timeout keeps diagnosis runner-side: a hung gate wedges the event
+  // loop entirely, and while the daemon stall backstop reaps it eventually,
+  // a bounded spawnSync surfaces the failure here instead.
   await sink.emit({ type: 'log', text: `pickup gate: ${pickup || '(none)'}`, who: 'runner' });
+  const gateTimeoutMs =
+    parseInt(process.env.FLEET_GATE_TIMEOUT_MS ?? '', 10) || 60_000;
   const gate = spawnSync(pickup, {
     shell: true,
     cwd: workspace,
     encoding: 'utf8',
     env: process.env,
+    timeout: gateTimeoutMs,
+    killSignal: 'SIGKILL',
+    // SIGKILL, not the default SIGTERM: a gate that traps SIGTERM keeps
+    // spawnSync blocked past its own timeout, which is the wedge the timeout
+    // exists to break. Signalling the shell still orphans any grandchild it
+    // spawned, but the runner is free to report instead of hanging.
   });
+  if (gate.status === null) {
+    const reason = gate.signal !== null
+      ? `pickup gate timed out after ${gateTimeoutMs / 1000}s (killed with ${gate.signal})`
+      : `pickup gate failed: ${gate.error?.message ?? 'unknown error'}`;
+    await settleBlocked(sink, reason);
+    await sink.emit({ type: 'state', state: 'cancelled', reason: 'pickup-gate' });
+    process.exit(1);
+  }
   if (gate.status !== 0) {
     const output = `${gate.stdout ?? ''}\n${gate.stderr ?? ''}`;
     const firstLine =
@@ -288,10 +307,16 @@ async function main(): Promise<void> {
   // runner (provider terminate, an operator's Ctrl-C on a process-provider
   // daemon) no longer reaches it by inheritance. Forward it, or cancelling a
   // job leaves a live harness burning tokens with nowhere to report.
+  //
+  // The full teardown (SIGTERM → grace → SIGKILL, best-effort WIP push,
+  // best-effort settle, exit) is installed once the helpers below are defined.
+  // Until then — the narrow window between spawn and helper definition — a
+  // bare kill+exit is the best we can do, and it matches the old behavior.
+  let cancelTeardown: ((signal: NodeJS.Signals) => Promise<void>) | undefined;
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
-      killTree(child, 'SIGTERM');
-      process.exit(1);
+      if (cancelTeardown !== undefined) void cancelTeardown(signal);
+      else { killTree(child, 'SIGTERM'); process.exit(1); }
     });
   }
 
@@ -365,10 +390,32 @@ async function main(): Promise<void> {
   const exit = Promise.withResolvers<number>();
   /** True once 'close' has fired: the tree is gone AND the pipes are released. */
   let harnessClosed = false;
+  /**
+   * Resolves when the signal handler's teardown takes over. The main flow
+   * races it and then stands down: the teardown owns push, settle and exit
+   * from that point, and two paths pushing the same workspace is worse than
+   * either one alone.
+   */
+  const cancelPromise = Promise.withResolvers<void>();
   child.on('close', (code) => {
     harnessClosed = true;
     exit.resolve(code ?? 1);
   });
+  // Spawn failure (EMFILE/EAGAIN under fd pressure): the 'error' event fires
+  // instead of 'close', and without a listener it is an uncaught exception —
+  // the runner crashes with no settle and no log. Resolve the exit promise with
+  // a synthetic code so the normal teardown path (settle + state cancelled) runs.
+  child.on('error', (err) => {
+    if (harnessClosed) return; // already exited normally
+    forget(sink.emit({
+      type: 'log',
+      text: `harness spawn failed: ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+      who: 'runner',
+    }));
+    harnessClosed = true;
+    exit.resolve(127);
+  });
+
   const linesDone = Promise.withResolvers<void>();
   lines.once('close', () => linesDone.resolve());
 
@@ -393,9 +440,9 @@ async function main(): Promise<void> {
    * process that will not exit on its own (#39), so the kill, not the harness,
    * has to be what ends the run.
    */
-  const endHarness = async (): Promise<void> => {
+  const endHarness = async (grace = graceMs): Promise<void> => {
     killTree(child, 'SIGTERM');
-    await Promise.race([exit.promise, delay(graceMs)]);
+    await Promise.race([exit.promise, delay(grace)]);
     // Escalate unless 'close' already fired. Not `child.exitCode` — the shell can
     // be dead while the harness it forked lives on holding the pipe, which is
     // the case this escalation exists for. 'close' is the honest signal that
@@ -403,7 +450,7 @@ async function main(): Promise<void> {
     // -pid at a group id the kernel may since have recycled.
     if (!harnessClosed) {
       killTree(child, 'SIGKILL');
-      await Promise.race([exit.promise, delay(graceMs)]);
+      await Promise.race([exit.promise, delay(grace)]);
     }
   };
 
@@ -413,10 +460,10 @@ async function main(): Promise<void> {
    * setsid()s itself) holds the write end open. Settling late beats not
    * settling, so past the grace window the runner takes the stream down itself.
    */
-  const drainOutput = async (): Promise<void> => {
+  const drainOutput = async (grace = graceMs): Promise<void> => {
     const drained = await Promise.race([
       linesDone.promise.then(() => true),
-      delay(graceMs).then(() => false),
+      delay(grace).then(() => false),
     ]);
     if (drained) return;
     lines.close();
@@ -434,6 +481,122 @@ async function main(): Promise<void> {
     const stream = captureStream;
     captureStream = undefined;
     return new Promise<void>((resolve) => stream.end(resolve));
+  };
+
+  // --- Cancel teardown (#111): the signal handler's real teardown path. ---
+  // The old handler was killTree(SIGTERM) + process.exit(1) — no SIGKILL
+  // escalation, no WIP push, no settle. A cancel of a nearly-done job threw
+  // away everything uncommitted, and a SIGTERM-trapping harness survived as a
+  // zombie. This runs the same escalation as endHarness, then best-effort
+  // pushes WIP and settles, all inside a hard deadline.
+  //
+  // The deadline has to fit inside the shortest grace a provider gives between
+  // SIGTERM and SIGKILL, because past it the teardown is cut off mid-sentence:
+  // ECS is 30s (stopTimeout, pinned in infra/aws/main.tf rather than inherited
+  // from an AWS default), and the docker provider stops the container with an
+  // explicit grace before removing it (DockerProvider.STOP_GRACE_SECONDS —
+  // `rm -f` alone is SIGKILL and no teardown would run at all). 20s leaves both
+  // a margin and the teardown room to finish.
+  const CANCEL_DEADLINE_MS =
+    parseInt(process.env.FLEET_CANCEL_DEADLINE_MS ?? '', 10) || 20_000;
+  // Killing the harness gets a slice of the cancel budget, not all of it.
+  // endHarness and drainOutput default to `graceMs` — the wall-clock grace, 30s
+  // — which on a SIGTERM-trapping harness (the case this exists for) exhausts
+  // the deadline before the push or the settle is attempted, leaving a cancel
+  // that kills the tree and throws the work away. Which is the bug. These two
+  // are what is left over from, not what is taken out of, the work that matters:
+  // ~6s to kill, ~2s to drain, the remaining ~12s for the push and the settle.
+  const cancelKillGraceMs = Math.max(500, Math.floor(CANCEL_DEADLINE_MS * 0.15));
+  const cancelDrainGraceMs = Math.max(250, Math.floor(CANCEL_DEADLINE_MS * 0.1));
+  /** Best-effort WIP push: the job is cancelled, but partial work may be
+   *  recoverable. pushWip commits and pushes only when there are changes. */
+  const cancelPushWip = async (signal: NodeJS.Signals): Promise<void> => {
+    if (!gitUrl || !branch) return;
+    try {
+      const outcome = pushWip(workspace, `cancelled: ${signal}`);
+      await sink.emit({
+        type: 'log',
+        text: outcome === 'pushed'
+          ? `wip pushed to ${branch} (cancelled)`
+          : `workspace clean at cancel; no new commit beyond ${branch}`,
+        who: 'runner',
+      });
+    } catch (err) {
+      await sink.emit({
+        type: 'log',
+        text: `wip push failed (cancelling anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+        who: 'runner',
+      });
+    }
+  };
+
+  /** Best-effort settle: a PARTIAL report so the transcript explains itself. */
+  const cancelSettle = async (signal: NodeJS.Signals): Promise<void> => {
+    try {
+      const { body, notes } = composeSettle({
+        jobId,
+        startedAt,
+        decisions: watcher.count,
+        workspace,
+        ...(sink.dropped > 0 ? { droppedEvents: sink.dropped } : {}),
+      });
+      body.report = { status: 'PARTIAL', next_action: `job cancelled: runner received ${signal}` };
+      for (const note of notes) {
+        await sink.emit({ type: 'log', text: note, who: 'runner' });
+      }
+      await sink.emit(body);
+    } catch (err) {
+      await sink.emit({
+        type: 'log',
+        text: `settle failed (cancelling): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+        who: 'runner',
+      });
+    }
+  };
+
+  cancelTeardown = async (signal) => {
+    cancelPromise.resolve();
+    const deadline = delay(CANCEL_DEADLINE_MS).then(() => 'timeout' as const);
+    const teardown = (async () => {
+      await sink.emit({
+        type: 'log',
+        text: `runner received ${signal}; tearing down`,
+        who: 'runner',
+      });
+      await endHarness(cancelKillGraceMs);
+      await drainOutput(cancelDrainGraceMs);
+      await endCapture();
+      await watcher.stop();
+      await sink.flush();
+      await cancelPushWip(signal);
+      await cancelSettle(signal);
+      await sink.emit({ type: 'state', state: 'cancelled', reason: 'signal' });
+      await sink.flush();
+      return 'done' as const;
+    })();
+
+    // The exit is in a finally, and the teardown's rejection is caught rather
+    // than raced: the signal handler calls this without awaiting it, so a throw
+    // anywhere above (a sink.emit against a daemon that is already gone is the
+    // likely one) would otherwise become an unhandled rejection with no exit —
+    // and the main flow, having stood down, waits on it forever. A cancelled
+    // runner that never exits is the zombie this whole change is about.
+    try {
+      const outcome = await Promise.race([
+        teardown.catch((err: unknown) => {
+          console.error(`runner: cancel teardown failed: ${String(err)}`);
+          return 'failed' as const;
+        }),
+        deadline,
+      ]);
+      if (outcome !== 'done') {
+        // Deadline blown, or the teardown threw partway: the tree may still be
+        // up and nothing else is going to kill it.
+        killTree(child, 'SIGKILL');
+      }
+    } finally {
+      process.exit(1);
+    }
   };
 
   // Park signal: resolves with the decision id when block_hot fires.
@@ -464,7 +627,15 @@ async function main(): Promise<void> {
     wallClockExpired.then(() => ({ kind: 'wall-clock' as const })),
     idleExpired.then(() => ({ kind: 'stall' as const })),
     parkPromise,
+    cancelPromise.promise.then(() => ({ kind: 'cancel' as const })),
   ]);
+
+  if (result.kind === 'cancel') {
+    // Stand down: the teardown owns push, settle and exit from here. It always
+    // reaches process.exit — deadline blown, throw, or clean — so this wait
+    // cannot outlive it.
+    await new Promise<void>(() => {});
+  }
 
   if (result.kind === 'parked') {
     // block_hot expired: commit WIP, emit blocked/parked, exit 0.

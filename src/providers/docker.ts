@@ -19,6 +19,13 @@ const DEFAULT_IMAGE = "node:22";
 const DEFAULT_RUNNER_CMD = ["node", "/opt/fleet/src/runner/main.ts"];
 const CONTAINER_WORKSPACE = "/workspace";
 
+/**
+ * SIGTERM-to-SIGKILL grace given to a container being terminated. Must exceed
+ * the runner's cancel deadline (FLEET_CANCEL_DEADLINE_MS, 20s) so the teardown
+ * finishes its WIP push and settle rather than being cut off mid-push.
+ */
+const STOP_GRACE_SECONDS = 25;
+
 export class DockerProvider implements Provider {
   readonly name = "docker";
   readonly #defaultImage: string;
@@ -61,6 +68,20 @@ export class DockerProvider implements Provider {
   }
 
   async terminate(handle: string): Promise<void> {
+    // Stop before remove (#111). `docker rm -f` is SIGKILL with no grace: the
+    // runner's cancel teardown — kill the harness tree, push the WIP, settle —
+    // never gets a signal, so on the default local provider a cancel silently
+    // threw away everything uncommitted. `stop -t` sends SIGTERM and waits,
+    // which is the grace the teardown is written against.
+    //
+    // Failure is ignored, never rethrown: this call is also the post-settle
+    // reaper (#120), where the container has already exited and `stop` has
+    // nothing to do. Only the removal below decides whether terminate failed.
+    try {
+      await run("docker", ["stop", "-t", String(STOP_GRACE_SECONDS), handle]);
+    } catch {
+      // Already gone, already stopped, or refusing to stop — `rm -f` settles it.
+    }
     try {
       await run("docker", ["rm", "-f", handle]);
     } catch (error) {
