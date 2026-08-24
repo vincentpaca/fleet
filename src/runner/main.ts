@@ -508,6 +508,52 @@ async function main(): Promise<void> {
   // ~6s to kill, ~2s to drain, the remaining ~12s for the push and the settle.
   const cancelKillGraceMs = Math.max(500, Math.floor(CANCEL_DEADLINE_MS * 0.15));
   const cancelDrainGraceMs = Math.max(250, Math.floor(CANCEL_DEADLINE_MS * 0.1));
+  /** Best-effort WIP push: the job is cancelled, but partial work may be
+   *  recoverable. pushWip commits and pushes only when there are changes. */
+  const cancelPushWip = async (signal: NodeJS.Signals): Promise<void> => {
+    if (!gitUrl || !branch) return;
+    try {
+      const outcome = pushWip(workspace, `cancelled: ${signal}`);
+      await sink.emit({
+        type: 'log',
+        text: outcome === 'pushed'
+          ? `wip pushed to ${branch} (cancelled)`
+          : `workspace clean at cancel; no new commit beyond ${branch}`,
+        who: 'runner',
+      });
+    } catch (err) {
+      await sink.emit({
+        type: 'log',
+        text: `wip push failed (cancelling anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+        who: 'runner',
+      });
+    }
+  };
+
+  /** Best-effort settle: a PARTIAL report so the transcript explains itself. */
+  const cancelSettle = async (signal: NodeJS.Signals): Promise<void> => {
+    try {
+      const { body, notes } = composeSettle({
+        jobId,
+        startedAt,
+        decisions: watcher.count,
+        workspace,
+        ...(sink.dropped > 0 ? { droppedEvents: sink.dropped } : {}),
+      });
+      body.report = { status: 'PARTIAL', next_action: `job cancelled: runner received ${signal}` };
+      for (const note of notes) {
+        await sink.emit({ type: 'log', text: note, who: 'runner' });
+      }
+      await sink.emit(body);
+    } catch (err) {
+      await sink.emit({
+        type: 'log',
+        text: `settle failed (cancelling): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+        who: 'runner',
+      });
+    }
+  };
+
   cancelTeardown = async (signal) => {
     cancelPromise.resolve();
     const deadline = delay(CANCEL_DEADLINE_MS).then(() => 'timeout' as const);
@@ -522,47 +568,8 @@ async function main(): Promise<void> {
       await endCapture();
       await watcher.stop();
       await sink.flush();
-      // Best-effort WIP push — the job is cancelled, but partial work may be
-      // recoverable. pushWip commits and pushes only when there are changes.
-      if (gitUrl && branch) {
-        try {
-          const wipOutcome = pushWip(workspace, `cancelled: ${signal}`);
-          await sink.emit({
-            type: 'log',
-            text: wipOutcome === 'pushed'
-              ? `wip pushed to ${branch} (cancelled)`
-              : `workspace clean at cancel; no new commit beyond ${branch}`,
-            who: 'runner',
-          });
-        } catch (err) {
-          await sink.emit({
-            type: 'log',
-            text: `wip push failed (cancelling anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
-            who: 'runner',
-          });
-        }
-      }
-      // Best-effort settle — a PARTIAL report so the transcript explains itself.
-      try {
-        const { body, notes } = composeSettle({
-          jobId,
-          startedAt,
-          decisions: watcher.count,
-          workspace,
-          ...(sink.dropped > 0 ? { droppedEvents: sink.dropped } : {}),
-        });
-        body.report = { status: 'PARTIAL', next_action: `job cancelled: runner received ${signal}` };
-        for (const note of notes) {
-          await sink.emit({ type: 'log', text: note, who: 'runner' });
-        }
-        await sink.emit(body);
-      } catch (err) {
-        await sink.emit({
-          type: 'log',
-          text: `settle failed (cancelling): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
-          who: 'runner',
-        });
-      }
+      await cancelPushWip(signal);
+      await cancelSettle(signal);
       await sink.emit({ type: 'state', state: 'cancelled', reason: 'signal' });
       await sink.flush();
       return 'done' as const;
