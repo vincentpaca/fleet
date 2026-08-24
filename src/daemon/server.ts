@@ -10,6 +10,7 @@ import { dirname, join, relative } from "node:path";
 import { validateManifest, validateWorkOrder, validateEvent } from "../validate.mjs";
 import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
+import { stableStringify } from "../shared/json.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
 import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
@@ -125,23 +126,6 @@ function stringRecord(value: unknown, what: string): Record<string, string> {
 function defaultGhRunner(): import("./verify.ts").GhRunner {
   return (args: string[]) =>
     execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-}
-
-/**
- * Deterministic JSON for deep equality: object keys sorted at every depth.
- *
- * Not `JSON.stringify(value, Object.keys(value).sort())` — an array second
- * argument is a property allowlist applied recursively, so that shape silently
- * erases every nested field whose key does not also appear at the top level,
- * and two events differing only inside `report` compare equal.
- */
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
 
 /**
@@ -726,6 +710,36 @@ export class FleetDaemon {
     // Schema-validated just above: claimed carries job/seq/type plus per-type fields.
     const event = claimed as StoredEvent;
 
+    const rejection = this.#screenIntake(job, event);
+    if (rejection !== null) return rejection;
+
+    // Accepted. Append to the journal FIRST (issue #113: append-before-seq).
+    // The journal is the source of truth; if we crash after this but before
+    // recording the seq, the retry is safely deduped by content.
+    const { job: _job, seq: _seq, ...payload } = event;
+    // Stamp the runner's claimed seq on the stored event for dedup lookups.
+    payload.runnerSeq = event.seq;
+
+    // Batch: coalesce all job.json writes from appendEvent + applyEffects
+    // into one persist at the end.
+    this.registry.beginBatch();
+    try {
+      this.registry.appendEvent(job.id, payload);
+      // Record the runner's claimed seq AFTER the journal append (issue #113).
+      this.registry.setLastRunnerSeq(job.id, event.seq);
+      this.#applyEffects(job, event, "intake");
+    } finally {
+      this.registry.endBatch(job.id);
+    }
+    return null;
+  }
+
+  /**
+   * Every reason a schema-valid runner event is still refused, in the order the
+   * checks have to run. Returns null when the event may be appended,
+   * `{deduped}` when it is a retry of one already stored.
+   */
+  #screenIntake(job: JobRecord, event: StoredEvent): IntakeResult {
     if (event.job !== job.id) {
       return { status: 422, errors: [`event.job "${event.job}" does not match job ${job.id}`] };
     }
@@ -767,47 +781,38 @@ export class FleetDaemon {
         errors: ["runners may not post answer events; answers arrive only via the operator /answer endpoint"],
       };
     }
-    if (event.type === "state") {
-      // Schema-validated: state is one of the five states, marker parked|stale.
-      const nextState = event.state as JobState;
-      const marker = event.marker as Marker | undefined;
-      if (!canTransition(job.state, nextState)) {
-        // Special protocol: the runner emits state:blocked,marker:parked when
-        // block_hot expires on an already-blocked job. This is a marker update
-        // (not a new state transition) and is explicitly permitted.
-        const isParking = job.state === "blocked" && nextState === "blocked" && marker === "parked";
-        if (!isParking) {
-          return { status: 422, errors: [`illegal transition: ${job.state} -> ${nextState}`] };
-        }
-      }
-      if (marker !== undefined && !isMarkerAllowed(nextState, marker)) {
-        return { status: 422, errors: [`marker "${marker}" not allowed on state ${nextState}`] };
+    if (event.type === "state") return this.#screenStateEvent(job, event);
+    if (event.type === "decision") return this.#screenDecisionEvent(job, event);
+    return null;
+  }
+
+  /** Transition and marker legality for a runner `state` event. */
+  #screenStateEvent(job: JobRecord, event: StoredEvent): IntakeError | null {
+    // Schema-validated: state is one of the five states, marker parked|stale.
+    const nextState = event.state as JobState;
+    const marker = event.marker as Marker | undefined;
+    if (!canTransition(job.state, nextState)) {
+      // Special protocol: the runner emits state:blocked,marker:parked when
+      // block_hot expires on an already-blocked job. This is a marker update
+      // (not a new state transition) and is explicitly permitted.
+      const isParking = job.state === "blocked" && nextState === "blocked" && marker === "parked";
+      if (!isParking) {
+        return { status: 422, errors: [`illegal transition: ${job.state} -> ${nextState}`] };
       }
     }
-    if (event.type === "decision" && !canTransition(job.state, "blocked")) {
+    if (marker !== undefined && !isMarkerAllowed(nextState, marker)) {
+      return { status: 422, errors: [`marker "${marker}" not allowed on state ${nextState}`] };
+    }
+    return null;
+  }
+
+  /** Transition legality for a runner `decision` event. */
+  #screenDecisionEvent(job: JobRecord, event: StoredEvent): IntakeError | null {
+    if (!canTransition(job.state, "blocked")) {
       return {
         status: 422,
         errors: [`decision not accepted while ${job.state}: illegal transition ${job.state} -> blocked`],
       };
-    }
-
-    // Accepted. Append to the journal FIRST (issue #113: append-before-seq).
-    // The journal is the source of truth; if we crash after this but before
-    // recording the seq, the retry is safely deduped by content.
-    const { job: _job, seq: _seq, ...payload } = event;
-    // Stamp the runner's claimed seq on the stored event for dedup lookups.
-    payload.runnerSeq = event.seq;
-
-    // Batch: coalesce all job.json writes from appendEvent + applyEffects
-    // into one persist at the end.
-    this.registry.beginBatch();
-    try {
-      this.registry.appendEvent(job.id, payload);
-      // Record the runner's claimed seq AFTER the journal append (issue #113).
-      this.registry.setLastRunnerSeq(job.id, event.seq);
-      this.#applyEffects(job, event, "intake");
-    } finally {
-      this.registry.endBatch(job.id);
     }
     return null;
   }
@@ -841,92 +846,101 @@ export class FleetDaemon {
    * event that will arrive again.
    */
   #applyEffects(job: JobRecord, event: StoredEvent, mode: EffectsMode = "intake"): void {
-    if (event.type === "state") {
-      // Schema-validated at intake.
-      const nextState = event.state as JobState;
-      const marker = event.marker as Marker | undefined;
-      // Cancellation reason (wall-clock, stall, pickup-gate, ...) is part of the
-      // record so status/board can distinguish kinds of cancellation.
-      const reason = typeof event.reason === "string" ? { reason: event.reason } : {};
-      if (marker !== undefined) {
-        this.registry.updateJob(job.id, { state: nextState, marker, ...reason });
-      } else {
-        this.registry.clearMarker(job.id);
-        this.registry.updateJob(job.id, { state: nextState, ...reason });
-      }
-      // Wall-clock tracking: running = active, blocked/terminal = inactive.
-      // Not replayed: these read the daemon clock, so a replay would collapse
-      // every recorded segment to zero length and hand the job a fresh budget.
-      // Wall-clock accounting is the one thing the journal cannot rebuild
-      // (D15's accepted cost); the snapshot's value stands.
-      if (mode === "intake") {
-        if (nextState === "running") {
-          this.registry.wallClockBecameActive(job.id);
-        } else if (nextState === "blocked" || isTerminal(nextState)) {
-          this.registry.wallClockBecameInactive(job.id);
-        }
-      }
-      if (isTerminal(nextState)) {
-        // Settle rides ahead of the terminal state event; verify the target
-        // rung — locally for lower rungs, via gh for upper rungs.
-        const target = targetRung(job.workOrder);
-        // On replay, no gh: verifyRung records "unverified: requires gh" for the
-        // upper rungs instead of shelling out synchronously inside the
-        // constructor. An honest unverified beats a boot that blocks on the
-        // network, and the operator can re-check.
-        const ghRunner = mode === "intake" ? defaultGhRunner() : undefined;
-        const doneCheck = verifyRung(job.settle, target, { ghRunner });
-        this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
-        // Reap the stopped container on clean settle (#120): exited containers
-        // pile up forever without this. Skip jobs whose workspace the runner
-        // retained after a failed push — they keep their container so the
-        // operator can retry the push from inside it via `fleet resume-push`.
-        if (job.handle !== undefined) {
-          const retained = this.registry
-            .eventsAfter(job.id, -1)
-            .some(
-              (e) =>
-                e.type === "log" &&
-                typeof e.text === "string" &&
-                e.text.startsWith(RETAINED_WORKSPACE_NOTE_PREFIX),
-            );
-          if (!retained && mode === "intake") {
-            this.#options.provider
-              .terminate(job.handle)
-              .catch(() => {});
-          }
-        }
-      }
-      return;
+    if (event.type === "state") return this.#applyStateEvent(job, event, mode);
+    if (event.type === "decision") return this.#applyDecisionEvent(job, event, mode);
+    if (event.type === "settle") return this.#applySettleEvent(job, event);
+  }
+
+  /** State transition, marker, wall-clock segment, and the terminal handling. */
+  #applyStateEvent(job: JobRecord, event: StoredEvent, mode: EffectsMode): void {
+    // Schema-validated at intake.
+    const nextState = event.state as JobState;
+    const marker = event.marker as Marker | undefined;
+    // Cancellation reason (wall-clock, stall, pickup-gate, ...) is part of the
+    // record so status/board can distinguish kinds of cancellation.
+    const reason = typeof event.reason === "string" ? { reason: event.reason } : {};
+    if (marker !== undefined) {
+      this.registry.updateJob(job.id, { state: nextState, marker, ...reason });
+    } else {
+      this.registry.clearMarker(job.id);
+      this.registry.updateJob(job.id, { state: nextState, ...reason });
     }
-    if (event.type === "decision") {
-      // Schema-validated at intake: decision has id, question, options[{id,...}].
-      const decision = event as StoredEvent & { id: string; question: string; options: { id: string }[] };
-      this.registry.setOpenDecision(job.id, {
-        id: decision.id,
-        question: decision.question,
-        optionIds: decision.options.map((option) => option.id),
-      });
-      this.registry.updateJob(job.id, { state: "blocked" });
-      // Record when this decision first arrived — the decision_timeout clock
-      // starts here (regardless of whether the job is hot or parked). On replay
-      // the event's own timestamp is the honest answer: dating a two-day-old
-      // decision to boot time would silently restart the operator's clock.
-      const blockedAt = mode === "intake" ? Date.now() : Date.parse(String(event.at ?? ""));
-      this.registry.setDecisionBlockedAt(job.id, Number.isFinite(blockedAt) ? blockedAt : Date.now());
-      // The job is now waiting for an operator answer — operator wait time is
-      // excluded from the wall-clock budget, same as the runner-side behaviour.
-      if (mode === "intake") this.registry.wallClockBecameInactive(job.id);
-      if (mode === "intake") this.#notify(job.id, decision.question);
-      return;
+    // Wall-clock tracking: running = active, blocked/terminal = inactive.
+    // Not replayed: these read the daemon clock, so a replay would collapse
+    // every recorded segment to zero length and hand the job a fresh budget.
+    // Wall-clock accounting is the one thing the journal cannot rebuild
+    // (D15's accepted cost); the snapshot's value stands.
+    if (mode === "intake") {
+      if (nextState === "running") {
+        this.registry.wallClockBecameActive(job.id);
+      } else if (nextState === "blocked" || isTerminal(nextState)) {
+        this.registry.wallClockBecameInactive(job.id);
+      }
     }
-    if (event.type === "settle") {
-      const settle: Record<string, unknown> = { outcome: event.outcome };
-      if (event.rung !== undefined) settle.rung = event.rung;
-      if (event.minutes !== undefined) settle.minutes = event.minutes;
-      if (event.report !== undefined) settle.report = event.report;
-      this.registry.updateJob(job.id, { settle });
+    if (isTerminal(nextState)) this.#applyTerminalState(job, mode);
+  }
+
+  /** Rung verification and the clean-settle container reap. */
+  #applyTerminalState(job: JobRecord, mode: EffectsMode): void {
+    // Settle rides ahead of the terminal state event; verify the target
+    // rung — locally for lower rungs, via gh for upper rungs.
+    const target = targetRung(job.workOrder);
+    // On replay, no gh: verifyRung records "unverified: requires gh" for the
+    // upper rungs instead of shelling out synchronously inside the constructor.
+    // An honest unverified beats a boot that blocks on the network, and the
+    // operator can re-check.
+    const ghRunner = mode === "intake" ? defaultGhRunner() : undefined;
+    const doneCheck = verifyRung(job.settle, target, { ghRunner });
+    this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
+    // Reap the stopped container on clean settle (#120): exited containers
+    // pile up forever without this. Skip jobs whose workspace the runner
+    // retained after a failed push — they keep their container so the
+    // operator can retry the push from inside it via `fleet resume-push`.
+    // Not replayed: terminating containers from a constructor is not boot's job.
+    if (job.handle === undefined || mode !== "intake") return;
+    const retained = this.registry
+      .eventsAfter(job.id, -1)
+      .some(
+        (e) =>
+          e.type === "log" &&
+          typeof e.text === "string" &&
+          e.text.startsWith(RETAINED_WORKSPACE_NOTE_PREFIX),
+      );
+    if (!retained) {
+      this.#options.provider.terminate(job.handle).catch(() => {});
     }
+  }
+
+  /** Open the decision, block the job, start the decision-timeout clock. */
+  #applyDecisionEvent(job: JobRecord, event: StoredEvent, mode: EffectsMode): void {
+    // Schema-validated at intake: decision has id, question, options[{id,...}].
+    const decision = event as StoredEvent & { id: string; question: string; options: { id: string }[] };
+    this.registry.setOpenDecision(job.id, {
+      id: decision.id,
+      question: decision.question,
+      optionIds: decision.options.map((option) => option.id),
+    });
+    this.registry.updateJob(job.id, { state: "blocked" });
+    // Record when this decision first arrived — the decision_timeout clock
+    // starts here (regardless of whether the job is hot or parked). On replay
+    // the event's own timestamp is the honest answer: dating a two-day-old
+    // decision to boot time would silently restart the operator's clock.
+    const blockedAt = mode === "intake" ? Date.now() : Date.parse(String(event.at ?? ""));
+    this.registry.setDecisionBlockedAt(job.id, Number.isFinite(blockedAt) ? blockedAt : Date.now());
+    if (mode !== "intake") return;
+    // The job is now waiting for an operator answer — operator wait time is
+    // excluded from the wall-clock budget, same as the runner-side behaviour.
+    this.registry.wallClockBecameInactive(job.id);
+    this.#notify(job.id, decision.question);
+  }
+
+  /** Record the settle facts the terminal state event will verify. */
+  #applySettleEvent(job: JobRecord, event: StoredEvent): void {
+    const settle: Record<string, unknown> = { outcome: event.outcome };
+    if (event.rung !== undefined) settle.rung = event.rung;
+    if (event.minutes !== undefined) settle.minutes = event.minutes;
+    if (event.report !== undefined) settle.report = event.report;
+    this.registry.updateJob(job.id, { settle });
   }
 
   /**

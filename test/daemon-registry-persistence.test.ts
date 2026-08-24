@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
+import { stableStringify } from "../src/shared/json.ts";
 import { hostname } from "node:os";
 import { jobDir, daemonLockPath } from "../src/shared/home.ts";
 import { STALE_AFTER_MS } from "../src/daemon/lock.ts";
@@ -656,4 +657,27 @@ test("parseNdjson throws on mid-file corruption (not just the final line)", () =
   const text = `${good}\n${bad}\n${good2}\n`;
 
   assert.throws(() => parseNdjson(text));
+});
+// --- stableStringify: the comparison dedup-by-content rests on ---------------
+
+test("stableStringify is insertion-order independent at every depth", () => {
+  assert.equal(
+    stableStringify({ b: 1, a: { d: 2, c: [3, { f: 4, e: 5 }] } }),
+    stableStringify({ a: { c: [3, { e: 5, f: 4 }], d: 2 }, b: 1 }),
+  );
+});
+
+test("stableStringify distinguishes values that differ only deep inside", () => {
+  // The trap this function exists for: `JSON.stringify(o, Object.keys(o).sort())`
+  // treats the array as a recursive property allowlist, so `report`'s contents
+  // are erased and these two serialise identically. For a dedup check that
+  // means accepting a retry as "already have exactly this" when it is not.
+  const a = { type: "settle", report: { status: "READY", next_action: "open the PR" } };
+  const b = { type: "settle", report: { status: "PARTIAL", next_action: "something else" } };
+  assert.notEqual(stableStringify(a), stableStringify(b));
+});
+
+test("stableStringify omits undefined properties, matching JSON.stringify", () => {
+  assert.equal(stableStringify({ a: 1, b: undefined }), stableStringify({ a: 1 }));
+  assert.equal(stableStringify({ a: 1 }), '{"a":1}');
 });

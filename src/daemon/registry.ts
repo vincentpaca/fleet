@@ -56,6 +56,62 @@ function journalDerivedState(events: StoredEvent[]): JobState | null {
   return null;
 }
 
+/**
+ * The two halves of a persisted job.json. They live in one file (one atomic
+ * rename per job) but are separate in memory: `record` is the wire shape the
+ * operator sees, `internal` is daemon bookkeeping that never leaves the daemon.
+ *
+ * Split out of the loader so the defaulting — one `??` per field, and every one
+ * of them a branch — is not counted against the function doing the file I/O and
+ * the error handling. Each default is the value a record written before that
+ * field existed should read as.
+ */
+function publicFields(raw: JobRecord & JobInternal): JobRecord {
+  const {
+    lastRunnerSeq, runnerSeqEpoch, openDecision,
+    wallClockMs, wallClockActiveMs, wallClockActiveSince,
+    idleMs, lastEventAt,
+    decisionTimeoutMs, decisionBlockedAt,
+    launchManifest, launchEnv, launchSync, launchImage,
+    ...record
+  } = raw;
+  return record;
+}
+
+/**
+ * What each internal field reads as when the persisted record predates it. A
+ * table rather than a field-by-field `?? default`: fourteen of those is
+ * fourteen branches through one function, and the table also puts every
+ * migration default in one place a reader can check against JobInternal.
+ */
+const INTERNAL_DEFAULTS: JobInternal = {
+  lastRunnerSeq: null,
+  // Pre-#113 records have no epoch: -1 searches the whole log, which is the old
+  // behaviour and correct for a journal with only one generation in it.
+  runnerSeqEpoch: -1,
+  openDecision: null,
+  wallClockMs: null,
+  wallClockActiveMs: 0,
+  wallClockActiveSince: null,
+  idleMs: null,
+  lastEventAt: null,
+  decisionTimeoutMs: null,
+  decisionBlockedAt: null,
+  launchManifest: null,
+  launchEnv: {},
+  launchSync: {},
+  launchImage: undefined,
+};
+
+function internalFields(raw: Partial<JobInternal>): JobInternal {
+  const stored = raw as Record<string, unknown>;
+  const present = Object.keys(INTERNAL_DEFAULTS).filter((key) => stored[key] !== undefined);
+  return {
+    ...INTERNAL_DEFAULTS,
+    ...Object.fromEntries(present.map((key) => [key, stored[key]])),
+  };
+}
+
 export type OpenDecision = {
   /** Decision event id (e.g. "d1"). */
   id: string;
@@ -188,73 +244,53 @@ export class Registry extends EventEmitter {
       // and from loading a stale record under a second key for the same id.
       if (id.endsWith(QUARANTINE_SUFFIX)) continue;
       const dir = join(jobsRoot, id);
-      const recordPath = join(dir, "job.json");
-      if (!existsSync(recordPath)) continue;
-
-      // Tolerant boot: a torn or empty job.json (host crash mid-rename) must
-      // not brick the daemon. Quarantine the corrupt job and keep loading the
-      // rest — one bad file never crash-loops the whole process.
-      let raw: JobRecord & JobInternal;
-      try {
-        const text = readFileSync(recordPath, "utf8");
-        if (text.trim().length === 0) throw new Error("job.json is empty");
-        raw = JSON.parse(text) as JobRecord & JobInternal;
-        if (typeof raw.id !== "string" || typeof raw.state !== "string") {
-          throw new Error("job.json missing required fields");
-        }
-      } catch (err) {
-        this.#quarantine(jobsRoot, id, `job.json unreadable: ${String(err)}`);
-        continue;
-      }
-
-      const {
-        lastRunnerSeq, runnerSeqEpoch, openDecision,
-        wallClockMs, wallClockActiveMs, wallClockActiveSince,
-        idleMs, lastEventAt,
-        decisionTimeoutMs, decisionBlockedAt,
-        launchManifest, launchEnv, launchSync, launchImage,
-        ...record
-      } = raw;
-      const eventsPath = join(dir, "events.jsonl");
-      let events: StoredEvent[];
-      try {
-        events = existsSync(eventsPath)
-          ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
-          : [];
-      } catch (err) {
-        // The events log is corrupted beyond a truncated trailing line.
-        // Quarantine like a bad job.json — the journal is the source of truth
-        // (D15) and a job whose journal cannot be read cannot be served.
-        this.#quarantine(jobsRoot, id, `events.jsonl corrupt: ${String(err)}`);
-        continue;
-      }
-      const lastSeq = events.length > 0 ? events[events.length - 1].seq : -1;
-      const entry: JobEntry = {
-        record,
-        internal: {
-          lastRunnerSeq: lastRunnerSeq ?? null,
-          // Pre-#113 records have no epoch: -1 searches the whole log, which is
-          // the old behaviour and correct for a journal with one generation.
-          runnerSeqEpoch: runnerSeqEpoch ?? -1,
-          openDecision: openDecision ?? null,
-          wallClockMs: wallClockMs ?? null,
-          wallClockActiveMs: wallClockActiveMs ?? 0,
-          wallClockActiveSince: wallClockActiveSince ?? null,
-          idleMs: idleMs ?? null,
-          lastEventAt: lastEventAt ?? null,
-          decisionTimeoutMs: decisionTimeoutMs ?? null,
-          decisionBlockedAt: decisionBlockedAt ?? null,
-          launchManifest: launchManifest ?? null,
-          launchEnv: launchEnv ?? {},
-          launchSync: launchSync ?? {},
-          launchImage: launchImage ?? undefined,
-        },
-        events,
-        lastSeq,
-        dirty: false,
-      };
-      this.#jobs.set(id, entry);
+      if (!existsSync(join(dir, "job.json"))) continue;
+      // Tolerant boot: one torn file must not brick the daemon. Either half
+      // being unreadable quarantines that job and loading continues.
+      const entry = this.#loadOne(jobsRoot, id, dir);
+      if (entry !== null) this.#jobs.set(id, entry);
     }
+  }
+
+  /**
+   * Read one job dir into an entry, or quarantine it and return null. A torn
+   * `job.json` (host crash mid-rename, so the rename persisted before the data)
+   * and a journal corrupted beyond a truncated trailing line are both fatal to
+   * that job and to nothing else — the journal is the source of truth (D15), so
+   * a job whose journal cannot be read whole cannot be served.
+   */
+  #loadOne(jobsRoot: string, id: string, dir: string): JobEntry | null {
+    let raw: JobRecord & JobInternal;
+    try {
+      const text = readFileSync(join(dir, "job.json"), "utf8");
+      if (text.trim().length === 0) throw new Error("job.json is empty");
+      raw = JSON.parse(text) as JobRecord & JobInternal;
+      if (typeof raw.id !== "string" || typeof raw.state !== "string") {
+        throw new Error("job.json missing required fields");
+      }
+    } catch (err) {
+      this.#quarantine(jobsRoot, id, `job.json unreadable: ${String(err)}`);
+      return null;
+    }
+
+    const eventsPath = join(dir, "events.jsonl");
+    let events: StoredEvent[];
+    try {
+      events = existsSync(eventsPath)
+        ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
+        : [];
+    } catch (err) {
+      this.#quarantine(jobsRoot, id, `events.jsonl corrupt: ${String(err)}`);
+      return null;
+    }
+
+    return {
+      record: publicFields(raw),
+      internal: internalFields(raw),
+      events,
+      lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
+      dirty: false,
+    };
   }
 
   /**
