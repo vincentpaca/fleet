@@ -33,3 +33,8 @@ export const ARTIFACT_TOTAL_CAP = 100 * 1024 * 1024;   // 100 MB
 export function operatorTokenPath(home: string): string {
   return join(home, "operator-token");
 }
+
+/** Single-writer lock: $FLEET_HOME/daemon.lock (O_EXCL pidfile, issue #112). */
+export function daemonLockPath(home: string): string {
+  return join(home, "daemon.lock");
+}

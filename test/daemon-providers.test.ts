@@ -1210,7 +1210,7 @@ function argvCalls(log: string): string[][] {
 }
 
 // Narrow a daemon JSON response down to its job record (runtime-checked).
-type JobView = { id: string; state: string };
+type JobView = { id: string; state: string; marker?: string };
 
 function jobOf(payload: unknown): JobView {
   if (typeof payload !== "object" || payload === null || !("job" in payload)) {
@@ -1294,6 +1294,7 @@ test("docker park -> answer -> resume launches cleanly and reaps on settle", asy
   const name = `fleet-${id}`;
 
   const state = async () => jobOf((await op(sock, "GET", `/jobs/${id}`)).json).state;
+  const marker = async () => jobOf((await op(sock, "GET", `/jobs/${id}`)).json).marker;
 
   // Launch #1: the pre-run removal must precede the run (the fix under test).
   await until(() => argvCalls(log).length >= 2, 10_000);
@@ -1301,7 +1302,13 @@ test("docker park -> answer -> resume launches cleanly and reaps on settle", asy
   assert.deepEqual(calls[0], ["rm", "-f", name]);
   assert.deepEqual(calls[1]?.slice(0, 4), ["run", "-d", "--name", name]);
 
-  await until(async () => (await state()) === "blocked", 10_000);
+  // Wait for the PARK, not just for `blocked`. The decision event blocks the
+  // job on its own, one event ahead of `state: blocked, marker: parked`, so a
+  // poll on the state alone can land in between — and an answer arriving there
+  // takes the hot path, which re-launches nothing and leaves this test waiting
+  // on a container that never starts.
+  await until(async () => (await marker()) === "parked", 10_000);
+  assert.equal(await state(), "blocked");
   const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "go" });
   assert.equal(answered.status, 200, answered.body);
 
