@@ -416,7 +416,10 @@ test("ProcessProvider round-trips a fake runner: events, decision, answer, settl
     state?: string;
   }[];
   const types = events.map((e) => e.type);
-  assert.deepEqual(types, ["state", "state", "decision", "answer", "think", "settle", "state"]);
+  // The state event after the answer is daemon-authored (#114): the hot-path
+  // blocked → running transition must be reconstructable from the log alone.
+  assert.deepEqual(types, ["state", "state", "decision", "answer", "state", "think", "settle", "state"]);
+  assert.equal(events[4].state, "running");
   assert.equal(events.find((e) => e.type === "answer")?.by, "operator");
   assert.equal(events.find((e) => e.type === "think")?.text, "answered: go");
   assert.equal(events[events.length - 1].state, "done");
