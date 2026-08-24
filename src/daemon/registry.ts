@@ -33,6 +33,59 @@ export type StoredEvent = {
 const QUARANTINE_SUFFIX = ".corrupt";
 
 /**
+ * The write-once half of a job's state, in its own file (issue #113).
+ *
+ * The launch manifest and the work order are set at creation and never change,
+ * but they are also the bulk of the record — a manifest with a synced-file map
+ * is kilobytes. Keeping them in job.json meant every event re-serialised and
+ * re-wrote all of it: on EFS, that is a multi-kilobyte network round trip per
+ * event to persist a state field. They live in launch.json now, and job.json is
+ * the hot record.
+ *
+ * A job created before the split has these fields inside its job.json and no
+ * launch.json. The loader migrates it — writes launch.json from what it read —
+ * because job.json is rewritten on the very next event WITHOUT them, and a
+ * record whose launch half is in neither file is unrecoverable.
+ */
+const LAUNCH_FILE = "launch.json";
+
+/**
+ * Stamped into job.json by every post-split write. It is what separates "this
+ * job predates the split" from "this job's launch.json is gone": both look like
+ * an absent file, one is routine and one is corruption, and neither file's
+ * tmp+rename is ordered against the other's under a host crash (D15 accepts no
+ * fsync). Without the marker the loader has to guess, and guessing "legacy"
+ * silently serves a job with no work order.
+ */
+const LAUNCH_SPLIT_VERSION = 1;
+
+/**
+ * The only keys read out of launch.json. An allowlist, not a convenience: the
+ * file is merged over the card, so any other key that parsed would be persisted
+ * and served — see #readLaunchFile.
+ */
+const LAUNCH_KEYS = [
+  "workOrder", "launchManifest", "launchEnv", "launchSync", "launchImage",
+] as const;
+
+/**
+ * What the loader concluded about a job's write-once half: the fields to merge,
+ * and whether a migration write is owed. A named type, not an inline one, on
+ * purpose — Lizard parses TypeScript as C, and braces in a return-type
+ * annotation read as a function body opening, so it mis-measures the function
+ * and everything after it as one 90-line block.
+ */
+type LaunchHalf = { fields: Partial<LaunchFile>; migrate: boolean };
+
+type LaunchFile = {
+  workOrder: unknown;
+  launchManifest: unknown;
+  launchEnv: Record<string, string>;
+  launchSync: Record<string, string>;
+  launchImage: string | undefined;
+};
+
+/**
  * How the effects function is being called. `"intake"` is a live event and runs
  * everything; `"replay"` is boot reconciliation and runs the record derivation
  * only — see `#reconcile` for why the side effects must not fire twice.
@@ -68,7 +121,7 @@ function journalDerivedState(events: StoredEvent[]): JobState | null {
  */
 function publicFields(raw: JobRecord & JobInternal): JobRecord {
   const {
-    lastRunnerSeq, runnerSeqEpoch, openDecision,
+    launchSplit, lastRunnerSeq, runnerSeqEpoch, openDecision,
     wallClockMs, wallClockActiveMs, wallClockActiveSince,
     idleMs, lastEventAt,
     decisionTimeoutMs, decisionBlockedAt,
@@ -85,6 +138,7 @@ function publicFields(raw: JobRecord & JobInternal): JobRecord {
  * migration default in one place a reader can check against JobInternal.
  */
 const INTERNAL_DEFAULTS: JobInternal = {
+  launchSplit: 0,
   lastRunnerSeq: null,
   // Pre-#113 records have no epoch: -1 searches the whole log, which is the old
   // behaviour and correct for a journal with only one generation in it.
@@ -145,6 +199,11 @@ export type JobRecord = {
 
 /** Daemon-internal bookkeeping persisted alongside the record in job.json. */
 type JobInternal = {
+  /**
+   * Which launch-file layout wrote this record: 0 (or absent) means pre-split,
+   * with the launch fields still inside job.json. See LAUNCH_SPLIT_VERSION.
+   */
+  launchSplit: number;
   /** Highest seq the runner has claimed on intake; null until the first runner event. */
   lastRunnerSeq: number | null;
   /**
@@ -217,6 +276,20 @@ export class Registry extends EventEmitter {
    * effects function, and that callback is set by the daemon after construction.
    */
   reconcileAll(): void {
+    // A lost launch half becomes a journal entry, not just a line on stderr.
+    // The journal is what the cockpit and `fleet events` read; without this the
+    // failure only surfaces much later as cancelled/launch-failed, which is
+    // indistinguishable from a real launch failure. Appended here rather than
+    // during the load because appendEvent needs the entry to be registered.
+    for (const id of this.#launchLost) {
+      if (isTerminal(this.#entry(id).record.state)) continue;
+      this.appendEvent(id, {
+        type: "log",
+        text: `launch data lost: ${LAUNCH_FILE} is missing or unreadable — this job cannot be re-launched after parking`,
+        who: "daemon",
+      });
+    }
+    this.#launchLost = [];
     for (const [id, entry] of this.#jobs) {
       this.#reconcile(id, entry);
     }
@@ -284,13 +357,84 @@ export class Registry extends EventEmitter {
       return null;
     }
 
-    return {
-      record: publicFields(raw),
-      internal: internalFields(raw),
+    const launch = this.#resolveLaunchHalf(id, dir, raw);
+    const merged = { ...raw, ...launch.fields } as JobRecord & JobInternal;
+    const entry: JobEntry = {
+      record: publicFields(merged),
+      internal: internalFields(merged),
       events,
       lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
       dirty: false,
     };
+    if (launch.migrate) {
+      // Migrate now, not later. The next event rewrites job.json WITHOUT these
+      // fields, so a legacy job that is read but not migrated loses its launch
+      // half on its first event and has it in neither file after that.
+      console.error(`fleet: migrating job ${id} to ${LAUNCH_FILE}`);
+      this.#writeLaunchJson(entry);
+    }
+    return entry;
+  }
+
+  /**
+   * Decide what the write-once half of a job is, from the two files. Three
+   * cases, and confusing them is how the launch data gets lost:
+   *
+   *  - launch.json readable                → it wins; job.json no longer holds these
+   *  - absent, and job.json unmarked       → a pre-split job; migrate it
+   *  - absent or torn, and job.json marked → the launch half is gone
+   *
+   * Returns the fields to merge and whether a migration write is owed.
+   */
+  #resolveLaunchHalf(id: string, dir: string, raw: JobRecord & JobInternal): LaunchHalf {
+    const launch = this.#readLaunchFile(dir);
+    if (launch !== null) return { fields: launch, migrate: false };
+    if ((raw.launchSplit ?? 0) < LAUNCH_SPLIT_VERSION) return { fields: {}, migrate: true };
+    // job.json says a launch.json was written, and it is not readable now. Not
+    // fatal (the journal is intact, the job serves and settles) but the job can
+    // never re-enter, so it must not pass silently.
+    console.error(
+      `fleet: job ${id} has no readable ${LAUNCH_FILE}; its launch data is lost ` +
+      `and it cannot be re-launched after parking`,
+    );
+    this.#launchLost.push(id);
+    return { fields: {}, migrate: false };
+  }
+
+  /** Jobs whose launch.json was marked-but-unreadable at load (see #loadAll). */
+  #launchLost: string[] = [];
+
+  /**
+   * Read launch.json. Returns null when it is absent or unreadable — the caller
+   * decides what that means from job.json's `launchSplit` marker.
+   *
+   * The five fields are picked by name, never spread wholesale. Anything that
+   * parses would otherwise land in the record and be persisted and served: an
+   * array injects "0", "1", … keys, and an object carrying `state`,
+   * `runnerToken` or `handle` overrides the card, because the launch half is
+   * spread last. On the process provider the job runs as the same user with
+   * access to $FLEET_HOME, so that path lets a job edit its own control record —
+   * the one thing the /internal-only token exists to prevent.
+   */
+  #readLaunchFile(dir: string): Partial<LaunchFile> | null {
+    const path = join(dir, LAUNCH_FILE);
+    if (!existsSync(path)) return null;
+    let parsed: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${LAUNCH_FILE} is not a JSON object`);
+      }
+      parsed = value as Record<string, unknown>;
+    } catch (err) {
+      console.error(`fleet: ${path} unreadable: ${String(err)}`);
+      return null;
+    }
+    const picked: Record<string, unknown> = {};
+    for (const key of LAUNCH_KEYS) {
+      if (key in parsed) picked[key] = parsed[key];
+    }
+    return picked as Partial<LaunchFile>;
   }
 
   /**
@@ -367,12 +511,47 @@ export class Registry extends EventEmitter {
   #writeJobJson(entry: JobEntry): void {
     const dir = jobDir(this.home, entry.record.id);
     mkdirSync(dir, { recursive: true });
+    // The write-once fields are excluded: they are in launch.json, and the
+    // whole point of the split is that this payload stays small. `launchSplit`
+    // is NOT excluded — it is how a later boot knows launch.json should exist.
+    const { workOrder: _workOrder, ...record } = entry.record;
+    const {
+      launchManifest: _m, launchEnv: _e, launchSync: _s, launchImage: _i,
+      ...internal
+    } = entry.internal;
+    internal.launchSplit = LAUNCH_SPLIT_VERSION;
     const path = join(dir, "job.json");
-    const payload = JSON.stringify({ ...entry.record, ...entry.internal }, null, 2);
-    writeFileSync(`${path}.tmp`, payload);
+    writeFileSync(`${path}.tmp`, JSON.stringify({ ...record, ...internal }, null, 2));
     renameSync(`${path}.tmp`, path);
     entry.dirty = false;
     this.#persistCount++;
+  }
+
+  /**
+   * Write the launch half. Called at creation and when the launch details
+   * arrive — never from intake, so it costs nothing per event.
+   */
+  #writeLaunchJson(entry: JobEntry): void {
+    const dir = jobDir(this.home, entry.record.id);
+    mkdirSync(dir, { recursive: true });
+    const payload: LaunchFile = {
+      workOrder: entry.record.workOrder,
+      launchManifest: entry.internal.launchManifest,
+      launchEnv: entry.internal.launchEnv,
+      launchSync: entry.internal.launchSync,
+      launchImage: entry.internal.launchImage,
+    };
+    const path = join(dir, LAUNCH_FILE);
+    writeFileSync(`${path}.tmp`, JSON.stringify(payload, null, 2));
+    renameSync(`${path}.tmp`, path);
+    this.#launchWriteCount++;
+  }
+
+  /** launch.json writes since construction (test seam; must not grow per event). */
+  #launchWriteCount = 0;
+
+  launchWriteCount(): number {
+    return this.#launchWriteCount;
   }
 
   /** Number of job.json writes since construction (test instrumentation). */
@@ -413,6 +592,7 @@ export class Registry extends EventEmitter {
     const entry: JobEntry = {
       record,
       internal: {
+        launchSplit: LAUNCH_SPLIT_VERSION,
         lastRunnerSeq: null,
         runnerSeqEpoch: -1,
         openDecision: null,
@@ -433,6 +613,7 @@ export class Registry extends EventEmitter {
       dirty: false,
     };
     this.#jobs.set(record.id, entry);
+    this.#writeLaunchJson(entry);
     this.#persist(entry);
   }
 
@@ -706,7 +887,9 @@ export class Registry extends EventEmitter {
     entry.internal.launchEnv = details.env;
     entry.internal.launchSync = details.sync;
     entry.internal.launchImage = details.image;
-    this.#persist(entry);
+    // The launch half, not the hot record: these fields are write-once and
+    // job.json no longer carries them.
+    this.#writeLaunchJson(entry);
   }
 
   /** Retrieve the stored launch details for re-launching a parked job. */
