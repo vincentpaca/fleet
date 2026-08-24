@@ -176,17 +176,19 @@ test('pickup gate failure settles BLOCKED and cancels with reason pickup-gate', 
     assert.deepEqual(daemon.rejected, []);
     assert.equal(daemon.badTokenCount, 0);
 
-    // The log line is the gate announcing itself before it runs (#39): the gate
-    // is a blocking spawnSync, and the daemon's stall backstop reads silence on
-    // the event stream, so an unannounced gate is indistinguishable from a wedge.
+    // The first two logs are the setup-script announce + skip (#49: declared in
+    // the manifest, not on disk in this workspace). The third is the gate
+    // announcing itself before it runs (#39): the gate is a blocking spawnSync,
+    // and the daemon's stall backstop reads silence on the event stream, so an
+    // unannounced gate is indistinguishable from a wedge.
     assert.deepEqual(
       daemon.events.map((event) => event.type),
-      ['state', 'log', 'settle', 'state'],
+      ['state', 'log', 'log', 'log', 'settle', 'state'],
     );
-    assert.deepEqual(daemon.events.map((event) => event.seq), [0, 1, 2, 3]);
+    assert.deepEqual(daemon.events.map((event) => event.seq), [0, 1, 2, 3, 4, 5]);
     assert.ok(daemon.events.every((event) => event.job === 'job-gate-1'));
 
-    const [running, gateLog, settle, cancelled] = daemon.events;
+    const [running, , , gateLog, settle, cancelled] = daemon.events;
     assert.match(String(gateLog.text), /^pickup gate: /);
     assert.equal(running.state, 'running');
 

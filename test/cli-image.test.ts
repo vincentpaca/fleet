@@ -27,8 +27,10 @@ import {
   twoLayerEnabled,
   imageExistsLocally,
   buildJobImage,
+  jobImageDockerfile,
   type ImageManifest,
 } from '../src/cli/images.ts';
+import { SETUP_BAKED_BASENAME } from '../src/shared/setup-marker.ts';
 
 // ---------- fixtures ----------
 
@@ -141,6 +143,37 @@ describe('computeImageHash', () => {
   test('is exactly 16 hex characters', () => {
     const hash = computeImageHash(BASE_MANIFEST);
     assert.match(hash, /^[0-9a-f]{16}$/);
+  });
+});
+
+// ---------- jobImageDockerfile (baked-setup marker, #49) ----------
+
+describe('jobImageDockerfile', () => {
+  test('setup.script mode runs the script and leaves the baked marker in the same layer', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { script: '.fleet/setup.sh' },
+    });
+    assert.match(dockerfile, /^FROM fleet-runner:claude-code-1\.2\.3\n/);
+    assert.match(dockerfile, /COPY \.fleet\/setup\.sh \/tmp\/fleet-setup\.sh/);
+    // The marker is what tells the runner NOT to run setup.script again before
+    // the pickup gate (src/runner/setup.ts). Same RUN as the script: a build
+    // where setup failed must not leave the marker behind.
+    assert.match(
+      dockerfile,
+      new RegExp(`RUN sh /tmp/fleet-setup\\.sh && touch "\\$HOME/${SETUP_BAKED_BASENAME}"`),
+    );
+    // $HOME, never /etc: the runner base drops to USER node before this layer.
+    assert.ok(!dockerfile.includes('/etc/'), 'job-image layers run as node and cannot write /etc');
+  });
+
+  test('no setup.script → plain base alias, and no marker', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { image: 'node:22' },
+    });
+    assert.equal(dockerfile, 'FROM fleet-runner:claude-code-1.2.3\n');
+    assert.ok(!dockerfile.includes(SETUP_BAKED_BASENAME), 'an image that baked nothing must not claim it did');
   });
 });
 

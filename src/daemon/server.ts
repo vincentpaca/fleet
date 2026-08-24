@@ -421,6 +421,18 @@ export class FleetDaemon {
       }
     }
 
+    // Dispatch-time image-override check (#49): a provider whose image is
+    // pinned by the substrate (ECS) refuses the two-layer job image here,
+    // loudly, before a job record exists — never a silent fallback to an
+    // image the manifest versioned away from.
+    if (imageOverride !== undefined && this.#options.provider.checkImageOverride) {
+      try {
+        this.#options.provider.checkImageOverride(imageOverride);
+      } catch (error) {
+        return sendJson(res, 422, { errors: [{ instancePath: "/image", message: String(error) }] });
+      }
+    }
+
     const id = newId("job");
     const now = new Date().toISOString();
     const record: JobRecord = {

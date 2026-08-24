@@ -427,6 +427,26 @@ export class EcsProvider implements Provider {
   }
 
   /**
+   * Two-layer job images (#49): this provider cannot honor a per-job image
+   * override. `ecs run-task` container overrides cannot change the image, the
+   * runner task definition pins the deployment's :runner tag, and the
+   * CLI-built job image is local to the operator's docker anyway — nothing
+   * pushes it to a registry ECS could pull. Until delegate pushes the image
+   * to the deployment's ECR and this provider registers a task-definition
+   * revision for it, refuse at dispatch: a silent fallback to the pinned
+   * image would run the job in an environment the manifest explicitly
+   * versioned away from. buildRunTaskArgs deliberately never reads spec.image.
+   */
+  checkImageOverride(image: string): void {
+    throw new Error(
+      `the ecs provider cannot run the computed job image ${image}: ` +
+        "the runner task definition pins its own image and run-task cannot override it. " +
+        "Remove harness.cli_version from the manifest (one-layer mode: the runner executes " +
+        "setup.script in the workspace before the pickup gate), or dispatch to a docker deployment.",
+    );
+  }
+
+  /**
    * Run one `aws` call under its phase budget (#122): the deadline races the
    * CLI so the daemon's launch/cancel path settles either way, and the same
    * value is passed down so the real child process is killed rather than left

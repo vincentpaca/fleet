@@ -58,6 +58,16 @@ export interface Provider {
    * Called at dispatch time before launch() so failures surface immediately.
    */
   checkResources?(resources: ResourceRequest): void;
+  /**
+   * Optional: validate that launch() can honor a per-job image override
+   * (LaunchSpec.image carrying the CLI-built two-layer job image, #49).
+   * Throws with what to do instead when it cannot — a substrate that pins its
+   * image (the ECS runner task definition) must refuse at dispatch, before a
+   * job record exists, rather than silently run the job on the wrong image.
+   * Absent means the override is honored (docker uses it directly; process
+   * runs on the host, where no image applies by construction).
+   */
+  checkImageOverride?(image: string): void;
 }
 
 /**

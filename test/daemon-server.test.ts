@@ -772,6 +772,66 @@ test("POST /jobs with no limits.resources passes undefined resources to the Laun
   assert.equal(launch.resources, undefined);
 });
 
+// --- Dispatch-time image-override check (#49) ---------------------------------
+
+/** Provider stub that cannot honor a per-job image override (the ECS shape). */
+class ImagePinnedProvider extends StubProvider {
+  override readonly name = "ecs";
+  checkImageOverride(image: string): void {
+    throw new Error(`the ecs provider cannot run the computed job image ${image}`);
+  }
+}
+
+test("POST /jobs refuses an image override the provider cannot honor — 422, no job created", async (t) => {
+  const provider = new ImagePinnedProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: MANIFEST,
+    image: "fleet-job:abc123def4567890",
+  });
+
+  assert.equal(res.status, 422);
+  const { errors } = res.json as { errors: { instancePath: string; message: string }[] };
+  assert.ok(errors.some((e) => e.instancePath === "/image"), `expected /image error; got: ${JSON.stringify(errors)}`);
+  assert.ok(
+    errors.some((e) => e.message.includes("fleet-job:abc123def4567890")),
+    `the refusal must name the image; got: ${JSON.stringify(errors)}`,
+  );
+
+  // The silent-fallback bug this guards: no job may exist, nothing may launch.
+  const list = await op(sock, "GET", "/jobs");
+  assert.deepEqual((list.json as { jobs: unknown[] }).jobs, []);
+  assert.equal(provider.launches.length, 0);
+});
+
+test("POST /jobs without an image override dispatches normally on an image-pinned provider", async (t) => {
+  const provider = new ImagePinnedProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  assert.equal(provider.launches.length, 1);
+});
+
+test("POST /jobs forwards the image override to a provider that honors it", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const res = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: MANIFEST,
+    image: "fleet-job:abc123def4567890",
+  });
+  assert.equal(res.status, 201, res.body);
+  assert.equal(ctx.provider.launches[0].image, "fleet-job:abc123def4567890");
+});
+
 // --- Parked-job re-entry (issue #6) ---
 
 // (No manifest helper needed for decision_timeout tests — registry is seeded directly
