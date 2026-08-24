@@ -703,7 +703,12 @@ test("job.json carries no manifest or work order; launch.json does", async (t) =
 
   // The API is unchanged: the record still serves the work order, it is just
   // not re-serialised into job.json on every event.
-  assert.deepEqual(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).workOrder, WORK_ORDER);
+  const served = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json) as Record<string, unknown>;
+  assert.deepEqual(served.workOrder, WORK_ORDER);
+  // The on-disk marker is daemon bookkeeping. publicFields strips the internal
+  // fields by name, so a new one that is not listed there leaks onto the wire.
+  assert.equal(served.launchSplit, undefined, "the split marker must not reach the operator");
+  assert.equal(card.launchSplit, 1, "but it must be on disk — it is how the next boot knows");
 });
 
 test("the hot record does not grow with the manifest", async (t) => {
@@ -750,44 +755,135 @@ test("launch.json is written once, not once per event", async (t) => {
   );
 });
 
-test("a job dir written before the split still loads and can re-enter", async (t) => {
+test("a pre-split job dir is migrated, and survives a write after boot", async (t) => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   const { id, token } = await createJob(ctx);
-  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
   await ctx.daemon.stop();
 
-  // Fold launch.json back into job.json and delete it — the on-disk shape every
-  // existing home has. There is no migration step, so the loader has to cope.
+  // Fold launch.json back into job.json and delete it, then drop the marker —
+  // the on-disk shape of every job in an existing home. There is no migration
+  // step run by hand, so the loader has to cope on its own.
   const dir = jobDir(home, id);
   const card = JSON.parse(readFileSync(join(dir, "job.json"), "utf8"));
   const launch = JSON.parse(readFileSync(join(dir, "launch.json"), "utf8"));
+  delete card.launchSplit;
   writeFileSync(join(dir, "job.json"), JSON.stringify({ ...card, ...launch }, null, 2));
   rmSync(join(dir, "launch.json"));
 
   const ctx2 = await startDaemon(home);
-  t.after(() => ctx2.daemon.stop());
+  assert.equal(jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json).state, "queued");
 
-  const job = jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json);
+  // Reading it right is not enough. job.json is rewritten on the very next
+  // event WITHOUT the launch fields, so a job that is read but not migrated has
+  // its launch half in neither file from that point on — silently, and for
+  // every job in the home at once.
+  await runnerPost(ctx2.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await ctx2.daemon.stop();
+
+  const ctx3 = await startDaemon(home);
+  t.after(() => ctx3.daemon.stop());
+  const job = jobOf((await op(ctx3.sock, "GET", `/jobs/${id}`)).json);
   assert.equal(job.state, "running");
-  assert.deepEqual(job.workOrder, WORK_ORDER, "the work order survives from the old shape");
-  // The launch details re-entry needs are intact, which is the half that would
-  // silently go missing if the loader only looked at the new file.
-  assert.deepEqual(ctx2.daemon.registry.getLaunchDetails(id).manifest, MANIFEST);
+  assert.deepEqual(job.workOrder, WORK_ORDER, "the work order must survive the rewrite");
+  assert.deepEqual(
+    ctx3.daemon.registry.getLaunchDetails(id).manifest,
+    MANIFEST,
+    "the launch details re-entry needs must survive the rewrite",
+  );
 });
 
-test("an unreadable launch.json does not stop the job loading", async (t) => {
+test("every launch field round-trips through the file, not just the manifest", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const env = { API_TOKEN: "t0ken", REGION: "ap-southeast-1" };
+  const sync = { "docs/spec.md": "the spec body" };
+  const res = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: MANIFEST,
+    env,
+    sync,
+    image: "node:24",
+  });
+  assert.equal(res.status, 201, res.body);
+  const { id } = jobOf(res.json);
+  const before = ctx.daemon.registry.getLaunchDetails(id);
+  await ctx.daemon.stop();
+
+  // Only workOrder and the manifest were pinned before, so a #writeLaunchJson
+  // that dropped launchSync — the field the size test says is the bulk of it —
+  // passed the whole suite, and re-entry would launch with no synced files.
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+  assert.deepEqual(ctx2.daemon.registry.getLaunchDetails(id), before);
+  assert.deepEqual(ctx2.daemon.registry.getLaunchDetails(id).env, env);
+  assert.deepEqual(ctx2.daemon.registry.getLaunchDetails(id).sync, sync);
+  assert.equal(ctx2.daemon.registry.getLaunchDetails(id).image, "node:24");
+});
+
+test("launch.json cannot overwrite the card it is merged into", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id } = await createJob(ctx);
+  await ctx.daemon.stop();
+
+  // The launch half is merged over the card, so anything that parses used to
+  // land in the record and be persisted and served. On the process provider the
+  // job runs as the same user with access to $FLEET_HOME, which makes this a
+  // job editing its own control record — the thing the /internal-only runner
+  // token exists to prevent.
+  const dir = jobDir(home, id);
+  const launch = JSON.parse(readFileSync(join(dir, "launch.json"), "utf8"));
+  writeFileSync(
+    join(dir, "launch.json"),
+    JSON.stringify({ ...launch, state: "done", runnerToken: "stolen", handle: "attacker", extra: 1 }),
+  );
+
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+  const job = jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json) as Record<string, unknown>;
+  assert.equal(job.state, "queued", "the card's state must win");
+  assert.notEqual(job.handle, "attacker", "the card's handle must win");
+  assert.equal(job.extra, undefined, "unknown keys must not reach the record");
+  assert.deepEqual(job.workOrder, WORK_ORDER, "the fields it does own still load");
+});
+
+test("a launch.json that is not an object is treated as unreadable", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id } = await createJob(ctx);
+  await ctx.daemon.stop();
+  writeFileSync(join(jobDir(home, id), "launch.json"), '["not", "an", "object"]');
+
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+  // An array parses fine and spreads as "0", "1", "2" keys.
+  const job = jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json) as Record<string, unknown>;
+  assert.equal(job["0"], undefined, "array indices must not become record fields");
+  assert.equal(job.state, "queued");
+});
+
+test("a lost launch.json is loud in the journal, and does not stop the job loading", async (t) => {
   const home = tempHome();
   const ctx = await startDaemon(home);
   const { id, token } = await createJob(ctx);
   await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
   await ctx.daemon.stop();
+  // job.json carries the split marker, so an unreadable launch.json here is
+  // corruption, not a pre-split job — the distinction the marker exists for.
   writeFileSync(join(jobDir(home, id), "launch.json"), "{ torn");
 
-  // Not quarantined: the launch half is only needed to re-launch a parked job.
-  // A job whose journal is intact still serves its history and still settles,
-  // and one torn file taking a live job out is the #112 failure again.
+  // Not quarantined: the journal is intact, so the job serves its history and
+  // can still settle. One torn file taking a live job out is #112 again.
   const ctx2 = await startDaemon(home);
   t.after(() => ctx2.daemon.stop());
   assert.equal(jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json).state, "running");
+
+  // But it must not pass silently: the consequence is a job that can never
+  // re-enter, and stderr on a container host is not somewhere an operator
+  // looks. The journal is what the cockpit reads.
+  const notes = ctx2.daemon.registry
+    .eventsAfter(id, -1)
+    .filter((e) => e.type === "log" && String(e.text).includes("launch data lost"));
+  assert.equal(notes.length, 1, "the lost launch half must be recorded in the journal");
 });
