@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
   appendFileSync,
 } from "node:fs";
@@ -680,4 +681,113 @@ test("stableStringify distinguishes values that differ only deep inside", () => 
 test("stableStringify omits undefined properties, matching JSON.stringify", () => {
   assert.equal(stableStringify({ a: 1, b: undefined }), stableStringify({ a: 1 }));
   assert.equal(stableStringify({ a: 1 }), '{"a":1}');
+});
+
+// --- #113: the write-once launch data lives in its own file -----------------
+
+test("job.json carries no manifest or work order; launch.json does", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  const { id } = await createJob(ctx);
+
+  const card = JSON.parse(readFileSync(join(jobDir(home, id), "job.json"), "utf8"));
+  assert.equal(card.workOrder, undefined, "the work order must not be in the hot record");
+  assert.equal(card.launchManifest, undefined, "the manifest must not be in the hot record");
+  assert.equal(card.launchEnv, undefined);
+  assert.equal(card.launchSync, undefined);
+
+  const launch = JSON.parse(readFileSync(join(jobDir(home, id), "launch.json"), "utf8"));
+  assert.deepEqual(launch.workOrder, WORK_ORDER);
+  assert.deepEqual(launch.launchManifest, MANIFEST);
+
+  // The API is unchanged: the record still serves the work order, it is just
+  // not re-serialised into job.json on every event.
+  assert.deepEqual(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).workOrder, WORK_ORDER);
+});
+
+test("the hot record does not grow with the manifest", async (t) => {
+  // The reason for the split: every intake event rewrites job.json, so anything
+  // in it is a per-event cost — on EFS, a per-event network round trip sized by
+  // the manifest. A synced-file map makes that kilobytes.
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+
+  // Synced files ride in on the dispatch body and are stored for re-entry, so
+  // they are exactly the write-once bulk this split is about.
+  const sync = Object.fromEntries(
+    Array.from({ length: 200 }, (_, i) => [`FILE_${i}`, "x".repeat(200)]),
+  );
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST, sync });
+  assert.equal(res.status, 201, res.body);
+  const { id } = jobOf(res.json);
+
+  const cardBytes = readFileSync(join(jobDir(home, id), "job.json"), "utf8").length;
+  const launchBytes = readFileSync(join(jobDir(home, id), "launch.json"), "utf8").length;
+  assert.ok(launchBytes > 40_000, `the fat manifest must be somewhere: ${launchBytes} bytes`);
+  assert.ok(
+    cardBytes < 2_000,
+    `job.json must stay small regardless of manifest size; got ${cardBytes} bytes`,
+  );
+});
+
+test("launch.json is written once, not once per event", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+  const before = ctx.daemon.registry.launchWriteCount();
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, { type: "think", text: "working" }));
+  await runnerPost(ctx.sock, id, token, event(id, 2, SETTLE));
+
+  assert.equal(
+    ctx.daemon.registry.launchWriteCount() - before,
+    0,
+    "intake must never touch the write-once file",
+  );
+});
+
+test("a job dir written before the split still loads and can re-enter", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id, token } = await createJob(ctx);
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await ctx.daemon.stop();
+
+  // Fold launch.json back into job.json and delete it — the on-disk shape every
+  // existing home has. There is no migration step, so the loader has to cope.
+  const dir = jobDir(home, id);
+  const card = JSON.parse(readFileSync(join(dir, "job.json"), "utf8"));
+  const launch = JSON.parse(readFileSync(join(dir, "launch.json"), "utf8"));
+  writeFileSync(join(dir, "job.json"), JSON.stringify({ ...card, ...launch }, null, 2));
+  rmSync(join(dir, "launch.json"));
+
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+
+  const job = jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json);
+  assert.equal(job.state, "running");
+  assert.deepEqual(job.workOrder, WORK_ORDER, "the work order survives from the old shape");
+  // The launch details re-entry needs are intact, which is the half that would
+  // silently go missing if the loader only looked at the new file.
+  assert.deepEqual(ctx2.daemon.registry.getLaunchDetails(id).manifest, MANIFEST);
+});
+
+test("an unreadable launch.json does not stop the job loading", async (t) => {
+  const home = tempHome();
+  const ctx = await startDaemon(home);
+  const { id, token } = await createJob(ctx);
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await ctx.daemon.stop();
+  writeFileSync(join(jobDir(home, id), "launch.json"), "{ torn");
+
+  // Not quarantined: the launch half is only needed to re-launch a parked job.
+  // A job whose journal is intact still serves its history and still settles,
+  // and one torn file taking a live job out is the #112 failure again.
+  const ctx2 = await startDaemon(home);
+  t.after(() => ctx2.daemon.stop());
+  assert.equal(jobOf((await op(ctx2.sock, "GET", `/jobs/${id}`)).json).state, "running");
 });
