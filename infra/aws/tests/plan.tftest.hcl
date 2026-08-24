@@ -9,7 +9,7 @@
 # mock_provider makes the plan free and offline — no credentials, no API calls,
 # no state — while keeping the part that rejects the value: the real provider
 # schema. Run it as part of the infra pre-release checklist (see the unit
-# README) — by hand for now: CI's terraform job runs fmt and validate only.
+# README); CI's terraform job runs it too (.github/workflows/tests.yml).
 #
 #   terraform -chdir=infra/aws init -backend=false -input=false
 #   terraform -chdir=infra/aws test

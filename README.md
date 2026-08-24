@@ -15,7 +15,7 @@ Everything runs in your account with your credentials. There is no hosted servic
 npm install -g github:<org>/fleet
 ```
 
-That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. Fleet is not on the npm registry yet — see [Status](#status).
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. Fleet is not on the npm registry yet — see [Status](#status). One caveat: first-time infrastructure bring-up (`fleet setup infra` and `images/build.sh` in the quick start below) does run from a Fleet checkout, because the Terraform unit and image sources ship by git, not in the npm package.
 
 ## What Fleet owns
 

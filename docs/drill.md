@@ -1,6 +1,6 @@
 # The operator-independence drill
 
-The phase-1 exit criterion ([roadmap](roadmap.md#phase-1--first-real-delegated-run-in-progress)), executed as a repeatable acceptance drill. It proves the one claim everything else rests on: **no local process is load-bearing**. A job blocks on a real decision, the dispatching machine disappears, the job parks to zero cost, a *different* machine answers, the job re-enters and delivers a PR, and the cluster returns to zero.
+The phase-1 exit criterion ([roadmap](roadmap.md#phase-1--first-real-delegated-run)), executed as a repeatable acceptance drill. It proves the one claim everything else rests on: **no local process is load-bearing**. A job blocks on a real decision, the dispatching machine disappears, the job parks to zero cost, a *different* machine answers, the job re-enters and delivers a PR, and the cluster returns to zero.
 
 Run it against a live deployment after any change to the daemon, the runner lifecycle, or an infra unit. [The harness drill](#the-harness-drill) below is its companion: the same claim from the operator's side of the pipe, exercised through a live coding-harness session.
 

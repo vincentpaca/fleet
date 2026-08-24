@@ -44,7 +44,7 @@ Fleet is a standalone tool. Knowledge from real deployments informs its design a
 
 ## D11 — GitHub Issues are the work source for this repo
 
-A delegatable ticket needs an identifier, a readable spec, a machine-checkable readiness state, and a place for results to land. For this repo that is a GitHub issue (id, body with acceptance criteria, `ready` label, PR link-back), with `docs/tasks/<n>-*.md` files for specs too large for an issue body. The pickup gate checks issue readiness via `gh`.
+A delegatable ticket needs an identifier, a readable spec, a machine-checkable readiness state, and a place for results to land. For this repo that is a GitHub issue (id, body with acceptance criteria, `ready` label, PR link-back), with `docs/tasks/<n>-*.md` files for specs too large for an issue body (none exist yet). The pickup gate checks issue readiness via `gh`.
 
 **Amended 2026-08-22 — readiness is checked per mode, not per dispatch.** The gate originally ran the issue check unconditionally, which made `fleet delegate "<prose>" --mode investigate` un-dispatchable on this repo: a legitimate prompt-target job whose deliverable is a report artifact died for not being a ready ticket. A gate should spend strictness proportionally to the authority the mode grants, so `implement`/`followthrough` (edit authority, PR at the end) pay the full check while the read-only modes (`assess`/`investigate`/`review`/`compare`) pass with a note. A missing target still fails everywhere. Naming issues as the work source was never a demand that every dispatch be a ticket, and this repo's gate is the reference implementation others copy.
 
