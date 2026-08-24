@@ -1,4 +1,7 @@
 // Provider contract: how the daemon launches and terminates job sandboxes.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** Resource requirements from manifest limits.resources. */
 export type ResourceRequest = {
@@ -134,6 +137,21 @@ export function isMissingResourceError(error: unknown): boolean {
   const err = error as { message?: unknown; stderr?: unknown };
   const text = `${String(err?.message ?? "")} ${typeof err?.stderr === "string" ? err.stderr : ""}`;
   return /No such container|TaskNotFoundException|already stopped/i.test(text);
+}
+
+/**
+ * Materialise secret payload for a CLI shell-out as a file instead of argv
+ * (#126): anything on argv is world-readable in `ps` for the child's lifetime,
+ * and lands in any shell/audit logging that captures command lines. The file
+ * lives alone in a fresh mkdtemp directory (0700) with mode 0600. Callers must
+ * run `cleanup()` in a finally — the secret must not outlive the command on
+ * either the success or the failure path.
+ */
+export function writeSecretTempFile(prefix: string, content: string): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const path = join(dir, "payload");
+  writeFileSync(path, content, { mode: 0o600 });
+  return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 /** FLEET_* env every provider injects into the sandbox. */
