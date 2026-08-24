@@ -68,5 +68,23 @@ COPY schemas/ schemas/
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Drop root. A job's harness is the least trusted code Fleet runs — it is an
+# agent executing a work order against a cloned repo — and until now it ran as
+# uid 0 inside the container, one kernel bug away from the host (Hadolint
+# missing-user / Opengrep missing-user-entrypoint).
+#
+# `node` (uid 1000) ships in the base image. Everything above this line still
+# runs as root because it has to: apt, the gh APT source, and `npm install -g`
+# all write outside $HOME. Nothing below needs to.
+#
+# /workspace is created here rather than by the runner, which is the one thing
+# that breaks without root: materializeWorkspace mkdirs FLEET_WORKSPACE, and
+# creating a directory at the filesystem root is not something uid 1000 can do.
+# The container is ephemeral and mounts no volume, so there is no host-side
+# ownership to reconcile — unlike the daemon image, which writes to EFS and
+# cannot drop root without relocating or chowning a live filesystem.
+RUN mkdir -p /workspace && chown node:node /workspace
+USER node
+
 # Entrypoint: the runner. API keys arrive via docker run -e, never baked in.
-ENTRYPOINT ["node", "src/runner/main.ts"]
+ENTRYPOINT ["node", "/opt/fleet/src/runner/main.ts"]

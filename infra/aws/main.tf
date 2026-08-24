@@ -1,4 +1,5 @@
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -47,6 +48,20 @@ resource "aws_vpc" "this" {
   enable_dns_hostnames = true
 
   tags = merge(local.tags, { Name = var.name })
+}
+
+# Every VPC ships a default security group that allows all traffic between its
+# members. Nothing in Fleet uses it — every resource here names its own SG — but
+# it stays permissive unless something claims it, so anything later launched into
+# this VPC without an explicit SG lands in an allow-all group. Adopting it with
+# no rules closes that (Checkov CKV2_AWS_12). Only when Fleet owns the VPC:
+# adopting an operator's default SG would silently change their other workloads.
+resource "aws_default_security_group" "this" {
+  count = local.create_vpc ? 1 : 0
+
+  vpc_id = aws_vpc.this[0].id
+
+  tags = merge(local.tags, { Name = "${var.name}-default-locked" })
 }
 
 resource "aws_internet_gateway" "this" {
@@ -207,6 +222,16 @@ resource "aws_ecr_repository" "runner" {
     scan_on_push = true
   }
 
+  # KMS rather than the AES256 default (Checkov CKV_AWS_136). Deliberately the
+  # AWS-managed ECR key, not the CMK above: images are rebuildable from this
+  # repo, so there is nothing here worth the key-policy surface a CMK adds.
+  encryption_configuration {
+    encryption_type = "KMS"
+  }
+
+  # image_tag_mutability stays MUTABLE. images/build.sh owns the :runner and
+  # :daemon tags that infra/aws/ pins by name and re-pushes them on every build;
+  # IMMUTABLE makes the second push fail. See docs/decisions.md.
   tags = local.tags
 }
 
@@ -217,6 +242,10 @@ resource "aws_ecr_repository" "project" {
 
   image_scanning_configuration {
     scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "KMS"
   }
 
   tags = local.tags
@@ -318,6 +347,14 @@ resource "aws_iam_role_policy" "daemon_ssm_config" {
         Action   = ["ssm:GetParameter"]
         Resource = aws_ssm_parameter.fleet_config.arn
       },
+      {
+        # The parameter is a SecureString, so reading it is two authorizations:
+        # ssm:GetParameter above and kms:Decrypt here. Scoped to decrypt only —
+        # the daemon never writes the parameter.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = aws_kms_key.fleet.arn
+      },
     ]
   })
 }
@@ -408,6 +445,14 @@ resource "aws_launch_template" "instances" {
     name = aws_iam_instance_profile.instance.name
   }
 
+  # IMDSv2 is required; the hop limit stays at 2. Checkov CKV_AWS_341 wants 1,
+  # and 1 is the safer number — a container that can reach IMDS can assume the
+  # *instance* role, which is broader than any job's task role. But this line
+  # already says containers depend on it, so dropping it is a deployment change
+  # with a settled call behind it, not a lint fix. Reopen it with a human:
+  # if nothing in a job actually reads IMDS (task credentials come from the ECS
+  # credential endpoint at 169.254.170.2, which is not IMDS), this should be 1.
+  # See docs/decisions.md.
   metadata_options {
     http_tokens                 = "required"
     http_put_response_hop_limit = 2 # containers need the instance role via IMDS
@@ -497,10 +542,69 @@ resource "aws_ecs_cluster_capacity_providers" "this" {
   }
 }
 
+# --- KMS (customer-managed key for state at rest) --------------------------------
+# EFS, the log groups and the fleet-config parameter are all encrypted by default
+# with an AWS-managed key, which the operator cannot rotate, audit by policy, or
+# revoke. One CMK covers all three so those things are the operator's to control
+# (Checkov CKV_AWS_184 / CKV_AWS_158, Opengrep aws-efs-filesystem-encrypted-with-cmk).
+#
+# Deletion window is 30 days, deliberately not 7: the key is the only way to read
+# a job's history, and a fat-fingered destroy should be recoverable for longer
+# than a weekend.
+
+resource "aws_kms_key" "fleet" {
+  description             = "${var.name}: EFS state, log groups, fleet-config parameter"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  # CloudWatch Logs encrypts with the key itself rather than through a caller's
+  # credentials, so the log service needs its own grant. Scoped by
+  # kms:EncryptionContext so it can only be used for this deployment's groups —
+  # a bare logs.* principal would let any log group in the account use this key.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AccountFullControl"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "CloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.${data.aws_region.current.region}.amazonaws.com" }
+        Action = [
+          "kms:Encrypt*",
+          "kms:Decrypt*",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:Describe*",
+        ]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/${var.name}/*"
+          }
+        }
+      },
+    ]
+  })
+
+  tags = merge(local.tags, { Name = var.name })
+}
+
+resource "aws_kms_alias" "fleet" {
+  name          = "alias/${var.name}"
+  target_key_id = aws_kms_key.fleet.key_id
+}
+
 # --- EFS (FLEET_HOME durable state) ---------------------------------------------
 
 resource "aws_efs_file_system" "fleet_home" {
-  encrypted = true
+  encrypted  = true
+  kms_key_id = aws_kms_key.fleet.arn
 
   lifecycle_policy {
     transition_to_ia = "AFTER_30_DAYS"
@@ -522,12 +626,14 @@ resource "aws_efs_mount_target" "fleet_home" {
 resource "aws_cloudwatch_log_group" "daemon" {
   name              = "/${var.name}/daemon"
   retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.fleet.arn
   tags              = local.tags
 }
 
 resource "aws_cloudwatch_log_group" "runner" {
   name              = "/${var.name}/runner"
   retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.fleet.arn
   tags              = local.tags
 }
 
@@ -625,9 +731,15 @@ locals {
 }
 
 resource "aws_ssm_parameter" "fleet_config" {
-  name  = local.fleet_config_ssm_path
-  type  = "String"
-  value = jsonencode(local.fleet_config)
+  name = local.fleet_config_ssm_path
+  # SecureString under the deployment's CMK. The contents are not secrets — task
+  # definition family, cluster name, subnet ids — but they are a complete map of
+  # how to dispatch a job into this account, and a String parameter is readable
+  # by anything holding ssm:GetParameter on the path. Readers must pass
+  # --with-decryption and hold kms:Decrypt (see daemon_ssm_config below).
+  type   = "SecureString"
+  key_id = aws_kms_key.fleet.arn
+  value  = jsonencode(local.fleet_config)
 
   tags = local.tags
 }

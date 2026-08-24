@@ -142,6 +142,11 @@ export async function ecsConfigFromSsm(path: string): Promise<EcsConfig> {
     "get-parameter",
     "--name",
     path,
+    // The parameter is a SecureString (infra/aws/main.tf). Without this the
+    // call succeeds and returns the ciphertext, so the failure is a JSON parse
+    // error at daemon boot rather than an access denied — harmless with a
+    // String parameter, and required with any encrypted one.
+    "--with-decryption",
     "--output",
     "json",
   ]);
