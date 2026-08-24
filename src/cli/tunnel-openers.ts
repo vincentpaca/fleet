@@ -59,7 +59,9 @@ export function refreshDeployment(
   if (config.provider !== 'ecs') return undefined;
   const ssmPath = config.ssm_config_path;
   if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
-  return run(['ssm', 'get-parameter', '--name', ssmPath, '--output', 'json']).then((stdout) => ({
+  // --with-decryption: the parameter is a SecureString (infra/aws/main.tf), and
+  // without it the call returns ciphertext that fails to parse.
+  return run(['ssm', 'get-parameter', '--name', ssmPath, '--with-decryption', '--output', 'json']).then((stdout) => ({
     source: `SSM parameter ${ssmPath}`,
     config: parseFleetConfigSsmResponse(stdout),
   }));

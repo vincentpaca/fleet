@@ -259,6 +259,34 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     cleanup.push(BASE_TAG);
   });
 
+  // The harness is the least trusted code Fleet runs, so the container it runs
+  // in must not be root. Asserted on the built image rather than by reading the
+  // Dockerfile: a later `USER root`, a base-image change, or an ENTRYPOINT that
+  // re-escalates would all pass a grep and fail here.
+  test('the runner image runs as a non-root user that can still do the job', () => {
+    const sh = (script: string): string =>
+      execFileSync('docker', ['run', '--rm', '--entrypoint', 'sh', BASE_TAG, '-c', script], {
+        encoding: 'utf8',
+      }).trim();
+
+    assert.equal(sh('id -u'), '1000', 'the runner must not run as root');
+
+    // Non-root is worthless if it cannot work. These are the four things the
+    // runner does before the harness produces a line: create the workspace,
+    // clone into it, find its own entrypoint, and write its own home.
+    assert.equal(
+      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"'),
+      'ok',
+      'the runner must be able to materialise FLEET_WORKSPACE',
+    );
+    assert.equal(sh('git init -q /workspace/repo && echo ok'), 'ok');
+    assert.equal(sh('[ -w "$HOME" ] && echo ok'), 'ok', 'the harness writes config under $HOME');
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"'),
+      'ok',
+    );
+  });
+
   // AC3: no secrets baked into any image layer
   test('docker history contains no baked-in secret values', () => {
     const history = execFileSync(
@@ -395,8 +423,14 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
         image: tag,
       }),
     });
-    assert.equal(created.status, 201, `job creation failed: ${await created.text()}`);
-    const { job } = (await created.json()) as { job: { id: string } };
+    // Read the body once. A template literal in an assertion message is
+    // evaluated eagerly, so `${await created.text()}` consumed the body whether
+    // the assertion passed or not and the next line threw "Body has already
+    // been read" — meaning this test could never pass, and being gated behind
+    // FLEET_TEST_DOCKER=1 meant nobody found out.
+    const createdBody = await created.text();
+    assert.equal(created.status, 201, `job creation failed: ${createdBody}`);
+    const { job } = JSON.parse(createdBody) as { job: { id: string } };
     const jobId = job.id;
 
     t.after(() => {
