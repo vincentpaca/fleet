@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -375,4 +376,33 @@ test('remoteHasHead answers only for this HEAD, not for "the branch moved"', () 
   const gone = mkdtempSync(join(tmpdir(), 'fleet-git-gone-'));
   run(workspace, ['remote', 'set-url', 'origin', join(gone, 'nope.git')]);
   assert.equal(remoteHasHead(workspace, branch), false);
+});
+
+test('a push that hangs is SIGKILLed at its bound and throws a timeout that names it (#152)', async () => {
+  // A working remote first: a timeout on a live connection must never fire.
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  setupWorkspace(workspace, opts(remote));
+  writeFileSync(join(workspace, 'half-done.txt'), 'wip\n');
+  assert.equal(pushWip(workspace, 'block_hot expired', 30_000), 'pushed');
+
+  // Then the black-holed remote from the issue: a server that accepts the
+  // connection and never answers. Without the bound, git push waits on it
+  // forever — and because these calls are execFileSync, so does the caller's
+  // whole event loop: on pre-#152 code this test wedges instead of failing
+  // an assertion.
+  const server = createServer(() => { /* hold every request open */ });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  assert.ok(addr !== null && typeof addr === 'object');
+  run(workspace, ['remote', 'set-url', 'origin', `http://127.0.0.1:${addr.port}/repo.git`]);
+  writeFileSync(join(workspace, 'half-done.txt'), 'more wip\n');
+  const started = Date.now();
+  assert.throws(
+    () => pushWip(workspace, 'cancelled: SIGTERM', 1_500),
+    /git push timed out after 1500ms/,
+    'the error must name the timeout so the teardown log can distinguish a hang from a rejection',
+  );
+  assert.ok(Date.now() - started < 10_000, 'the hang must be cut at the bound, not ride it out');
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 });

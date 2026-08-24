@@ -53,6 +53,16 @@ export interface Provider {
    */
   terminate(handle: string): Promise<void>;
   /**
+   * Optional: rebuild the terminate-able handle for a job from its id alone
+   * (#115). A daemon crash between `launch` resolving and the handle being
+   * persisted leaves a live sandbox the record cannot name — and Provider has
+   * no list op, so without this the container is unkillable. Providers that
+   * name sandboxes deterministically (docker: fleet-<jobId>) implement it;
+   * providers whose handles are substrate-assigned (ECS task ARNs) omit it.
+   * Purely a name derivation: it must not claim the sandbox exists.
+   */
+  deriveHandle?(jobId: string): string;
+  /**
    * Optional: validate that the requested resources fit within the offered capacity.
    * Throws with the exact requested vs available numbers when the request cannot be served.
    * Called at dispatch time before launch() so failures surface immediately.
@@ -68,6 +78,13 @@ export interface Provider {
    * runs on the host, where no image applies by construction).
    */
   checkImageOverride?(image: string): void;
+   * Optional: settle whatever a previous daemon's death left behind (#123).
+   * Called once by the daemon entrypoint after it starts serving. The process
+   * provider re-runs workspace disposition for runners whose exit handler
+   * died with the old daemon; container providers have no equivalent — the
+   * substrate outlives the daemon and owns the sandbox lifecycle.
+   */
+  recover?(): void | Promise<void>;
 }
 
 /**

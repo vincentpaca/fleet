@@ -15,7 +15,7 @@ export type DockerProviderOptions = {
   runnerCmd?: string[];
 };
 
-const DEFAULT_IMAGE = "node:22";
+const DEFAULT_IMAGE = "node:24";
 const DEFAULT_RUNNER_CMD = ["node", "/opt/fleet/src/runner/main.ts"];
 const CONTAINER_WORKSPACE = "/workspace";
 
@@ -65,6 +65,15 @@ export class DockerProvider implements Provider {
     const containerId = stdout.trim();
     if (containerId.length === 0) throw new Error("docker run returned no container id");
     return { handle: containerId };
+  }
+
+  /**
+   * Containers are launched under a deterministic name (see buildRunArgs), so
+   * a handle lost to a daemon crash is derivable (#115): `docker stop`/`rm`
+   * accept the name as readily as the id.
+   */
+  deriveHandle(jobId: string): string {
+    return `fleet-${jobId}`;
   }
 
   async terminate(handle: string): Promise<void> {

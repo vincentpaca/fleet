@@ -28,7 +28,7 @@ Fleet containers use two image layers so the expensive base never rebuilds unnec
 ```text
 Layer 1 — runner base (Fleet publishes)
   fleet-runner:<harness-cli>-<cli_version>
-  FROM node:22  +  harness CLI installed globally  +  Fleet runner source
+  FROM node:24-slim  +  harness CLI installed globally  +  Fleet runner source
   Built once per CLI release by Fleet maintainers; pushed to the operator's ECR.
   Dockerfile: images/runner/Dockerfile   Build script: images/build.sh
 
@@ -93,7 +93,7 @@ Answers travel one path only: the daemon's operator-authenticated answer API. Th
 Who holds the wait, in order of preference:
 
 1. **The dispatching harness session.** `integrations/SKILL.md` teaches any coding harness to dispatch, poll, relay the decision to the human through its own question mechanism (options verbatim, recommendation marked, never auto-answered), post the answer, and report the settle. The decision schema maps one-to-one onto every harness's ask tool — same contract on both ends of the pipe. `fleet setup harness` installs it where each harness discovers it: Claude Code, Codex and OpenCode all read a `<name>/SKILL.md` directory with `name`/`description` frontmatter, so one canonical file drives every variant, and the only per-harness differences — the parent directory and how that harness asks its human — are generated from a record in `src/cli/setup-harnesses.ts`. Variants are never checked in; `test/harness-mirrors.test.ts` fails a committed fork the way it fails a drifting `.claude/` mirror.
-2. **A terminal.** The cockpit (bare `fleet`) renders every blocked job's card at the top of the board and answers from its command line — an option id is an answer, in the same grammar `fleet answer` takes. `fleet delegate --watch` and `fleet attach --answer` prompt on stdin for a single job.
+2. **A terminal.** The cockpit (bare `fleet`) sorts blocked jobs to the top of the board (the board windows to the terminal, keeping the selected job's card on screen; cards past the fold take a scroll), pins the selected blocked job's open decision above the input line, and answers from its command line — an option id is an answer, in the same grammar `fleet answer` takes. `fleet delegate --watch` and `fleet attach --answer` prompt on stdin for a single job.
 3. **Nobody.** A webhook ping if `FLEET_NOTIFY_WEBHOOK` is set; otherwise pull via `fleet status`, which lists blocked jobs first.
 
 Invariant across all three: **watching is a view, never a lifeline.** Disconnecting a watcher changes nothing — events are persisted, hot→park→stale proceeds, any session on any machine re-attaches later.
