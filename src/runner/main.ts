@@ -32,6 +32,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
+import { runSetupScript } from './setup.ts';
 import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
@@ -172,6 +173,35 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  // --- Setup script (#49): one-layer images carry no repo setup layer. ---
+  // The two-layer build bakes manifest setup.script into the job image and
+  // leaves a marker; when the marker is absent — the ECS task definition's
+  // pinned :runner image, a bare setup.image, the process provider's host —
+  // the runner runs the script here, after the clone and before the gate, so
+  // the gate probes the environment the manifest actually promised. The
+  // announce line is awaited before the blocking spawnSync for the same
+  // reason the gate's is: it dates the silence the stall backstops measure.
+  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
+  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
+  if (setupScript !== '') {
+    await sink.emit({ type: 'log', text: `setup script: ${setupScript}`, who: 'runner' });
+    const setupOutcome = runSetupScript({
+      workspace,
+      manifest,
+      ...(process.env.FLEET_SETUP_TIMEOUT_MS
+        ? { timeoutMs: parseInt(process.env.FLEET_SETUP_TIMEOUT_MS, 10) || undefined }
+        : {}),
+    });
+    if (setupOutcome.kind !== 'none') {
+      await sink.emit({ type: 'log', text: setupOutcome.note, who: 'runner' });
+    }
+    if (setupOutcome.kind === 'failed') {
+      await settleBlocked(sink, `fix setup script: ${setupOutcome.detail}`);
+      await sink.emit({ type: 'state', state: 'cancelled', reason: 'setup-script' });
+      process.exit(1);
+    }
+  }
+
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
   const gates = (manifest.gates ?? {}) as Record<string, unknown>;
   const pickup = typeof gates.pickup === 'string' ? gates.pickup : '';

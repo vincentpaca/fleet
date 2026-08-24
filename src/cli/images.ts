@@ -29,6 +29,7 @@
 // not here — until then AWS_REGION must match the registry for this path.
 
 import { createHash } from "node:crypto";
+import { SETUP_BAKED_BASENAME } from "../shared/setup-marker.ts";
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -143,18 +144,45 @@ export type BuildJobImageOptions = {
 };
 
 /**
- * Build the per-repo job image.
+ * The generated Dockerfile for a job image built without `setup.dockerfile`.
+ * Pure and exported: the baked-marker contract below is what keeps setup from
+ * running twice (or never), and it has to be testable without a docker daemon.
  *
- * Three modes, selected by `manifest.setup`:
- *   - `setup.dockerfile` set → use it directly (`-f setup.dockerfile`); the
- *     Dockerfile is expected to start FROM the runner base.
- *   - `setup.script` set → generate a minimal Dockerfile:
+ *   - `setup.script` set →
  *       FROM <runnerBase>
  *       COPY <setup.script> /tmp/fleet-setup.sh
- *       RUN sh /tmp/fleet-setup.sh
+ *       RUN sh /tmp/fleet-setup.sh && touch "$HOME/<marker>"
+ *     The marker rides the same layer as the script run (#49): the runner
+ *     executes setup.script itself before the pickup gate unless this file
+ *     exists (src/runner/setup.ts). `$HOME`, never /etc — the runner base
+ *     drops to USER node before any job-image layer runs.
+ *   - `setup.devcontainer` set → comment only (Phase 2); builds as a base alias.
  *   - neither → plain `FROM <runnerBase>` alias (base caching, no extra layers).
+ */
+export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): string {
+  const setup = manifest.setup ?? {};
+  const lines: string[] = [`FROM ${baseTag}`];
+
+  if (setup.script) {
+    // Copy the script into the build so it runs during image creation, not at
+    // runtime — this is the per-repo dependency install layer.
+    lines.push(`COPY ${setup.script} /tmp/fleet-setup.sh`);
+    lines.push(`RUN sh /tmp/fleet-setup.sh && touch "$HOME/${SETUP_BAKED_BASENAME}"`);
+  } else if (setup.devcontainer) {
+    // Phase 2: @devcontainers/cli integration. For now, emit a comment so the
+    // image still builds successfully (as a plain runner base alias).
+    lines.push(`# devcontainer: ${setup.devcontainer} — Phase 2 support`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Build the per-repo job image.
  *
- * devcontainer support is Phase 2.
+ * Two paths: `setup.dockerfile` set → use it directly (`-f setup.dockerfile`;
+ * the Dockerfile is expected to start FROM the runner base, and owns the baked
+ * marker if it runs the repo's setup itself). Otherwise → build from the
+ * generated Dockerfile above.
  */
 export function buildJobImage(opts: BuildJobImageOptions): void {
   const { tag, baseTag, manifest, contextDir = process.cwd() } = opts;
@@ -168,23 +196,10 @@ export function buildJobImage(opts: BuildJobImageOptions): void {
     return;
   }
 
-  const lines: string[] = [`FROM ${baseTag}`];
-
-  if (setup.script) {
-    // Copy the script into the build so it runs during image creation, not at
-    // runtime — this is the per-repo dependency install layer.
-    lines.push(`COPY ${setup.script} /tmp/fleet-setup.sh`);
-    lines.push("RUN sh /tmp/fleet-setup.sh");
-  } else if (setup.devcontainer) {
-    // Phase 2: @devcontainers/cli integration. For now, emit a comment so the
-    // image still builds successfully (as a plain runner base alias).
-    lines.push(`# devcontainer: ${setup.devcontainer} — Phase 2 support`);
-  }
-
   const tmpDir = mkdtempSync(join(tmpdir(), "fleet-image-build-"));
   try {
     const dockerfilePath = join(tmpDir, "Dockerfile.fleet-job");
-    writeFileSync(dockerfilePath, lines.join("\n") + "\n");
+    writeFileSync(dockerfilePath, jobImageDockerfile(baseTag, manifest));
     execFileSync("docker", ["build", "-t", tag, "-f", dockerfilePath, contextDir], {
       stdio: "inherit",
     });

@@ -1575,3 +1575,48 @@ test("cleanly settled docker job is reaped; retained-workspace container is not"
     "a retained workspace keeps its stopped container",
   );
 });
+
+// --- Two-layer image override on ECS (#49) -----------------------------------
+
+test("EcsProvider.checkImageOverride refuses the computed job image, naming it and the way out", () => {
+  const provider = new EcsProvider({
+    cluster: "c",
+    taskDefinition: "t",
+    containerName: "runner",
+    subnets: [],
+    securityGroups: [],
+    launchType: "EC2",
+    assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  assert.throws(
+    () => provider.checkImageOverride("fleet-job:abc123def4567890"),
+    (error: Error) => {
+      // The refusal must be actionable: name the image, say why ECS cannot run
+      // it, and point at both exits (drop cli_version, or a docker deployment).
+      assert.match(error.message, /fleet-job:abc123def4567890/);
+      assert.match(error.message, /task definition pins/);
+      assert.match(error.message, /cli_version/);
+      return true;
+    },
+  );
+});
+
+test("EcsProvider.buildRunTaskArgs never leaks spec.image into run-task — the refusal is the contract", () => {
+  const provider = new EcsProvider({
+    cluster: "c",
+    taskDefinition: "pinned-task-def",
+    containerName: "runner",
+    subnets: [],
+    securityGroups: [],
+    launchType: "EC2",
+    assignPublicIp: "DISABLED",
+    capacityTiers: [],
+  });
+  // If someone wires spec.image into the argv without the ECR push and a
+  // task-definition revision, ECS would reject or (worse) half-honor it —
+  // dispatch must keep using the pinned task definition only.
+  const args = provider.buildRunTaskArgs({ ...SPEC, image: "fleet-job:abc123def4567890" });
+  assert.equal(args.includes("fleet-job:abc123def4567890"), false);
+  assert.equal(args[args.indexOf("--task-definition") + 1], "pinned-task-def");
+});
