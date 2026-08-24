@@ -9,6 +9,12 @@
  *    crash — proving the synthetic exit-code path the 'error' handler uses.
  * 3. watcher.stop() returns promptly with a long-poll in flight.
  * 4. watcher.stop() aborts a long-poll even when the daemon holds the connection.
+ *
+ * Bounded teardown pushes (#152): the WIP push shells out to git, which hangs
+ * without bound on a black-holed remote — and, being execFileSync, blocks the
+ * event loop, so even the cancel deadline timer never fires. Tests 7 and 8
+ * prove a hung push is cut at its own bound and the teardown finishes: the
+ * settle outranks the push on cancel, and a park still parks.
  */
 
 import { test } from 'node:test';
@@ -93,6 +99,37 @@ function writeWorkspace(
   );
   writeFileSync(join(workspace, '.fleet', 'order.json'), JSON.stringify({ target }));
   return workspace;
+}
+
+/**
+ * A `git` shim for the hung-push tests (#152): delegates every call to the
+ * real git until the marker file exists — from then on any `push` ignores
+ * SIGTERM and hangs forever, like a push over a black-holed connection. The
+ * hang execs `sleep` in place (no grandchildren): the ignored-signal
+ * disposition survives exec, and the SIGKILL the timeout sends must land on
+ * the process that holds the stdio pipes or execFileSync stays blocked.
+ * Prepend the returned directory to PATH; create the marker once setup's own
+ * pushes are done.
+ */
+function makeHangingPushGit(marker: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-fake-git-'));
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(
+    join(dir, 'git'),
+    [
+      '#!/bin/sh',
+      'for arg in "$@"; do',
+      `  if [ "$arg" = push ] && [ -e "${marker}" ]; then`,
+      "    trap '' TERM",
+      '    exec sleep 3600',
+      '  fi',
+      'done',
+      `exec "${realGit}" "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return dir;
 }
 
 function spawnRunner(env: Record<string, string>): {
@@ -427,6 +464,143 @@ test('cancel: when the deadline expires the tree is killed and the runner exits 
       // Already gone.
     }
     rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+// --- 7: a hung WIP push cannot cost the settle (#152) ------------------------
+//
+// Production values throughout, as in test 1: the default cancel deadline and
+// the default push slice derived from it. On pre-#152 code this test fails as
+// 'still running' — the hung push blocks the event loop, so not even the
+// deadline timer fires, and the runner wedges until the provider's outer
+// SIGKILL (which in this test never comes).
+
+test('cancel: a WIP push that hangs is cut at its own bound; the settle still lands inside the deadline', async () => {
+  const token = 'cancel-token-7';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const workspace = writeWorkspace({ idle: '60s' });
+  const shimDir = mkdtempSync(join(tmpdir(), 'fleet-hang-marker-'));
+  const marker = join(shimDir, 'hang-now');
+  const fakeGitDir = makeHangingPushGit(marker);
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-cancel-hung-push',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_GIT_URL: remote,
+    FLEET_GIT_NAME: 'Operator One',
+    FLEET_GIT_EMAIL: 'op@example.com',
+    FLEET_HARNESS_CMD: `node ${cancelHarness}`,
+    PATH: `${fakeGitDir}:${process.env.PATH ?? ''}`,
+  });
+  try {
+    // Setup's own pushes must succeed; the hang arms only once the run is live.
+    await waitFor(
+      () => heartbeat(workspace, 'harness') !== '',
+      'the harness to beat at least once',
+    );
+    writeFileSync(marker, '');
+
+    assert.ok(child.pid !== undefined);
+    process.kill(child.pid, 'SIGTERM');
+
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(40_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 1', 'a hung push must not wedge the cancel teardown');
+
+    // The settle landed — losing it to save a doomed push is the bug.
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle, 'the settle must survive a hung WIP push');
+    const last = daemon.events.at(-1);
+    assert.equal(last?.type, 'state');
+    assert.equal(last?.state, 'cancelled');
+
+    // And the transcript names the push timeout: "no wip commit" and "the
+    // push hung" must be distinguishable.
+    assert.ok(
+      logTexts(daemon.events).some((text) => /wip push failed \(cancelling anyway\): git push timed out after \d+ms/.test(text)),
+      `expected a log naming the push timeout; got ${JSON.stringify(logTexts(daemon.events))}`,
+    );
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(shimDir, { recursive: true, force: true });
+    rmSync(fakeGitDir, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+// --- 8: a park whose push hangs still parks (#152) ---------------------------
+//
+// The park path has no outer deadline at all: pre-#152, a hung push here
+// wedged the runner until the daemon's stall backstop reaped it — and the
+// backstop cannot push, cannot park, and says nothing about why.
+
+test('park: a WIP push that hangs is cut at its own bound; blocked/parked is still emitted', async () => {
+  const token = 'cancel-token-8';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const parkHarness = fileURLToPath(new URL('../fixtures/park-harness.mjs', import.meta.url));
+  const workspace = writeWorkspace({ idle: '60s', block_hot: '1s' });
+  const shimDir = mkdtempSync(join(tmpdir(), 'fleet-hang-marker-'));
+  const marker = join(shimDir, 'hang-now');
+  const fakeGitDir = makeHangingPushGit(marker);
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-park-hung-push',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_GIT_URL: remote,
+    FLEET_GIT_NAME: 'Operator One',
+    FLEET_GIT_EMAIL: 'op@example.com',
+    FLEET_HARNESS_CMD: `node ${parkHarness}`,
+    // The default (2 minutes) is sized for a real slow remote, not a test.
+    FLEET_GIT_TIMEOUT_MS: '1500',
+    PATH: `${fakeGitDir}:${process.env.PATH ?? ''}`,
+  });
+  try {
+    // Arm the hang only after the decision is raised: setup's pushes are done
+    // and the next git push is the park's WIP push.
+    await waitFor(
+      () => daemon.events.some((e) => e.type === 'decision'),
+      'the decision event to be raised',
+    );
+    writeFileSync(marker, '');
+
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(40_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 0', 'a hung push must not wedge the park');
+
+    const last = daemon.events.at(-1);
+    assert.equal(last?.type, 'state');
+    assert.equal(last?.state, 'blocked');
+    assert.equal(last?.marker, 'parked');
+
+    assert.ok(
+      logTexts(daemon.events).some((text) => /wip push failed \(parking anyway\): git push timed out after 1500ms/.test(text)),
+      `expected a log naming the push timeout; got ${JSON.stringify(logTexts(daemon.events))}`,
+    );
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(shimDir, { recursive: true, force: true });
+    rmSync(fakeGitDir, { recursive: true, force: true });
     await daemon.close();
   }
 });
