@@ -113,6 +113,53 @@ function defaultRef(workspace: string, url: string): string {
   return match[1];
 }
 
+/** Capture the dispatch payload in memory before git touches the tree. */
+function preserveDispatchFiles(workspace: string): Map<string, Buffer> {
+  const preserved = new Map<string, Buffer>();
+  for (const rel of stagedPaths(workspace)) {
+    const abs = join(workspace, rel);
+    if (existsSync(abs)) preserved.set(rel, readFileSync(abs));
+  }
+  return preserved;
+}
+
+/**
+ * Fetch and check out the job branch. Re-entry/adoption uses the existing
+ * remote branch; a fresh dispatch creates it from the default branch.
+ */
+function checkoutBranch(workspace: string, branch: string, base: string, existing: boolean, depth?: number): void {
+  if (existing) {
+    // Re-entry or adoption: the branch already exists on the remote (WIP
+    // commit from parking, or the continued PR's head). Fetch it, check it
+    // out, and set the upstream tracking so subsequent pushes work without
+    // specifying the remote.
+    git(workspace, ['fetch', '--depth', String(depth ?? 50), '-q', 'origin', branch]);
+    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
+    git(workspace, ['branch', '--set-upstream-to', 'origin/' + branch, branch]);
+  } else {
+    git(workspace, ['fetch', '--depth', String(depth ?? 50), '-q', 'origin', base]);
+    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
+  }
+}
+
+/**
+ * Restore the dispatch payload over the checkout and build the exclude list.
+ * Tracked files get skip-worktree; untracked files go into .git/info/exclude.
+ * Returns the full exclude list so the caller can write it once.
+ */
+function restoreDispatchFiles(workspace: string, preserved: Map<string, Buffer>): string[] {
+  const excludes: string[] = ['.fleet/out/'];
+  for (const [rel, content] of preserved) {
+    const abs = join(workspace, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+    const tracked = git(workspace, ['ls-files', '--', rel]).trim() !== '';
+    if (tracked) git(workspace, ['update-index', '--skip-worktree', '--', rel]);
+    else excludes.push(rel);
+  }
+  return excludes;
+}
+
 /**
  * Turn the staged workspace into a checkout of the repo on the job branch,
  * and push the branch immediately. Returns the branch name and base branch.
@@ -123,42 +170,19 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   // on the remote, so neither creates nor pushes anything at setup.
   const existing = opts.reentry === true || opts.adoptBranch !== undefined;
 
-  // Capture the dispatch payload before git touches the tree.
-  const preserved = new Map<string, Buffer>();
-  for (const rel of stagedPaths(workspace)) {
-    const abs = join(workspace, rel);
-    if (existsSync(abs)) preserved.set(rel, readFileSync(abs));
-  }
+  const preserved = preserveDispatchFiles(workspace);
 
   git(workspace, ['init', '-q']);
   if (opts.name) git(workspace, ['config', 'user.name', opts.name]);
   if (opts.email) git(workspace, ['config', 'user.email', opts.email]);
   git(workspace, ['remote', 'add', 'origin', opts.url]);
   const base = defaultRef(workspace, opts.url);
-  if (existing) {
-    // Re-entry or adoption: the branch already exists on the remote (WIP
-    // commit from parking, or the continued PR's head). Fetch it, check it
-    // out, and set the upstream tracking so subsequent pushes work without
-    // specifying the remote.
-    git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', branch]);
-    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
-    git(workspace, ['branch', '--set-upstream-to', `origin/${branch}`, branch]);
-  } else {
-    git(workspace, ['fetch', '--depth', String(opts.depth ?? 50), '-q', 'origin', base]);
-    git(workspace, ['checkout', '-q', '-f', '-B', branch, 'FETCH_HEAD']);
-  }
+
+  checkoutBranch(workspace, branch, base, existing, opts.depth);
 
   // Restore the dispatch payload over whatever the clone brought in, and make
   // sure none of it can ever be committed or pushed.
-  const excludes: string[] = ['.fleet/out/'];
-  for (const [rel, content] of preserved) {
-    const abs = join(workspace, rel);
-    mkdirSync(dirname(abs), { recursive: true });
-    writeFileSync(abs, content);
-    const tracked = git(workspace, ['ls-files', '--', rel]).trim() !== '';
-    if (tracked) git(workspace, ['update-index', '--skip-worktree', '--', rel]);
-    else excludes.push(rel);
-  }
+  const excludes = restoreDispatchFiles(workspace, preserved);
   mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
   appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
 

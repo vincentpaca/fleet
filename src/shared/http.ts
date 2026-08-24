@@ -111,7 +111,7 @@ export function request(opts: RequestOptions): Promise<HttpResponse> {
     req.destroy(new Error(`request timed out: ${opts.path}`)),
   );
   req.on("error", reject);
-  req.end(opts.body ?? undefined);
+  req.end(opts.body);
   return promise;
 }
 

@@ -253,6 +253,32 @@ function fromSystem(msg: Record<string, unknown>): Translated[] {
   return unknownTag(msg.type, msg.subtype);
 }
 
+/** Dispatch a parsed message record by type. */
+function dispatchMsg(msg: Record<string, unknown>): Translated[] {
+  switch (msg.type) {
+    case 'assistant': return fromAssistant(msg);
+    case 'user': return fromUser(msg);
+    case 'system': return fromSystem(msg);
+    case 'thinking': {
+      // Top-level thinking event: keep text, drop signature blob.
+      const out: Translated[] = [];
+      pushThink(out, typeof msg.thinking === 'string' ? msg.thinking : '');
+      return out;
+    }
+    case 'result': return [{ type: 'result', payload: msg }];
+    default: return unknownTag(msg.type, msg.subtype);
+  }
+}
+
+/** Filter known noise then dispatch. */
+function filterAndDispatch(msg: Record<string, unknown>): Translated[] {
+  // Known noise, checked before dispatch: the CLI has moved these between
+  // top-level `type` and `system.subtype` across releases.
+  const name = msg.type === 'system' ? msg.subtype : msg.type;
+  if (typeof name === 'string' && DROPPED.has(name)) return [];
+  return dispatchMsg(msg);
+}
+
 /** Translate one stream line into zero or more event bodies. Never throws. */
 export function translateLine(line: string): Translated[] {
   const raw = line.trim();
@@ -267,28 +293,5 @@ export function translateLine(line: string): Translated[] {
   }
   const msg = asRecord(parsed);
   if (!msg) return unknownTag(undefined, undefined);
-
-  // Known noise, checked before dispatch: the CLI has moved these between
-  // top-level `type` and `system.subtype` across releases.
-  const name = msg.type === 'system' ? msg.subtype : msg.type;
-  if (typeof name === 'string' && DROPPED.has(name)) return [];
-
-  switch (msg.type) {
-    case 'assistant':
-      return fromAssistant(msg);
-    case 'user':
-      return fromUser(msg);
-    case 'system':
-      return fromSystem(msg);
-    case 'thinking': {
-      // Top-level thinking event: keep text, drop signature blob.
-      const out: Translated[] = [];
-      pushThink(out, typeof msg.thinking === 'string' ? msg.thinking : '');
-      return out;
-    }
-    case 'result':
-      return [{ type: 'result', payload: msg }];
-    default:
-      return unknownTag(msg.type, msg.subtype);
-  }
+  return filterAndDispatch(msg);
 }

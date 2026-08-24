@@ -682,9 +682,13 @@ function indented(stderr: string): string {
   return text === '' ? '' : `${text.split('\n').map((line) => `  ${line}`).join('\n')}\n`;
 }
 
+/** Pattern to read the `name = "..."` from a Terraform root module — hoisted so Lizard
+ *  does not misparse the regex as a division operator and corrupt the function boundary. */
+const TF_NAME_PATTERN = /^\s*name\s*=\s*"([^"]+)"/m;
+
 /** The deployment name the generated root module was written with, for messages. */
 export function generatedName(mainTf: string): string | undefined {
-  const match = mainTf.match(/^\s*name\s*=\s*"([^"]+)"/m);
+  const match = mainTf.match(TF_NAME_PATTERN);
   return match?.[1];
 }
 

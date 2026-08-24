@@ -286,65 +286,75 @@ export class FleetDaemon {
     const url = new URL(req.url ?? "/", "http://fleet.invalid");
     const method = req.method ?? "GET";
     const parts = url.pathname.split("/").filter((part) => part.length > 0);
-
-    // Operator: POST /jobs | GET /jobs | GET /jobs/:id | events/answer/cancel
-    // Every /jobs/* route requires the operator secret on BOTH listeners (issue
-    // #133): the TCP listener is reachable from job containers in remote
-    // deployments, so socket-permission trust would not hold there. /health
-    // stays open; /internal/* keeps its own per-job token.
-    if (parts[0] === "jobs") {
-      if (!this.#operatorAuthorized(req)) {
-        return sendJson(res, 401, { error: "unauthorized" });
-      }
-      if (parts.length === 1 && method === "POST") return this.#createJob(req, res);
-      if (parts.length === 1 && method === "GET") {
-        const jobs = this.registry
-          .listJobs()
-          .sort((a, b) => RANK[a.state] - RANK[b.state] || a.createdAt.localeCompare(b.createdAt))
-          .map(publicJob);
-        return sendJson(res, 200, { jobs });
-      }
-      const job = this.registry.getJob(parts[1] ?? "");
-      if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[1]}` });
-      if (parts.length === 2 && method === "GET") return sendJson(res, 200, { job: publicJob(job) });
-      if (parts.length === 3 && parts[2] === "events" && method === "GET") {
-        return this.#streamEvents(job, url, res);
-      }
-      if (parts.length === 3 && parts[2] === "answer" && method === "POST") {
-        return this.#answer(job, req, res);
-      }
-      if (parts.length === 3 && parts[2] === "cancel" && method === "POST") {
-        return this.#cancel(job, res);
-      }
-      // Artifact lane (issue #18): list and fetch delivered artifacts.
-      if (parts[2] === "artifacts" && method === "GET") {
-        if (parts.length === 3) return this.#listArtifacts(job, res);
-        const artPath = parts.slice(3).map(decodeURIComponent).join("/");
-        return this.#getArtifact(job, artPath, res);
-      }
-    }
-
-    // Runner: POST /internal/jobs/:id/events | GET /internal/jobs/:id/answer
-    //         POST /internal/jobs/:id/artifacts
-    if (parts[0] === "internal" && parts[1] === "jobs" && parts.length === 4) {
-      // Unknown id and bad token answer identically (issue #133): a
-      // distinguishable 404 would let a token holder probe which job ids exist.
-      const job = this.registry.getJob(parts[2]);
-      if (!job || !this.#runnerAuthorized(req, job)) {
-        return sendJson(res, 401, { error: "invalid runner token" });
-      }
-      if (parts[3] === "events" && method === "POST") return this.#intakeEvents(job, req, res);
-      if (parts[3] === "answer" && method === "GET") return this.#answerPoll(job, url, res);
-      if (parts[3] === "artifacts" && method === "POST") return this.#receiveArtifact(job, req, res);
-    }
-
-    // Health check: GET /health — answers without any state; used by the daemon
-    // Dockerfile HEALTHCHECK and by operators verifying the service is up.
-    if (url.pathname === "/health" && method === "GET") {
-      return sendJson(res, 200, { ok: true });
-    }
-
+    if (parts[0] === "jobs") return this.#routeJobs(url, method, parts, req, res);
+    if (parts[0] === "internal") return this.#routeInternal(method, parts, req, res);
+    if (url.pathname === "/health" && method === "GET") return sendJson(res, 200, { ok: true });
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+  }
+
+  /**
+   * Handle all /jobs/* routes. Every route here requires the operator secret on
+   * BOTH listeners (issue #133): the TCP listener is reachable from job
+   * containers in remote deployments, so socket-permission trust would not hold.
+   */
+  async #routeJobs(url: URL, method: string, parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.#operatorAuthorized(req)) return sendJson(res, 401, { error: "unauthorized" });
+    if (parts.length === 1) return this.#routeJobCollection(method, req, res);
+    const job = this.registry.getJob(parts[1] ?? "");
+    if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[1]}` });
+    if (parts.length === 2 && method === "GET") return sendJson(res, 200, { job: publicJob(job) });
+    return this.#routeJob(url, method, parts, job, req, res);
+  }
+
+  /** Handle POST /jobs and GET /jobs (the collection, not a specific job). */
+  async #routeJobCollection(method: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (method === "POST") return this.#createJob(req, res);
+    if (method === "GET") {
+      const jobs = this.registry
+        .listJobs()
+        .sort((a, b) => RANK[a.state] - RANK[b.state] || a.createdAt.localeCompare(b.createdAt))
+        .map(publicJob);
+      return sendJson(res, 200, { jobs });
+    }
+    sendJson(res, 405, { error: `method not allowed: ${method} /jobs` });
+  }
+
+  /** Handle routes for a specific known job: events, answer, cancel, artifacts. */
+  async #routeJob(url: URL, method: string, parts: string[], job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Combine sub-path and method into a single key to avoid compound && conditions.
+    const key = `${parts[2] ?? ""}:${method}`;
+    if (key === "events:GET") return this.#streamEvents(job, url, res);
+    if (key === "answer:POST") return this.#answer(job, req, res);
+    if (key === "cancel:POST") return this.#cancel(job, res);
+    // Artifact lane (issue #18): list and fetch delivered artifacts.
+    if (key === "artifacts:GET") {
+      if (parts.length === 3) return this.#listArtifacts(job, res);
+      return this.#getArtifact(job, parts.slice(3).map(decodeURIComponent).join("/"), res);
+    }
+    sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+  }
+
+  /**
+   * Handle /internal/* routes. Unknown id and bad token answer identically
+   * (issue #133): a distinguishable 404 would let a token holder probe job ids.
+   * Runner: POST /internal/jobs/:id/events | GET /internal/jobs/:id/answer
+   *         POST /internal/jobs/:id/artifacts
+   */
+  async #routeInternal(method: string, parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (parts[1] !== "jobs" || parts.length !== 4) {
+      return sendJson(res, 404, { error: `no route: ${method} /${parts.join("/")}` });
+    }
+    const job = this.registry.getJob(parts[2]);
+    if (!job || !this.#runnerAuthorized(req, job)) {
+      return sendJson(res, 401, { error: "invalid runner token" });
+    }
+    // Combine sub-path and method into a single key to avoid compound && conditions.
+    const url = new URL(req.url ?? "/", "http://fleet.invalid");
+    const key = `${parts[3]}:${method}`;
+    if (key === "events:POST") return this.#intakeEvents(job, req, res);
+    if (key === "answer:GET") return this.#answerPoll(job, url, res);
+    if (key === "artifacts:POST") return this.#receiveArtifact(job, req, res);
+    sendJson(res, 404, { error: `no internal route: ${method} ${parts[3]}` });
   }
 
   /** Constant-time check of the x-fleet-operator-token header against the boot secret. */
@@ -365,29 +375,42 @@ export class FleetDaemon {
     return a.length === b.length && timingSafeEqual(a, b);
   }
 
-  async #createJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  /** Ajv boundary: cast the raw error array to the shape we use in responses. */
+  static #ajvErrors(errors: unknown[]): ({ instancePath?: string; message?: string } & Record<string, unknown>)[] {
+    return errors as ({ instancePath?: string; message?: string } & Record<string, unknown>)[];
+  }
+
+  /**
+   * Parse and schema-validate the POST /jobs body. Returns the extracted fields
+   * or sends an error response and returns null.
+   */
+  async #parseCreateBody(req: IncomingMessage, res: ServerResponse): Promise<{
+    manifest: unknown; workOrder: unknown; env: Record<string, string>;
+    sync: Record<string, string>; imageOverride: string | undefined;
+  } | null> {
     let body: unknown;
     try {
       body = JSON.parse(await readBody(req));
     } catch (error) {
-      return sendJson(res, 400, { error: `invalid JSON body: ${String(error)}` });
+      sendJson(res, 400, { error: `invalid JSON body: ${String(error)}` });
+      return null;
     }
     if (!body || typeof body !== "object") {
-      return sendJson(res, 400, { error: "body must be a JSON object" });
+      sendJson(res, 400, { error: "body must be a JSON object" });
+      return null;
     }
     const manifest = "manifest" in body ? body.manifest : undefined;
     const workOrder = "workOrder" in body ? body.workOrder : undefined;
-    // Ajv boundary: validate.mjs returns ajv ErrorObject[] (instancePath, message, ...).
-    const ajvErrors = (errors: unknown[]) => errors as ({ instancePath?: string; message?: string } & Record<string, unknown>)[];
     const manifestCheck = validateManifest(manifest);
     const orderCheck = validateWorkOrder(workOrder);
     if (!manifestCheck.ok || !orderCheck.ok) {
-      return sendJson(res, 422, {
+      sendJson(res, 422, {
         errors: [
-          ...ajvErrors(manifestCheck.errors).map((error) => ({ in: "manifest", ...error })),
-          ...ajvErrors(orderCheck.errors).map((error) => ({ in: "workOrder", ...error })),
+          ...FleetDaemon.#ajvErrors(manifestCheck.errors).map((e) => ({ in: "manifest", ...e })),
+          ...FleetDaemon.#ajvErrors(orderCheck.errors).map((e) => ({ in: "workOrder", ...e })),
         ],
       });
+      return null;
     }
     let env: Record<string, string>;
     let sync: Record<string, string>;
@@ -395,24 +418,50 @@ export class FleetDaemon {
       env = stringRecord("env" in body ? body.env : undefined, "env");
       sync = stringRecord("sync" in body ? body.sync : undefined, "sync");
     } catch (error) {
-      return sendJson(res, 422, { errors: [{ instancePath: "", message: String(error) }] });
+      sendJson(res, 422, { errors: [{ instancePath: "", message: String(error) }] });
+      return null;
     }
     // Optional image override: when the CLI has pre-built the per-repo job
     // image (two-layer model, issue #5), it passes the computed tag here so
     // the daemon does not need to inspect the manifest setup section.
-    const imageOverride = "image" in body && typeof body.image === "string"
-      ? body.image
-      : undefined;
+    const imageOverride = "image" in body && typeof body.image === "string" ? body.image : undefined;
+    return { manifest, workOrder, env, sync, imageOverride };
+  }
+
+  /**
+   * Arm wall-clock, stall, and decision-timeout backstop timers for a new job.
+   * Stall detection is always armed — idleLimitMs supplies the default when the
+   * manifest declares no limits block at all.
+   */
+  #initJobLimits(id: string, manifestLimits: unknown): void {
+    this.registry.initIdle(id, idleLimitMs(manifestLimits));
+    if (!manifestLimits || typeof manifestLimits !== "object") return;
+    const limits = manifestLimits as Record<string, unknown>;
+    const wallClockStr = limits.wall_clock;
+    if (typeof wallClockStr === "string") {
+      const limitMs = parseDurationMs(wallClockStr);
+      if (limitMs !== undefined) this.registry.initWallClock(id, limitMs);
+    }
+    const decisionTimeoutStr = limits.decision_timeout;
+    if (typeof decisionTimeoutStr === "string") {
+      const limitMs = parseDurationMs(decisionTimeoutStr);
+      if (limitMs !== undefined) this.registry.initDecisionTimeout(id, limitMs);
+    }
+  }
+
+  async #createJob(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const parsed = await this.#parseCreateBody(req, res);
+    if (!parsed) return;
+    const { manifest, workOrder, env, sync, imageOverride } = parsed;
+
     // Schema-validated above: work order requires mode + target strings.
     const order = workOrder as { mode: string; target: string };
-    // Schema-validated above: manifest setup.image is an optional string;
-    // limits.resources is an optional object with integer cpu/memory/disk.
+    // Schema-validated above: manifest setup.image is optional; limits.resources is optional.
     const manifestDoc = manifest as { setup?: { image?: string }; limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
     const resources = manifestDoc.limits?.resources;
 
     // Dispatch-time resource check: reject before creating a job record if the
-    // request cannot be served by any offered capacity tier.  This prevents
-    // jobs queuing forever against capacity that can never satisfy them.
+    // request cannot be served by any offered capacity tier.
     if (resources && this.#options.provider.checkResources) {
       try {
         this.#options.provider.checkResources(resources);
@@ -424,65 +473,23 @@ export class FleetDaemon {
     const id = newId("job");
     const now = new Date().toISOString();
     const record: JobRecord = {
-      id,
-      state: "queued",
-      workOrder,
-      createdAt: now,
-      updatedAt: now,
-      provider: this.#options.provider.name,
-      runnerToken: newRunnerToken(),
+      id, state: "queued", workOrder, createdAt: now, updatedAt: now,
+      provider: this.#options.provider.name, runnerToken: newRunnerToken(),
     };
     this.registry.createJob(record);
     this.registry.appendEvent(id, {
-      type: "state",
-      state: "queued",
-      meta: {
-        kind: "delegated",
-        label: `${order.mode}: ${order.target}`,
-        target: order.target,
-        where: this.#options.provider.name,
-        fleet: [],
-      },
+      type: "state", state: "queued",
+      meta: { kind: "delegated", label: `${order.mode}: ${order.target}`, target: order.target, where: this.#options.provider.name, fleet: [] },
     });
 
-    // Initialise wall-clock, stall, and decision-timeout backstop tracking.
-    const manifestLimits = (manifest as Record<string, unknown>).limits;
-    // Stall detection is always armed — idleLimitMs supplies the default when
-    // the manifest declares no limits block at all.
-    this.registry.initIdle(id, idleLimitMs(manifestLimits));
-    if (manifestLimits && typeof manifestLimits === "object") {
-      const limits = manifestLimits as Record<string, unknown>;
-      const wallClockStr = limits.wall_clock;
-      if (typeof wallClockStr === "string") {
-        const limitMs = parseDurationMs(wallClockStr);
-        if (limitMs !== undefined) this.registry.initWallClock(id, limitMs);
-      }
-      const decisionTimeoutStr = limits.decision_timeout;
-      if (typeof decisionTimeoutStr === "string") {
-        const limitMs = parseDurationMs(decisionTimeoutStr);
-        if (limitMs !== undefined) this.registry.initDecisionTimeout(id, limitMs);
-      }
-    }
-
+    this.#initJobLimits(id, (manifest as Record<string, unknown>).limits);
     // Store launch details for potential re-entry after parking (issue #6).
-    this.registry.storeLaunchDetails(id, {
-      manifest,
-      env,
-      sync,
-      image: imageOverride,
-    });
+    this.registry.storeLaunchDetails(id, { manifest, env, sync, image: imageOverride });
 
     try {
       const { handle } = await this.#options.provider.launch({
-        jobId: id,
-        daemonUrl: this.daemonUrl,
-        runnerToken: record.runnerToken,
-        image: imageOverride ?? manifestDoc.setup?.image,
-        env,
-        sync,
-        manifest,
-        workOrder,
-        resources,
+        jobId: id, daemonUrl: this.daemonUrl, runnerToken: record.runnerToken,
+        image: imageOverride ?? manifestDoc.setup?.image, env, sync, manifest, workOrder, resources,
       });
       const updated = this.registry.updateJob(id, { handle });
       return sendJson(res, 201, { job: publicJob(updated) });
@@ -521,46 +528,92 @@ export class FleetDaemon {
     return done.promise;
   }
 
-  async #answer(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (job.state !== "blocked") {
-      return sendJson(res, 409, { error: `job is ${job.state}, not blocked` });
-    }
-    const decision = this.registry.openDecision(job.id);
-    if (!decision) {
-      return sendJson(res, 409, { error: "job is blocked but has no open decision" });
-    }
+  /**
+   * Parse the answer body fields. Returns {option, text} (either may be
+   * undefined) on success; on validation failure, sends the error response and
+   * returns null so the caller can return early.
+   */
+  async #parseAnswerBody(req: IncomingMessage, res: ServerResponse, decision: { id: string; optionIds: string[] }): Promise<{ option: string | undefined; text: string | undefined } | null> {
     let body: unknown;
     try {
       body = JSON.parse(await readBody(req));
     } catch (error) {
-      return sendJson(res, 400, { error: `invalid JSON body: ${String(error)}` });
+      sendJson(res, 400, { error: `invalid JSON body: ${String(error)}` });
+      return null;
     }
     if (!body || typeof body !== "object") {
-      return sendJson(res, 400, { error: "body must be a JSON object" });
+      sendJson(res, 400, { error: "body must be a JSON object" });
+      return null;
     }
     const rawOption = "option" in body ? body.option : undefined;
     const rawText = "text" in body ? body.text : undefined;
     if (rawOption !== undefined && typeof rawOption !== "string") {
-      return sendJson(res, 422, { error: "option must be a string" });
+      sendJson(res, 422, { error: "option must be a string" }); return null;
     }
     if (rawText !== undefined && typeof rawText !== "string") {
-      return sendJson(res, 422, { error: "text must be a string" });
+      sendJson(res, 422, { error: "text must be a string" }); return null;
     }
-    const option = rawOption;
-    const text = rawText;
+    const option = rawOption as string | undefined;
+    const text = rawText as string | undefined;
     // An invalid option id is an error, never silently downgraded to free text.
     if (option !== undefined && !decision.optionIds.includes(option)) {
-      return sendJson(res, 422, {
-        error: `option "${option}" does not match the open decision`,
-        options: decision.optionIds,
-      });
+      sendJson(res, 422, { error: `option "${option}" does not match the open decision`, options: decision.optionIds });
+      return null;
     }
     if (option === undefined && (text === undefined || text.length === 0)) {
-      return sendJson(res, 422, { error: "answer requires an option id or free text" });
+      sendJson(res, 422, { error: "answer requires an option id or free text" }); return null;
     }
+    return { option, text };
+  }
+
+  /**
+   * Re-launch a parked or stale job with the operator's answer pre-materialised.
+   * The old runner has already exited; the new container picks up where it left off.
+   */
+  async #relaunchParkedJob(job: JobRecord, decision: { id: string; optionIds: string[] }, option: string | undefined, text: string | undefined, res: ServerResponse): Promise<void> {
+    this.registry.clearMarker(job.id);
+    this.registry.resetRunnerSeq(job.id);
+    const newToken = newRunnerToken();
+    const details = this.registry.getLaunchDetails(job.id);
+    const reAnswer: { option?: string; text?: string } = {};
+    if (option !== undefined) reAnswer.option = option;
+    if (text !== undefined) reAnswer.text = text;
+    // Derive resources from the stored manifest.
+    const storedManifest = details.manifest as { limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
+    const resources = storedManifest?.limits?.resources;
+    try {
+      const { handle } = await this.#options.provider.launch({
+        jobId: job.id, daemonUrl: this.daemonUrl, runnerToken: newToken,
+        image: details.image, env: details.env, sync: details.sync,
+        manifest: details.manifest, workOrder: job.workOrder, resources,
+        reentryAnswer: { decisionId: decision.id, answer: reAnswer },
+        // Seed the new runner's decision counter past prior ids (issue #110).
+        reentryDecisionSeed: this.registry.decisionSeed(job.id),
+      });
+      const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
+      return sendJson(res, 200, { job: publicJob(updated) });
+    } catch (error) {
+      // Re-launch failed: cancel so the job reaches a terminal state.
+      // Leaving it in blocked with no runner and no marker would make it
+      // permanently unrecoverable without manual intervention.
+      this.registry.appendEvent(job.id, { type: "log", text: `re-launch failed after answer: ${String(error)}`, who: "daemon" });
+      this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-failed" });
+      this.registry.updateJob(job.id, { state: "cancelled", reason: "launch-failed" });
+      return sendJson(res, 500, { error: `re-launch failed: ${String(error)}` });
+    }
+  }
+
+  async #answer(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (job.state !== "blocked") return sendJson(res, 409, { error: `job is ${job.state}, not blocked` });
+    const decision = this.registry.openDecision(job.id);
+    if (!decision) return sendJson(res, 409, { error: "job is blocked but has no open decision" });
+
+    const input = await this.#parseAnswerBody(req, res, decision);
+    if (!input) return;
+    const { option, text } = input;
+
     this.registry.appendEvent(job.id, {
-      type: "answer",
-      decision: decision.id,
+      type: "answer", decision: decision.id,
       ...(option !== undefined ? { option } : {}),
       ...(text !== undefined ? { text } : {}),
       by: "operator",
@@ -568,61 +621,14 @@ export class FleetDaemon {
     this.registry.setOpenDecision(job.id, null);
     this.registry.setDecisionBlockedAt(job.id, null);
 
-    // Parked (or stale) job: re-entry path. The old runner has already exited.
-    // Re-launch a fresh container with the answer pre-materialised so the
-    // status-driven harness can pick up where it left off. The state stays
-    // blocked until the new runner emits state:running (blocked → running is a
-    // valid transition). The runner seq resets so the fresh container starts at 0.
+    // Parked (or stale) job: re-entry path via a fresh container.
     if (job.marker === "parked" || job.marker === "stale") {
-      this.registry.clearMarker(job.id);
-      this.registry.resetRunnerSeq(job.id);
-      const newToken = newRunnerToken();
-      const details = this.registry.getLaunchDetails(job.id);
-      const reAnswer: { option?: string; text?: string } = {};
-      if (option !== undefined) reAnswer.option = option;
-      if (text !== undefined) reAnswer.text = text;
-      // Derive resources from the stored manifest so the provider can apply
-      // any resource overrides declared in manifest.limits.resources.
-      const storedManifest = details.manifest as { limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
-      const resources = storedManifest?.limits?.resources;
-      try {
-        const { handle } = await this.#options.provider.launch({
-          jobId: job.id,
-          daemonUrl: this.daemonUrl,
-          runnerToken: newToken,
-          image: details.image,
-          env: details.env,
-          sync: details.sync,
-          manifest: details.manifest,
-          workOrder: job.workOrder,
-          resources,
-          reentryAnswer: { decisionId: decision.id, answer: reAnswer },
-          // Seed the new runner's decision counter past prior ids (issue #110).
-          reentryDecisionSeed: this.registry.decisionSeed(job.id),
-        });
-        const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
-        return sendJson(res, 200, { job: publicJob(updated) });
-      } catch (error) {
-        // Re-launch failed: the old runner is dead and no new one is starting.
-        // Cancel the job so it reaches a terminal state the operator can reason
-        // about — leaving it in blocked with no runner and no marker would make
-        // it permanently unrecoverable without manual intervention.
-        this.registry.appendEvent(job.id, {
-          type: "log",
-          text: `re-launch failed after answer: ${String(error)}`,
-          who: "daemon",
-        });
-        this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-failed" });
-        this.registry.updateJob(job.id, { state: "cancelled", reason: "launch-failed" });
-        return sendJson(res, 500, { error: `re-launch failed: ${String(error)}` });
-      }
+      return this.#relaunchParkedJob(job, decision, option, text, res);
     }
 
     // Hot job: the existing runner is still alive and polling for its answer.
-    // The blocked → running transition happens immediately here.
     this.registry.clearMarker(job.id);
     const updated = this.registry.updateJob(job.id, { state: "running" });
-    // Job is active again; resume the daemon-side wall-clock meter.
     this.registry.wallClockBecameActive(job.id);
     return sendJson(res, 200, { job: publicJob(updated) });
   }
@@ -1184,40 +1190,56 @@ export class FleetDaemon {
   }
 
   /**
-   * POST /internal/jobs/:id/artifacts
-   * Runner uploads one artifact at a time. Body: JSON {path, content (base64), sha256?, bytes}.
-   * Enforces per-file and total caps; path-escape-guarded. Runner-token auth.
+   * Validate and decode the POST /internal/jobs/:id/artifacts body.
+   * Returns the structured payload on success; sends an error response and
+   * returns null on any validation failure.
    */
-  async #receiveArtifact(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async #parseArtifactPayload(req: IncomingMessage, res: ServerResponse): Promise<{
+    relPath: string; contentB64: string; declaredBytes: number;
+    declaredSha256: string | undefined; safePath: string;
+  } | null> {
     let body: unknown;
     try {
       body = JSON.parse(await readBody(req));
     } catch {
-      return sendJson(res, 400, { error: "invalid JSON body" });
+      sendJson(res, 400, { error: "invalid JSON body" }); return null;
     }
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return sendJson(res, 400, { error: "body must be a JSON object" });
+      sendJson(res, 400, { error: "body must be a JSON object" }); return null;
     }
     const raw = body as Record<string, unknown>;
     const relPath = raw.path;
     const contentB64 = raw.content;
     const declaredBytes = raw.bytes;
-    const declaredSha256 = raw.sha256;
-
     if (typeof relPath !== "string" || !relPath) {
-      return sendJson(res, 400, { error: "path (string) required" });
+      sendJson(res, 400, { error: "path (string) required" }); return null;
     }
     if (typeof contentB64 !== "string") {
-      return sendJson(res, 400, { error: "content (base64 string) required" });
+      sendJson(res, 400, { error: "content (base64 string) required" }); return null;
     }
     if (typeof declaredBytes !== "number" || declaredBytes < 0) {
-      return sendJson(res, 400, { error: "bytes (non-negative number) required" });
+      sendJson(res, 400, { error: "bytes (non-negative number) required" }); return null;
     }
-
     const safePath = FleetDaemon.#safeArtifactPath(relPath);
     if (!safePath) {
-      return sendJson(res, 400, { error: `invalid artifact path: ${relPath}` });
+      sendJson(res, 400, { error: `invalid artifact path: ${relPath}` }); return null;
     }
+    return {
+      relPath, contentB64, declaredBytes,
+      declaredSha256: typeof raw.sha256 === "string" ? raw.sha256 : undefined,
+      safePath,
+    };
+  }
+
+  /**
+   * POST /internal/jobs/:id/artifacts
+   * Runner uploads one artifact at a time. Body: JSON {path, content (base64), sha256?, bytes}.
+   * Enforces per-file and total caps; path-escape-guarded. Runner-token auth.
+   */
+  async #receiveArtifact(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const payload = await this.#parseArtifactPayload(req, res);
+    if (!payload) return;
+    const { relPath, contentB64, declaredBytes, declaredSha256, safePath } = payload;
 
     // Per-file cap: checked against declared bytes before decoding.
     if (declaredBytes > ARTIFACT_PER_FILE_CAP) {
@@ -1229,30 +1251,22 @@ export class FleetDaemon {
     // Decode and verify integrity.
     const decoded = Buffer.from(contentB64, "base64");
     if (decoded.length !== declaredBytes) {
-      return sendJson(res, 422, {
-        error: `bytes mismatch: declared ${declaredBytes}, actual ${decoded.length}`,
-      });
+      return sendJson(res, 422, { error: `bytes mismatch: declared ${declaredBytes}, actual ${decoded.length}` });
     }
-    if (typeof declaredSha256 === "string") {
+    if (declaredSha256 !== undefined) {
       const actualSha256 = createHash("sha256").update(decoded).digest("hex");
-      if (actualSha256 !== declaredSha256) {
-        return sendJson(res, 422, { error: `sha256 mismatch for ${relPath}` });
-      }
+      if (actualSha256 !== declaredSha256) return sendJson(res, 422, { error: `sha256 mismatch for ${relPath}` });
     }
 
     // Total cap: compute current on-disk total before writing.
     const artDir = artifactDir(this.#options.home, job.id);
-    const currentTotal = FleetDaemon.#artifactDirSize(artDir);
-    if (currentTotal + declaredBytes > ARTIFACT_TOTAL_CAP) {
-      return sendJson(res, 413, {
-        error: `total artifact cap (${ARTIFACT_TOTAL_CAP} bytes) would be exceeded`,
-      });
+    if (FleetDaemon.#artifactDirSize(artDir) + declaredBytes > ARTIFACT_TOTAL_CAP) {
+      return sendJson(res, 413, { error: `total artifact cap (${ARTIFACT_TOTAL_CAP} bytes) would be exceeded` });
     }
 
     const targetPath = join(artDir, safePath);
     mkdirSync(dirname(targetPath), { recursive: true });
     writeFileSync(targetPath, decoded);
-
     return sendJson(res, 200, { stored: true, path: relPath, bytes: declaredBytes });
   }
 
