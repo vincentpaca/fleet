@@ -126,8 +126,8 @@ you publish elsewhere.
 `fmt` and `validate` are not enough, and #9's bring-up proved it: `assign_public_ip`
 carrying a string where the provider wants a bool passed both and died at apply, after
 four paid attempts. Run every check below before an infra change ships — CI's terraform
-job runs `fmt` and `validate` today, and the plan smoke is still yours to run until the
-job learns it (`.github/workflows/tests.yml`, #48):
+job runs all of them, plan smoke included (`.github/workflows/tests.yml`, #48), but
+locally first is the fast loop:
 
 ```sh
 terraform fmt -check -recursive infra/

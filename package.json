@@ -2,7 +2,7 @@
   "name": "fleet",
   "version": "0.1.0",
   "type": "module",
-  "description": "Run coding-agent jobs in containers on your own AWS account.",
+  "description": "Run coding-agent jobs in containers in your own cloud.",
   "license": "PolyForm-Shield-1.0.0",
   "engines": {
     "node": ">=23.6"

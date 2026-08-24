@@ -15,7 +15,7 @@ export type DockerProviderOptions = {
   runnerCmd?: string[];
 };
 
-const DEFAULT_IMAGE = "node:22";
+const DEFAULT_IMAGE = "node:24";
 const DEFAULT_RUNNER_CMD = ["node", "/opt/fleet/src/runner/main.ts"];
 const CONTAINER_WORKSPACE = "/workspace";
 
