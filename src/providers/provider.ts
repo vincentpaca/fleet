@@ -68,6 +68,14 @@ export interface Provider {
    * Called at dispatch time before launch() so failures surface immediately.
    */
   checkResources?(resources: ResourceRequest): void;
+  /**
+   * Optional: settle whatever a previous daemon's death left behind (#123).
+   * Called once by the daemon entrypoint after it starts serving. The process
+   * provider re-runs workspace disposition for runners whose exit handler
+   * died with the old daemon; container providers have no equivalent — the
+   * substrate outlives the daemon and owns the sandbox lifecycle.
+   */
+  recover?(): void | Promise<void>;
 }
 
 /**

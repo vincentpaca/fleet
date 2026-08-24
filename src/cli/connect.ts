@@ -25,7 +25,7 @@ import net from 'node:net';
 import path from 'node:path';
 import type { TunnelEndpoint, TunnelOpener } from '../providers/provider.ts';
 import { request } from '../shared/http.ts';
-import { killTree } from '../shared/process.ts';
+import { killTree, pidAlive } from '../shared/process.ts';
 import { configDaemonUrl, describeTarget, daemonTarget, fleetConfigFiles } from './client.ts';
 import { refreshDeployment, tunnelOpenerFor, type CloudRunner, type Deployment } from './tunnel-openers.ts';
 
@@ -212,16 +212,9 @@ export function listTunnelRecords(home: string): TunnelRecord[] {
   return records;
 }
 
-/** Is a recorded supervisor still alive? signal 0 probes without delivering. */
-export function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but belongs to someone else — still alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
+// pidAlive moved to src/shared/process.ts (the process provider needs it too);
+// re-exported so existing imports of this module keep working.
+export { pidAlive };
 
 // ---------- supervision ----------
 

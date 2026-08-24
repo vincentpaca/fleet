@@ -112,9 +112,10 @@ if (!tcpHost) tcpHost = "127.0.0.1";
 // persisted 0600 at $FLEET_HOME/operator-token, read by the CLI over the
 // socket and over an SSM tunnel alike. Every real daemon enforces it —
 // there is no credential-free deployment of the /jobs/* surface.
+const provider = await buildProvider(choice, home);
 const daemon = new FleetDaemon({
   home,
-  provider: await buildProvider(choice, home),
+  provider,
   port,
   bindHost,
   tcpHost,
@@ -125,6 +126,11 @@ const { socketPath: sock, port: boundPort } = await daemon.start();
 // Same `fleet daemon: ` prefix as the lines above: one filter on a log stream
 // must not drop the line that says the daemon is up.
 console.log(`fleet daemon: listening on ${sock}${boundPort !== null ? ` and ${bindHost}:${boundPort} (advertising ${tcpHost})` : ""}`);
+
+// Only after start() holds the home lock: settle what a previous daemon's
+// death orphaned (#123). Quiet unless it acts, and never on stdout — the boot
+// lines above are a pinned contract (test/daemon-boot-log.test.ts).
+await provider.recover?.();
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
