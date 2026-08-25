@@ -47,6 +47,9 @@ export type Target =
  */
 export class DaemonTargetError extends Error {}
 
+/** Hosts that are this machine. Loopback is the daemon-target trust boundary (#135). */
+export const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
 /**
  * The boot-generated operator secret gating /jobs/* (issue #133), read once
  * per process from $FLEET_HOME/operator-token. Undefined when the file is
@@ -155,18 +158,81 @@ function parseHttpUrl(raw: string, source: string): URL {
   return u;
 }
 
+/**
+ * The trust check on a repo-named daemon address (#135, item 1). The config
+ * file travels with the checkout, so a cloned malicious repo chooses where
+ * `fleet delegate` POSTs its secret-bearing payload (env vars, synced files).
+ * Loopback is safe — the only way off this machine from there is a tunnel the
+ * operator opened. Anything else is refused unless the operator explicitly
+ * takes responsibility with FLEET_ALLOW_REMOTE_DAEMON=1. https is refused
+ * outright: this client cannot speak it (src/shared/http.ts is node:http).
+ */
+function assertTrustedDaemonUrl(u: URL, configPath: string, env: Record<string, string | undefined>): void {
+  if (u.protocol !== 'http:') {
+    throw new DaemonTargetError(
+      `daemon_url in ${configPath} is ${u.protocol}// — Fleet's client speaks plain HTTP only; point it at a loopback tunnel (http://127.0.0.1:<port>)`,
+    );
+  }
+  if (LOOPBACK_HOSTS.has(u.hostname)) return;
+  if (env.FLEET_ALLOW_REMOTE_DAEMON === '1') return;
+  throw new DaemonTargetError(
+    `refusing daemon_url ${u.origin} from ${configPath}: it is not loopback, and dispatch sends secrets `
+    + `(env vars, synced files) over plain HTTP to whatever daemon this repo-controlled file names. `
+    + `If you trust that address, set FLEET_ALLOW_REMOTE_DAEMON=1.`,
+  );
+}
+
+/**
+ * Say — loudly, once — when a checkout's config names a daemon_url this
+ * machine has never used for it (#135). The record lives under FLEET_HOME,
+ * never under .fleet/: the repo is the untrusted party here, and a state file
+ * it can rewrite is no state at all. Read/write failures fail open to warning
+ * again next run — the safe direction.
+ */
+function warnFirstSeenDaemonUrl(
+  u: URL,
+  configPath: string,
+  cwd: string,
+  env: Record<string, string | undefined>,
+): void {
+  const file = path.join(fleetHome(env), 'seen-daemon-urls.json');
+  let seen: Record<string, string[]> = {};
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) seen = raw as Record<string, string[]>;
+  } catch {
+    // first run, or an unreadable record: treat everything as unseen
+  }
+  const urls = Array.isArray(seen[cwd]) ? seen[cwd] : [];
+  if (urls.includes(u.href)) return;
+  console.error(
+    `fleet: NOTE: first use of daemon_url ${u.href} (from ${configPath}) in this checkout — `
+    + `fleet commands will talk to it, and dispatch sends secrets to it.`,
+  );
+  seen[cwd] = [...urls, u.href];
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(seen, null, 2)}\n`);
+  } catch {
+    // unrecordable: warn again next run rather than never again
+  }
+}
+
 /** The uncached resolution behind {@link daemonTarget}. */
 function resolveDaemonTarget(env: Record<string, string | undefined>, cwd: string): Target {
   // 1. Explicit env override — the operator's own environment, so it is the
-  //    override channel: validated for shape and scheme.
+  //    override channel: validated for shape and scheme, not for loopback.
   const url = env.FLEET_DAEMON_URL;
   if (url) return urlToTcpTarget(parseHttpUrl(url, 'FLEET_DAEMON_URL'));
 
   // 2. Per-deployment fleet-config.json (written by `fleet setup infra` (#13) or by hand).
   //    Scan .fleet/infra/<provider>/fleet-config.json for a daemon_url field; first wins.
-  for (const { config } of fleetConfigFiles(cwd)) {
+  //    This file arrives with the checkout, so it gets the trust check (#135).
+  for (const { path: configPath, config } of fleetConfigFiles(cwd)) {
     const u = configDaemonUrl(config);
     if (!u) continue;
+    assertTrustedDaemonUrl(u, configPath, env);
+    warnFirstSeenDaemonUrl(u, configPath, cwd, env);
     return urlToTcpTarget(u);
   }
 
@@ -193,7 +259,7 @@ export function daemonTarget(
   opts: { cwd?: string } = {},
 ): Target {
   const cwd = opts.cwd ?? process.cwd();
-  const key = [env.FLEET_DAEMON_URL ?? '', env.FLEET_HOME ?? '', cwd]
+  const key = [env.FLEET_DAEMON_URL ?? '', env.FLEET_HOME ?? '', env.FLEET_ALLOW_REMOTE_DAEMON ?? '', cwd]
     .join('\u0000');
   const cached = targetCache.get(key);
   if (cached !== undefined) return cached;

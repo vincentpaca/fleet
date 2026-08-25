@@ -55,7 +55,7 @@ import {
 import { makeCol, visualClip, visualLength } from './ansi.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { gitValue } from '../shared/git.ts';
-import { daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
+import { LOOPBACK_HOSTS, daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
 import { logsNoColor } from './format.ts';
 import { holdTunnel, portAccepts, resolveTunnel, tunnelReport, type HeldTunnel } from './connect.ts';
 
@@ -629,8 +629,9 @@ const STATUS_STICKY_MS = 60_000;
 const FOLLOW_SETTLE_MS = 250;
 /** A resident view runs for hours: the tail is a window, not a transcript. */
 const MAX_TAIL_EVENTS = 2_000;
-/** Hosts a local port-forward can actually serve; anything else is somebody else's address. */
-const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// Loopback hosts — the ones a local port-forward can actually serve — come
+// from ./client.ts (LOOPBACK_HOSTS), the same set the daemon-target trust
+// boundary is drawn on (#135).
 
 /** Never re-examine the tunnel more often than this, however badly the daemon is doing. */
 const TUNNEL_RECHECK_MS = 15_000;
@@ -864,7 +865,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
     }
     // A forward binds a local port. If the daemon address is not local, opening
     // one would forward a port nothing reads from — worse than no tunnel.
-    if (!LOOPBACK.has(target.host)) {
+    if (!LOOPBACK_HOSTS.has(target.host)) {
       model.tunnel = { kind: 'failed', why: `${endpoint} is not a local address — nothing here can tunnel to it` };
       note(model.tunnel.why);
       return;

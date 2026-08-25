@@ -130,7 +130,8 @@ Commands:
 Flags:
   --version                                Print version and exit
 
-Daemon address: FLEET_DAEMON_URL env → .fleet/infra/<provider>/fleet-config.json (daemon_url) → unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).`;
+Daemon address: FLEET_DAEMON_URL env → .fleet/infra/<provider>/fleet-config.json (daemon_url) → unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).
+A config daemon_url must be loopback — that file travels with the repo, and dispatch sends secrets to whatever it names. FLEET_ALLOW_REMOTE_DAEMON=1 overrides, on your own authority.`;
 
 class UsageError extends Error {}
 class CliError extends Error {}
