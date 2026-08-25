@@ -274,6 +274,27 @@ export function renderEventLines(events: FleetEvent[], w: number, noColor: boole
 }
 
 /**
+ * Clamp a proposed tail scroll (lines back from the end) to the lines the tail
+ * can actually render: min(proposed, total lines − 1), never negative. Counts
+ * from the end and stops as soon as the proposal is known to fit — rendering
+ * all ≤2000 tail events per keypress to learn one number was one of the two
+ * O(n²) render costs #125 names. Line counts are what they would be in
+ * `renderEventLines`: no renderer's line count depends on the pending map or
+ * on colour, only on the event itself.
+ */
+export function clampTailScroll(events: FleetEvent[], proposed: number): number {
+  if (proposed <= 0) return 0;
+  const col = makeCol(true);
+  const pending = new Map<string, string>();
+  let lines = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    lines += renderEvent(events[i], { kind: 'pane', col, pending }).length;
+    if (lines > proposed) return proposed;
+  }
+  return Math.max(0, lines - 1);
+}
+
+/**
  * The one-line identity of a job, for the drill-down header: id, state, mode,
  * target and elapsed. The title is shown in full (the caller clips to width),
  * and the separator is a colon here — "#42: Fix login" — against the roster's
@@ -544,6 +565,18 @@ async function fetchDecision(
  */
 function decisionKey(job: BoardJob): string {
   return `${job.id}@${job.updatedAt ?? ''}`;
+}
+
+/**
+ * Drop one job's cached decision(s): the answer is the transition, so the next
+ * poll must re-read what that job asks next. One job's, targeted — clearing
+ * the whole cache here made answering one decision refetch every other blocked
+ * job's full event log on the following poll (#125).
+ */
+export function invalidateDecision(cache: Map<string, PendingDecision>, jobId: string): void {
+  for (const key of cache.keys()) {
+    if (key.startsWith(`${jobId}@`)) cache.delete(key);
+  }
 }
 
 /**

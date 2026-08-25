@@ -30,10 +30,12 @@
 import {
   ENTER_ALT,
   RESTORE_SEQ,
+  clampTailScroll,
   detectColorLevel,
   decisionCardLines,
   fetchBoardJobs,
   followJobEvents,
+  invalidateDecision,
   jobCounts,
   parseAnswerLine,
   renderBanner,
@@ -141,11 +143,16 @@ const PROMPT = '› ';
  */
 export function windowRosterRows(rows: RosterRow[], selection: number, budget: number): string[] {
   if (budget <= 0) return [];
-  const height = (from: number, to: number): number =>
-    rows.slice(from, to + 1).reduce((n, r) => n + r.lines.length, 0);
-  let start = 0;
   const target = Math.max(0, Math.min(selection, rows.length - 1));
-  while (start < target && height(start, target) > budget) start += 1;
+  // One running sum, shrunk as the window slides: re-summing rows[start..target]
+  // per iteration made this O(n²) in job count per frame (#125).
+  let span = 0;
+  for (let i = 0; i <= target; i++) span += rows[i]?.lines.length ?? 0;
+  let start = 0;
+  while (start < target && span > budget) {
+    span -= rows[start].lines.length;
+    start += 1;
+  }
   return rows.slice(start).flatMap((r) => r.lines).slice(0, budget);
 }
 
@@ -949,9 +956,12 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
         if (posted.ok) say(`answered ${job.id}`);
         else refuse(`answer failed: ${posted.error ?? 'unknown error'}`);
         if (posted.ok) {
-          // The answer is the transition: drop the cached decision so the next
-          // poll reads whatever the job asks next rather than the old card.
-          decisions.clear();
+          // The answer is the transition: drop this job's cached decision so
+          // the next poll reads whatever it asks next rather than the old
+          // card. Only this job's — the other blocked jobs' questions have
+          // not changed, and refetching each of their full event logs made
+          // one answer cost a poll cycle per blocked job (#125).
+          invalidateDecision(decisions, job.id);
           await poll();
         }
         return;
@@ -1052,8 +1062,9 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
         if (model.view !== 'job') break;
         // Clamped to the tail it is scrolling, so PgUp past the top does not
         // build up a debt that PgDn has to spend before anything moves.
-        const room = Math.max(0, renderEventLines(model.tail, width(), noColor).length - 1);
-        model.tailScroll = Math.max(0, Math.min(room, model.tailScroll + action.delta));
+        // clampTailScroll counts only the lines the clamp needs — rendering the
+        // whole tail per keypress to learn one number was an #125 cost.
+        model.tailScroll = clampTailScroll(model.tail, model.tailScroll + action.delta);
         dirty = true;
         break;
       }

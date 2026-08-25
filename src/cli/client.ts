@@ -40,6 +40,14 @@ export type Target =
   | { kind: 'tcp'; host: string; port: number; basePath: string };
 
 /**
+ * A daemon address that cannot be used: unparseable, a scheme this client
+ * cannot speak, or a repo-named target the trust check refuses (#135). Its
+ * message is the whole story — main.ts prints it and exits 1 instead of
+ * letting a raw TypeError stack out of `new URL` (#125).
+ */
+export class DaemonTargetError extends Error {}
+
+/**
  * The boot-generated operator secret gating /jobs/* (issue #133), read once
  * per process from $FLEET_HOME/operator-token. Undefined when the file is
  * absent — socket-only deployments from before the secret existed, and tests
@@ -126,17 +134,37 @@ function urlToTcpTarget(u: URL): Target {
   };
 }
 
-export function daemonTarget(
-  env: Record<string, string | undefined> = process.env,
-  opts: { cwd?: string } = {},
-): Target {
-  // 1. Explicit env override.
+/**
+ * Parse an operator-supplied daemon URL, failing readably instead of letting
+ * `new URL` throw a raw TypeError (#125). http only: src/shared/http.ts is
+ * node:http — an https:// value used to be silently spoken as plain HTTP to
+ * port 80, which is worse than a refusal.
+ */
+function parseHttpUrl(raw: string, source: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new DaemonTargetError(`${source} is not a valid URL: "${raw}"`);
+  }
+  if (u.protocol !== 'http:') {
+    throw new DaemonTargetError(
+      `${source} must be an http:// URL — Fleet's client speaks plain HTTP over loopback or a tunnel (got "${raw}")`,
+    );
+  }
+  return u;
+}
+
+/** The uncached resolution behind {@link daemonTarget}. */
+function resolveDaemonTarget(env: Record<string, string | undefined>, cwd: string): Target {
+  // 1. Explicit env override — the operator's own environment, so it is the
+  //    override channel: validated for shape and scheme.
   const url = env.FLEET_DAEMON_URL;
-  if (url) return urlToTcpTarget(new URL(url));
+  if (url) return urlToTcpTarget(parseHttpUrl(url, 'FLEET_DAEMON_URL'));
 
   // 2. Per-deployment fleet-config.json (written by `fleet setup infra` (#13) or by hand).
   //    Scan .fleet/infra/<provider>/fleet-config.json for a daemon_url field; first wins.
-  for (const { config } of fleetConfigFiles(opts.cwd ?? process.cwd())) {
+  for (const { config } of fleetConfigFiles(cwd)) {
     const u = configDaemonUrl(config);
     if (!u) continue;
     return urlToTcpTarget(u);
@@ -145,6 +173,33 @@ export function daemonTarget(
   // 3. Unix socket at $FLEET_HOME.
   const home = env.FLEET_HOME ?? path.join(os.homedir(), '.fleet');
   return { kind: 'socket', socketPath: path.join(home, 'daemon.sock') };
+}
+
+/**
+ * Memoized for the life of the process, the same bargain as the operator
+ * token above (#125): `request` resolves the target on every call, and the
+ * cockpit's 2-second poll was re-walking `.fleet/infra/*` with sync fs reads
+ * on its resident loop. Safe because nothing changes a resolution mid-process:
+ * `fleet setup infra` writes fleet-config.json and exits without resolving
+ * again, and the cockpit deliberately holds one address for its lifetime — its
+ * tunnel is bound to it. Keyed on every input resolution reads (env vars and
+ * cwd), so a test or caller with a different environment gets its own entry.
+ * Failed resolutions are not cached: a refusal must repeat, not vanish.
+ */
+const targetCache = new Map<string, Target>();
+
+export function daemonTarget(
+  env: Record<string, string | undefined> = process.env,
+  opts: { cwd?: string } = {},
+): Target {
+  const cwd = opts.cwd ?? process.cwd();
+  const key = [env.FLEET_DAEMON_URL ?? '', env.FLEET_HOME ?? '', cwd]
+    .join('\u0000');
+  const cached = targetCache.get(key);
+  if (cached !== undefined) return cached;
+  const target = resolveDaemonTarget(env, cwd);
+  targetCache.set(key, target);
+  return target;
 }
 
 export function describeTarget(

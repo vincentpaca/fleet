@@ -3,14 +3,15 @@
 // spoken to, NDJSON streaming folded into the shared client.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import { FleetDaemon, DEFAULT_LONG_POLL_MS } from "../src/daemon/server.ts";
-import { request as cliRequest } from "../src/cli/client.ts";
+import { request as cliRequest, daemonTarget, DaemonTargetError } from "../src/cli/client.ts";
 import { request, DEFAULT_TIMEOUT_MS } from "../src/shared/http.ts";
 import { FOLLOW_TIMEOUT_MS } from "../src/cli/board.ts";
+import { runCli, makeTempDir } from "./cli-helpers.ts";
 
 test("a CLI call succeeds after the daemon socket is restarted under the same home", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "cli-client-"));
@@ -122,3 +123,46 @@ test("the shared client still refuses connection pooling", () => {
   const src = readFileSync(join(import.meta.dirname ?? ".", "..", "src", "shared", "http.ts"), "utf8");
   assert.match(src, /agent:\s*false/);
 });
+
+// ── Daemon-target resolution: memoized and validated (#125) ──────────────────
+
+/** A checkout with one provider config naming `daemonUrl`. */
+function checkoutWithDaemonUrl(daemonUrl: string): string {
+  const cwd = makeTempDir("cli-target-cwd-");
+  const infraDir = join(cwd, ".fleet", "infra", "aws");
+  mkdirSync(infraDir, { recursive: true });
+  writeFileSync(join(infraDir, "fleet-config.json"), JSON.stringify({ daemon_url: daemonUrl }));
+  return cwd;
+}
+
+test("daemonTarget memoizes per process: a config rewrite mid-run does not re-read the disk", () => {
+  // The cockpit's 2s poll resolved the target inside every request, re-walking
+  // .fleet/infra with sync fs reads on the resident loop (#125). Resolution is
+  // now once per (env, cwd) for the life of the process — nothing changes a
+  // daemon_url mid-process (`fleet setup infra` writes it and exits), so a
+  // rewrite mid-run staying invisible IS the documented behaviour.
+  const cwd = checkoutWithDaemonUrl("http://127.0.0.1:1234");
+  const env = { FLEET_HOME: makeTempDir("cli-target-home-") };
+  const first = daemonTarget(env, { cwd });
+  assert.ok(first.kind === "tcp" && first.port === 1234);
+
+  writeFileSync(
+    join(cwd, ".fleet", "infra", "aws", "fleet-config.json"),
+    JSON.stringify({ daemon_url: "http://127.0.0.1:5678" }),
+  );
+  const second = daemonTarget(env, { cwd });
+  assert.ok(second.kind === "tcp" && second.port === 1234, "resolved once, served from memory after");
+});
+
+test("a bad FLEET_DAEMON_URL is a one-line failure, exit 1, no stack (#125)", async () => {
+  const garbage = await runCli(["status"], { env: { FLEET_DAEMON_URL: "garbage" } });
+  assert.equal(garbage.code, 1);
+  assert.match(garbage.stderr, /FLEET_DAEMON_URL is not a valid URL: "garbage"/);
+  assert.doesNotMatch(garbage.stderr, /TypeError|node:internal|at .*\.ts:\d/, "no stack trace");
+
+  const https = await runCli(["status"], { env: { FLEET_DAEMON_URL: "https://127.0.0.1:9" } });
+  assert.equal(https.code, 1);
+  assert.match(https.stderr, /FLEET_DAEMON_URL must be an http:\/\/ URL/);
+  assert.doesNotMatch(https.stderr, /TypeError|node:internal/, "no stack trace");
+});
+

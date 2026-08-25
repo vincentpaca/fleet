@@ -18,7 +18,7 @@ import {
   type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
-import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, DaemonTargetError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision } from './board.ts';
@@ -818,6 +818,10 @@ async function daemonCall(
   try {
     return await request(method, reqPath, body, { onLine });
   } catch (err) {
+    // Target resolution itself refused (bad FLEET_DAEMON_URL, untrusted
+    // daemon_url — #125/#135): its message is the whole story, and asking
+    // describeTarget below would only throw the same thing again.
+    if (err instanceof DaemonTargetError) fail(err.message);
     // A TCP address means a port-forward is carrying this call, and a dead
     // session is the likeliest cause (#57) — say where to look, not just what broke.
     const tcpHint = '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state';
@@ -1042,7 +1046,14 @@ async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
   if (typeof values.out === 'string') {
     const filename = path.basename(artifactPath);
     const outPath = path.join(values.out, filename);
-    fs.writeFileSync(outPath, buffer);
+    // A missing --out directory is created, and anything else unwritable is a
+    // one-line failure — not an unhandled ENOENT stack (#125).
+    try {
+      fs.mkdirSync(values.out, { recursive: true });
+      fs.writeFileSync(outPath, buffer);
+    } catch (err) {
+      fail('artifacts get: cannot write ' + outPath + ': ' + errorMessage(err));
+    }
     console.log('saved to ' + outPath);
   } else {
     process.stdout.write(buffer);
@@ -1376,29 +1387,25 @@ async function fetchResumeDecision(jobId: string): Promise<PendingDecision | und
   return decision;
 }
 
-/**
- * Read the local dispatch ledger, fetch live state for every entry, and print
- * a reconnect-oriented summary: blocked/stale first with open decisions, then
- * active, then a tail of recent terminal jobs.
- */
-async function cmdResume(args: string[]): Promise<number> {
-  const { values } = parseCommand(args, { answer: { type: 'boolean' } }, 0, 0);
-  const answerMode = values.answer === true;
+/** One ledger entry with its live state: the job, or why there is none. */
+type ResumeResult = {
+  entry: LedgerEntry;
+  job?: Job;
+  decision?: PendingDecision;
+  unknown?: boolean;   // true: 404 or non-200 from daemon
+  fetchError?: string; // set when unknown=true and the cause was a non-404 error
+};
 
-  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
-  if (!fs.existsSync(ledgerPath)) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
+/** Parse the ledger's JSONL lines. A missing file or no parseable lines → []. */
+function readLedgerEntries(ledgerPath: string): LedgerEntry[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(ledgerPath, 'utf8');
+  } catch {
+    return [];
   }
-
-  const rawLedger = fs.readFileSync(ledgerPath, 'utf8').trim();
-  if (!rawLedger) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
-  }
-
   const entries: LedgerEntry[] = [];
-  for (const line of rawLedger.split('\n')) {
+  for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
@@ -1407,98 +1414,149 @@ async function cmdResume(args: string[]): Promise<number> {
       // ignore malformed ledger lines
     }
   }
+  return entries;
+}
 
-  if (entries.length === 0) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
-  }
+/** Reads resume keeps in flight at once: enough to hide latency, few enough not to dogpile a tunnel. */
+const RESUME_FETCH_LIMIT = 6;
 
-  // Fetch live state for each entry. daemonCall fails fast (exit 1) on network
-  // errors — never report stale data. 404 = daemon doesn't know this job.
-  type ResumeResult = {
-    entry: LedgerEntry;
-    job?: Job;
-    decision?: PendingDecision;
-    unknown?: boolean;   // true: 404 or non-200 from daemon
-    fetchError?: string; // set when unknown=true and the cause was a non-404 error
-  };
-
-  const results: ResumeResult[] = [];
-  for (const entry of entries) {
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(entry.jobId)}`);
-    if (res.status === 404) {
-      results.push({ entry, unknown: true });
-    } else if (res.status !== 200) {
-      // Surface other daemon errors; include the job in the output as unknown so
-      // it is never silently dropped from the summary table.
-      const errBody = res.json as { error?: string } | undefined;
-      const msg = errBody?.error ?? `HTTP ${res.status}`;
-      results.push({ entry, unknown: true, fetchError: msg });
-    } else {
-      const body = res.json as { job: Job };
-      const rr: ResumeResult = { entry, job: body.job };
-      if (body.job.state === 'blocked') {
-        rr.decision = await fetchResumeDecision(entry.jobId);
-      }
-      results.push(rr);
+/** Run `fn` over `items` with at most `limit` in flight; results stay in item order. */
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next;
+      next += 1;
+      results[i] = await fn(items[i]);
     }
-  }
-
-  // Sort priority: stale-blocked → blocked → running/queued → terminal → unknown.
-  const sortKey = (rr: ResumeResult): number => {
-    if (rr.unknown) return 100;
-    if (!rr.job) return 90;
-    const { state, marker } = rr.job;
-    if (state === 'blocked' && marker === 'stale') return 0;
-    if (state === 'blocked') return 1;
-    if (state === 'running' || state === 'queued') return 2;
-    return 10; // terminal
   };
-  results.sort((a, b) => sortKey(a) - sortKey(b));
+  await Promise.all(Array.from({ length: Math.min(limit, Math.max(1, items.length)) }, worker));
+  return results;
+}
 
-  const ACTIVE_STATES = new Set(['blocked', 'running', 'queued']);
+/**
+ * Live state for one ledger entry. daemonCall fails fast (exit 1) on network
+ * errors — never report stale data. 404 = daemon doesn't know this job; other
+ * daemon errors surface on the row rather than silently dropping it.
+ */
+async function fetchResumeResult(entry: LedgerEntry): Promise<ResumeResult> {
+  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(entry.jobId)}`);
+  if (res.status === 404) return { entry, unknown: true };
+  if (res.status !== 200) {
+    const errBody = res.json as { error?: string } | undefined;
+    return { entry, unknown: true, fetchError: errBody?.error ?? `HTTP ${res.status}` };
+  }
+  const body = res.json as { job: Job };
+  const rr: ResumeResult = { entry, job: body.job };
+  if (body.job.state === 'blocked') rr.decision = await fetchResumeDecision(entry.jobId);
+  return rr;
+}
+
+/** Sort priority: stale-blocked → blocked → running/queued → terminal → unknown. */
+function resumeSortKey(rr: ResumeResult): number {
+  if (rr.unknown) return 100;
+  if (!rr.job) return 90;
+  const { state, marker } = rr.job;
+  if (state === 'blocked' && marker === 'stale') return 0;
+  if (state === 'blocked') return 1;
+  if (state === 'running' || state === 'queued') return 2;
+  return 10; // terminal
+}
+
+/**
+ * Rewrite the ledger without the entries the daemon confirmed terminal (#125):
+ * the file is append-only at dispatch and nothing else prunes it, so resume
+ * used to pay one round trip per job ever dispatched from this checkout.
+ * Unknown-to-daemon entries stay — they may live on another daemon (the
+ * entry's daemonUrl says which), and dropping them would lose the only local
+ * pointer. Best-effort: a failed rewrite costs speed on the next resume, never
+ * truth (remote is truth; the ledger holds no status fields at all).
+ */
+function pruneLedger(ledgerPath: string, results: ResumeResult[]): number {
+  const settled = (rr: ResumeResult): boolean =>
+    rr.job !== undefined && TERMINAL_STATES.includes(rr.job.state);
+  const keep = results.filter((rr) => !settled(rr));
+  if (keep.length === results.length) return 0;
+  try {
+    fs.writeFileSync(ledgerPath, keep.map((rr) => `${JSON.stringify(rr.entry)}\n`).join(''));
+  } catch {
+    return 0; // hygiene only — the listing above already reported the live truth
+  }
+  return results.length - keep.length;
+}
+
+const ACTIVE_STATES = new Set(['blocked', 'running', 'queued']);
+
+/** One blocked job's open decision, with how to answer it. */
+function printResumeDecision(jobId: string, dec: PendingDecision): void {
+  console.log(`  ? ${dec.question}`);
+  for (const opt of dec.options) {
+    const rec = opt.recommended ? ' (recommended)' : '';
+    const label = opt.label ? `: ${opt.label}` : '';
+    console.log(`    - ${opt.id}${rec}${label}`);
+  }
+  console.log(`  run: fleet answer ${jobId} --option <id>  |  fleet resume --answer`);
+}
+
+/**
+ * Print the resume summary from sorted results: active jobs (blocked first)
+ * with open decisions, a tail of recent terminal jobs, then entries the daemon
+ * does not know (with daemonUrl context, so the user knows which daemon was
+ * asked and where the job may actually live). Returns the first blocked
+ * result, which is what --answer drops into.
+ */
+function printResumeResults(results: ResumeResult[]): ResumeResult | undefined {
   const active = results.filter((rr) => !rr.unknown && rr.job && ACTIVE_STATES.has(rr.job.state));
   const terminal = results.filter((rr) => !rr.unknown && rr.job && !ACTIVE_STATES.has(rr.job.state));
   const unknown = results.filter((rr) => rr.unknown);
 
   let firstBlocked: ResumeResult | undefined;
-
-  // Active jobs (blocked first, then running/queued).
   for (const rr of active) {
     const job = rr.job!;
     console.log(formatJob(job));
     if (rr.decision) {
       if (!firstBlocked) firstBlocked = rr;
-      const dec = rr.decision;
-      console.log(`  ? ${dec.question}`);
-      for (const opt of dec.options) {
-        const rec = opt.recommended ? ' (recommended)' : '';
-        const label = opt.label ? `: ${opt.label}` : '';
-        console.log(`    - ${opt.id}${rec}${label}`);
-      }
-      console.log(`  run: fleet answer ${job.id} --option <id>  |  fleet resume --answer`);
+      printResumeDecision(job.id, rr.decision);
     } else if (job.state === 'blocked' && !firstBlocked) {
       firstBlocked = rr;
     }
   }
 
   // Recent terminal tail (last 5, oldest first within the tail).
-  const recentTerminal = terminal.slice(-5);
-  for (const rr of recentTerminal) {
-    console.log(formatJob(rr.job!));
-  }
+  for (const rr of terminal.slice(-5)) console.log(formatJob(rr.job!));
 
-  // Unknown-to-daemon entries (404 or daemon error). Include daemonUrl so the
-  // user knows which daemon was queried and where the job may actually live.
   for (const rr of unknown) {
     const reason = rr.fetchError ? `error: ${rr.fetchError}` : 'unknown to daemon';
     console.log(`${rr.entry.jobId}  ${reason}  target=${rr.entry.target}  daemon=${describeTarget()}  delegated=${rr.entry.at}`);
   }
+  return firstBlocked;
+}
 
-  if (active.length === 0 && terminal.length === 0 && unknown.length === 0) {
+/**
+ * Read the local dispatch ledger, fetch live state for every entry (a few at a
+ * time), print a reconnect-oriented summary — blocked/stale first with open
+ * decisions, then active, then a tail of recent terminal jobs — and prune the
+ * confirmed-terminal entries so resume time stays bounded by live jobs, not by
+ * lifetime dispatch count (#125).
+ */
+async function cmdResume(args: string[]): Promise<number> {
+  const { values } = parseCommand(args, { answer: { type: 'boolean' } }, 0, 0);
+  const answerMode = values.answer === true;
+
+  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
+  const entries = readLedgerEntries(ledgerPath);
+  if (entries.length === 0) {
     console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
     return EXIT_OK;
   }
+
+  const results = await mapWithLimit(entries, RESUME_FETCH_LIMIT, fetchResumeResult);
+  const pruned = pruneLedger(ledgerPath, results); // ledger order, before the display sort
+  results.sort((a, b) => resumeSortKey(a) - resumeSortKey(b));
+
+  const firstBlocked = printResumeResults(results);
+  if (pruned > 0) console.log(`(pruned ${pruned} settled job${pruned === 1 ? '' : 's'} from ${ledgerPath})`);
 
   // --answer: drop into interactive answer loop on the first blocked job.
   if (answerMode) {
@@ -1613,6 +1671,12 @@ export async function main(argv: string[]): Promise<number> {
       return EXIT_USAGE;
     }
     if (err instanceof CliError) {
+      console.error(err.message);
+      return EXIT_FAILURE;
+    }
+    // Daemon-address resolution refused outside a daemonCall (the cockpit's
+    // startup, doctor's tunnel section): still a one-line failure, not a stack.
+    if (err instanceof DaemonTargetError) {
       console.error(err.message);
       return EXIT_FAILURE;
     }
