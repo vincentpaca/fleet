@@ -367,6 +367,8 @@ test('logs: default (narrative) filters tool_use/tool_result; --tools includes t
 test('attach follows long-poll cycles until the job reaches a terminal state', async (t) => {
   let calls = 0;
   const daemon = await startMockDaemon({
+    // attach probes the job before following (#124), so a typo'd id fails fast.
+    'GET /jobs/job-1': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { job: RUNNING_JOB }),
     'GET /jobs/job-1/events': (req: MockRequest, res: ServerResponse) => {
       calls += 1;
       const params = new URL(req.url, 'http://x').searchParams;

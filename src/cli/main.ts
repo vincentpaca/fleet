@@ -21,7 +21,7 @@ import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, DaemonTargetError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
-import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision } from './board.ts';
+import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
@@ -794,18 +794,6 @@ async function cmdImageBuild(args: string[]): Promise<number> {
 // ---------- job event rendering ----------
 // formatEvent, logsNoColor, FleetEvent — imported from ./format.ts
 
-/** Print one NDJSON event line from the daemon. Returns the parsed event on success. */
-function printEventLine(line: string, noColor: boolean): FleetEvent | undefined {
-  try {
-    const event: FleetEvent = JSON.parse(line);
-    console.log(formatEvent(event, noColor));
-    return event;
-  } catch {
-    console.log(line); // never crash on a malformed daemon line
-    return undefined;
-  }
-}
-
 // ---------- daemon-backed commands ----------
 
 type OnLine = (line: string) => void;
@@ -926,57 +914,89 @@ async function cmdLogs(args: string[]): Promise<number> {
 /**
  * Read one answer line from stdin for a pending decision.
  * Grammar: "<option-id> [supplementary text]" | "text: <free text>" | "" (skip).
+ * The signal closes the prompt when the watch ends: a readline waiting on
+ * stdin would otherwise hold the process open after the job settled.
  */
-async function readAnswerLine(prompt: string): Promise<{ option?: string; text?: string } | undefined> {
+async function readAnswerLine(
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<{ option?: string; text?: string } | undefined> {
   const readline = await import('node:readline/promises'); // lazy: only in interactive watch mode
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   try {
-    return parseAnswerLine(await rl.question(prompt));
+    return parseAnswerLine(await rl.question(prompt, signal === undefined ? {} : { signal }));
+  } catch (err) {
+    if (signal?.aborted) return undefined; // the watch ended while the prompt was open
+    throw err;
   } finally {
     rl.close();
   }
 }
 
 /**
- * Follow a job to a terminal state, printing events. With answerMode, pending
- * decisions are answered from stdin between poll cycles. Watching is a view,
- * never a lifeline: disconnecting changes nothing for the job.
+ * Follow a job to a terminal state, printing events; with answerMode, pending
+ * decisions are answered from stdin as they arrive.
+ *
+ * One follow implementation in the codebase (#124): resume from the last
+ * daemon seq (`?after=`), reconnect-on-error and the anti-spin pause against
+ * an immediate-close peer all come from the board's `followJobEvents` — a
+ * transient tunnel blip used to exit an overnight `--watch` with code 1 here.
+ * This layer owns only what attach adds: printing, the answer prompt, and
+ * stopping at a terminal state. Watching is a view, never a lifeline:
+ * disconnecting changes nothing for the job.
  */
-/** Build the events query string for a follow or resume-from-seq request. */
-function followQuery(after: number | undefined): string {
-  return after === undefined ? '?follow=1' : '?after=' + after + '&follow=1';
-}
-
 async function followJob(jobId: string, answerMode: boolean): Promise<number> {
-  let after: number | undefined;
-  let terminal = false;
-  let pendingDecision: FleetEvent | undefined;
-  const isTTY = process.stdout.isTTY === true;
-  const noColor = logsNoColor(process.env as Record<string, string | undefined>, isTTY);
+  // A job the daemon does not know must refuse now: the follow loop treats
+  // every failure as transient, and would retry a typo'd id forever.
+  const probe = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}`);
+  if (probe.status !== 200) return daemonFailure(probe, 'attach');
 
-  while (!terminal) {
-    const query = followQuery(after);
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, (line) => {
-      const event = printEventLine(line, noColor);
-      if (!event) return;
-      if (typeof event.seq === 'number') after = event.seq;
-      if (event.type === 'decision') pendingDecision = event;
-      if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
-      if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
-        terminal = true;
-      }
-    });
-    if (res.status !== 200) return daemonFailure(res, 'attach');
-    if (!terminal && answerMode && pendingDecision) {
-      const ids = (pendingDecision.options ?? []).map((o) => o.id).join(' | ');
-      const answer = await readAnswerLine(`answer [${ids}] ("<id> [note]" or "text: ..." or empty to keep waiting): `);
-      if (answer) {
+  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY === true);
+  const done = new AbortController();
+  let pendingDecision: FleetEvent | undefined;
+  let prompting = false;
+
+  // The prompt runs beside the stream, not instead of it: events keep printing
+  // while the operator types, and an answer landing from another surface (the
+  // 'answer' event below) simply ends the wait for one here.
+  const promptLoop = async (): Promise<void> => {
+    if (prompting) return;
+    prompting = true;
+    try {
+      while (pendingDecision !== undefined && !done.signal.aborted) {
+        const ids = (pendingDecision.options ?? []).map((o) => o.id).join(' | ');
+        const answer = await readAnswerLine(
+          `answer [${ids}] ("<id> [note]" or "text: ..." or empty to keep waiting): `,
+          done.signal,
+        );
+        if (done.signal.aborted) return;
+        if (!answer) continue; // keep waiting: the decision is still open, ask again
         const posted = await daemonCall('POST', `/jobs/${encodeURIComponent(jobId)}/answer`, answer);
-        if (posted.status !== 200) daemonFailure(posted, 'answer'); // print and keep watching
+        if (posted.status !== 200) console.error(daemonFailureMessage(posted, 'answer')); // print and keep watching
         else pendingDecision = undefined;
       }
+    } finally {
+      prompting = false;
     }
-  }
+  };
+
+  await followJobEvents(
+    jobId,
+    (event) => {
+      console.log(formatEvent(event, noColor));
+      if (event.type === 'decision') {
+        pendingDecision = event;
+        // A failed answer POST must not kill the watch — print it and keep watching.
+        if (answerMode) void promptLoop().catch((err) => console.error(errorMessage(err)));
+      }
+      if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
+      if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
+        done.abort();
+      }
+    },
+    process.env as Record<string, string | undefined>,
+    done.signal,
+  );
   return EXIT_OK;
 }
 
