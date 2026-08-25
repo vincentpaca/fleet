@@ -367,6 +367,8 @@ test('logs: default (narrative) filters tool_use/tool_result; --tools includes t
 test('attach follows long-poll cycles until the job reaches a terminal state', async (t) => {
   let calls = 0;
   const daemon = await startMockDaemon({
+    // attach probes the job before following (#124), so a typo'd id fails fast.
+    'GET /jobs/job-1': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { job: RUNNING_JOB }),
     'GET /jobs/job-1/events': (req: MockRequest, res: ServerResponse) => {
       calls += 1;
       const params = new URL(req.url, 'http://x').searchParams;
@@ -444,6 +446,46 @@ test('cancel posts to the cancel endpoint', async (t) => {
   assert.match(res.stdout, /cancelled job-1/);
   assert.equal(daemon.requests.length, 1);
   assert.equal(daemon.requests[0].method, 'POST');
+});
+
+// ── artifacts get --out: readable failures, never an ENOENT stack (#125) ─────
+
+/** Mock daemon serving one artifact, the shape the real one returns. */
+function artifactDaemon(): ReturnType<typeof startMockDaemon> {
+  return startMockDaemon({
+    'GET /jobs/job-1/artifacts/report.md': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, { path: 'report.md', content: Buffer.from('# hi\n').toString('base64'), bytes: 5 }),
+  });
+}
+
+test('artifacts get --out creates a missing directory instead of crashing on ENOENT', async (t) => {
+  const daemon = await artifactDaemon();
+  t.after(daemon.close);
+
+  const outDir = path.join(makeTempDir('fleet-art-'), 'not', 'yet', 'there');
+  const res = await runCli(['artifacts', 'job-1', 'get', 'report.md', '--out', outDir], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /saved to /);
+  const { readFileSync } = await import('node:fs');
+  assert.equal(readFileSync(path.join(outDir, 'report.md'), 'utf8'), '# hi\n');
+});
+
+test('artifacts get --out that cannot be written is a one-line failure, exit 1, no stack', async (t) => {
+  const daemon = await artifactDaemon();
+  t.after(daemon.close);
+
+  // --out names an existing *file*: mkdir/write must fail, readably.
+  const blocked = path.join(makeTempDir('fleet-art-'), 'blocked');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(blocked, 'i am a file');
+  const res = await runCli(['artifacts', 'job-1', 'get', 'report.md', '--out', blocked], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /artifacts get: cannot write /);
+  assert.doesNotMatch(res.stderr, /node:internal|at .*\.ts:\d/, 'no stack trace');
 });
 
 test('status prints friendly empty-state with delegate hint when no jobs', async (t) => {

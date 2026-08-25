@@ -30,10 +30,12 @@
 import {
   ENTER_ALT,
   RESTORE_SEQ,
+  clampTailScroll,
   detectColorLevel,
   decisionCardLines,
   fetchBoardJobs,
   followJobEvents,
+  invalidateDecision,
   jobCounts,
   parseAnswerLine,
   renderBanner,
@@ -53,7 +55,7 @@ import {
 import { makeCol, visualClip, visualLength } from './ansi.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { gitValue } from '../shared/git.ts';
-import { daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
+import { LOOPBACK_HOSTS, daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
 import { logsNoColor } from './format.ts';
 import { holdTunnel, portAccepts, resolveTunnel, tunnelReport, type HeldTunnel } from './connect.ts';
 
@@ -141,11 +143,16 @@ const PROMPT = '› ';
  */
 export function windowRosterRows(rows: RosterRow[], selection: number, budget: number): string[] {
   if (budget <= 0) return [];
-  const height = (from: number, to: number): number =>
-    rows.slice(from, to + 1).reduce((n, r) => n + r.lines.length, 0);
-  let start = 0;
   const target = Math.max(0, Math.min(selection, rows.length - 1));
-  while (start < target && height(start, target) > budget) start += 1;
+  // One running sum, shrunk as the window slides: re-summing rows[start..target]
+  // per iteration made this O(n²) in job count per frame (#125).
+  let span = 0;
+  for (let i = 0; i <= target; i++) span += rows[i]?.lines.length ?? 0;
+  let start = 0;
+  while (start < target && span > budget) {
+    span -= rows[start].lines.length;
+    start += 1;
+  }
   return rows.slice(start).flatMap((r) => r.lines).slice(0, budget);
 }
 
@@ -622,8 +629,9 @@ const STATUS_STICKY_MS = 60_000;
 const FOLLOW_SETTLE_MS = 250;
 /** A resident view runs for hours: the tail is a window, not a transcript. */
 const MAX_TAIL_EVENTS = 2_000;
-/** Hosts a local port-forward can actually serve; anything else is somebody else's address. */
-const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// Loopback hosts — the ones a local port-forward can actually serve — come
+// from ./client.ts (LOOPBACK_HOSTS), the same set the daemon-target trust
+// boundary is drawn on (#135).
 
 /** Never re-examine the tunnel more often than this, however badly the daemon is doing. */
 const TUNNEL_RECHECK_MS = 15_000;
@@ -913,7 +921,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
     }
     // A forward binds a local port. If the daemon address is not local, opening
     // one would forward a port nothing reads from — worse than no tunnel.
-    if (!LOOPBACK.has(target.host)) {
+    if (!LOOPBACK_HOSTS.has(target.host)) {
       model.tunnel = { kind: 'failed', why: `${endpoint} is not a local address — nothing here can tunnel to it` };
       note(model.tunnel.why);
       return;
@@ -996,9 +1004,12 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
         if (posted.ok) say(`answered ${job.id}`);
         else refuse(`answer failed: ${posted.error ?? 'unknown error'}`);
         if (posted.ok) {
-          // The answer is the transition: drop the cached decision so the next
-          // poll reads whatever the job asks next rather than the old card.
-          decisions.clear();
+          // The answer is the transition: drop this job's cached decision so
+          // the next poll reads whatever it asks next rather than the old
+          // card. Only this job's — the other blocked jobs' questions have
+          // not changed, and refetching each of their full event logs made
+          // one answer cost a poll cycle per blocked job (#125).
+          invalidateDecision(decisions, job.id);
           await poll();
         }
         return;
@@ -1099,8 +1110,9 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
         if (model.view !== 'job') break;
         // Clamped to the tail it is scrolling, so PgUp past the top does not
         // build up a debt that PgDn has to spend before anything moves.
-        const room = Math.max(0, renderEventLines(model.tail, width(), noColor).length - 1);
-        model.tailScroll = Math.max(0, Math.min(room, model.tailScroll + action.delta));
+        // clampTailScroll counts only the lines the clamp needs — rendering the
+        // whole tail per keypress to learn one number was an #125 cost.
+        model.tailScroll = clampTailScroll(model.tail, model.tailScroll + action.delta);
         dirty = true;
         break;
       }

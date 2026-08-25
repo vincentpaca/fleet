@@ -23,6 +23,13 @@ test('attach --answer posts the stdin answer and exits on done', async (t) => {
 
   const daemon = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method === 'GET' && url.pathname === '/jobs/job-1') {
+      // attach probes the job before following (#124): a typo'd id must fail
+      // fast rather than reconnect forever.
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ job: { id: 'job-1', state: 'running' } }));
+      return;
+    }
     if (req.method === 'GET' && url.pathname === '/jobs/job-1/events') {
       const after = Number(url.searchParams.get('after') ?? '-1');
       res.setHeader('content-type', 'application/x-ndjson');
@@ -98,4 +105,82 @@ test('attach --answer posts the stdin answer and exits on done', async (t) => {
   assert.match(out, /rebase \(recommended\)/);
   assert.match(out, /settle rung=implemented status=READY next: open the pull request/);
   assert.match(out, /state → done/);
+});
+
+// #124: the one thing an overnight `--watch` must survive is a transient
+// socket error — a tunnel blip used to exit the whole process with code 1.
+// The follow must reconnect and resume with ?after= from the last daemon seq.
+test('attach survives a mid-stream socket drop, reconnects, and resumes from the right seq', async (t) => {
+  const eventCalls: string[] = [];
+  const daemon = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method === 'GET' && url.pathname === '/jobs/job-2') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ job: { id: 'job-2', state: 'running' } }));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/jobs/job-2/events') {
+      eventCalls.push(url.search);
+      res.setHeader('content-type', 'application/x-ndjson');
+      if (eventCalls.length === 1) {
+        // Two events, then the socket dies mid-stream — the tunnel blip.
+        res.write(ndjson([
+          { job: 'job-2', seq: 0, type: 'state', state: 'running' },
+          { job: 'job-2', seq: 1, type: 'phase', text: 'implementing' },
+        ]));
+        setTimeout(() => res.destroy(), 50);
+        return;
+      }
+      res.end(ndjson([
+        { job: 'job-2', seq: 2, type: 'state', state: 'done' },
+      ]));
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  daemon.listen(0, '127.0.0.1');
+  await once(daemon, 'listening');
+  t.after(() => daemon.close());
+  const address = daemon.address();
+  assert.ok(address && typeof address === 'object');
+
+  const child = spawn('node', [cli, 'attach', 'job-2'], {
+    env: { ...process.env, FLEET_DAEMON_URL: `http://127.0.0.1:${address.port}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (c) => (out += c));
+  let err = '';
+  child.stderr.on('data', (c) => (err += c));
+
+  const [code] = (await once(child, 'exit')) as [number];
+  assert.equal(code, 0, `a socket drop must reconnect, not exit 1\nstderr:\n${err}\nstdout:\n${out}`);
+  assert.ok(eventCalls.length >= 2, 'the follow reconnected after the drop');
+  assert.match(eventCalls[1], /after=1/, 'the reconnect resumed from the last daemon seq seen');
+  assert.match(out, /\[1\] phase implementing/, 'events before the drop were printed');
+  assert.match(out, /\[2\] state → done/, 'events after the reconnect were printed');
+});
+
+test('attach on a job the daemon does not know exits 1 with a readable error, not a retry loop', async (t) => {
+  const daemon = http.createServer((_req, res) => {
+    res.statusCode = 404;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ error: 'no such job' }));
+  });
+  daemon.listen(0, '127.0.0.1');
+  await once(daemon, 'listening');
+  t.after(() => daemon.close());
+  const address = daemon.address();
+  assert.ok(address && typeof address === 'object');
+
+  const child = spawn('node', [cli, 'attach', 'job-typo'], {
+    env: { ...process.env, FLEET_DAEMON_URL: `http://127.0.0.1:${address.port}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let err = '';
+  child.stderr.on('data', (c) => (err += c));
+  const [code] = (await once(child, 'exit')) as [number];
+  assert.equal(code, 1, 'an unknown job is a failure, not a wait');
+  assert.match(err, /no such job/, 'the daemon error is surfaced');
 });

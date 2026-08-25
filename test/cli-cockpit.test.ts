@@ -752,6 +752,50 @@ test("a blocked job's decision is answered from the cockpit, and never by the co
   assert.equal(await cockpit.quit(), 0);
 });
 
+test("answering one decision does not refetch the other blocked jobs' logs (#125)", async (t) => {
+  const decisionOf = (id: string, option: string) => [
+    { job: id, seq: 0, type: 'decision', id: 'd1', question: `Proceed on ${id}?`, options: [{ id: option, label: 'Go', recommended: true }, { id: 'halt', label: 'Halt' }] },
+    { job: id, seq: 1, type: 'state', state: 'blocked' },
+  ];
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jobs: [
+          { id: 'job-a', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '1' } },
+          { id: 'job-b', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '2' } },
+        ],
+      }),
+    'GET /jobs/job-a/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, decisionOf('job-a', 'go')),
+    'GET /jobs/job-b/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, decisionOf('job-b', 'go')),
+    'POST /jobs/job-a/answer': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { ok: true }),
+  });
+  t.after(daemon.close);
+
+  const cockpit = startCockpit({ cwd: makeTempDir('fleet-cockpit-'), env: { FLEET_DAEMON_URL: daemon.url } });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+
+  await shows(cockpit, 'Proceed on job-b?', "both jobs' decision cards");
+  // Decision reads are the plain (non-follow) event GETs; the drill-down's own
+  // tail follows with ?follow=1 and must not count here.
+  const decisionReads = (id: string): number =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith(`/jobs/${id}/events`) && !r.url.includes('follow=1')).length;
+  assert.equal(decisionReads('job-b'), 1, "job-b's log was read once to render its card");
+
+  // Answer the selected job (job-a, first blocked row) with its option id.
+  cockpit.type('go\r');
+  await shows(cockpit, 'answered job-a');
+
+  // Let two full poll cycles land: the cache decides what gets refetched now.
+  const pollsAtAnswer = daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith('/jobs') && !r.url.includes('/events')).length;
+  await waitFor(cockpit, 'two more board polls', () =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith('/jobs') && !r.url.includes('/events')).length >= pollsAtAnswer + 2);
+
+  // The answer invalidated job-a's cached decision only: job-b's whole event
+  // log must not be re-read because a different job was answered.
+  assert.equal(decisionReads('job-b'), 1, "answering job-a must not refetch job-b's log");
+  assert.equal(await cockpit.quit(), 0);
+});
+
 test('cancelling from the cockpit asks first, and only y goes through', async (t) => {
   const cancels: string[] = [];
   const daemon = await startMockDaemon({

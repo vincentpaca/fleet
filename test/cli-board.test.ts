@@ -8,7 +8,9 @@ import {
   FLEET_BANNER,
   answerJob,
   cancelJob,
+  clampTailScroll,
   fetchBoardJobs,
+  invalidateDecision,
   jobCounts,
   parseAnswerLine,
   renderBanner,
@@ -313,6 +315,35 @@ test('renderEventLines: exact output for every event type, color and noColor (#1
 test('renderEventLines: every line is clipped to width', () => {
   const events: FleetEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
   for (const line of renderEventLines(events, 60, true)) assert.ok(line.length <= 60);
+});
+
+test('clampTailScroll agrees with the full render it replaces, at every proposal', () => {
+  // The cockpit used to render the entire tail per PgUp keypress just to learn
+  // the scroll ceiling (#125). The cheap count must clamp exactly like
+  // min(proposed, total lines − 1) over renderEventLines — the battery includes
+  // multi-line decision cards, so a per-event line count that drifted from the
+  // renderer's would fail here.
+  const battery = EVENT_BATTERY as FleetEvent[];
+  const total = renderEventLines(battery, 1_000, true).length;
+  for (const proposed of [-5, 0, 1, 3, total - 1, total, total + 50]) {
+    assert.equal(
+      clampTailScroll(battery, proposed),
+      Math.max(0, Math.min(proposed, total - 1)),
+      `proposal ${proposed} (total ${total} lines)`,
+    );
+  }
+  assert.equal(clampTailScroll([], 7), 0, 'an empty tail has nowhere to scroll');
+});
+
+test('invalidateDecision drops exactly one job\'s cached decisions', () => {
+  const decision: PendingDecision = { id: 'd1', question: 'q', options: [{ id: 'a' }, { id: 'b' }] };
+  const cache = new Map<string, PendingDecision>([
+    ['job-a@2026-01-01T00:00:00Z', decision],
+    ['job-a@2026-01-02T00:00:00Z', decision],
+    ['job-b@2026-01-01T00:00:00Z', decision],
+  ]);
+  invalidateDecision(cache, 'job-a');
+  assert.deepEqual([...cache.keys()], ['job-b@2026-01-01T00:00:00Z'], 'only the answered job is dropped');
 });
 
 // ── Chrome ────────────────────────────────────────────────────────────────────

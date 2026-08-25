@@ -69,8 +69,6 @@ const FUNCTION_BASELINE = [
   'src/cli/main.ts::cmdLint',
   // dispatchDelegate: full dispatch state machine = CCN 51, NLOC 108; genuine.
   'src/cli/main.ts::dispatchDelegate',
-  // cmdResume: multi-step resume with decision poll = CCN 30, NLOC 96; genuine.
-  'src/cli/main.ts::cmdResume',
   // main: top-level argument dispatch over all subcommands = CCN 23; genuine.
   'src/cli/main.ts::main',
   // run (the cockpit's command switch): one case per verb plus their guards =

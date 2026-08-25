@@ -321,8 +321,13 @@ test('resume --answer via fleet-config.json: posts answer and follows to done', 
   const { CLI } = await import('./cli-helpers.ts');
   const child = spawn(process.execPath, [CLI, 'resume', '--answer'], {
     cwd,
-    // No FLEET_DAEMON_URL — must resolve via fleet-config.json.
-    env: Object.fromEntries(Object.entries({ ...process.env, FLEET_DAEMON_URL: undefined }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+    // No FLEET_DAEMON_URL — must resolve via fleet-config.json. FLEET_HOME is
+    // pinned to a temp dir: the first-seen daemon_url record (#135) lives there,
+    // and a test must never touch ~/.fleet.
+    env: Object.fromEntries(
+      Object.entries({ ...process.env, FLEET_DAEMON_URL: undefined, FLEET_HOME: makeTempDir('fleet-resume-home-') })
+        .filter(([, v]) => v !== undefined),
+    ) as Record<string, string>,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -344,4 +349,72 @@ test('resume --answer via fleet-config.json: posts answer and follows to done', 
   assert.match(out, /Merge strategy\?/, 'decision question shown');
   assert.match(out, /squash.*recommended/, 'recommended option shown');
   assert.match(out, /state → done/, 'followed to done');
+});
+
+// ── Ledger pruning and bounded fetch time (#125) ─────────────────────────────
+
+test('resume prunes confirmed-terminal entries from the ledger; live and unknown entries stay', async (t) => {
+  const cwd = scaffold();
+  const daemon = await startMockDaemon({
+    'GET /jobs/job-done': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, { job: { id: 'job-done', state: 'done', workOrder: { mode: 'implement', target: '1' } } }),
+    'GET /jobs/job-live': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, { job: { id: 'job-live', state: 'running', workOrder: { mode: 'implement', target: '2' } } }),
+    'GET /jobs/job-gone': (_req: MockRequest, res: ServerResponse) => sendJson(res, 404, { error: 'not found' }),
+  });
+  t.after(daemon.close);
+
+  seedLedger(cwd, [
+    { jobId: 'job-done', target: '1', daemonUrl: daemon.url },
+    { jobId: 'job-live', target: '2', daemonUrl: daemon.url },
+    { jobId: 'job-gone', target: '3', daemonUrl: daemon.url },
+  ]);
+
+  const res = await runCli(['resume'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /job-done/, 'the settled job still appears in this run\'s summary');
+  assert.match(res.stdout, /pruned 1 settled job/, 'the prune is reported');
+
+  // The ledger is append-only at dispatch and nothing else prunes it: without
+  // this rewrite, resume pays one round trip per job ever dispatched.
+  const ledger = fs.readFileSync(path.join(cwd, '.fleet', 'dispatched.jsonl'), 'utf8');
+  const ids = ledger.trim().split('\n').map((l) => (JSON.parse(l) as { jobId: string }).jobId);
+  assert.deepEqual(ids, ['job-live', 'job-gone'], 'terminal entry gone; live and unknown kept, in ledger order');
+
+  // A second resume no longer asks the daemon about the pruned job at all.
+  const before = daemon.requests.length;
+  const again = await runCli(['resume'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(again.code, 0, again.stderr);
+  const asked = daemon.requests.slice(before).map((r) => r.url);
+  assert.ok(!asked.some((u) => u.includes('job-done')), 'resume time is bounded by live jobs, not dispatch history');
+});
+
+test('resume fetches ledger entries concurrently, not one round trip at a time', async (t) => {
+  // Structural, not stopwatch: each job GET is held open until answered, and
+  // the daemon records how many were in flight at once. A serial resume never
+  // has two open together, however fast or slow the machine is.
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const routes: Record<string, (req: MockRequest, res: ServerResponse) => void> = {};
+  const jobIds = Array.from({ length: 6 }, (_, i) => `job-par-${i}`);
+  for (const id of jobIds) {
+    routes[`GET /jobs/${id}`] = (_req, res) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      setTimeout(() => {
+        inFlight -= 1;
+        sendJson(res, 200, { job: { id, state: 'running', workOrder: { mode: 'implement', target: '1' } } });
+      }, 150);
+    };
+  }
+  const daemon = await startMockDaemon(routes);
+  t.after(daemon.close);
+
+  const cwd = scaffold();
+  seedLedger(cwd, jobIds.map((jobId) => ({ jobId, target: '1', daemonUrl: daemon.url })));
+
+  const res = await runCli(['resume'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, res.stderr);
+  for (const id of jobIds) assert.match(res.stdout, new RegExp(id));
+  assert.ok(maxInFlight > 1, `never more than ${maxInFlight} fetch in flight — that is serial, not parallel`);
 });
