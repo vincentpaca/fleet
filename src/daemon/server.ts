@@ -5,14 +5,14 @@ import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { validateManifest, validateWorkOrder, validateEvent } from "../validate.mjs";
 import { readBody, sendJson } from "../shared/http.ts";
 import { parseNdjson } from "../shared/ndjson.ts";
 import { stableStringify } from "../shared/json.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
-import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
+import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, jobDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
 import { parseDurationMs, idleLimitMs, decisionTimeoutMs, mergedLimits, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import { HomeLock } from "./lock.ts";
@@ -57,6 +57,21 @@ function boundJobList(jobs: JobRecord[], all: boolean): JobRecord[] {
     .slice(0, LIST_TERMINAL_LIMIT);
   return [...jobs.filter((job) => !isTerminal(job.state)), ...settled];
 }
+
+/**
+ * Suffix reserved for in-flight artifact writes (#119). An upload lands as
+ * `<path>.fleet-tmp` and is renamed into place, so a crash mid-write leaves a
+ * suffixed leftover — never a truncated file at the final path. The suffix is
+ * rejected by the path guard (a leftover can never be fetched or uploaded
+ * over) and skipped by the bookkeeping walk (never listed or counted).
+ */
+const ARTIFACT_TMP_SUFFIX = ".fleet-tmp";
+
+/** Per-artifact bookkeeping: size for the cap total, sha256 recorded at intake (#119). */
+type ArtifactEntry = { bytes: number; sha256: string | null };
+
+/** Per-job artifact bookkeeping: `total` is kept equal to the sum of `files` sizes. */
+type ArtifactMeta = { files: Map<string, ArtifactEntry>; total: number };
 
 export type DaemonOptions = {
   home: string;
@@ -1515,6 +1530,9 @@ export class FleetDaemon {
    */
   static #safeArtifactPath(relPath: string): string | null {
     if (!relPath || relPath.startsWith("/") || relPath.startsWith("\\")) return null;
+    // Reserved for in-flight writes (#119): a crashed upload's leftover must
+    // not be fetchable, and no upload may collide with a tmp name.
+    if (relPath.endsWith(ARTIFACT_TMP_SUFFIX)) return null;
     const parts = relPath.split(/[/\\]/);
     for (const part of parts) {
       if (part === "" || part === "." || part === "..") return null;
@@ -1522,20 +1540,90 @@ export class FleetDaemon {
     return relPath;
   }
 
-  /** Compute total bytes stored under an artifact directory. */
-  static #artifactDirSize(dir: string): number {
-    if (!existsSync(dir)) return 0;
-    let total = 0;
+  /**
+   * Per-job artifact bookkeeping (#119): running byte total for the cap check
+   * and the sha256 recorded at intake, so an upload costs zero stat calls
+   * (previously a full tree walk with a statSync per file, per upload —
+   * O(N²) across a job, sync on the event loop) and reads can verify against
+   * the recorded hash instead of trusting whatever bytes are on disk.
+   */
+  #artifactMeta = new Map<string, ArtifactMeta>();
+
+  /** Tree walks performed by the meta loader (test seam; must not grow per upload). */
+  #artifactWalkCount = 0;
+
+  artifactWalkCount(): number {
+    return this.#artifactWalkCount;
+  }
+
+  /**
+   * Load a job's artifact bookkeeping, once per daemon lifetime. Disk is
+   * authoritative for existence and size: the tree is walked once here rather
+   * than trusting the persisted index, which can miss a file if the daemon
+   * died between an artifact rename and the index write. The index contributes
+   * only the shas recorded at intake — files it lists that are gone are
+   * dropped, files it misses read as sha-unknown (pre-#119 artifacts).
+   */
+  #artifactMetaOf(jobId: string): ArtifactMeta {
+    const cached = this.#artifactMeta.get(jobId);
+    if (cached) return cached;
+    const index = this.#readArtifactIndex(jobId);
+    const meta: ArtifactMeta = { files: new Map(), total: 0 };
+    this.#artifactWalkCount++;
+    for (const { path, bytes } of FleetDaemon.#walkArtifactFiles(artifactDir(this.#options.home, jobId))) {
+      const recorded = index[path];
+      const sha256 = recorded && typeof recorded.sha256 === "string" ? recorded.sha256 : null;
+      meta.files.set(path, { bytes, sha256 });
+      meta.total += bytes;
+    }
+    this.#artifactMeta.set(jobId, meta);
+    return meta;
+  }
+
+  /** One walk of an artifact tree: every stored file with its size. In-flight tmp leftovers are skipped. */
+  static #walkArtifactFiles(dir: string): { path: string; bytes: number }[] {
+    if (!existsSync(dir)) return [];
+    const files: { path: string; bytes: number }[] = [];
     const stack = [dir];
     while (stack.length > 0) {
       const current = stack.pop()!;
       for (const entry of readdirSync(current, { withFileTypes: true })) {
         const full = join(current, entry.name);
         if (entry.isDirectory()) stack.push(full);
-        else total += statSync(full).size;
+        else if (!entry.name.endsWith(ARTIFACT_TMP_SUFFIX)) {
+          files.push({ path: relative(dir, full).replace(/\\/g, "/"), bytes: statSync(full).size });
+        }
       }
     }
-    return total;
+    return files;
+  }
+
+  /** $FLEET_HOME/jobs/<id>/artifacts.json — sits beside the artifact tree, never inside it. */
+  #artifactIndexPath(jobId: string): string {
+    return join(jobDir(this.#options.home, jobId), "artifacts.json");
+  }
+
+  /** Shas recorded at intake, keyed by artifact path; {} when absent or unreadable. */
+  #readArtifactIndex(jobId: string): Record<string, ArtifactEntry> {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(this.#artifactIndexPath(jobId), "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, ArtifactEntry>;
+      }
+    } catch {
+      // Tolerant load: a missing or corrupt index means shas are unknown
+      // (reads fall back to serving without verification), not a dead job.
+    }
+    return {};
+  }
+
+  /** Persist the index (tmp + rename, same pattern as job.json). */
+  #writeArtifactIndex(jobId: string, meta: ArtifactMeta): void {
+    const path = this.#artifactIndexPath(jobId);
+    mkdirSync(dirname(path), { recursive: true });
+    const payload = Object.fromEntries(meta.files);
+    writeFileSync(`${path}.tmp`, JSON.stringify(payload, null, 2));
+    renameSync(`${path}.tmp`, path);
   }
 
   /**
@@ -1597,47 +1685,47 @@ export class FleetDaemon {
       });
     }
 
-    // Decode and verify integrity.
+    // Decode and verify integrity. The sha is computed whether or not the
+    // runner declared one: it is recorded at intake so reads can detect a
+    // later-damaged file instead of re-hashing whatever bytes are on disk.
     const decoded = Buffer.from(contentB64, "base64");
     if (decoded.length !== declaredBytes) {
       return sendJson(res, 422, { error: `bytes mismatch: declared ${declaredBytes}, actual ${decoded.length}` });
     }
-    if (declaredSha256 !== undefined) {
-      const actualSha256 = createHash("sha256").update(decoded).digest("hex");
-      if (actualSha256 !== declaredSha256) return sendJson(res, 422, { error: `sha256 mismatch for ${relPath}` });
+    const sha256 = createHash("sha256").update(decoded).digest("hex");
+    if (declaredSha256 !== undefined && sha256 !== declaredSha256) {
+      return sendJson(res, 422, { error: `sha256 mismatch for ${relPath}` });
     }
 
-    // Total cap: compute current on-disk total before writing.
-    const artDir = artifactDir(this.#options.home, job.id);
-    if (FleetDaemon.#artifactDirSize(artDir) + declaredBytes > ARTIFACT_TOTAL_CAP) {
+    // Total cap against the running total (#119) — no tree walk per upload.
+    // An overwrite is charged the delta, not old-plus-new. From here to the
+    // response there is no await: check, write, and bookkeeping are one
+    // synchronous block in a single-threaded daemon, so concurrent uploads
+    // cannot interleave between the check and the write (the handler's only
+    // await is the body read, which happened above).
+    const meta = this.#artifactMetaOf(job.id);
+    const existingBytes = meta.files.get(safePath)?.bytes ?? 0;
+    if (meta.total - existingBytes + declaredBytes > ARTIFACT_TOTAL_CAP) {
       return sendJson(res, 413, { error: `total artifact cap (${ARTIFACT_TOTAL_CAP} bytes) would be exceeded` });
     }
 
-    const targetPath = join(artDir, safePath);
+    // tmp + rename (same pattern as job.json): a crash mid-write leaves a
+    // reserved-suffix leftover, never a truncated file at the final path.
+    const targetPath = join(artifactDir(this.#options.home, job.id), safePath);
     mkdirSync(dirname(targetPath), { recursive: true });
-    writeFileSync(targetPath, decoded);
+    writeFileSync(`${targetPath}${ARTIFACT_TMP_SUFFIX}`, decoded);
+    renameSync(`${targetPath}${ARTIFACT_TMP_SUFFIX}`, targetPath);
+    meta.total += declaredBytes - existingBytes;
+    meta.files.set(safePath, { bytes: declaredBytes, sha256 });
+    this.#writeArtifactIndex(job.id, meta);
     return sendJson(res, 200, { stored: true, path: relPath, bytes: declaredBytes });
   }
 
-  /** GET /jobs/:id/artifacts — list artifacts stored for the job. */
+  /** GET /jobs/:id/artifacts — list artifacts from the intake bookkeeping (no per-request tree walk, #119). */
   async #listArtifacts(job: JobRecord, res: ServerResponse): Promise<void> {
-    const artDir = artifactDir(this.#options.home, job.id);
-    const artifacts: { path: string; bytes: number }[] = [];
-    if (existsSync(artDir)) {
-      const stack = [artDir];
-      while (stack.length > 0) {
-        const current = stack.pop()!;
-        for (const entry of readdirSync(current, { withFileTypes: true })) {
-          const full = join(current, entry.name);
-          if (entry.isDirectory()) stack.push(full);
-          else {
-            const relPath = relative(artDir, full).replace(/\\/g, "/");
-            artifacts.push({ path: relPath, bytes: statSync(full).size });
-          }
-        }
-      }
-      artifacts.sort((a, b) => a.path.localeCompare(b.path));
-    }
+    const artifacts = [...this.#artifactMetaOf(job.id).files]
+      .map(([path, entry]) => ({ path, bytes: entry.bytes }))
+      .sort((a, b) => a.path.localeCompare(b.path));
     return sendJson(res, 200, { artifacts });
   }
 
@@ -1658,6 +1746,14 @@ export class FleetDaemon {
     }
     const content = readFileSync(fullPath);
     const sha256 = createHash("sha256").update(content).digest("hex");
+    // Verify against the sha recorded at intake (#119): a torn or corrupted
+    // file must surface as an error, not be served with a self-consistent
+    // hash recomputed from the damaged bytes. Artifacts stored before the
+    // index existed have no recorded sha and are served unverified, as before.
+    const recorded = this.#artifactMetaOf(job.id).files.get(safePath);
+    if (recorded?.sha256 != null && recorded.sha256 !== sha256) {
+      return sendJson(res, 500, { error: `artifact corrupted: sha256 mismatch for ${relPath}` });
+    }
     return sendJson(res, 200, {
       path: relPath,
       content: content.toString("base64"),
