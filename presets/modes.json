@@ -17,8 +17,7 @@
       "mode": "investigate",
       "authority": { "edit": false, "publish": false, "jira": ["read", "comment"], "merge": false, "deploy": false, "runtime_read": true },
       "finish": "inspected",
-      "report": "status-first",
-      "note": "edit/publish unlock only after the evidence artifact is recorded; the daemon re-mints authority at that point."
+      "report": "status-first"
     },
     "followthrough": {
       "mode": "followthrough",

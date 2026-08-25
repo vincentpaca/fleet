@@ -892,7 +892,7 @@ export function repoManifest(answers: Answers): RepoManifest {
     version: 1,
     setup: { image: answers.image, script: '.fleet/setup.sh' },
     workspace: { repo: answers.repo, strategy: 'branch-per-job' },
-    // Phase 1 ships one runner adapter, so the CLI is shown rather than asked.
+    // One runner adapter exists, so the CLI is shown rather than asked.
     harness: { cli: 'claude-code', commands: [{ path: answers.command_path, critic: answers.critic }] },
     gates: { pickup: answers.pickup, default_finish: 'merge-ready' },
     // Not interviewed: these are the documented defaults (src/shared/time.ts),
@@ -986,7 +986,7 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
   let merged: Interview;
   try {
-    opts.log('harness: claude-code — the Phase 1 runner adapter');
+    opts.log('harness: claude-code — the supported runner adapter');
     merged = await interview(repoPrompts(opts.cwd, existing), {
       flags: opts.flags,
       env: opts.env,

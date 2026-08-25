@@ -9,7 +9,7 @@
  * record's `type`/`subtype` — never the record — and renders a bounded tag.
  * Leaking a payload is impossible by construction, not by string-filtering.
  *
- * Mapping (the Phase 1 contract, recalibrated against the 2026-08 CLI):
+ * Mapping (the stream contract, recalibrated against the 2026-08 CLI):
  * - assistant text block            → think
  * - assistant thinking block        → think (text only, signature dropped)
  * - assistant tool_use block        → log, `tool_use <name>: <primary arg>`

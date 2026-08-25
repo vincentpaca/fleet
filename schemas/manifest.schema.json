@@ -37,7 +37,7 @@
         "sync": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Gitignored runtime config shipped from the operator's CLI to the daemon at dispatch. Phase 1: may carry secret values (laptop trust class); Phase 2 lints .env* out and moves values to env.vars + broker. Injected env vars win over file-loaded values where the process environment is consulted."
+          "description": "Gitignored runtime config shipped from the operator's CLI to the daemon at dispatch. May carry secret values (laptop trust class) until a broker lints .env* out and moves values to env.vars. Injected env vars win over file-loaded values where the process environment is consulted."
         }
       }
     },
@@ -48,7 +48,7 @@
         "vars": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
-          "description": "Names only — values injected at task start, never stored in the manifest. Phase 1 lookup: exact name in the dispatching shell's environment; missing value fails dispatch loudly."
+          "description": "Names only — values injected at task start, never stored in the manifest. Lookup: exact name in the dispatching shell's environment; missing value fails dispatch loudly."
         }
       }
     },
@@ -63,7 +63,7 @@
           "name": { "type": "string" },
           "scope": { "type": "array", "items": { "type": "string" } },
           "permissions": { "type": "array", "items": { "type": "string" } },
-          "config": { "type": "string", "description": "For mcp: <path>#<key> where key is the entry under mcpServers in the referenced file. Phase 1: creds ride the synced config, broker-exempt; Phase 2: broker templates the config and injects short-lived tokens." }
+          "config": { "type": "string", "description": "For mcp: <path>#<key> where key is the entry under mcpServers in the referenced file. Creds ride the synced config (broker-exempt) until a broker templates the config and injects short-lived tokens." }
         }
       }
     },
@@ -72,14 +72,14 @@
       "required": ["cli", "commands"],
       "additionalProperties": false,
       "properties": {
-        "cli": { "enum": ["claude-code", "codex", "opencode"], "description": "Phase 1 runner adapter: claude-code only; others when an adopter needs them." },
+        "cli": { "enum": ["claude-code", "codex", "opencode"], "description": "Runner adapter: claude-code; others when an adopter needs them." },
         "cli_version": { "type": "string", "description": "Pin the CLI version in the image — format churn arrives only when the repo chooses to upgrade." },
         "env": {
           "type": "object",
           "additionalProperties": { "type": "string" },
           "description": "Harness-runtime env flags baked into the task (e.g. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1). Not secrets."
         },
-        "agents": { "type": "string", "description": "Path to the agent definitions directory (e.g. .claude/agents). Phase 2: every agent file must match a registry entry by frontmatter name or dispatch refuses." },
+        "agents": { "type": "string", "description": "Path to the agent definitions directory (e.g. .claude/agents). Declared for dispatch-time validation: every agent file must match a registry entry by frontmatter name or dispatch refuses." },
         "commands": {
           "type": "array",
           "minItems": 1,
@@ -116,11 +116,11 @@
         "idle": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Liveness check, not a cost bound: no harness output for this long (blocked time excluded) → SIGTERM + grace, partial work pushed, settle with the idle duration, state cancelled reason stall. Supports s/m/h units; zero is not a value — stall detection cannot be switched off, only widened. Must exceed the pickup gate's runtime: the daemon's mirror of this limit measures silence on the event stream, which the gate does not feed. Absent defaults to 20m — the default lives in src/shared/time.ts (idleLimitMs), the one source of truth (#134)." },
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "How long a blocked container stays hot before parking (WIP committed, task exits). Absent defaults to 30m — the default lives in src/shared/time.ts (blockHotLimitMs), the one source of truth (#134)." },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered. Absent defaults to 24h — the default lives in src/shared/time.ts (decisionTimeoutMs), the one source of truth (#134)." },
-        "model_spend": { "type": "string", "description": "OPEN — unenforced until the Phase 2 metering spike; the Terraform budget alarm is the interim backstop." },
+        "model_spend": { "type": "string", "description": "OPEN — not enforced; the structural bounds apply meanwhile (scale to zero, the capacity cap, wall_clock). Per-job metering arrives with fleet-native cost reporting." },
         "egress": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Hostname allowlist, applies after setup completes. Phase 1: declared, unenforced. Phase 2+: absent field denies everything except hosts implied by services and the model API. TBD = DENY."
+          "description": "Hostname allowlist, applies after setup completes. Declared today, unenforced; once enforced, an absent field denies everything except hosts implied by services and the model API. TBD = DENY."
         },
         "resources": {
           "type": "object",

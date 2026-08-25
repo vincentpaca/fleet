@@ -2,8 +2,7 @@
 // Configuration sources (highest priority first):
 //   1. ecsConfigFromEnv()   — FLEET_ECS_* env vars (tests / manual override)
 //   2. ecsConfigFromSsm()   — SSM parameter written by the infra unit (production)
-// Phase 1: methods implemented, integration untested — command construction
-// is the unit-tested surface.
+// The unit-tested surface is command construction; everything here shells out.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { CloudCliRunner, JobSandbox, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";

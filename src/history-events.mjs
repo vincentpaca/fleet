@@ -2,7 +2,7 @@
  * Lossless converter between the Operating Plane demo's run-history records
  * (harness-x-operating-plane/data/history.json) and the Fleet event stream.
  *
- * This is the Phase 0 exit test: if every demo run round-trips through the
+ * Exit check for that claim: if every demo run round-trips through the
  * event schema with nothing lost, the demo's registry can consume the real
  * stream with no translation layer beyond deserialisation.
  */

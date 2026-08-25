@@ -12,8 +12,7 @@ const MODE_NAMES = ['assess', 'implement', 'investigate', 'followthrough', 'revi
 test('all six modes have presets and validate with a target', () => {
   assert.deepStrictEqual(Object.keys(modes).sort(), [...MODE_NAMES].sort());
   for (const [name, preset] of Object.entries(modes)) {
-    const { note, ...fields } = preset;
-    const { ok, errors } = validateWorkOrder({ ...fields, target: 'X-1' });
+    const { ok, errors } = validateWorkOrder({ ...preset, target: 'X-1' });
     assert.ok(ok, `${name}: ${JSON.stringify(errors)}`);
   }
 });

@@ -21,8 +21,7 @@
 // ECR push: images/build.sh covers the runner base and daemon layers — it
 // builds for the deployment's architecture, tags them :runner / :daemon, pushes
 // to the repository its fleet_config names, and rolls the daemon service.
-// Per-repo images are pushed here when --registry is configured (Phase 1: doc +
-// path; live exercise against real ECR belongs to #9 once the ECS substrate is up).
+// Per-repo images are pushed here when --registry is configured.
 // Region precedence differs from that script and predates it: pushToEcr below
 // composes the ECR host from a flag/AWS_REGION region, while build.sh reads the
 // region out of the repository URL (a login token is region-scoped, so the URL
@@ -252,8 +251,7 @@ function runDockerBuild(
  *     executes setup.script itself before the pickup gate unless this file
  *     exists (src/runner/setup.ts). `$HOME`, never /etc — the runner base
  *     drops to USER node before any job-image layer runs.
- *   - `setup.devcontainer` set → comment only (Phase 2); builds as a base alias.
- *   - neither → plain `FROM <runnerBase>` alias (base caching, no extra layers).
+ *   - `setup.devcontainer` set → comment only; builds as a plain runner-base alias.
  */
 export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): string {
   const setup = manifest.setup ?? {};
@@ -265,9 +263,9 @@ export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): st
     lines.push(`COPY ${setup.script} /tmp/fleet-setup.sh`);
     lines.push(`RUN sh /tmp/fleet-setup.sh && touch "$HOME/${SETUP_BAKED_BASENAME}"`);
   } else if (setup.devcontainer) {
-    // Phase 2: @devcontainers/cli integration. For now, emit a comment so the
-    // image still builds successfully (as a plain runner base alias).
-    lines.push(`# devcontainer: ${setup.devcontainer} — Phase 2 support`);
+    // No devcontainer build yet: emit a marker so the image still builds
+    // (a plain runner-base alias). A real build layers @devcontainers/cli output.
+    lines.push(`# devcontainer: ${setup.devcontainer} (not built; base alias only)`);
   }
   return lines.join("\n") + "\n";
 }
