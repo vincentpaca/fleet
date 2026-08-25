@@ -33,9 +33,19 @@ import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDr
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { runSetupScript } from './setup.ts';
-import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes } from '../shared/time.ts';
+import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
+
+/**
+ * Hard cap on one harness stdout line (#139). Readline buffers the whole line
+ * before 'line' fires, but everything downstream — the capture file, the
+ * translator's JSON.parse, the event it may become — must not carry an
+ * unbounded payload. Generous: real stream-json lines with embedded file
+ * contents run to the hundreds of KB, never MBs.
+ */
+const MAX_LINE_CHARS = 1_048_576;
+const LINE_TRUNCATION_MARKER = '…[truncated by fleet runner]';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -391,10 +401,27 @@ async function main(): Promise<void> {
   const heartbeatWindow =
     parseInt(process.env.FLEET_HEARTBEAT_MS ?? '', 10) || heartbeatMs(idleMs);
   let lastEmitAt = startedAt;
-  lines.on('line', (line) => {
+  // Line-length cap (#139): truncate, mark, and continue — never crash on an
+  // unbounded line. Only the first truncation is announced; a harness that
+  // streams many oversized lines must not turn the cap into its own flood.
+  let truncatedLines = 0;
+  const capLine = (raw: string): string => {
+    if (raw.length <= MAX_LINE_CHARS) return raw;
+    truncatedLines += 1;
+    if (truncatedLines === 1) {
+      forget(sink.emit({
+        type: 'log',
+        who: 'runner',
+        text: `harness emitted a ${raw.length}-char line; truncated to ${MAX_LINE_CHARS} (later truncations are silent)`,
+      }));
+    }
+    return raw.slice(0, MAX_LINE_CHARS) + LINE_TRUNCATION_MARKER;
+  };
+  lines.on('line', (rawLine) => {
     // Any output line is proof of life, translatable or not: the stall clock
     // measures silence on the harness's own stream, not event throughput.
     idle.touch();
+    const line = capLine(rawLine);
     if (capture) {
       captureStream ??= createWriteStream(capture, { flags: 'a' });
       captureStream.write(line + '\n');
@@ -756,6 +783,26 @@ async function main(): Promise<void> {
   await endCapture();
   await watcher.stop();
 
+  // Settle heartbeat (#139): the liveness line above lives in the stdout
+  // handler and dies with the harness — exactly when the settle work (WIP/work
+  // push, PR create, artifact upload) starts racing the daemon's backstops.
+  // The idle sweep measures event-stream silence and, firing, terminates the
+  // container without pushing anything; one bounded line per window keeps it
+  // fed for as long as the settle honestly takes. The wall-clock backstop is
+  // deliberately NOT extended: after a wall-clock expiry the whole settle —
+  // SIGTERM grace (30s default) + pushes + PR + artifacts — must fit inside
+  // its fixed margin (DEFAULT_BACKSTOP_MARGIN_MS, 90s). That is the budget.
+  const settleStartedAt = Date.now();
+  const settleHeartbeatWindow =
+    parseInt(process.env.FLEET_SETTLE_HEARTBEAT_MS ?? '', 10) || SETTLE_HEARTBEAT_MS;
+  const settleHeartbeat = setInterval(() => {
+    forget(sink.emit({
+      type: 'log',
+      who: 'runner',
+      text: `settling — ${toMinutes(Date.now() - settleStartedAt)}m in (pushing work, collecting artifacts)`,
+    }));
+  }, settleHeartbeatWindow);
+
   // Deliver the work (#2): commit and push whatever the harness produced —
   // partial work included; evidence over tidiness.
   let pushNote: string | undefined;
@@ -908,6 +955,7 @@ async function main(): Promise<void> {
     const notDone = Array.isArray(report.not_done) ? report.not_done as unknown[] : [];
     body.report = { ...report, not_done: [...notDone, timeout.nextAction] };
   }
+  clearInterval(settleHeartbeat);
   await sink.emit(body);
 
   if (ok) {

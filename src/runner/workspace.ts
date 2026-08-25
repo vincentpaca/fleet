@@ -50,11 +50,17 @@ export function materializeWorkspace(workspace: string): void {
       string,
       string
     >;
+    const root = resolve(workspace);
     for (const [rel, b64] of Object.entries(sync)) {
-      const target = resolve(workspace, rel);
-      // Reject any path that escapes the workspace (security invariant).
-      if (target !== workspace && !target.startsWith(workspace + sep)) {
-        console.error(`runner: materializeWorkspace: dropping path-traversal sync entry: ${rel}`);
+      const target = resolve(root, rel);
+      // Strict containment (#139): the target must live *inside* the workspace.
+      // The old guard (`target !== workspace && !startsWith`) admitted the
+      // workspace root itself, so a sync key of "." reached writeFileSync(root)
+      // and crashed EISDIR before any EventSink existed — an opaque
+      // pre-running death. Root and escape are the same rejection: neither is
+      // a file inside the workspace.
+      if (!target.startsWith(root + sep)) {
+        console.error(`runner: materializeWorkspace: dropping sync entry "${rel}" — resolves to the workspace root or escapes it (${target})`);
         continue;
       }
       mkdirSync(dirname(target), { recursive: true });

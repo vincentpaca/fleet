@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectArtifacts, ARTIFACT_PER_FILE_CAP } from '../src/runner/artifacts.ts';
+import { collectArtifacts, ARTIFACT_PER_FILE_CAP, ARTIFACT_MAX_FILES } from '../src/runner/artifacts.ts';
 
 type ReceivedPost = { path: string; sha256: string; bytes: number; content: string };
 
@@ -192,6 +192,66 @@ test('nested artifact subdirectory → path includes subdir', async () => {
     assert.equal(produced.length, 1);
     assert.equal(produced[0].path, 'charts/fig1.png');
     assert.equal(produced[0].type, 'file');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await server.close();
+  }
+});
+
+test('file-count bomb → walk capped with a loud note; capped set still uploaded (#139)', async () => {
+  // The byte caps bound size, not count: before #139 a directory of thousands
+  // of tiny files was enumerated and uploaded one by one, delaying the settle
+  // into the daemon's backstop margin. The walk itself must stop at the cap.
+  const server = await startArtifactServer();
+  const workspace = makeWorkspace();
+  try {
+    const dir = join(workspace, '.fleet', 'out', 'artifacts');
+    for (let i = 0; i < ARTIFACT_MAX_FILES + 5; i++) {
+      writeFileSync(join(dir, `f${String(i).padStart(4, '0')}.txt`), 'x');
+    }
+
+    const { produced, notes } = await collectArtifacts({
+      workspace,
+      jobId: 'job-a6',
+      daemonUrl: server.url,
+      token: 'tok',
+    });
+
+    assert.equal(produced.length, ARTIFACT_MAX_FILES, 'exactly the cap is delivered');
+    assert.equal(server.posts.length, ARTIFACT_MAX_FILES, 'no upload beyond the cap');
+    assert.ok(
+      notes.some((n) => n.includes(`capped at ${ARTIFACT_MAX_FILES} files`)),
+      `expected a loud cap note; got: ${JSON.stringify(notes)}`,
+    );
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await server.close();
+  }
+});
+
+test('directory nested past the depth cap → skipped with a note, settle proceeds (#139)', async () => {
+  const server = await startArtifactServer();
+  const workspace = makeWorkspace();
+  try {
+    const dir = join(workspace, '.fleet', 'out', 'artifacts');
+    writeFileSync(join(dir, 'shallow.txt'), 'kept');
+    let deep = dir;
+    for (let i = 0; i < 40; i++) deep = join(deep, 'd');
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(join(deep, 'buried.txt'), 'never walked');
+
+    const { produced, notes } = await collectArtifacts({
+      workspace,
+      jobId: 'job-a7',
+      daemonUrl: server.url,
+      token: 'tok',
+    });
+
+    assert.deepEqual(produced.map((p) => p.path), ['shallow.txt'], 'shallow files still delivered');
+    assert.ok(
+      notes.some((n) => n.includes('nested deeper')),
+      `expected a depth-skip note; got: ${JSON.stringify(notes)}`,
+    );
   } finally {
     rmSync(workspace, { recursive: true, force: true });
     await server.close();

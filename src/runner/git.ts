@@ -74,10 +74,16 @@ const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
  */
 export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   if (!env.GH_TOKEN && !env.GITHUB_TOKEN) return {};
+  // Merge with inherited GIT_CONFIG_* (#139): the job env may already carry
+  // config entries (an operator's own injection, a CI harness). Returning a
+  // hardcoded GIT_CONFIG_COUNT of 1 silently clobbered them — append the
+  // helper at the next index instead.
+  const inherited = parseInt(env.GIT_CONFIG_COUNT ?? '', 10);
+  const next = Number.isInteger(inherited) && inherited > 0 ? inherited : 0;
   return {
-    GIT_CONFIG_COUNT: '1',
-    GIT_CONFIG_KEY_0: 'credential.https://github.com.helper',
-    GIT_CONFIG_VALUE_0: '!gh auth git-credential',
+    GIT_CONFIG_COUNT: String(next + 1),
+    [`GIT_CONFIG_KEY_${next}`]: 'credential.https://github.com.helper',
+    [`GIT_CONFIG_VALUE_${next}`]: '!gh auth git-credential',
   };
 }
 
@@ -223,7 +229,13 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   // sure none of it can ever be committed or pushed.
   const excludes = restoreDispatchFiles(workspace, preserved);
   mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
-  appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
+  // Idempotent append (#139): every launch gets a fresh workspace today, but
+  // nothing structural guarantees that — dedupe so a reused workspace (or a
+  // future re-entry that reuses one) never accretes duplicate entries.
+  const excludeFile = join(workspace, '.git', 'info', 'exclude');
+  const present = new Set(existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8').split('\n') : []);
+  const fresh = excludes.filter((line) => !present.has(line));
+  if (fresh.length > 0) appendFileSync(excludeFile, fresh.join('\n') + '\n');
 
   if (!existing) {
     // Initial setup: push the branch immediately so evidence is preserved even

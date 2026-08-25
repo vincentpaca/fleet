@@ -105,6 +105,16 @@ export function heartbeatMs(idleMs: number): number {
 }
 
 /**
+ * Cadence of the runner's settle-window liveness line (#139). The stdout-driven
+ * heartbeat above dies with the harness, which is exactly when the settle work
+ * (pushes, PR create, artifact upload) starts racing the daemon's idle
+ * backstop — a sweep that measures event-stream silence and cannot push the
+ * work first when it fires. A third of the backstop margin leaves two missed
+ * beats of slack, same reasoning as heartbeatMs.
+ */
+export const SETTLE_HEARTBEAT_MS = DEFAULT_BACKSTOP_MARGIN_MS / 3;
+
+/**
  * ms as minutes rounded to 2dp — the unit the settle event already reports
  * (`minutes`), reused so durations read the same everywhere in the log.
  */

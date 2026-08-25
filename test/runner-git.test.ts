@@ -112,6 +112,49 @@ test('gitCredentialEnv wires gh as the github.com helper only when a token exist
   assert.deepEqual(gitCredentialEnv({ GITHUB_TOKEN: 't' }), injected, 'both token spellings gh honors');
 });
 
+test('gitCredentialEnv merges with inherited GIT_CONFIG_* instead of clobbering it (#139)', () => {
+  const inherited = {
+    GH_TOKEN: 't',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'fleet.inherited',
+    GIT_CONFIG_VALUE_0: 'kept',
+  };
+  const injected = gitCredentialEnv(inherited);
+  assert.equal(injected.GIT_CONFIG_COUNT, '2', 'the count grows past the inherited entries');
+  assert.equal(injected.GIT_CONFIG_KEY_1, 'credential.https://github.com.helper', 'the helper lands at the next free index');
+  assert.equal(injected.GIT_CONFIG_VALUE_1, '!gh auth git-credential');
+  assert.equal(injected.GIT_CONFIG_KEY_0, undefined, 'slot 0 stays the environment\'s — never rewritten');
+
+  // git must resolve BOTH configs from the merged env — the inherited entry
+  // was clobbered wholesale before #139.
+  const env = { ...process.env, ...inherited, ...injected };
+  const keptValue = execFileSync('git', ['config', '--get', 'fleet.inherited'], { encoding: 'utf8', env }).trim();
+  assert.equal(keptValue, 'kept', 'the inherited config still resolves');
+  const helper = execFileSync('git', ['config', '--get', 'credential.https://github.com.helper'], { encoding: 'utf8', env }).trim();
+  assert.equal(helper, '!gh auth git-credential', 'the injected helper resolves too');
+});
+
+test('setupWorkspace never duplicates .git/info/exclude entries already present (#139)', () => {
+  // Every launch gets a fresh workspace today, so duplicates cannot pile up —
+  // but nothing structural guarantees that, so the append is idempotent.
+  // Byte-diff: pre-seed the exclude file with exactly what setup would write
+  // and assert setup leaves it byte-identical.
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const excludeFile = join(workspace, '.git', 'info', 'exclude');
+  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
+  const seeded = '.fleet/out/\n.fleet/order.json\n.env.fleet\n';
+  writeFileSync(excludeFile, seeded);
+
+  setupWorkspace(workspace, opts(remote));
+
+  assert.equal(
+    readFileSync(excludeFile, 'utf8'),
+    seeded,
+    'exclude must be byte-identical — no entry appended twice',
+  );
+});
+
 test('git accepts the injected credential config — key names are real, not typos', () => {
   const out = execFileSync('git', ['config', '--get', 'credential.https://github.com.helper'], {
     encoding: 'utf8',
