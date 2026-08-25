@@ -54,38 +54,42 @@ export function logsNoColor(env: Record<string, string | undefined>, isTTY: bool
  * tool_use Read: {"file_path":"/p"} → tool_use Read file_path=/p
  * tool_result toolu_01: <body>      → tool_result toolu_01 (N bytes)
  */
-export function formatLogText(text: string): string {
-  if (text.startsWith('tool_use ')) {
-    // Legacy format: "tool_use <Name>: <json-input>"
-    const colonIdx = text.indexOf(': ');
-    if (colonIdx !== -1) {
-      const namepart = text.slice('tool_use '.length, colonIdx); // e.g. "Read"
-      const jsonPart = text.slice(colonIdx + 2);
-      try {
-        const parsed: unknown = JSON.parse(jsonPart);
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an input object');
-        // Same priority order the translator renders with — one list, shared.
-        const arg = pickPrimaryArg(parsed as Record<string, unknown>, 120);
-        return arg ? `tool_use ${namepart} ${arg.key}=${arg.value}` : `tool_use ${namepart}`;
-      } catch {
-        // Not valid JSON — fall through to raw text.
-      }
-    }
-  } else if (text.startsWith('tool_result ')) {
-    // Format: "tool_result <id>: <body>"
-    const colonIdx = text.indexOf(': ');
-    if (colonIdx !== -1) {
-      const idpart = text.slice('tool_result '.length, colonIdx);
-      const body = text.slice(colonIdx + 2);
-      // Only a raw dump gets traded for a byte count. Since #50 the translator
-      // emits a one-line summary within TERSE_RESULT_MAX; replacing that with
-      // "(42 bytes)" would hide the summary AND misreport the output's real
-      // size — and on a failed call the summary is the whole diagnosis.
-      if (body.length > TERSE_RESULT_MAX || body.includes('\n')) {
-        return `tool_result ${idpart} (${body.length} bytes)`;
-      }
-    }
+/** Format a legacy tool_use log line, or return unchanged if not parseable. */
+function formatToolUse(text: string): string {
+  const colonIdx = text.indexOf(': ');
+  if (colonIdx === -1) return text;
+  const namepart = text.slice('tool_use '.length, colonIdx); // e.g. "Read"
+  const jsonPart = text.slice(colonIdx + 2);
+  try {
+    const parsed: unknown = JSON.parse(jsonPart);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an input object');
+    // Same priority order the translator renders with — one list, shared.
+    const arg = pickPrimaryArg(parsed as Record<string, unknown>, 120);
+    return arg ? `tool_use ${namepart} ${arg.key}=${arg.value}` : `tool_use ${namepart}`;
+  } catch {
+    return text; // Not valid JSON — return raw.
   }
+}
+
+/** Format a tool_result log line, or return unchanged when short enough to keep. */
+function formatToolResult(text: string): string {
+  const colonIdx = text.indexOf(': ');
+  if (colonIdx === -1) return text;
+  const idpart = text.slice('tool_result '.length, colonIdx);
+  const body = text.slice(colonIdx + 2);
+  // Only a raw dump gets traded for a byte count. Since #50 the translator
+  // emits a one-line summary within TERSE_RESULT_MAX; replacing that with
+  // "(42 bytes)" would hide the summary AND misreport the output's real
+  // size — and on a failed call the summary is the whole diagnosis.
+  if (body.length > TERSE_RESULT_MAX || body.includes('\n')) {
+    return `tool_result ${idpart} (${body.length} bytes)`;
+  }
+  return text;
+}
+
+export function formatLogText(text: string): string {
+  if (text.startsWith('tool_use ')) return formatToolUse(text);
+  if (text.startsWith('tool_result ')) return formatToolResult(text);
   return text;
 }
 

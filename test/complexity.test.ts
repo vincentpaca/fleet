@@ -63,33 +63,18 @@ const TARGETS = ['src', '.fleet'];
  * When a number here looks absurd, measure the function by hand first.
  */
 const FUNCTION_BASELINE = [
-  'src/cli/board.ts::(anonymous)',
-  'src/cli/board.ts::buildBanner',
-  'src/cli/board.ts::renderContextStrip',
+  // renderEventLines: switch over 7 event types + operators = CCN 21; genuine.
   'src/cli/board.ts::renderEventLines',
-  'src/cli/client.ts::daemonTarget',
-  'src/cli/cockpit.ts::checkTunnel',
-  'src/cli/cockpit.ts::cockpitKeyAction',
-  'src/cli/cockpit.ts::parseCockpitInput',
-  'src/cli/cockpit.ts::renderCockpit',
-  'src/cli/connect.ts::superviseTunnel',
-  'src/cli/format.ts::formatLogText',
+  // cmdDoctor: checks ~10 env/tool prerequisites = CCN 39, NLOC 83; genuine.
+  'src/cli/main.ts::cmdDoctor',
+  // cmdLint: two try/catch loops + git check = CCN 15; genuine.
   'src/cli/main.ts::cmdLint',
-  'src/cli/main.ts::daemonFailureMessage',
+  // dispatchDelegate: full dispatch state machine = CCN 51, NLOC 108; genuine.
   'src/cli/main.ts::dispatchDelegate',
-  'src/cli/setup.ts::generatedName',
-  'src/daemon/server.ts::#createJob',
-  'src/daemon/server.ts::#route',
-  'src/daemon/verify.ts::verifyWithGh',
-  'src/runner/artifacts.ts::collectArtifacts',
-  'src/runner/git.ts::setupWorkspace',
-  'src/runner/harness.ts::buildHarnessCommand',
-  'src/runner/harness.ts::versionSatisfies',
-  'src/runner/settle.ts::composeSettle',
-  'src/runner/translate.ts::translateLine',
-  'src/shared/http.ts::request',
-  '.fleet/gate.mjs::evaluate',
-  '.fleet/gate.mjs::main',
+  // cmdResume: multi-step resume with decision poll = CCN 30, NLOC 96; genuine.
+  'src/cli/main.ts::cmdResume',
+  // main: top-level argument dispatch over all subcommands = CCN 23; genuine.
+  'src/cli/main.ts::main',
 ];
 
 /** Files already over FILE_NLOC_LIMIT. Same bargain as FUNCTION_BASELINE. */
