@@ -644,11 +644,67 @@ export type CockpitDeps = {
     mode?: string;
     log: (line: string) => void;
     warn: (line: string) => void;
+    /** Aborted when the cockpit closes: a dispatch mid-build must die with the view (#121). */
+    signal?: AbortSignal;
   }) => Promise<{ jobId: string; state: string }>;
 };
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The one dispatch in flight, fired outside the key queue (#121). A cold-image
+ * delegate spends minutes in `docker build`; awaited inside the serialized key
+ * queue it froze the repaint, starved the poll loop, and left ^C an unread
+ * stdin byte until someone SIGKILLed the process. Completion and failure reach
+ * the operator through the same status line every other notice uses, and
+ * `abort()` (wired to the view closing) kills the build's docker child.
+ */
+function delegateRunner(io: {
+  delegate: CockpitDeps['delegate'];
+  say: (line: string, hold?: number) => void;
+  refuse: (line: string) => void;
+  poll: () => Promise<void>;
+}): { start: (command: { target: string; mode?: string }) => void; abort: () => void } {
+  let inFlight: string | undefined;
+  let controller: AbortController | undefined;
+  const dispatch = async (command: { target: string; mode?: string }, signal: AbortSignal): Promise<void> => {
+    try {
+      const created = await io.delegate({
+        target: command.target,
+        mode: command.mode,
+        // Progress holds the footer the way a refusal does: a build is minutes
+        // long, and a notice that expired mid-build reads as a dispatch that
+        // silently went away.
+        log: (line) => io.say(line, STATUS_STICKY_MS),
+        warn: (line) => io.say(line, STATUS_STICKY_MS),
+        signal,
+      });
+      io.say(`${created.jobId} ${created.state} — ${command.target}`);
+      await io.poll().catch(() => {});
+    } catch (err) {
+      io.refuse(`delegate failed: ${errorText(err)}`);
+    } finally {
+      inFlight = undefined;
+      controller = undefined;
+    }
+  };
+  return {
+    start: (command) => {
+      // Refused, not queued: a second build racing the first for the same tag
+      // (or silently stacking behind it) is worse than a one-line answer.
+      if (inFlight !== undefined) {
+        io.refuse(`delegate: still dispatching ${inFlight} — wait for it to settle`);
+        return;
+      }
+      inFlight = command.target;
+      controller = new AbortController();
+      io.say(`delegating ${command.target} …`);
+      void dispatch(command, controller.signal);
+    },
+    abort: () => controller?.abort(),
+  };
 }
 
 /** Best-effort repo/branch/provider for the header strip; every field is optional. */
@@ -907,6 +963,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
   };
 
   // ── what a submitted line does ──
+  const delegate = delegateRunner({ delegate: deps.delegate, say, refuse, poll });
   const run = async (command: CockpitCommand): Promise<void> => {
     switch (command.kind) {
       case 'nothing':
@@ -920,22 +977,12 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
       case 'error':
         refuse(command.message);
         return;
-      case 'delegate': {
-        say(`delegating ${command.target} …`);
-        try {
-          const created = await deps.delegate({
-            target: command.target,
-            mode: command.mode,
-            log: (line) => say(line),
-            warn: (line) => say(line),
-          });
-          say(`${created.jobId} ${created.state} — ${command.target}`);
-          await poll();
-        } catch (err) {
-          refuse(`delegate failed: ${errorText(err)}`);
-        }
+      case 'delegate':
+        // Fired and tracked by `delegate`, never awaited here (#121): this runs
+        // inside the serialized key queue, and a queue waiting on a cold-image
+        // build cannot read the next key — including the ^C that ends the wait.
+        delegate.start(command);
         return;
-      }
       case 'answer': {
         const job = selectedJob(model);
         if (!job || job.state !== 'blocked') {
@@ -1135,6 +1182,9 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
   });
 
   followAbort?.abort();
+  // A dispatch still building dies with the view: the abort kills its docker
+  // child, and the build-before-POST ordering means no job was created yet.
+  delegate.abort();
   process.off('SIGINT', onSignal);
   process.off('SIGTERM', onSignal);
   process.stdout.off('resize', onResize);

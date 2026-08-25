@@ -31,7 +31,8 @@
 
 import { createHash } from "node:crypto";
 import { SETUP_BAKED_BASENAME } from "../shared/setup-marker.ts";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 import { readFileSync, existsSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -151,6 +152,29 @@ export function localImageId(tag: string): string | undefined {
   return id ? id : undefined;
 }
 
+const execFileAsync = promisify(execFile);
+
+/**
+ * `localImageId` without blocking the event loop. The delegate path runs on the
+ * cockpit's live loop (#121): a spawnSync against a wedged docker daemon would
+ * freeze every keypress including ^C. The sync form above stays for the plain
+ * `fleet image build` command and as `computeImageHash`'s injectable default.
+ */
+export async function localImageIdAsync(tag: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], {
+      encoding: "utf8",
+      signal,
+    });
+    const id = result.stdout.trim();
+    return id ? id : undefined;
+  } catch {
+    // Nonzero exit (no such tag), no docker at all, or an abort: all read as
+    // "no local image", same as the sync form.
+    return undefined;
+  }
+}
+
 /** True when the image tag exists in the local Docker daemon. */
 export function imageExistsLocally(tag: string): boolean {
   return localImageId(tag) !== undefined;
@@ -166,7 +190,54 @@ export type BuildJobImageOptions = {
   manifest: ImageManifest;
   /** Build context directory (the repo root). */
   contextDir?: string;
+  /**
+   * Receives docker's combined stdout+stderr as it streams. The caller owns
+   * presentation: the plain CLI writes it through, the cockpit passes nothing —
+   * it owns the alternate screen, and raw build bytes splatted over it were the
+   * original #121 symptom. Output is always captured either way, so a failure
+   * carries its tail in the error.
+   */
+  onOutput?: (chunk: string) => void;
+  /** Aborting kills the docker build — ^C mid-build must actually stop it. */
+  signal?: AbortSignal;
 };
+
+/** How much of the build's tail a failure carries in its error message. */
+const BUILD_ERROR_TAIL = 4_096;
+
+/** Spawn `docker <args>` with captured output; resolve on exit 0, reject with the output tail otherwise. */
+function runDockerBuild(
+  args: string[],
+  onOutput: ((chunk: string) => void) | undefined,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"], signal });
+    let tail = "";
+    const consume = (chunk: Buffer): void => {
+      const text = chunk.toString();
+      onOutput?.(text);
+      tail = (tail + text).slice(-BUILD_ERROR_TAIL);
+    };
+    child.stdout.on("data", consume);
+    child.stderr.on("data", consume);
+    let settled = false;
+    const done = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve();
+    };
+    // With a `signal`, an abort surfaces here as an AbortError after the child
+    // is killed; say what actually happened instead.
+    child.on("error", (err) => done(signal?.aborted ? new Error("docker build aborted") : err));
+    child.on("close", (code, killSignal) => {
+      if (code === 0) done();
+      else if (signal?.aborted) done(new Error("docker build aborted"));
+      else done(new Error(`docker build exited ${code ?? `on ${killSignal}`}${tail ? `:\n${tail.trimEnd()}` : ""}`));
+    });
+  });
+}
 
 /**
  * The generated Dockerfile for a job image built without `setup.dockerfile`.
@@ -208,16 +279,19 @@ export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): st
  * the Dockerfile is expected to start FROM the runner base, and owns the baked
  * marker if it runs the repo's setup itself). Otherwise → build from the
  * generated Dockerfile above.
+ *
+ * Async, with output captured rather than inherited (#121): a build takes
+ * minutes, and both callers run on an event loop that must stay live — the
+ * cockpit's for the keys it has to keep reading, the plain CLI's so the same
+ * one path serves both. Progress reaches the caller through `onOutput`.
  */
-export function buildJobImage(opts: BuildJobImageOptions): void {
-  const { tag, baseTag, manifest, contextDir = process.cwd() } = opts;
+export async function buildJobImage(opts: BuildJobImageOptions): Promise<void> {
+  const { tag, baseTag, manifest, contextDir = process.cwd(), onOutput, signal } = opts;
   const setup = manifest.setup ?? {};
 
   if (setup.dockerfile) {
     // Use the repo's own Dockerfile; it controls the full build.
-    execFileSync("docker", ["build", "-t", tag, "-f", setup.dockerfile, contextDir], {
-      stdio: "inherit",
-    });
+    await runDockerBuild(["build", "-t", tag, "-f", setup.dockerfile, contextDir], onOutput, signal);
     return;
   }
 
@@ -225,9 +299,7 @@ export function buildJobImage(opts: BuildJobImageOptions): void {
   try {
     const dockerfilePath = join(tmpDir, "Dockerfile.fleet-job");
     writeFileSync(dockerfilePath, jobImageDockerfile(baseTag, manifest));
-    execFileSync("docker", ["build", "-t", tag, "-f", dockerfilePath, contextDir], {
-      stdio: "inherit",
-    });
+    await runDockerBuild(["build", "-t", tag, "-f", dockerfilePath, contextDir], onOutput, signal);
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }

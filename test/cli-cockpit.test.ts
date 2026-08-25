@@ -942,6 +942,136 @@ test('with no tunnel there, the cockpit opens one and takes it down on the way o
   assert.equal(await portAccepts('127.0.0.1', localPort), false, 'the port is free again');
 });
 
+// ---------- a delegate that has to build its image (#121) ----------
+
+/**
+ * A `docker` on PATH whose `image inspect` always misses (the image is never
+ * cached) and whose `build` records its own pid and argv, prints a line the way
+ * a real build streams progress, then runs `buildScript`. The pid is what lets
+ * a test prove the build was actually killed rather than orphaned.
+ */
+function fakeDockerBin(buildScript: string): { bin: string; log: string } {
+  const bin = makeTempDir('fleet-fake-docker-');
+  const log = path.join(bin, 'docker-calls.log');
+  fs.writeFileSync(
+    path.join(bin, 'docker'),
+    `#!/bin/sh
+case "$1" in
+  build)
+    echo "$$ $*" >> "${log}"
+    echo "RAW_DOCKER_BUILD_OUTPUT step 1/3"
+    ${buildScript}
+    ;;
+  image) exit 1 ;;
+  *) exit 0 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return { bin, log };
+}
+
+/** scaffold(), with harness.cli_version pinned so delegate takes the two-layer image path. */
+function scaffoldColdImage(): string {
+  const cwd = scaffold();
+  const manifestPath = path.join(cwd, '.fleet', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.harness.cli_version = '9.9.9';
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  return cwd;
+}
+
+test('a cold-image delegate builds off the key queue: keys and polls keep working, a second dispatch is refused, and ^C kills the build', async (t) => {
+  // The build sleeps far longer than any timeout here, so every assertion below
+  // happens WHILE it runs. On the blocked-queue code (#121) the synchronous
+  // build froze the whole event loop — no key, no poll, no repaint, no ^C —
+  // and this test times out instead of passing.
+  const docker = fakeDockerBin('exec sleep 120');
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+    'POST /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 201, { job: { id: 'job-new', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+  const cockpit = startCockpit({
+    cwd: scaffoldColdImage(),
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${docker.bin}:${process.env.PATH}` },
+  });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+  await shows(cockpit, 'no jobs', 'the empty board');
+
+  cockpit.type('delegate APP-123\r');
+  await waitFor(cockpit, 'the docker build to start', () => fs.existsSync(docker.log));
+  const buildPid = Number(fs.readFileSync(docker.log, 'utf8').trim().split(' ')[0]);
+  t.after(() => {
+    try {
+      process.kill(buildPid, 'SIGKILL');
+    } catch {
+      // already dead — the good case
+    }
+  });
+
+  // The loop is alive mid-build: a typed command is parsed, run, and painted.
+  cockpit.type('help\r');
+  await nowShows(cockpit, 'answer <id> [note]', 'the help line, typed mid-build');
+  // And the background keeps breathing: the daemon poll continues.
+  const pollsAtBuildStart = daemon.requests.filter((r) => r.method === 'GET' && r.url === '/jobs').length;
+  await waitFor(cockpit, 'polling to continue during the build', () =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url === '/jobs').length >= pollsAtBuildStart + 2);
+
+  // A second delegate while one is building is refused with a reason — not
+  // queued behind it, not a second build racing the first for the same tag.
+  cockpit.type('delegate 99\r');
+  await nowShows(cockpit, 'still dispatching APP-123', 'the refusal');
+  assert.equal(
+    fs.readFileSync(docker.log, 'utf8').trim().split('\n').length,
+    1,
+    'exactly one build, however many times delegate is typed',
+  );
+
+  // The cockpit owns the alternate screen: docker's own bytes never reach it.
+  assert.ok(!cockpit.output().includes('RAW_DOCKER_BUILD_OUTPUT'), 'raw build output leaked to the terminal');
+  // Build-before-POST still holds: no job exists while the image does not.
+  assert.equal(daemon.requests.filter((r) => r.method === 'POST').length, 0, 'no job before the image is ready');
+
+  // ^C mid-build leaves cleanly — and takes the build down with it, so an
+  // abandoned dispatch is not minutes of orphaned docker.
+  assert.equal(await cockpit.quit(), 0, '^C must work during a build');
+  await until(() => !pidAlive(buildPid), 'the docker build to be killed with the view');
+  assert.equal(daemon.requests.filter((r) => r.method === 'POST').length, 0, 'an aborted build creates no job');
+});
+
+test('a delegate whose build finishes posts the job with the tag it just built', async (t) => {
+  const docker = fakeDockerBin('exit 0');
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+    'POST /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 201, { job: { id: 'job-new', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+  const cockpit = startCockpit({
+    cwd: scaffoldColdImage(),
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${docker.bin}:${process.env.PATH}` },
+  });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+  await shows(cockpit, 'no jobs', 'the empty board');
+
+  cockpit.type('delegate APP-123\r');
+  await shows(cockpit, 'job-new queued — APP-123', 'the dispatched job');
+
+  const posted = daemon.requests.filter((r) => r.method === 'POST' && r.url === '/jobs');
+  assert.equal(posted.length, 1, 'exactly one dispatch');
+  const body = JSON.parse(posted[0].body);
+  assert.match(body.image, /^fleet-job:[0-9a-f]{16}$/, 'the computed tag rides the dispatch');
+  assert.ok(
+    fs.readFileSync(docker.log, 'utf8').includes(`-t ${body.image}`),
+    'the daemon got exactly the tag the build produced',
+  );
+  // Even a successful build keeps its bytes off the cockpit screen.
+  assert.ok(!cockpit.output().includes('RAW_DOCKER_BUILD_OUTPUT'), 'raw build output leaked to the terminal');
+  assert.equal(await cockpit.quit(), 0);
+});
+
 // ---------- the command surface ----------
 
 test('fleet board is gone: the cockpit is the live view', async () => {
