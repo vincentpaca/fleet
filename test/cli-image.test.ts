@@ -403,7 +403,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     }
   });
 
-  test('buildJobImage creates an inspectable local image; imageExistsLocally detects it', () => {
+  test('buildJobImage creates an inspectable local image; imageExistsLocally detects it', async () => {
     const manifest: ImageManifest = {
       harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
       setup: { image: 'node:22' },
@@ -411,7 +411,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     const hash = computeImageHash(manifest);
     const tag = jobImageTag(hash);
 
-    buildJobImage({ tag, baseTag: BASE_TAG, manifest, contextDir: repoRoot });
+    await buildJobImage({ tag, baseTag: BASE_TAG, manifest, contextDir: repoRoot });
     cleanup.push(tag);
 
     assert.ok(imageExistsLocally(tag), `image not found after build: ${tag}`);

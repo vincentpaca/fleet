@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // fleet — operator CLI. Exit codes: 0 ok, 1 failure, 2 usage.
-import { parseArgs } from 'node:util';
+import { parseArgs, promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +43,7 @@ import {
   runnerBaseTag,
   jobImageTag,
   imageExistsLocally,
+  localImageIdAsync,
   buildJobImage,
   pushToEcr,
   type ImageManifest,
@@ -492,32 +493,46 @@ function parsePrTarget(target: string): number | undefined {
 }
 
 /**
+ * gh, asynchronously. The delegate path runs on the cockpit's live event loop
+ * (#121): a spawnSync over the network would freeze every keypress — including
+ * the ^C that ends the wait — for as long as GitHub takes to answer.
+ */
+const execFileAsync = promisify(execFile);
+
+/** Run `gh pr view` and return its stdout, failing with gh's own first stderr line. */
+async function ghPrViewJson(target: string, ref: string, signal?: AbortSignal): Promise<string> {
+  try {
+    const raw = await execFileAsync(
+      'gh',
+      ['pr', 'view', ref, '--json', 'number,state,headRefName,title,closingIssuesReferences'],
+      { encoding: 'utf8', signal },
+    );
+    return raw.stdout;
+  } catch (err) {
+    const reason = ((err as { stderr?: string }).stderr ?? '').trim().split('\n')[0] || errorMessage(err);
+    fail(`cannot resolve PR target ${target} via gh: ${reason}`);
+  }
+}
+
+/**
  * Resolve a PR target via gh at dispatch (#80): the head branch the job will
  * adopt, the PR title, and the linked issue when exactly one is derivable.
  * Refuses non-open PRs — a merged or closed PR has no branch to continue, and
  * the refusal must land BEFORE any POST reaches the daemon.
  */
-function resolvePrTarget(target: string, prNumber: number): {
+async function resolvePrTarget(target: string, prNumber: number, signal?: AbortSignal): Promise<{
   number: number;
   branch: string;
   title?: string;
   issue?: number;
-} {
+}> {
   // A full URL goes to gh verbatim (it names the repo); pr/<n> resolves
   // against the current checkout's repo, like every other gh call here.
   const ref = target.startsWith('https://') ? target : String(prNumber);
-  const raw = spawnSync(
-    'gh',
-    ['pr', 'view', ref, '--json', 'number,state,headRefName,title,closingIssuesReferences'],
-    { encoding: 'utf8' },
-  );
-  if (raw.error !== undefined || raw.status !== 0) {
-    const reason = (raw.stderr ?? '').trim().split('\n')[0] || `gh exited ${raw.status}`;
-    fail(`cannot resolve PR target ${target} via gh: ${reason}`);
-  }
+  const stdout = await ghPrViewJson(target, ref, signal);
   let pr: { number?: unknown; state?: unknown; headRefName?: unknown; title?: unknown; closingIssuesReferences?: unknown };
   try {
-    pr = JSON.parse(raw.stdout);
+    pr = JSON.parse(stdout);
   } catch {
     fail(`cannot resolve PR target ${target}: gh returned unparseable JSON`);
   }
@@ -546,7 +561,32 @@ type DelegateRequest = {
   manifestPath?: string;
   log: (line: string) => void;
   warn: (line: string) => void;
+  /**
+   * Docker build progress, streamed raw. `fleet delegate` writes it through to
+   * its own stdout; the cockpit passes nothing — it owns the alternate screen,
+   * so the build is captured silently and surfaces only in a failure (#121).
+   */
+  buildOutput?: (chunk: string) => void;
+  /** Aborting interrupts the slow externals (gh resolution, docker build). */
+  signal?: AbortSignal;
 };
+
+/**
+ * Resolve an issue title via gh at dispatch. Best-effort: gh unavailable, a
+ * non-issue target, or an abort all degrade to no title, never an empty one.
+ */
+async function resolveIssueTitle(target: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const raw = await execFileAsync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
+      encoding: 'utf8',
+      signal,
+    });
+    const title = raw.stdout.trim();
+    return title === '' ? undefined : title;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * One dispatch, however it was asked for. `fleet delegate` parses flags and
@@ -576,7 +616,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     if (req.mode !== undefined && req.mode !== 'followthrough') {
       fail(`a PR target implies --mode followthrough; it cannot be dispatched as ${req.mode}`);
     }
-    const resolved = resolvePrTarget(target, prNumber);
+    const resolved = await resolvePrTarget(target, prNumber, req.signal);
     continues = { pr: resolved.number, branch: resolved.branch };
     prTitle = resolved.title;
     // Lineage on the board: the linked issue when exactly one is derivable,
@@ -596,15 +636,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // A PR target already resolved its title from the PR — one gh call, one truth.
   let issueTitle: string | undefined = prTitle;
   if (issueTitle === undefined && /^\d+$/.test(target)) {
-    try {
-      const raw = spawnSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
-        encoding: 'utf8',
-      });
-      if (raw.status === 0) {
-        const t = raw.stdout.trim();
-        if (t) issueTitle = t;
-      }
-    } catch { /* gh unavailable or not a real issue — proceed without title */ }
+    issueTitle = await resolveIssueTitle(target, req.signal);
   }
 
   const workOrder: Record<string, unknown> = {
@@ -658,15 +690,26 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
 
   // Two-layer image model (#5): when harness.cli_version is set, compute the
   // per-repo job image hash, build the image if it doesn't exist locally, and
-  // pass the computed tag to the daemon as an image override.
+  // pass the computed tag to the daemon as an image override. Everything docker
+  // here is async (#121): this can be minutes of build on the cockpit's event
+  // loop, and the build must still complete before the POST below — that
+  // ordering is what makes an abort mid-build leave no orphan job.
   let imageOverride: string | undefined;
   if (twoLayerEnabled(rawManifest as ImageManifest)) {
-    const hash = computeImageHash(rawManifest as ImageManifest);
+    const imageManifest = rawManifest as ImageManifest;
+    const base = runnerBaseTag(imageManifest);
+    const baseId = await localImageIdAsync(base, req.signal);
+    const hash = computeImageHash(imageManifest, undefined, () => baseId);
     const tag = jobImageTag(hash);
-    const base = runnerBaseTag(rawManifest as ImageManifest);
-    if (!imageExistsLocally(tag)) {
+    if (await localImageIdAsync(tag, req.signal) === undefined) {
       req.log(`fleet: building job image ${tag} from ${base} ...`);
-      buildJobImage({ tag, baseTag: base, manifest: rawManifest as ImageManifest });
+      await buildJobImage({
+        tag,
+        baseTag: base,
+        manifest: imageManifest,
+        onOutput: req.buildOutput,
+        signal: req.signal,
+      });
       req.log(`fleet: job image ready: ${tag}`);
     } else {
       req.log(`fleet: job image exists (${tag}), skipping build`);
@@ -717,6 +760,8 @@ async function cmdDelegate(args: string[]): Promise<number> {
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,
     log: (line) => console.log(line),
     warn: (line) => console.error(line),
+    // This surface owns its stdout, so build progress streams straight through.
+    buildOutput: (chunk) => process.stdout.write(chunk),
   });
   console.log(`${created.jobId} ${created.state}`);
   if (values.watch === true) return followJob(created.jobId, true);
@@ -772,7 +817,7 @@ async function cmdImageBuild(args: string[]): Promise<number> {
   } else {
     console.log(`building job image: ${tag}`);
     console.log(`  base: ${base}`);
-    buildJobImage({ tag, baseTag: base, manifest: imageManifest });
+    await buildJobImage({ tag, baseTag: base, manifest: imageManifest, onOutput: (chunk) => process.stdout.write(chunk) });
     console.log(`built: ${tag}`);
   }
 
@@ -1112,7 +1157,7 @@ async function cmdCockpit(): Promise<number> {
     home: fleetHome(),
     env: process.env as Record<string, string | undefined>,
     delegate: (req) =>
-      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn }),
+      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn, signal: req.signal }),
   });
 }
 

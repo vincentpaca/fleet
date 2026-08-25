@@ -402,6 +402,55 @@ test('delegate rejects a PR target with a conflicting --mode', async (t) => {
   assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
+// --- Two-layer image on the delegate path (#121): async build, streamed to this stdout ---
+
+test('delegate with cli_version builds the job image, streams docker output to stdout, and ships the tag', async (t) => {
+  const cwd = scaffold({ ...MIN_MANIFEST, harness: { ...MIN_MANIFEST.harness, cli_version: '9.9.9' } });
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  // A docker whose inspect always misses and whose build streams a line, the
+  // way a real build narrates its layers.
+  const bin = makeTempDir('fleet-fake-docker-');
+  fs.writeFileSync(
+    path.join(bin, 'docker'),
+    '#!/bin/sh\ncase "$1" in\n  build) echo "FAKE_BUILD_PROGRESS step 1/3" ;;\n  image) exit 1 ;;\nesac\nexit 0\n',
+    { mode: 0o755 },
+  );
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /building job image fleet-job:/);
+  // The plain CLI owns its stdout: build progress streams through, the same
+  // visibility stdio:'inherit' used to give — without blocking the event loop.
+  assert.match(res.stdout, /FAKE_BUILD_PROGRESS step 1\/3/);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.match(body.image, /^fleet-job:[0-9a-f]{16}$/, 'the built tag rides the dispatch');
+});
+
+test('delegate fails loudly when the build fails, carrying the build tail, before any POST', async (t) => {
+  const cwd = scaffold({ ...MIN_MANIFEST, harness: { ...MIN_MANIFEST.harness, cli_version: '9.9.9' } });
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = makeTempDir('fleet-fake-docker-');
+  fs.writeFileSync(
+    path.join(bin, 'docker'),
+    '#!/bin/sh\ncase "$1" in\n  build) echo "no space left on device" >&2; exit 17 ;;\n  image) exit 1 ;;\nesac\nexit 0\n',
+    { mode: 0o755 },
+  );
+
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /docker build exited 17/);
+  assert.match(res.stderr, /no space left on device/, 'the failure carries the build tail');
+  assert.equal(daemon.requests.length, 0, 'a failed build posts nothing — build-before-POST');
+});
+
 test('toHttpsGitUrl: github ssh forms rewrite, everything else passes through', () => {
   assert.equal(toHttpsGitUrl('git@github.com:acme/example-app.git'), 'https://github.com/acme/example-app.git');
   assert.equal(toHttpsGitUrl('ssh://git@github.com/acme/example-app.git'), 'https://github.com/acme/example-app.git');

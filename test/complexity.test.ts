@@ -73,6 +73,15 @@ const FUNCTION_BASELINE = [
   'src/cli/main.ts::cmdResume',
   // main: top-level argument dispatch over all subcommands = CCN 23; genuine.
   'src/cli/main.ts::main',
+  // run (the cockpit's command switch): one case per verb plus their guards =
+  // CCN 18; genuine, and pre-existing — invisible until #121 flattened the
+  // delegate case, whose old inline try/catch made Lizard's TS-as-C parse
+  // absorb the whole switch into a neighbouring segment.
+  'src/cli/cockpit.ts::run',
+  // runCockpit: Lizard misparse (see the note above). It reports 53 NLOC over a
+  // 285-line span; the function's real direct body is several times that and
+  // was never measured before #121, for the same segmentation reason as `run`.
+  'src/cli/cockpit.ts::runCockpit',
 ];
 
 /** Files already over FILE_NLOC_LIMIT. Same bargain as FUNCTION_BASELINE. */
