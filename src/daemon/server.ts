@@ -13,7 +13,7 @@ import { parseNdjson } from "../shared/ndjson.ts";
 import { stableStringify } from "../shared/json.ts";
 import { newId, newRunnerToken } from "../shared/ids.ts";
 import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from "../shared/home.ts";
-import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
+import { parseDurationMs, idleLimitMs, decisionTimeoutMs, mergedLimits, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import { HomeLock } from "./lock.ts";
 import type { EffectsMode, JobRecord, OpenDecision, StoredEvent } from "./registry.ts";
@@ -435,22 +435,20 @@ export class FleetDaemon {
 
   /**
    * Arm wall-clock, stall, and decision-timeout backstop timers for a new job.
-   * Stall detection is always armed — idleLimitMs supplies the default when the
-   * manifest declares no limits block at all.
+   * `limits` is the merged view (work-order overrides over manifest values —
+   * see mergedLimits). Stall detection and the stale sweep are always armed:
+   * idleLimitMs and decisionTimeoutMs supply the documented defaults when the
+   * manifest declares no limits block at all (#134). Only wall_clock stays
+   * opt-in — an unbounded run is a legitimate (if brave) choice; an unanswered
+   * question that never surfaces is not.
    */
-  #initJobLimits(id: string, manifestLimits: unknown): void {
-    this.registry.initIdle(id, idleLimitMs(manifestLimits));
-    if (!manifestLimits || typeof manifestLimits !== "object") return;
-    const limits = manifestLimits as Record<string, unknown>;
+  #initJobLimits(id: string, limits: Record<string, unknown>): void {
+    this.registry.initIdle(id, idleLimitMs(limits));
+    this.registry.initDecisionTimeout(id, decisionTimeoutMs(limits));
     const wallClockStr = limits.wall_clock;
     if (typeof wallClockStr === "string") {
       const limitMs = parseDurationMs(wallClockStr);
       if (limitMs !== undefined) this.registry.initWallClock(id, limitMs);
-    }
-    const decisionTimeoutStr = limits.decision_timeout;
-    if (typeof decisionTimeoutStr === "string") {
-      const limitMs = parseDurationMs(decisionTimeoutStr);
-      if (limitMs !== undefined) this.registry.initDecisionTimeout(id, limitMs);
     }
   }
 
@@ -499,7 +497,10 @@ export class FleetDaemon {
       meta: { kind: "delegated", label: `${order.mode}: ${order.target}`, target: order.target, where: this.#options.provider.name, fleet: [] },
     });
 
-    this.#initJobLimits(id, (manifest as Record<string, unknown>).limits);
+    this.#initJobLimits(id, mergedLimits(
+      (manifest as Record<string, unknown>).limits,
+      (workOrder as Record<string, unknown>).limits,
+    ));
     // Store launch details for potential re-entry after parking (issue #6).
     this.registry.storeLaunchDetails(id, { manifest, env, sync, image: imageOverride });
 

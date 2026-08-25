@@ -187,6 +187,10 @@ function initManifest(): unknown {
       commands: [{ path: '.claude/commands/dev-sprint.md', critic: 'code-reviewer' }],
     },
     gates: { pickup: 'node .fleet/check-ready.js', default_finish: 'merge-ready' },
+    // The documented defaults (src/shared/time.ts), written out so the cost
+    // model is visible in the file the operator edits — absent keys get the
+    // same values, but an invisible default is how #134 happened.
+    limits: { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
   };
 }
 

@@ -33,7 +33,7 @@ import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDr
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { runSetupScript } from './setup.ts';
-import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
+import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
 
@@ -110,9 +110,13 @@ async function main(): Promise<void> {
   // named PR branch instead of creating a fresh one. Schema-validated at
   // dispatch; the shape check here only guards direct runner invocations.
   let continues: { pr: number; branch: string } | undefined;
+  // Per-dispatch limit overrides (#134): the work order's limits win over the
+  // manifest's. Merged below through the same chokepoint the daemon uses.
+  let orderLimits: unknown;
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
+    orderLimits = order.limits;
     if (typeof order.title === 'string' && order.title) orderTitle = order.title;
     authorityPublish = order?.authority?.publish === true;
     if (typeof order?.continues?.pr === 'number' && typeof order?.continues?.branch === 'string' && order.continues.branch !== '') {
@@ -288,14 +292,16 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
 
   // Parse limits; build timers so the decision watcher can pause the wall-clock
-  // while blocked and park the job when block_hot expires.
-  const limits = (manifest.limits ?? {}) as Record<string, unknown>;
+  // while blocked and park the job when block_hot expires. Work-order limits
+  // override manifest limits (#134) — same merge the daemon applies at intake.
+  const limits = mergedLimits(manifest.limits, orderLimits);
   const wallClockStr = typeof limits.wall_clock === 'string' ? limits.wall_clock : undefined;
   const wallClockLimitMs = wallClockStr !== undefined ? parseDurationMs(wallClockStr) : undefined;
   const wallClock = wallClockLimitMs !== undefined ? new WallClockTimer(wallClockLimitMs, startedAt) : undefined;
 
-  const blockHotStr = typeof limits.block_hot === 'string' ? limits.block_hot : undefined;
-  const blockHotMs = blockHotStr !== undefined ? parseDurationMs(blockHotStr) : undefined;
+  // Always a number (#134): a job whose question is never answered must park
+  // at the documented default rather than keeping the container hot forever.
+  const blockHotMs = blockHotLimitMs(limits);
 
   // Stall detection (#39): unlike wall_clock this is always armed — a running
   // job that emits nothing is never in an intended state. The threshold defaults
@@ -645,8 +651,8 @@ async function main(): Promise<void> {
     }
   };
 
-  // Park signal: resolves with the decision id when block_hot fires.
-  // Silently never resolves if blockHotMs is not set.
+  // Park signal: resolves with the decision id when block_hot fires. Always
+  // armed — blockHotLimitMs defaults when the merged limits carry no value.
   const parkPromise = watcher.parked.then(
     (decisionId) => ({ kind: 'parked' as const, decisionId }),
   );
