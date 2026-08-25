@@ -132,6 +132,21 @@ console.log(`fleet daemon: listening on ${sock}${boundPort !== null ? ` and ${bi
 // lines above are a pinned contract (test/daemon-boot-log.test.ts).
 await provider.recover?.();
 
+// Same slot, cloud side (#147): stop any task whose startedBy names a job the
+// registry holds terminal — a wedged run-task or a failed stop-task leaves one
+// running and billing with no stored handle. No-op for providers without a
+// sandbox listing; a sweep failure must not take the daemon down with it.
+try {
+  for (const orphan of (await daemon.reconcileOrphans()).orphans) {
+    console.error(
+      `fleet: reconcile ${orphan.stopped ? "stopped" : "could not stop"} ` +
+      `orphaned task ${orphan.handle} (job ${orphan.job})`,
+    );
+  }
+} catch (error) {
+  console.error(`fleet: orphan reconcile failed at boot: ${String(error)}`);
+}
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     daemon.stop().finally(() => process.exit(0));

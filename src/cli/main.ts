@@ -1167,6 +1167,38 @@ async function doctorTunnel(home: string): Promise<{ notes: string[]; findings: 
   });
 }
 
+/**
+ * Orphaned cloud tasks for doctor (#147): ask the daemon to run its reconcile
+ * sweep now and report what it found. The daemon owns the sweep — only its
+ * registry can say which jobs are terminal — so doctor is a trigger and a
+ * reporter, the same relationship the tunnel check has with the deployment.
+ * Every orphan is a finding: a stopped one was billing until this run, an
+ * unstopped one still is. Silent when no daemon answers (the tunnel section
+ * already reports that) and when the daemon predates the endpoint (404) —
+ * not knowing is not a defect.
+ */
+async function doctorOrphans(): Promise<{ notes: string[]; findings: string[] }> {
+  let res: DaemonResponse;
+  try {
+    res = await request('POST', '/reconcile');
+  } catch {
+    return { notes: [], findings: [] };
+  }
+  if (res.status === 404) return { notes: [], findings: [] };
+  if (res.status !== 200) {
+    return { notes: [`orphan reconcile: daemon answered ${res.status} — sweep not run`], findings: [] };
+  }
+  const orphans = (res.json as { orphans?: { job: string; handle: string; stopped: boolean }[] })?.orphans ?? [];
+  return {
+    notes: [],
+    findings: orphans.map((orphan) =>
+      orphan.stopped
+        ? `orphaned task stopped: ${orphan.handle} (job ${orphan.job} was terminal; its task was still running and billing)`
+        : `orphaned task still running: ${orphan.handle} (job ${orphan.job} is terminal but stop-task failed) — rerun fleet doctor, or stop it in the cloud console`,
+    ),
+  };
+}
+
 async function cmdDoctor(args: string[]): Promise<number> {
   const { values } = parseCommand(args, { manifest: { type: 'string' } }, 0, 0);
   const manifestPath =
@@ -1264,6 +1296,13 @@ async function cmdDoctor(args: string[]): Promise<number> {
       `retained workspace: ${record.workspace}${missing} (job ${record.jobId}, push failed ${record.at}) — retry with: fleet resume-push ${record.jobId}`,
     );
   }
+
+  // 8. Orphaned cloud tasks (#147): run the daemon's reconcile sweep on demand
+  //    and list what it found — a task billing behind a terminal job is exactly
+  //    the spend nothing else surfaces until the runner's wall-clock cap.
+  const orphans = await doctorOrphans();
+  for (const note of orphans.notes) console.log(note);
+  findings.push(...orphans.findings);
 
   if (findings.length === 0) {
     console.log('doctor: clean');

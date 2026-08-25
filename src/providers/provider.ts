@@ -89,7 +89,27 @@ export interface Provider {
    * substrate outlives the daemon and owns the sandbox lifecycle.
    */
   recover?(): void | Promise<void>;
+  /**
+   * Optional: list every live sandbox on the substrate attributable to a fleet
+   * job, keyed by the job id the launch stamped on it (#147). This is the
+   * reconcile sweep's evidence: a launch that succeeded substrate-side while
+   * the CLI wedged past its budget leaves a running, billing sandbox with no
+   * stored handle, and only the substrate can say it exists. Implementations
+   * must return the complete set (pagination handled inside) — an orphan past
+   * page one is exactly the one nobody is watching. ECS implements it via the
+   * run-task `startedBy: fleet:<jobId>` stamp; providers whose substrate has
+   * no such listing omit it and the daemon's reconcile is a no-op.
+   */
+  listJobSandboxes?(): Promise<JobSandbox[]>;
 }
+
+/**
+ * One live sandbox attributable to a fleet job (#147): the job id its launch
+ * stamped on it, and the handle terminate() accepts. A named type — an inline
+ * object in a return annotation reads as a function body to Lizard and hides
+ * the function from the complexity gate (see registry.ts on LaunchHalf).
+ */
+export type JobSandbox = { jobId: string; handle: string };
 
 /**
  * Operator access to the daemon without public ingress (`docs/decisions.md#d12`).

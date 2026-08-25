@@ -23,14 +23,16 @@ import {
   buildListDaemonTasksArgs,
   buildDescribeDaemonTaskArgs,
   ecsTunnelOpener,
+  parseFleetTasks,
 } from "../src/providers/ecs.ts";
+import { requestJson } from "../src/shared/http.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
 import { writeSecretTempFile } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
-import { MANIFEST, WORK_ORDER, op, tempHome, until } from "./daemon-helpers.ts";
+import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until } from "./daemon-helpers.ts";
 
 const SPEC: LaunchSpec = {
   jobId: "job-abc123",
@@ -1938,4 +1940,251 @@ test("EcsProvider.buildRunTaskInput never leaks spec.image into run-task — the
   const input = provider.buildRunTaskInput({ ...SPEC, image: "fleet-job:abc123def4567890" });
   assert.equal(JSON.stringify(input).includes("fleet-job:abc123def4567890"), false);
   assert.equal(input.taskDefinition, "pinned-task-def");
+});
+
+// --- Orphan-task reconcile (#147) ---------------------------------------------
+// A run-task that succeeds on the AWS side while the CLI wedges past its budget
+// records launch-failed with no handle; a stop-task failure that survives its
+// retry cancels the job with a live container. Either way a task keeps billing
+// behind a terminal job. The reconcile sweep lists the cluster's running tasks,
+// keys on the startedBy stamp, and stops only what the registry holds terminal.
+
+const RECONCILE_ECS_CONFIG = {
+  cluster: "fleet-cluster",
+  taskDefinition: "fleet-runner:3",
+  containerName: "runner",
+  region: "ap-southeast-1",
+  subnets: [] as string[],
+  securityGroups: [] as string[],
+  launchType: "EC2",
+  assignPublicIp: "DISABLED",
+  capacityTiers: [] as { cpu: number; memory: number }[],
+};
+
+test("list/describe builders carry cluster, desired-status, region, and the continuation token (#147)", () => {
+  const provider = new EcsProvider(RECONCILE_ECS_CONFIG);
+  const first = provider.buildListClusterTasksArgs();
+  assert.deepEqual(first.slice(0, 6), ["ecs", "list-tasks", "--cluster", "fleet-cluster", "--desired-status", "RUNNING"]);
+  assert.ok(!first.includes("--starting-token"), "no token on the first page");
+  assert.equal(first[first.indexOf("--region") + 1], "ap-southeast-1");
+  const paged = provider.buildListClusterTasksArgs("42");
+  assert.equal(paged[paged.indexOf("--starting-token") + 1], "42");
+
+  const describe = provider.buildDescribeTasksArgs(["arn:task/a", "arn:task/b"]);
+  assert.deepEqual(describe.slice(0, 4), ["ecs", "describe-tasks", "--cluster", "fleet-cluster"]);
+  assert.deepEqual(
+    describe.slice(describe.indexOf("--tasks") + 1, describe.indexOf("--output")),
+    ["arn:task/a", "arn:task/b"],
+  );
+  assert.equal(describe[describe.indexOf("--region") + 1], "ap-southeast-1");
+});
+
+test("parseFleetTasks keeps only fleet-stamped tasks and maps startedBy back to the job id (#147)", () => {
+  const found = parseFleetTasks(JSON.stringify({
+    tasks: [
+      { taskArn: "arn:task/t1", startedBy: "fleet:job-aaa" },
+      // The daemon service's own task and an operator's hand-run task are not
+      // fleet's to touch — conflating them with a job is how a sweep goes rogue.
+      { taskArn: "arn:task/t2", startedBy: "ecs-svc/9876543210" },
+      { taskArn: "arn:task/t3" },
+      { taskArn: "arn:task/t4", startedBy: "fleet:job-bbb" },
+    ],
+  }));
+  assert.deepEqual(found, [
+    { jobId: "job-aaa", handle: "arn:task/t1" },
+    { jobId: "job-bbb", handle: "arn:task/t4" },
+  ]);
+});
+
+test("listJobSandboxes follows the continuation token and batches describe-tasks at the API cap (#147)", async () => {
+  const arns = Array.from({ length: 250 }, (_, i) => `arn:task/${i}`);
+  const describeBatches: number[] = [];
+  const provider = ecsWith(async (args) => {
+    if (args[1] === "list-tasks") {
+      const start = args.includes("--starting-token") ? Number(args[args.indexOf("--starting-token") + 1]) : 0;
+      const page = arns.slice(start, start + 150);
+      return JSON.stringify({
+        taskArns: page,
+        ...(start + 150 < arns.length ? { nextToken: String(start + 150) } : {}),
+      });
+    }
+    assert.equal(args[1], "describe-tasks", `unexpected aws call: ${args.join(" ")}`);
+    const wanted = args.slice(args.indexOf("--tasks") + 1, args.indexOf("--output"));
+    describeBatches.push(wanted.length);
+    return JSON.stringify({ tasks: wanted.map((arn) => ({ taskArn: arn, startedBy: `fleet:job-${arn}` })) });
+  });
+  const found = await provider.listJobSandboxes();
+  assert.equal(found.length, 250, "an orphan past page one must not be invisible");
+  assert.deepEqual(describeBatches, [100, 100, 50], "DescribeTasks accepts at most 100 ARNs per call");
+});
+
+// Fake `aws` for the end-to-end reconcile test: an on-disk ECS control plane.
+// Tasks live in tasks.json next to the script; every argv lands in calls.log.
+// A `wedge-next` flag file makes the next run-task record its task AWS-side and
+// then die without printing the ARN — the exact shape of a CLI killed at its
+// budget (#122), which is the launch this sweep exists to reconcile.
+const FAKE_AWS_ECS = `
+import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+const dir = dirname(fileURLToPath(import.meta.url));
+const tasksFile = join(dir, "tasks.json");
+const args = process.argv.slice(2);
+appendFileSync(join(dir, "calls.log"), JSON.stringify(args) + "\\n");
+const load = () => (existsSync(tasksFile) ? JSON.parse(readFileSync(tasksFile, "utf8")) : []);
+const save = (tasks) => writeFileSync(tasksFile, JSON.stringify(tasks, null, 2));
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const cmd = args.slice(0, 2).join(" ");
+if (cmd === "ecs run-task") {
+  const input = JSON.parse(readFileSync(opt("--cli-input-json").slice("file://".length), "utf8"));
+  const tasks = load();
+  const arn = "arn:aws:ecs:ap-southeast-1:111122223333:task/fleet-cluster/" + String(tasks.length + 1).padStart(4, "0");
+  tasks.push({ taskArn: arn, startedBy: input.startedBy, desiredStatus: "RUNNING", lastStatus: "RUNNING" });
+  save(tasks);
+  if (existsSync(join(dir, "wedge-next"))) {
+    unlinkSync(join(dir, "wedge-next"));
+    process.stderr.write("aws: killed at budget\\n");
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({ tasks: [{ taskArn: arn }] }));
+} else if (cmd === "ecs list-tasks") {
+  const running = load().filter((t) => t.desiredStatus === "RUNNING").map((t) => t.taskArn);
+  const start = Number(opt("--starting-token") ?? 0);
+  const page = { taskArns: running.slice(start, start + 1) };
+  if (start + 1 < running.length) page.nextToken = String(start + 1);
+  process.stdout.write(JSON.stringify(page));
+} else if (cmd === "ecs describe-tasks") {
+  const from = args.indexOf("--tasks") + 1;
+  const wanted = [];
+  for (let i = from; i < args.length && !args[i].startsWith("--"); i++) wanted.push(args[i]);
+  process.stdout.write(JSON.stringify({ tasks: load().filter((t) => wanted.includes(t.taskArn)) }));
+} else if (cmd === "ecs stop-task") {
+  const tasks = load();
+  const task = tasks.find((t) => t.taskArn === opt("--task"));
+  if (!task) { process.stderr.write("TaskNotFoundException\\n"); process.exit(1); }
+  task.desiredStatus = "STOPPED";
+  save(tasks);
+  process.stdout.write(JSON.stringify({ task }));
+} else {
+  process.stderr.write("fake aws: unhandled command: " + cmd + "\\n");
+  process.exit(1);
+}
+`;
+
+/** The fake `aws` above, first on PATH (the #122 shim pattern); returns its dir. */
+function fakeEcsAwsOnPath(t: { after: (fn: () => void) => void }): string {
+  const bin = mkdtempSync(join(tmpdir(), "fleet-fake-aws-"));
+  writeFileSync(join(bin, "fake-aws.mjs"), FAKE_AWS_ECS);
+  writeFileSync(
+    join(bin, "aws"),
+    `#!/bin/sh\nexec "${process.execPath}" "${join(bin, "fake-aws.mjs")}" "$@"\n`,
+    { mode: 0o755 },
+  );
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  return bin;
+}
+
+test("reconcile stops the task a wedged run-task stranded behind a cancelled job — and nothing else (#147)", async (t) => {
+  const bin = fakeEcsAwsOnPath(t);
+  const tasksFile = join(bin, "tasks.json");
+  // A non-fleet task occupies page one (the fake lists one ARN per page), so
+  // the orphan below lands on a later page — where a sweep that drops the
+  // continuation token never looks.
+  const seedTask = (startedBy: string, id: string) => ({
+    taskArn: `arn:aws:ecs:ap-southeast-1:111122223333:task/fleet-cluster/${id}`,
+    startedBy,
+    desiredStatus: "RUNNING",
+    lastStatus: "RUNNING",
+  });
+  writeFileSync(tasksFile, JSON.stringify([seedTask("ecs-svc/1234567890", "daemon-task")]));
+
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new EcsProvider(RECONCILE_ECS_CONFIG) });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  // 1. The bug's exact shape (#147): run-task succeeds AWS-side, the CLI dies
+  //    before printing the ARN. The daemon records launch-failed and cancels —
+  //    a terminal job, a live task, and no stored handle.
+  writeFileSync(join(bin, "wedge-next"), "");
+  const wedged = await op(sock, "POST", "/jobs", { manifest: MANIFEST, workOrder: WORK_ORDER });
+  assert.equal(wedged.status, 500, wedged.body);
+  const orphanedJob = jobOf(wedged.json);
+  assert.equal(orphanedJob.state, "cancelled");
+
+  // 2. A healthy dispatch whose job is then running: the one task the sweep
+  //    must never stop.
+  const healthy = await op(sock, "POST", "/jobs", { manifest: MANIFEST, workOrder: WORK_ORDER });
+  assert.equal(healthy.status, 201, healthy.body);
+  const liveJob = jobOf(healthy.json);
+  daemon.registry.appendEvent(liveJob.id, { type: "state", state: "running" });
+  daemon.registry.updateJob(liveJob.id, { state: "running" });
+
+  // 3. A fleet-stamped task naming a job this registry has no record of:
+  //    without a record, "terminal" is not a fact the sweep holds — leave it.
+  const seeded = JSON.parse(readFileSync(tasksFile, "utf8")) as ReturnType<typeof seedTask>[];
+  seeded.push(seedTask("fleet:job-unknown", "stray-task"));
+  writeFileSync(tasksFile, JSON.stringify(seeded));
+
+  const res = await op(sock, "POST", "/reconcile");
+  assert.equal(res.status, 200, res.body);
+  const { orphans } = res.json as { orphans: { job: string; handle: string; stopped: boolean }[] };
+  assert.equal(orphans.length, 1, JSON.stringify(orphans));
+  assert.equal(orphans[0].job, orphanedJob.id);
+  assert.equal(orphans[0].stopped, true);
+
+  // The orphan's task is stopped; every other task survives the sweep.
+  const after = Object.fromEntries(
+    (JSON.parse(readFileSync(tasksFile, "utf8")) as ReturnType<typeof seedTask>[])
+      .map((task) => [task.startedBy, task.desiredStatus]),
+  );
+  assert.equal(after[`fleet:${orphanedJob.id}`], "STOPPED", "the orphan must be stopped");
+  assert.equal(after[`fleet:${liveJob.id}`], "RUNNING", "a running job's task must survive the sweep");
+  assert.equal(after["fleet:job-unknown"], "RUNNING", "an unaccountable task is not the sweep's to stop");
+  assert.equal(after["ecs-svc/1234567890"], "RUNNING", "non-fleet tasks are invisible to the sweep");
+
+  // The reconciliation is journalled on the job as a schema-legal log event.
+  const events = parseNdjson((await op(sock, "GET", `/jobs/${orphanedJob.id}/events`)).body) as Record<string, unknown>[];
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "log" && typeof event.text === "string" &&
+        event.text.includes("orphaned task") && event.text.includes(orphans[0].handle),
+    ),
+    `the job's event log must show the reconciliation: ${JSON.stringify(events)}`,
+  );
+
+  // stop-task went through the real argv builder: region-stamped, right cluster.
+  const calls = readFileSync(join(bin, "calls.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+  const stop = calls.find((call) => call[1] === "stop-task");
+  assert.ok(stop, "stop-task was invoked");
+  assert.equal(stop[stop.indexOf("--cluster") + 1], "fleet-cluster");
+  assert.equal(stop[stop.indexOf("--task") + 1], orphans[0].handle);
+  assert.equal(stop[stop.indexOf("--region") + 1], "ap-southeast-1");
+});
+
+test("POST /reconcile requires the operator token; providers without a listing report no orphans (#147)", async (t) => {
+  const daemon = new FleetDaemon({
+    home: tempHome(),
+    provider: new StubProvider(),
+    operatorToken: "secret-op-token",
+  });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  // The sweep stops cloud tasks — it is operator surface, never anonymous.
+  const denied = await op(sock, "POST", "/reconcile");
+  assert.equal(denied.status, 401);
+
+  const allowed = await requestJson({
+    socketPath: sock,
+    method: "POST",
+    path: "/reconcile",
+    headers: { "x-fleet-operator-token": "secret-op-token" },
+  });
+  assert.equal(allowed.status, 200, allowed.body);
+  assert.deepEqual(allowed.json, { orphans: [] });
 });

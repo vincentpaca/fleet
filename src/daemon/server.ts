@@ -118,6 +118,15 @@ export type DaemonOptions = {
 type IntakeError = { status: number; errors: unknown[] };
 type IntakeResult = IntakeError | { deduped: true } | null;
 
+/**
+ * One reconciled task (#147): the terminal job its startedBy named, the task
+ * handle, and whether the stop landed. A named type, not an inline return
+ * annotation — Lizard parses TypeScript as C, and braces in a return type read
+ * as a function body, hiding the function from the complexity gate (the same
+ * trap registry.ts documents on LaunchHalf).
+ */
+export type OrphanTask = { job: string; handle: string; stopped: boolean };
+
 /** Wire shape for operator responses: the runner token never leaves the daemon. */
 function publicJob(record: JobRecord): Omit<JobRecord, "runnerToken"> {
   const { runnerToken, ...rest } = record;
@@ -312,7 +321,10 @@ export class FleetDaemon {
     const parts = url.pathname.split("/").filter((part) => part.length > 0);
     if (parts[0] === "jobs") return this.#routeJobs(url, method, parts, req, res);
     if (parts[0] === "internal") return this.#routeInternal(method, parts, req, res);
-    if (url.pathname === "/health" && method === "GET") return sendJson(res, 200, { ok: true });
+    // Combine path and method into a single key to avoid compound && conditions.
+    const key = `${url.pathname}:${method}`;
+    if (key === "/reconcile:POST") return this.#reconcileRoute(req, res);
+    if (key === "/health:GET") return sendJson(res, 200, { ok: true });
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
   }
 
@@ -1325,6 +1337,66 @@ export class FleetDaemon {
     if (!current || current.state !== "blocked" || current.marker === "stale") return;
     this.registry.appendEvent(job.id, { type: "state", state: "blocked", marker: "stale" });
     this.registry.updateJob(job.id, { marker: "stale" });
+  }
+
+  // ---- Orphan-task reconcile (#147) ----
+
+  /**
+   * POST /reconcile — run the orphan sweep on demand (`fleet doctor`).
+   * Operator-authorized: it stops cloud tasks. Not under /jobs/*: the sweep is
+   * about tasks the record-keeping lost, so it cannot be addressed by job id.
+   */
+  async #reconcileRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.#operatorAuthorized(req)) return sendJson(res, 401, { error: "unauthorized" });
+    return sendJson(res, 200, await this.reconcileOrphans());
+  }
+
+  /**
+   * Stop every task whose startedBy names a job this registry holds terminal
+   * (#147). A run-task that succeeded on the AWS side while the CLI wedged past
+   * its budget records launch-failed with no handle; a stop-task failure that
+   * survived its retry leaves a cancelled job with a live container. Either way
+   * the task keeps billing with nothing watching it until the runner's own
+   * wall-clock cap fires. Runs at daemon boot (main.ts, after provider.recover)
+   * and on demand via the route above; providers without a sandbox listing make
+   * it a no-op. Each stop is journalled on its job as a log event.
+   *
+   * The one unforgivable bug here is stopping a live job's task: only a job
+   * this registry knows AND holds terminal is ever stopped. Terminal states
+   * have no exits (schemas/job-states.json), so the check cannot go stale
+   * between here and the stop. A task naming a job this registry has no record
+   * of is left alone — without a record, "terminal" is not a fact we hold.
+   */
+  async reconcileOrphans(): Promise<{ orphans: OrphanTask[] }> {
+    const provider = this.#options.provider;
+    if (!provider.listJobSandboxes) return { orphans: [] };
+    const orphans: OrphanTask[] = [];
+    for (const sandbox of await provider.listJobSandboxes()) {
+      const job = this.registry.getJob(sandbox.jobId);
+      if (!job || !isTerminal(job.state)) continue;
+      orphans.push(await this.#stopOrphan(job, sandbox.handle));
+    }
+    return { orphans };
+  }
+
+  /** Stop one orphaned task and journal the reconciliation on its job. */
+  async #stopOrphan(job: JobRecord, handle: string): Promise<OrphanTask> {
+    try {
+      await this.#options.provider.terminate(handle);
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `reconcile stopped orphaned task ${handle}: job is ${job.state} but its task was still running`,
+        who: "daemon",
+      });
+      return { job: job.id, handle, stopped: true };
+    } catch (error) {
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `reconcile could not stop orphaned task ${handle}: ${String(error)}`,
+        who: "daemon",
+      });
+      return { job: job.id, handle, stopped: false };
+    }
   }
 
   /**
