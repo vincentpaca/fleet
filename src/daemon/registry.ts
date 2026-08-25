@@ -92,7 +92,7 @@ type LaunchFile = {
  */
 export type EffectsMode = "intake" | "replay";
 
-export type ApplyEffectsFn = (job: JobRecord, event: StoredEvent, mode: EffectsMode) => void;
+type ApplyEffectsFn = (job: JobRecord, event: StoredEvent, mode: EffectsMode) => void;
 
 /**
  * The state the journal implies, or null when no event in it sets one. Both

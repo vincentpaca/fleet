@@ -8,7 +8,7 @@
 import type { GhRunnerAsync } from "../shared/git.ts";
 
 /** The unified evidence ladder, weakest to strongest (work-order.schema.json #/$defs/rung). */
-export const RUNG_LADDER = [
+export const RUNG_LADDER = [ // contract pin: test-only export, asserted by the suite
   "inspected",
   "implemented",
   "focused-green",
@@ -24,7 +24,7 @@ export const RUNG_LADDER = [
   "runtime-accepted",
 ] as const;
 
-export type Rung = (typeof RUNG_LADDER)[number];
+type Rung = (typeof RUNG_LADDER)[number];
 
 const LOCALLY_VERIFIABLE: Record<string, true> = { inspected: true, implemented: true };
 const GH_DEPENDENT: Record<string, true> = {
@@ -37,12 +37,12 @@ const GH_DEPENDENT: Record<string, true> = {
   merged: true,
 };
 
-export type SettleFacts = {
+export type SettleFacts = { // contract pin: test-only export, asserted by the suite
   rung?: string;
   report?: { status?: string; pr?: string } & Record<string, unknown>;
 } & Record<string, unknown>;
 
-export type RungVerification = {
+type RungVerification = {
   verified: boolean;
   reached: string | null;
   notes: string[];

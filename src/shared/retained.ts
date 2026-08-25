@@ -31,7 +31,7 @@ import { dirname, join } from "node:path";
  * written for it carries what little is known. `fleet resume-push` refuses to
  * push a record without target and branch rather than guessing.
  */
-export type RetainRequest = {
+type RetainRequest = {
   jobId: string;
   /** Work-order target; the retry reuses it for the commit message. */
   target?: string;
@@ -51,7 +51,7 @@ export type RetainRequest = {
 export type RetainedRecord = RetainRequest & { workspace: string };
 
 /** Runner → provider request file, inside the git-excluded out/ channel. */
-export function retainRequestPath(workspace: string): string {
+export function retainRequestPath(workspace: string): string { // contract pin: test-only export, asserted by the suite
   return join(workspace, ".fleet", "out", "retain-workspace.json");
 }
 

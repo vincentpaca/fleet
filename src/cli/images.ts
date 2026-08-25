@@ -59,7 +59,7 @@ export type ImageManifest = {
  * `readFile` is injectable so tests can verify hash behaviour without touching
  * the filesystem.
  */
-export function setupHashInputs(
+function setupHashInputs(
   manifest: ImageManifest,
   readFile: (path: string) => string = defaultReadFile,
 ): string {
@@ -143,7 +143,7 @@ export function twoLayerEnabled(manifest: ImageManifest): boolean {
  * no docker at all — a spawn failure is indistinguishable and treated the
  * same). The id is what a tag's text hides: it changes when the tag moves.
  */
-export function localImageId(tag: string): string | undefined {
+function localImageId(tag: string): string | undefined {
   const result = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], {
     stdio: ["ignore", "pipe", "ignore"],
   });
@@ -182,7 +182,7 @@ export function imageExistsLocally(tag: string): boolean {
 
 // ---------- build ----------
 
-export type BuildJobImageOptions = {
+type BuildJobImageOptions = {
   /** Local tag to assign (e.g. "fleet-job:abc123"). */
   tag: string;
   /** Fleet runner base tag (e.g. "fleet-runner:claude-code-1.2.3"). */
@@ -255,7 +255,7 @@ function runDockerBuild(
  *   - `setup.devcontainer` set → comment only (Phase 2); builds as a base alias.
  *   - neither → plain `FROM <runnerBase>` alias (base caching, no extra layers).
  */
-export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): string {
+export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): string { // contract pin: test-only export, asserted by the suite
   const setup = manifest.setup ?? {};
   const lines: string[] = [`FROM ${baseTag}`];
 
@@ -307,7 +307,7 @@ export async function buildJobImage(opts: BuildJobImageOptions): Promise<void> {
 
 // ---------- ECR push ----------
 
-export type PushToEcrOptions = {
+type PushToEcrOptions = {
   /** Local image tag to push. */
   localTag: string;
   /** ECR registry URI, e.g. "123456789012.dkr.ecr.us-east-1.amazonaws.com". */

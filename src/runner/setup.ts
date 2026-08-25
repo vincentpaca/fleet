@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { setupBakedMarkerPath } from "../shared/setup-marker.ts";
 
-export type SetupScriptOutcome =
+type SetupScriptOutcome =
   /** Manifest declares no setup.script — nothing to do, nothing to log. */
   | { kind: "none" }
   /** The image baked the script at build (marker present). */
@@ -31,7 +31,7 @@ export type SetupScriptOutcome =
   | { kind: "ran"; note: string }
   | { kind: "failed"; note: string; detail: string };
 
-export type RunSetupScriptOptions = {
+type RunSetupScriptOptions = {
   workspace: string;
   manifest: Record<string, unknown>;
   /** Marker path override; defaults to setupBakedMarkerPath(process.env). */
@@ -41,7 +41,7 @@ export type RunSetupScriptOptions = {
 };
 
 /** Kill budget default: setup is `npm ci`-shaped work, not a 60s gate probe. */
-export const SETUP_TIMEOUT_MS = 600_000;
+const SETUP_TIMEOUT_MS = 600_000;
 
 /** First non-empty line of a child's combined output, for one-line notes. */
 function firstLine(stdout: string | null, stderr: string | null): string {

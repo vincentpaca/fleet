@@ -29,7 +29,8 @@ import {
 import { renderRosterRows, sortJobs, type BoardJob } from '../src/cli/board.ts';
 import { visualLength } from '../src/cli/ansi.ts';
 import type { FleetEvent } from '../src/shared/events.ts';
-import { readTunnelRecord, pidAlive, portAccepts, probeDaemonHealth } from '../src/cli/connect.ts';
+import { readTunnelRecord, portAccepts, probeDaemonHealth } from '../src/cli/connect.ts';
+import { pidAlive } from '../src/shared/process.ts';
 import {
   CLI,
   closedPort,

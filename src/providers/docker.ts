@@ -8,7 +8,7 @@ import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempF
 
 const run = promisify(execFile);
 
-export type DockerProviderOptions = {
+type DockerProviderOptions = {
   /** Image used when the manifest/spec supplies none. */
   defaultImage?: string;
   /** Command executed inside the container. */

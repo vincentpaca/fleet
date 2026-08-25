@@ -24,7 +24,6 @@ import {
   tunnelReport,
   writeTunnelRecord,
   readTunnelRecord,
-  pidAlive,
   listTunnelRecords,
   clearTunnelRecord,
   FORWARD_SHUTDOWN_MS,
@@ -37,6 +36,7 @@ import {
   type ForwardHandle,
   type SuperviseDeps,
 } from '../src/cli/connect.ts';
+import { pidAlive } from '../src/shared/process.ts';
 import { tunnelOpenerFor } from '../src/cli/tunnel-openers.ts';
 import {
   CLI,

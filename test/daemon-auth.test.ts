@@ -11,8 +11,8 @@ import { tmpdir } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { FleetDaemon, loadOrCreateOperatorToken } from "../src/daemon/server.ts";
 import { operatorTokenPath } from "../src/shared/home.ts";
-import { request, requestJson } from "../src/shared/http.ts";
-import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost } from "./daemon-helpers.ts";
+import { request } from "../src/shared/http.ts";
+import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost, requestJson } from "./daemon-helpers.ts";
 import { runCli } from "./cli-helpers.ts";
 
 const OPERATOR_TOKEN = "op-secret-0123456789abcdef0123456789abcdef";

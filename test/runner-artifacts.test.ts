@@ -9,7 +9,8 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectArtifacts, ARTIFACT_PER_FILE_CAP, ARTIFACT_MAX_FILES } from '../src/runner/artifacts.ts';
+import { collectArtifacts } from '../src/runner/artifacts.ts';
+import { ARTIFACT_PER_FILE_CAP, ARTIFACT_MAX_FILES } from '../src/shared/home.ts';
 
 type ReceivedPost = { path: string; sha256: string; bytes: number; content: string };
 

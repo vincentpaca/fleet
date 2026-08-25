@@ -13,7 +13,7 @@ import { validateEvent } from '../validate.mjs';
 import { toMinutes } from '../shared/time.ts';
 import type { EventBody } from './events.ts';
 
-export type SettleComposition = {
+type SettleComposition = {
   body: EventBody;
   /**
    * Human-readable problems encountered (e.g. invalid report.json, a workspace
@@ -22,7 +22,7 @@ export type SettleComposition = {
   notes: string[];
 };
 
-export type SettleOpts = {
+type SettleOpts = {
   jobId: string;
   startedAt: number;
   decisions: number;

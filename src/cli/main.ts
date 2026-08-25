@@ -1712,7 +1712,7 @@ function terminalAvailable(): boolean {
   return (process.stdout.isTTY ?? false) && (process.stdin.isTTY ?? false);
 }
 
-export async function main(argv: string[]): Promise<number> {
+async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   try {
     // Bare `fleet` is the cockpit (#61), where there is a terminal for it.
