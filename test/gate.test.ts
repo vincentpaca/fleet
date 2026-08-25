@@ -90,6 +90,20 @@ test("the job's own branch never counts as a claim (creation-push and re-entry)"
   assert.ok(!findings.join('\n').includes('fleet/7-job-9,'), 'own branch must not be named a claimant');
 });
 
+test('a released -attemptN branch is not a claim; a live rival still blocks (#30)', () => {
+  // fleet/7-job-1-attempt1 starts with the fleet/7- prefix, so before #30 it
+  // read as a rival claim and blocked every re-dispatch after a failed attempt.
+  const released = { ...ready, jobId: 'job-2', branches: ['fleet/7-job-1-attempt1', 'fleet/7-job-1-attempt2'] };
+  assert.deepStrictEqual(evaluate(released), { ready: true, findings: [] });
+  // The exemption is exactly the suffix: an unreleased rival next to a
+  // released one still blocks, and the finding names only the rival.
+  const mixed = { ...ready, jobId: 'job-2', branches: ['fleet/7-job-1-attempt1', 'fleet/7-job-3'] };
+  const { ready: ok, findings } = evaluate(mixed);
+  assert.equal(ok, false);
+  assert.match(findings.join('\n'), /fleet\/7-job-3/);
+  assert.ok(!findings.join('\n').includes('attempt1'), 'the released branch must not be named a claimant');
+});
+
 test('closed issue fails', () => {
   const { ready: ok, findings } = evaluate({ ...ready, state: 'CLOSED' });
   assert.equal(ok, false);

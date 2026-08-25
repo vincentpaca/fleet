@@ -56,6 +56,14 @@ export type GitSetupOptions = {
    * pushes update the existing PR in place.
    */
   adoptBranch?: string;
+  /**
+   * Harness-exit auto-retry (#30): which launch attempt this is (2 = the one
+   * automatic retry). The previous attempt pushed this job's branch — same job
+   * id, same name — so before creating its own, this attempt renames the
+   * remote branch to <branch>-attempt<n-1>: the claim is released and the
+   * creation push cannot collide, while the pushed evidence stays reachable.
+   */
+  retryAttempt?: number;
 };
 
 const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
@@ -229,10 +237,42 @@ function mergeExcludes(workspace: string, excludes: string[]): void {
 }
 
 /**
- * Turn the staged workspace into a checkout of the repo on the job branch,
- * and push the branch immediately. Returns the branch name and base branch.
+ * Rename a branch on the remote without destroying its commits: copy the ref
+ * to the new name, then delete the old one. The daemon has no workspace, so
+ * this is how a claim branch is released from inside one — the auto-retry's
+ * fresh runner (#30) and `fleet reclaim` both call it. Returns 'absent' when
+ * the source branch does not exist on the remote (nothing to release —
+ * a prior attempt that died before its creation push).
  */
-export function setupWorkspace(workspace: string, opts: GitSetupOptions): { branch: string; base: string } {
+export function renameRemoteBranch(workspace: string, from: string, to: string, timeoutMs?: number): 'renamed' | 'absent' {
+  const listed = git(workspace, ['ls-remote', '--heads', 'origin', from], timeoutMs);
+  if (listed.trim() === '') return 'absent';
+  // Fetch the ref so the local repo holds the object FETCH_HEAD names — a
+  // push can only send commits it has.
+  git(workspace, ['fetch', '-q', 'origin', from], timeoutMs);
+  git(workspace, ['push', '-q', 'origin', `FETCH_HEAD:refs/heads/${to}`], timeoutMs);
+  git(workspace, ['push', '-q', 'origin', `:refs/heads/${from}`], timeoutMs);
+  return 'renamed';
+}
+
+/**
+ * Auto-retry (#30): release the previous attempt's claim before this attempt
+ * creates its branch under the same name. Rename, never delete — the partial
+ * work stays reachable at <branch>-attempt<n-1>. Returns the renamed branch,
+ * or undefined when this launch is not a retry (or nothing was ever pushed).
+ */
+function releaseRetryClaim(workspace: string, branch: string, existing: boolean, retryAttempt?: number): string | undefined {
+  if (existing || retryAttempt === undefined || retryAttempt <= 1) return undefined;
+  const attemptName = `${branch}-attempt${retryAttempt - 1}`;
+  return renameRemoteBranch(workspace, branch, attemptName) === 'renamed' ? attemptName : undefined;
+}
+
+/**
+ * Turn the staged workspace into a checkout of the repo on the job branch,
+ * and push the branch immediately. Returns the branch name and base branch,
+ * plus the released claim branch when a retry renamed one (#30).
+ */
+export function setupWorkspace(workspace: string, opts: GitSetupOptions): { branch: string; base: string; released?: string } {
   const branch = opts.adoptBranch ?? jobBranch(opts.target, opts.jobId);
   // Adoption and re-entry share the checkout path: the branch already exists
   // on the remote, so neither creates nor pushes anything at setup.
@@ -246,6 +286,8 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
   git(workspace, ['remote', 'add', 'origin', opts.url]);
   const base = defaultRef(workspace, opts.url);
 
+  const released = releaseRetryClaim(workspace, branch, existing, opts.retryAttempt);
+
   checkoutBranch(workspace, branch, base, existing, opts.depth);
 
   // Restore the dispatch payload over whatever the clone brought in, and make
@@ -257,7 +299,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
     // if the container dies before any work is committed.
     git(workspace, ['push', '-q', '-u', 'origin', branch]);
   }
-  return { branch, base };
+  return { branch, base, ...(released !== undefined ? { released } : {}) };
 }
 
 /**

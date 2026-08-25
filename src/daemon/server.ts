@@ -206,6 +206,15 @@ function defaultGhRunner(): GhRunnerAsync {
  */
 export const DEFAULT_LONG_POLL_MS = 25_000;
 
+/** Work-order target for operator-facing messages; a placeholder when unreadable. */
+function orderTarget(workOrder: unknown): string {
+  if (workOrder && typeof workOrder === "object" && "target" in workOrder) {
+    const target = (workOrder as { target?: unknown }).target;
+    if (typeof target === "string" && target !== "") return target;
+  }
+  return "<target>";
+}
+
 /** Target rung from a work order already validated at job creation. */
 function targetRung(workOrder: unknown): string {
   if (workOrder && typeof workOrder === "object" && "finish" in workOrder) {
@@ -725,7 +734,7 @@ export class FleetDaemon {
     res: ServerResponse,
   ): Promise<void> {
     try {
-      const updated = await this.#launchReentry(job, reentry);
+      const updated = await this.#launchFresh(job, { reentry });
       if (updated === null) {
         // The job went terminal while the container launched (#114): the fresh
         // container is already terminated; do not resurrect the record.
@@ -760,24 +769,36 @@ export class FleetDaemon {
   }
 
   /**
-   * Launch a fresh container for a blocked job whose runner has exited, with
-   * the operator's answer pre-materialised so the status-driven harness picks
-   * up where it left off. Shared by the parked/stale answer path, the
-   * answered-park recovery (#151), and boot recovery (#115). The state stays
-   * blocked until the new runner emits state:running (blocked → running is a
-   * valid transition). The runner seq resets so the fresh container starts at 0.
+   * Launch a fresh container for a job whose runner has exited. Two callers,
+   * one launch path (a second one would be the fork AGENTS.md names a defect):
+   *
+   * - `reentry`: a blocked job being re-entered with the operator's answer
+   *   pre-materialised so the status-driven harness picks up where it left
+   *   off. Used by the parked/stale answer path, the answered-park recovery
+   *   (#151), and boot recovery (#115). The state stays blocked until the new
+   *   runner emits state:running (blocked → running is a valid transition).
+   * - `retryAttempt`: a harness-exit auto-retry (#30) re-launching a re-queued
+   *   job from scratch. The runner sees FLEET_RETRY_ATTEMPT and renames the
+   *   previous attempt's branch (claim released, evidence retained) before
+   *   creating its own.
+   *
+   * Either way the runner seq resets so the fresh container starts at 0, and
+   * the decision seed keeps ids unique across generations (#110).
    *
    * Ordering is the crash-window contract (#115): the rotated runner token is
    * persisted BEFORE provider.launch, so a crash after the container started
    * leaves a record whose token still matches it, and boot recovery can finish
-   * the re-entry instead of stranding a container it cannot authenticate.
+   * the re-launch instead of stranding a container it cannot authenticate.
    *
    * Returns null when the job went terminal during the launch — the fresh
    * container is terminated and the terminal record left alone (#114).
    */
-  async #launchReentry(
+  async #launchFresh(
     job: JobRecord,
-    reentry: { decisionId: string; answer: { option?: string; text?: string } },
+    opts: {
+      reentry?: { decisionId: string; answer: { option?: string; text?: string } };
+      retryAttempt?: number;
+    },
   ): Promise<JobRecord | null> {
     this.registry.clearMarker(job.id);
     this.registry.resetRunnerSeq(job.id);
@@ -797,7 +818,8 @@ export class FleetDaemon {
       manifest: details.manifest,
       workOrder: job.workOrder,
       resources: storedManifest?.limits?.resources,
-      reentryAnswer: reentry,
+      ...(opts.reentry !== undefined ? { reentryAnswer: opts.reentry } : {}),
+      ...(opts.retryAttempt !== undefined ? { retryAttempt: opts.retryAttempt } : {}),
       // Seed the new runner's decision counter past prior ids (issue #110).
       reentryDecisionSeed: this.registry.decisionSeed(job.id),
     });
@@ -883,7 +905,7 @@ export class FleetDaemon {
       who: "daemon",
     });
     try {
-      await this.#launchReentry(current, pending);
+      await this.#launchFresh(current, { reentry: pending });
     } catch (error) {
       this.#cancelAfterFailedRelaunch(job.id, error);
     }
@@ -1137,16 +1159,25 @@ export class FleetDaemon {
     // Schema-validated at intake.
     const nextState = event.state as JobState;
     const marker = event.marker as Marker | undefined;
+    // Auto-retry (#30): a first harness-exit with no human context and budget
+    // left is re-queued instead of settled. Intake-only — the retry appends its
+    // own queued event to the journal, so replay derives the same record from
+    // the events alone and must not re-launch anything.
+    if (mode === "intake" && this.#interceptHarnessExitRetry(job, event, nextState)) return;
     // Cancellation reason (wall-clock, stall, pickup-gate, ...) is part of the
     // record so status/board can distinguish kinds of cancellation.
     const reason = typeof event.reason === "string" ? { reason: event.reason } : {};
+    // Attempt count (#30): absolute on the event, so replay derives it too.
+    const attempt = typeof event.attempt === "number" ? { attempt: event.attempt } : {};
     if (marker !== undefined) {
-      this.registry.updateJob(job.id, { state: nextState, marker, ...reason });
+      this.registry.updateJob(job.id, { state: nextState, marker, ...reason, ...attempt });
     } else {
       this.registry.clearMarker(job.id);
-      this.registry.updateJob(job.id, { state: nextState, ...reason });
+      this.registry.updateJob(job.id, { state: nextState, ...reason, ...attempt });
     }
-    // Wall-clock tracking: running = active, blocked/terminal = inactive.
+    // Wall-clock tracking: running = active, queued/blocked/terminal = inactive
+    // (queued only recurs on a retry re-queue — nothing is executing while the
+    // fresh container launches, and operator/launch time is not agent runtime).
     // Not replayed: these read the daemon clock, so a replay would collapse
     // every recorded segment to zero length and hand the job a fresh budget.
     // Wall-clock accounting is the one thing the journal cannot rebuild
@@ -1154,7 +1185,7 @@ export class FleetDaemon {
     if (mode === "intake") {
       if (nextState === "running") {
         this.registry.wallClockBecameActive(job.id);
-      } else if (nextState === "blocked" || isTerminal(nextState)) {
+      } else if (nextState === "queued" || nextState === "blocked" || isTerminal(nextState)) {
         this.registry.wallClockBecameInactive(job.id);
       }
       // A park landing on an already-answered decision means the runner parked
@@ -1193,6 +1224,86 @@ export class FleetDaemon {
       );
     if (!retained) {
       this.#options.provider.terminate(job.handle).catch(() => {});
+    }
+  }
+
+  // ---- Harness-exit auto-retry (#30) ----
+
+  /**
+   * Why a harness-exit cancellation is NOT auto-retried, or null when it is.
+   * The policy (settled in #30): retry exactly once, only when zero decisions
+   * were answered (no human context to lose), and only within the remaining
+   * wall-clock budget. Anything past that is an operator's call, surfaced
+   * loudly rather than retried quietly.
+   */
+  #harnessExitRetryBlocker(job: JobRecord): string | null {
+    if ((job.attempt ?? 1) >= 2) return "this was already the retry";
+    const answered = this.registry
+      .eventsAfter(job.id, -1)
+      .some((event) => event.type === "answer");
+    if (answered) return "decisions were answered (human context would be lost)";
+    const limitMs = this.registry.wallClockLimitMs(job.id);
+    if (limitMs !== null && (this.registry.wallClockActiveMs(job.id) ?? 0) >= limitMs) {
+      return "the wall-clock budget is spent";
+    }
+    return null;
+  }
+
+  /**
+   * Intercept a runner `state: cancelled, reason: harness-exit` at intake.
+   * True means the retry took over: the record never rests on cancelled — the
+   * daemon appends its own queued event (reason "retry", absolute attempt
+   * count) so the journal stays authoritative and replay derives the same
+   * record, then re-launches outside the intake batch. False means policy said
+   * no: the caller settles the cancellation for real, and the refusal is
+   * journalled with the `fleet reclaim` incantation so "needs operator" is a
+   * line in the transcript, not tribal knowledge.
+   */
+  #interceptHarnessExitRetry(job: JobRecord, event: StoredEvent, nextState: JobState): boolean {
+    if (nextState !== "cancelled" || event.reason !== "harness-exit") return false;
+    const blocker = this.#harnessExitRetryBlocker(job);
+    if (blocker !== null) {
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `harness exited (attempt ${job.attempt ?? 1}); not auto-retrying: ${blocker}. ` +
+          `Needs operator — \`fleet reclaim ${orderTarget(job.workOrder)}\` releases the branch claim for re-dispatch`,
+        who: "daemon",
+      });
+      return false;
+    }
+    const attempt = (job.attempt ?? 1) + 1;
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `harness exited (attempt ${attempt - 1}); auto-retrying once — re-queueing as attempt ${attempt}`,
+      who: "daemon",
+    });
+    const queued = this.registry.appendEvent(job.id, {
+      type: "state", state: "queued", reason: "retry", attempt,
+    });
+    // The queued event runs through the same effects derivation as any other
+    // state event (one path; replaying this journal does exactly this).
+    this.#applyStateEvent(job, queued, "intake");
+    // A decision left open by a harness that died while blocked dies with the
+    // attempt: nothing will ever collect its answer, and the retry starts over.
+    this.registry.setOpenDecision(job.id, null);
+    this.registry.setDecisionBlockedAt(job.id, null);
+    // Launch outside the intake batch (same shape as #maybeRecoverAnsweredPark).
+    setImmediate(() => {
+      this.#launchRetry(job.id, attempt).catch(() => {});
+    });
+    return true;
+  }
+
+  /** The deferred re-launch of a retry (#30): re-check, then one fresh launch. */
+  async #launchRetry(jobId: string, attempt: number): Promise<void> {
+    const current = this.registry.getJob(jobId);
+    // An operator cancel can land between the re-queue and this tick; a job
+    // that is no longer the queued retry we produced is not ours to launch.
+    if (!current || current.state !== "queued" || (current.attempt ?? 1) !== attempt) return;
+    try {
+      await this.#launchFresh(current, { retryAttempt: attempt });
+    } catch (error) {
+      this.#cancelAfterFailedRelaunch(jobId, error);
     }
   }
 
@@ -1529,6 +1640,13 @@ export class FleetDaemon {
   /** Route one job to the recovery its crash-window shape implies (#115). */
   async #recoverJobAtBoot(job: JobRecord): Promise<void> {
     if (isTerminal(job.state)) return this.#maybeReverifyAtBoot(job);
+    // A re-queued retry (#30) whose launch died with the old daemon. Checked
+    // before the lost-launch shape: attempt > 1 proves the queued state is the
+    // journalled retry decision, not a creation that never launched — finish
+    // the launch instead of cancelling it. No sweep covers queued.
+    if (job.state === "queued" && (job.attempt ?? 1) > 1) {
+      return this.#recoverRetryAtBoot(job);
+    }
     if (job.state === "queued" && job.handle === undefined) {
       return this.#resolveLostLaunch(job);
     }
@@ -1537,6 +1655,26 @@ export class FleetDaemon {
     }
     if (job.state === "blocked" && this.registry.openDecision(job.id) === null) {
       return this.#recoverBlockedWithoutDecision(job);
+    }
+  }
+
+  /**
+   * Finish a retry launch a daemon crash interrupted (#30). The retry decision
+   * is already durable (the queued reason=retry event is in the journal), so
+   * the only thing missing is the container — same contract as the re-entry
+   * recovery: relaunch from the stored launch details, cancel loudly if the
+   * launch fails again.
+   */
+  async #recoverRetryAtBoot(job: JobRecord): Promise<void> {
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `daemon restarted before retry attempt ${job.attempt} launched; re-launching`,
+      who: "daemon",
+    });
+    try {
+      await this.#launchFresh(job, { retryAttempt: job.attempt ?? 2 });
+    } catch (error) {
+      this.#cancelAfterFailedRelaunch(job.id, error);
     }
   }
 
@@ -1611,7 +1749,7 @@ export class FleetDaemon {
       who: "daemon",
     });
     try {
-      await this.#launchReentry(job, pending);
+      await this.#launchFresh(job, { reentry: pending });
     } catch (error) {
       this.#cancelAfterFailedRelaunch(job.id, error);
     }
