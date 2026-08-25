@@ -26,7 +26,7 @@
  * (the dispatched manifest wins over the cloned one, but is never pushed).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /** Inject a gh executor in tests; defaults to the real gh CLI. */
@@ -206,6 +206,29 @@ function restoreDispatchFiles(workspace: string, preserved: Map<string, Buffer>)
 }
 
 /**
+ * Merge exclude entries into .git/info/exclude, deduped (#139): every launch
+ * gets a fresh workspace today, but nothing structural guarantees that — a
+ * reused workspace must never accrete duplicate entries. Read-merge-write,
+ * not check-then-append: a read that treats a missing file as empty and one
+ * whole-file write leave no exists/read/append window (js/file-system-race).
+ */
+function mergeExcludes(workspace: string, excludes: string[]): void {
+  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
+  const excludeFile = join(workspace, '.git', 'info', 'exclude');
+  let current = '';
+  try {
+    current = readFileSync(excludeFile, 'utf8');
+  } catch {
+    // No exclude file yet: merge into empty content.
+  }
+  const present = new Set(current.split('\n'));
+  const fresh = excludes.filter((line) => !present.has(line));
+  if (fresh.length === 0) return;
+  const head = current === '' || current.endsWith('\n') ? current : current + '\n';
+  writeFileSync(excludeFile, head + fresh.join('\n') + '\n');
+}
+
+/**
  * Turn the staged workspace into a checkout of the repo on the job branch,
  * and push the branch immediately. Returns the branch name and base branch.
  */
@@ -227,15 +250,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
 
   // Restore the dispatch payload over whatever the clone brought in, and make
   // sure none of it can ever be committed or pushed.
-  const excludes = restoreDispatchFiles(workspace, preserved);
-  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
-  // Idempotent append (#139): every launch gets a fresh workspace today, but
-  // nothing structural guarantees that — dedupe so a reused workspace (or a
-  // future re-entry that reuses one) never accretes duplicate entries.
-  const excludeFile = join(workspace, '.git', 'info', 'exclude');
-  const present = new Set(existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8').split('\n') : []);
-  const fresh = excludes.filter((line) => !present.has(line));
-  if (fresh.length > 0) appendFileSync(excludeFile, fresh.join('\n') + '\n');
+  mergeExcludes(workspace, restoreDispatchFiles(workspace, preserved));
 
   if (!existing) {
     // Initial setup: push the branch immediately so evidence is preserved even
