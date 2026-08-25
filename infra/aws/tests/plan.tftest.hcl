@@ -134,6 +134,18 @@ run "public_subnets_give_the_daemon_a_public_ip" {
     error_message = "the daemon's fleet-home volume must mount through the EFS access point (authorization_config), or uid 1000 lands on an unwritable root"
   }
 
+  # Scale-to-zero is a design commitment, not a suggestion (#67): by default
+  # the worker ASG floors at zero so idle costs nothing. A default that drifts
+  # above zero bills the operator ~$30/mo per always-on t3.medium — more than
+  # the rest of a Fleet deployment combined — without anyone choosing it.
+  assert {
+    condition = (
+      aws_autoscaling_group.instances.min_size == 0 &&
+      aws_autoscaling_group.instances.desired_capacity == 0
+    )
+    error_message = "the worker ASG must default to a floor of zero: warm capacity is opt-in via min_instances, never a default cost"
+  }
+
   # The middle field is the task *id*, and the hint's TASK holds an ARN — the
   # slashes in which the API rejects just as it rejects the commas above. The
   # check above cannot see it, because a shell variable collapses to a
@@ -262,4 +274,56 @@ run "spot_split_knobs_hold_their_api_bounds" {
   }
 
   expect_failures = [var.on_demand_base_capacity, var.on_demand_percentage_above_base]
+}
+
+# --- warm capacity floor (#67) -------------------------------------------------
+
+# min_instances is the whole feature: it must land on the ASG minimum (what
+# keeps an instance warm) AND ride fleet_config (what lets `fleet doctor` say
+# why instances exist at idle). desired_capacity must start at the floor too:
+# the ASG API rejects desired < min at create — an apply-time failure this
+# plan-time assert is here to prevent.
+run "a_warm_floor_lands_on_the_asg_and_rides_fleet_config" {
+  command = plan
+
+  variables {
+    min_instances = 1
+  }
+
+  assert {
+    condition = (
+      aws_autoscaling_group.instances.min_size == 1 &&
+      aws_autoscaling_group.instances.desired_capacity == 1
+    )
+    error_message = "min_instances=1 must set the ASG minimum and initial desired capacity to 1, or the operator pays for a knob that keeps nothing warm"
+  }
+
+  assert {
+    condition     = output.fleet_config.min_instances == 1
+    error_message = "fleet_config must carry min_instances, or the cockpit cannot tell paid-for warm capacity from scale-in lag"
+  }
+}
+
+run "a_negative_floor_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    min_instances = -1
+  }
+
+  expect_failures = [var.min_instances]
+}
+
+# A floor above the cap is rejected by the ASG API only at apply. Cross-variable,
+# so it is the precondition on the ASG (not a variable validation — the module
+# supports terraform 1.5) that has to catch it at plan.
+run "a_floor_above_the_cap_is_held_by_the_precondition" {
+  command = plan
+
+  variables {
+    min_instances = 5
+    max_instances = 4
+  }
+
+  expect_failures = [aws_autoscaling_group.instances]
 }

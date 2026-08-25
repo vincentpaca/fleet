@@ -5,13 +5,15 @@ account: an ECS cluster backed by an EC2 auto scaling group that scales to zero,
 Fleet daemon as an always-on Fargate service with durable `FLEET_HOME` state on EFS,
 ECR repositories for the runner and project images, and CloudWatch log groups.
 
-Spend is bounded structurally — the ASG floors at zero and caps at `max_instances`,
-and core bounds each job's wall-clock. The unit provisions no billing products:
-budget alarms are your account's own concern (`docs/decisions.md#d12`).
+Spend is bounded structurally — the ASG floors at `min_instances` (default 0) and caps
+at `max_instances`, and core bounds each job's wall-clock. The unit provisions no billing
+products: budget alarms are your account's own concern (`docs/decisions.md#d12`).
 
 **Two-substrate design.** The daemon runs on Fargate (always-on, no EC2 pinned) while
 worker jobs run on the EC2 capacity provider with managed ASG scaling — the ASG can
 reach zero instances when the cluster is idle, and scale back out when a new job arrives.
+Operators who dispatch often can trade that for speed with a
+[warm capacity floor](#warm-capacity-floor).
 
 **Access model: SSM only.** No security group accepts inbound traffic from the public
 internet. Operators reach the daemon HTTP API via an SSM port-forward, which `fleet connect`
@@ -129,7 +131,8 @@ the right ownership on first mount.
 | `az_count` | `number` | `2` | AZs / subnets per tier for the module-created VPC. |
 | `enable_nat_gateway` | `bool` | `false` | `true`: private subnets behind NAT; `false`: public subnets with public-IP egress. Never any inbound either way. |
 | `instance_type` | `string` | `"t3.medium"` | EC2 instance type for container instances. |
-| `max_instances` | `number` | `4` | ASG maximum (minimum is always 0; must be ≥ 1). |
+| `max_instances` | `number` | `4` | ASG maximum (must be ≥ 1, and ≥ `min_instances`). |
+| `min_instances` | `number` | `0` | Warm capacity floor: instances kept running at idle so a job skips the ~3-4 min cold start. **Each always-on `t3.medium` bills 24/7 — roughly $30/mo, more than the rest of a Fleet deployment combined.** See [Warm capacity floor](#warm-capacity-floor). |
 | `on_demand_base_capacity` | `number` | `0` | Instances always launched on-demand before the Spot split applies. See [Spot by default](#spot-by-default). |
 | `on_demand_percentage_above_base` | `number` | `0` | Percentage of capacity above the base that is on-demand (0 = all Spot, 100 = all on-demand). See [Spot by default](#spot-by-default). |
 | `scaling_cooldown_seconds` | `number` | `300` | ASG cooldown between scaling events. Raise it if jobs die to aggressive scale-in. |
@@ -175,6 +178,34 @@ Five knobs shape the exposure:
 If a lost job costs you more than the on-demand premium — long jobs, jobs that
 are expensive to re-prompt — set `on_demand_percentage_above_base = 100` and
 pay for certainty.
+
+### Warm capacity floor
+
+By default the worker ASG scales to zero: idle costs nothing, and the price is
+a cold start on the first job of a burst — instance boot plus runner-image
+pull, roughly 3-4 minutes before the runner's first event. `min_instances`
+raises the floor: the ASG keeps that many instances running at idle, and a
+warm instance already holds the runner image, so warm-start is task start —
+the first delegate's runner emits its first event in seconds rather than
+minutes.
+
+The cost, stated plainly: **a warm instance bills 24/7 whether or not a job
+ever arrives. Each always-on `t3.medium` is roughly $30/mo — more than the
+rest of a Fleet deployment (Fargate daemon, EFS, logs) combined.** That is why
+the default is 0 and stays 0: scale-to-zero is a design commitment, not a
+suggestion. Raise the floor only if you dispatch often enough that the wait
+costs you more than the instance does. Setting it back to 0 returns the ASG to
+scale-to-zero.
+
+Two interactions to know:
+
+- With the Spot defaults above, warm floor instances are Spot too — a reclaim
+  can take your warm instance and the next job cold-starts anyway. Pair the
+  floor with `on_demand_base_capacity >= min_instances` for a floor reclaims
+  cannot touch (at the on-demand price).
+- `fleet_config` carries `min_instances`, so tooling reading the deployment's
+  self-description can tell paid-for warm capacity from scale-in lag when it
+  sees instances at idle.
 
 ## Outputs
 
