@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { canTransition, isTerminal, isMarkerAllowed, INITIAL_STATE, STATES } from "../src/daemon/state.ts";
-import { verifyRung, RUNG_LADDER } from "../src/daemon/verify.ts";
+import { verifyRung, verifyRungGh, RUNG_LADDER } from "../src/daemon/verify.ts";
 
 test("state machine mirrors schemas/job-states.json", () => {
   assert.equal(INITIAL_STATE, "queued");
@@ -113,104 +113,104 @@ test("verifyRung: gh-dependent rung without ghRunner stays unverified: requires 
   }
 });
 
-test("verifyRung: gh-dependent rung without PR URL reports missing URL", () => {
-  const mockGh = (_args: string[]) => { throw new Error("should not be called"); };
-  const result = verifyRung({ rung: "pr-open" }, "pr-open", { ghRunner: mockGh });
+test("verifyRungGh: gh-dependent rung without PR URL reports missing URL", async () => {
+  const mockGh = async (_args: string[]) => { throw new Error("should not be called"); };
+  const result = await verifyRungGh({ rung: "pr-open" }, "pr-open", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /no PR URL/);
 });
 
-test("verifyRung: reached rung below target fails before gh is called", () => {
-  const mockGh = (_args: string[]) => { throw new Error("should not be called"); };
-  const result = verifyRung(prSettle("pushed", PR), "pr-open", { ghRunner: mockGh });
+test("verifyRungGh: reached rung below target fails before gh is called", async () => {
+  const mockGh = async (_args: string[]) => { throw new Error("should not be called"); };
+  const result = await verifyRungGh(prSettle("pushed", PR), "pr-open", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /below target/);
 });
 
-test("verifyRung: pr-open verified when gh reports OPEN", () => {
-  const mockGh = (args: string[]) => {
+test("verifyRungGh: pr-open verified when gh reports OPEN", async () => {
+  const mockGh = async (args: string[]) => {
     assert.ok(args.includes(PR));
     return JSON.stringify({ state: "OPEN" });
   };
-  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+  const result = await verifyRungGh(prSettle("pr-open", PR), "pr-open", mockGh);
   assert.equal(result.verified, true);
   assert.match(result.notes.join(" "), /OPEN/);
 });
 
-test("verifyRung: pr-open fails when gh reports CLOSED", () => {
-  const mockGh = (_args: string[]) => JSON.stringify({ state: "CLOSED" });
-  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+test("verifyRungGh: pr-open fails when gh reports CLOSED", async () => {
+  const mockGh = async (_args: string[]) => JSON.stringify({ state: "CLOSED" });
+  const result = await verifyRungGh(prSettle("pr-open", PR), "pr-open", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /CLOSED/);
 });
 
-test("verifyRung: pushed verified by confirming PR head branch via gh", () => {
-  const mockGh = (_args: string[]) => JSON.stringify({ headRefName: "fleet/APP-7-job-1" });
-  const result = verifyRung(prSettle("pushed", PR), "pushed", { ghRunner: mockGh });
+test("verifyRungGh: pushed verified by confirming PR head branch via gh", async () => {
+  const mockGh = async (_args: string[]) => JSON.stringify({ headRefName: "fleet/APP-7-job-1" });
+  const result = await verifyRungGh(prSettle("pushed", PR), "pushed", mockGh);
   assert.equal(result.verified, true);
   assert.match(result.notes.join(" "), /fleet\/APP-7-job-1/);
 });
 
-test("verifyRung: ci-green passes when all checks COMPLETED SUCCESS", () => {
+test("verifyRungGh: ci-green passes when all checks COMPLETED SUCCESS", async () => {
   const checks = [
     { name: "unit", status: "COMPLETED", conclusion: "SUCCESS" },
     { name: "lint", status: "COMPLETED", conclusion: "NEUTRAL" },
   ];
-  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
-  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+  const mockGh = async (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
+  const result = await verifyRungGh(prSettle("ci-green", PR), "ci-green", mockGh);
   assert.equal(result.verified, true);
   assert.match(result.notes.join(" "), /2 check/);
 });
 
-test("verifyRung: ci-green fails when checks are absent (CI not configured)", () => {
-  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: [] });
-  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+test("verifyRungGh: ci-green fails when checks are absent (CI not configured)", async () => {
+  const mockGh = async (_args: string[]) => JSON.stringify({ statusCheckRollup: [] });
+  const result = await verifyRungGh(prSettle("ci-green", PR), "ci-green", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /absent or pending/);
 });
 
-test("verifyRung: ci-green fails when a check is still pending", () => {
+test("verifyRungGh: ci-green fails when a check is still pending", async () => {
   const checks = [
     { name: "unit", status: "COMPLETED", conclusion: "SUCCESS" },
     { name: "deploy-preview", status: "IN_PROGRESS", conclusion: null },
   ];
-  const mockGh = (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
-  const result = verifyRung(prSettle("ci-green", PR), "ci-green", { ghRunner: mockGh });
+  const mockGh = async (_args: string[]) => JSON.stringify({ statusCheckRollup: checks });
+  const result = await verifyRungGh(prSettle("ci-green", PR), "ci-green", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /deploy-preview/);
 });
 
-test("verifyRung: reviews-clear passes with no blocking reviews", () => {
-  const mockGh = (_args: string[]) =>
+test("verifyRungGh: reviews-clear passes with no blocking reviews", async () => {
+  const mockGh = async (_args: string[]) =>
     JSON.stringify({ reviews: [{ state: "APPROVED" }], reviewDecision: "APPROVED" });
-  const result = verifyRung(prSettle("reviews-clear", PR), "reviews-clear", { ghRunner: mockGh });
+  const result = await verifyRungGh(prSettle("reviews-clear", PR), "reviews-clear", mockGh);
   assert.equal(result.verified, true);
 });
 
-test("verifyRung: reviews-clear fails when CHANGES_REQUESTED", () => {
-  const mockGh = (_args: string[]) =>
+test("verifyRungGh: reviews-clear fails when CHANGES_REQUESTED", async () => {
+  const mockGh = async (_args: string[]) =>
     JSON.stringify({ reviews: [{ state: "CHANGES_REQUESTED" }], reviewDecision: "CHANGES_REQUESTED" });
-  const result = verifyRung(prSettle("reviews-clear", PR), "reviews-clear", { ghRunner: mockGh });
+  const result = await verifyRungGh(prSettle("reviews-clear", PR), "reviews-clear", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /CHANGES_REQUESTED/);
 });
 
-test("verifyRung: merge-ready passes when mergeStateStatus is CLEAN", () => {
-  const mockGh = (_args: string[]) => JSON.stringify({ mergeStateStatus: "CLEAN" });
-  const result = verifyRung(prSettle("merge-ready", PR), "merge-ready", { ghRunner: mockGh });
+test("verifyRungGh: merge-ready passes when mergeStateStatus is CLEAN", async () => {
+  const mockGh = async (_args: string[]) => JSON.stringify({ mergeStateStatus: "CLEAN" });
+  const result = await verifyRungGh(prSettle("merge-ready", PR), "merge-ready", mockGh);
   assert.equal(result.verified, true);
 });
 
-test("verifyRung: merge-ready fails when CI is pending (UNSTABLE)", () => {
-  const mockGh = (_args: string[]) => JSON.stringify({ mergeStateStatus: "UNSTABLE" });
-  const result = verifyRung(prSettle("merge-ready", PR), "merge-ready", { ghRunner: mockGh });
+test("verifyRungGh: merge-ready fails when CI is pending (UNSTABLE)", async () => {
+  const mockGh = async (_args: string[]) => JSON.stringify({ mergeStateStatus: "UNSTABLE" });
+  const result = await verifyRungGh(prSettle("merge-ready", PR), "merge-ready", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /UNSTABLE/);
 });
 
-test("verifyRung: gh errors are caught and reported as unverified", () => {
-  const mockGh = (_args: string[]) => { throw new Error("rate limit exceeded"); };
-  const result = verifyRung(prSettle("pr-open", PR), "pr-open", { ghRunner: mockGh });
+test("verifyRungGh: gh errors are caught and reported as unverified", async () => {
+  const mockGh = async (_args: string[]) => { throw new Error("rate limit exceeded"); };
+  const result = await verifyRungGh(prSettle("pr-open", PR), "pr-open", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /rate limit/);
 });

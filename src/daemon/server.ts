@@ -1,7 +1,7 @@
 // Fleet daemon HTTP server. Operator endpoints trust socket permissions;
 // runner endpoints trust the per-job X-Fleet-Runner-Token. Every event is
 // schema-validated at intake; reject, never coerce.
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -19,7 +19,8 @@ import { HomeLock } from "./lock.ts";
 import type { EffectsMode, JobRecord, OpenDecision, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
 import type { JobState, Marker } from "./state.ts";
-import { verifyRung } from "./verify.ts";
+import { requiresGh, verifyRung, verifyRungGh, REQUIRES_GH_NOTE } from "./verify.ts";
+import type { GhRunnerAsync } from "../shared/git.ts";
 import type { Provider } from "../providers/provider.ts";
 
 /**
@@ -128,6 +129,12 @@ export type DaemonOptions = {
    * enforcer, and this margin must leave it room to SIGTERM, push, and settle.
    */
   idleBackstopMarginMs?: number;
+  /**
+   * gh CLI seam for deferred rung verification (#117); tests inject stubs.
+   * Default shells out to `gh` via async execFile with GH_VERIFY_TIMEOUT_MS.
+   * Only ever called off the intake path — see #scheduleRungVerification.
+   */
+  ghRunner?: GhRunnerAsync;
 };
 
 type IntakeError = { status: number; errors: unknown[] };
@@ -162,13 +169,33 @@ function stringRecord(value: unknown, what: string): Record<string, string> {
 }
 
 /**
- * gh CLI runner for rung verification. If gh is absent or the call fails,
- * verifyRung catches the thrown error and records it as "gh error: ..." in
- * the doneCheck notes — no special treatment needed here.
+ * How long one deferred gh call may run before the daemon gives up on it
+ * (#117). gh's own network timeouts are not under our control; without an
+ * explicit bound a hung call would keep its verification chain link pending
+ * forever and every later job's check queued behind it.
  */
-function defaultGhRunner(): import("../shared/git.ts").GhRunner {
+export const GH_VERIFY_TIMEOUT_MS = 30_000;
+
+/**
+ * gh CLI runner for deferred rung verification. Async on purpose (#117): the
+ * old execFileSync variant blocked the whole event loop for the gh round-trip
+ * — /health, every runner's POST — whenever a gh-dependent job settled. If gh
+ * is absent, fails, or times out, verifyRungGh catches the rejection and
+ * records it as "gh error: ..." in the doneCheck notes.
+ */
+function defaultGhRunner(): GhRunnerAsync {
   return (args: string[]) =>
-    execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    new Promise((resolve, reject) => {
+      execFile(
+        "gh",
+        args,
+        { encoding: "utf8", timeout: GH_VERIFY_TIMEOUT_MS },
+        (error, stdout) => {
+          if (error) reject(error);
+          else resolve(stdout);
+        },
+      );
+    });
 }
 
 /**
@@ -1092,9 +1119,12 @@ export class FleetDaemon {
    * reconciliation. The record derivation is identical in both — that is the
    * point of one function — but the outward-facing effects run on intake only:
    * replaying them would re-notify operators about every historic decision,
-   * block the constructor on a synchronous `gh`, and terminate containers at
-   * boot. Every suppressed effect is either already done or belongs to a live
-   * event that will arrive again.
+   * queue a gh verification per historic settle from inside the constructor,
+   * and terminate containers at boot. Every suppressed effect is either
+   * already done or belongs to a live event that will arrive again (the one
+   * exception: a replay that lands on a terminal state leaves the interim
+   * "unverified: requires gh" doneCheck, and #maybeReverifyAtBoot finishes it
+   * once the daemon is up).
    */
   #applyEffects(job: JobRecord, event: StoredEvent, mode: EffectsMode = "intake"): void {
     if (event.type === "state") return this.#applyStateEvent(job, event, mode);
@@ -1136,16 +1166,17 @@ export class FleetDaemon {
 
   /** Rung verification and the clean-settle container reap. */
   #applyTerminalState(job: JobRecord, mode: EffectsMode): void {
-    // Settle rides ahead of the terminal state event; verify the target
-    // rung — locally for lower rungs, via gh for upper rungs.
+    // Settle rides ahead of the terminal state event; verify the target rung
+    // locally, right now. gh-dependent rungs record the honest interim
+    // "unverified: requires gh" and get their real verdict from a deferred
+    // follow-up (#117) — gh is a network call, and running it synchronously
+    // here froze every listener (/health, other runners' POSTs) until it
+    // returned. Replay schedules nothing; the boot re-check picks the interim
+    // note up once recovery runs (#maybeReverifyAtBoot).
     const target = targetRung(job.workOrder);
-    // On replay, no gh: verifyRung records "unverified: requires gh" for the
-    // upper rungs instead of shelling out synchronously inside the constructor.
-    // An honest unverified beats a boot that blocks on the network, and the
-    // operator can re-check.
-    const ghRunner = mode === "intake" ? defaultGhRunner() : undefined;
-    const doneCheck = verifyRung(job.settle, target, { ghRunner });
+    const doneCheck = verifyRung(job.settle, target);
     this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
+    if (mode === "intake") this.#scheduleRungVerification(job.id);
     // Reap the stopped container on clean settle (#120): exited containers
     // pile up forever without this. Skip jobs whose workspace the runner
     // retained after a failed push — they keep their container so the
@@ -1163,6 +1194,60 @@ export class FleetDaemon {
     if (!retained) {
       this.#options.provider.terminate(job.handle).catch(() => {});
     }
+  }
+
+  /**
+   * Deferred gh verifications, one at a time (#117). A promise chain rather
+   * than parallel fire-and-forget: several jobs settling together (or a boot
+   * re-check over history) spawn one gh process at a time instead of a burst,
+   * and GH_VERIFY_TIMEOUT_MS bounds how long any link can hold the chain.
+   */
+  #verifyChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Queue the deferred rung verification for a settled job (#117). Scheduling
+   * is synchronous and cheap — the gh call itself runs later, off the intake
+   * batch and after the HTTP response, so nothing that accepts events ever
+   * waits on the network. No-op for targets gh cannot help with.
+   */
+  #scheduleRungVerification(jobId: string): void {
+    const job = this.registry.getJob(jobId);
+    if (!job || !requiresGh(targetRung(job.workOrder))) return;
+    this.#verifyChain = this.#verifyChain
+      .then(() => this.#verifyRungDeferred(jobId))
+      .catch(() => {});
+  }
+
+  /**
+   * The deferred check's actual work. The job is already terminal and its
+   * interim doneCheck already persisted, so the verdict only replaces the
+   * record's doneCheck — there is nothing downstream waiting on it. A gh
+   * failure or timeout lands as a "gh error: ..." note (verifyRungGh catches),
+   * never a throw and never a block.
+   */
+  async #verifyRungDeferred(jobId: string): Promise<void> {
+    const job = this.registry.getJob(jobId);
+    if (!job) return;
+    const target = targetRung(job.workOrder);
+    const ghRunner = this.#options.ghRunner ?? defaultGhRunner();
+    const doneCheck = await verifyRungGh(job.settle, target, ghRunner);
+    this.registry.updateJob(jobId, { doneCheck: { target, ...doneCheck } });
+  }
+
+  /**
+   * A daemon that died between a terminal intake and its deferred gh check —
+   * or a journal replay, which never runs gh — leaves doneCheck at the interim
+   * "unverified: requires gh" (#117). The journal cannot rebuild the verdict
+   * (gh is the outside world), so boot re-schedules the check: one deferred gh
+   * call, after which the doneCheck is definitive and later boots skip it. A
+   * terminal job with no doneCheck at all (crash inside the backstop's
+   * unbatched writes, or a pre-doneCheck record) gets the same treatment.
+   */
+  #maybeReverifyAtBoot(job: JobRecord): void {
+    const notes = job.doneCheck?.notes;
+    const interim = Array.isArray(notes) && notes.includes(REQUIRES_GH_NOTE);
+    if (job.doneCheck !== undefined && !interim) return;
+    this.#scheduleRungVerification(job.id);
   }
 
   /** Open the decision, block the job, start the decision-timeout clock. */
@@ -1322,10 +1407,13 @@ export class FleetDaemon {
     this.registry.wallClockBecameInactive(job.id);
     const updated = this.registry.updateJob(job.id, { state: "cancelled", reason: cause.reason });
 
-    // Verify target rung (will show not-reached for a cancelled job).
+    // Verify target rung (will show not-reached for a cancelled job). Same
+    // split as #applyTerminalState (#117): local verdict now, gh deferred —
+    // the sweep interval shares the event loop with every listener.
     const target = targetRung(updated.workOrder);
-    const doneCheck = verifyRung(updated.settle, target, { ghRunner: defaultGhRunner() });
+    const doneCheck = verifyRung(updated.settle, target);
     this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
+    this.#scheduleRungVerification(job.id);
   }
 
   /**
@@ -1440,7 +1528,7 @@ export class FleetDaemon {
 
   /** Route one job to the recovery its crash-window shape implies (#115). */
   async #recoverJobAtBoot(job: JobRecord): Promise<void> {
-    if (isTerminal(job.state)) return;
+    if (isTerminal(job.state)) return this.#maybeReverifyAtBoot(job);
     if (job.state === "queued" && job.handle === undefined) {
       return this.#resolveLostLaunch(job);
     }
