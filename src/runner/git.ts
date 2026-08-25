@@ -28,9 +28,9 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-
-/** Inject a gh executor in tests; defaults to the real gh CLI. */
-export type GhRunner = (args: string[]) => string;
+// The gh-executor seam (inject in tests; defaults to the real gh CLI) is
+// shared with the daemon's rung verification — one definition (#128).
+import type { GhRunner } from '../shared/git.ts';
 
 export type GitSetupOptions = {
   url: string;

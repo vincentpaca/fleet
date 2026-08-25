@@ -3,6 +3,8 @@
 // are verified by shelling out to `gh` — the caller injects a GhRunner so
 // tests can mock it without spawning a real CLI.
 
+import type { GhRunner } from "../shared/git.ts";
+
 /** The unified evidence ladder, weakest to strongest (work-order.schema.json #/$defs/rung). */
 export const RUNG_LADDER = [
   "inspected",
@@ -43,12 +45,6 @@ export type RungVerification = {
   reached: string | null;
   notes: string[];
 };
-
-/**
- * Executes a gh CLI subcommand, returning stdout. Throw on any failure.
- * Inject in tests; the daemon passes execFileSync('gh', ...).
- */
-export type GhRunner = (args: string[]) => string;
 
 /**
  * Mechanically check whether a settle event supports the target rung.
