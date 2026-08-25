@@ -142,7 +142,7 @@ function stringRecord(value: unknown, what: string): Record<string, string> {
  * verifyRung catches the thrown error and records it as "gh error: ..." in
  * the doneCheck notes — no special treatment needed here.
  */
-function defaultGhRunner(): import("./verify.ts").GhRunner {
+function defaultGhRunner(): import("../shared/git.ts").GhRunner {
   return (args: string[]) =>
     execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }

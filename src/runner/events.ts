@@ -26,7 +26,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export type EventBody = Record<string, unknown>;
 
-export type FleetEvent = {
+/**
+ * The producer's event shape, as posted to `/internal/jobs/:id/events`:
+ * carries `job` and `at`, and its seq is the runner's claim — the daemon
+ * re-stamps the authoritative one. Deliberately NOT named like the consumer
+ * view (`FleetEvent`, src/shared/events.ts): the two are different contracts,
+ * and one name across both is how a reader conflates them (#128).
+ */
+export type RunnerEvent = {
   job: string;
   seq: number;
   at: string;
@@ -47,7 +54,7 @@ type PendingPost = {
   payload: string;
   contentType: string;
   /** Events carried by this post (one, or many for a batch). */
-  events: FleetEvent[];
+  events: RunnerEvent[];
   /** True when every carried event may be shed under pressure. */
   droppable: boolean;
   /** Resolved once the post is delivered or permanently abandoned. */
@@ -99,17 +106,17 @@ export class EventSink {
   }
 
   /** Build a full event, claiming the next seq. */
-  private build(body: EventBody): FleetEvent {
+  private build(body: EventBody): RunnerEvent {
     return {
       job: this.jobId,
       seq: this.seq++,
       at: new Date().toISOString(),
       ...body,
-    } as FleetEvent;
+    } as RunnerEvent;
   }
 
   /** Emit a single event (one JSON body per request). Never rejects. */
-  emit(body: EventBody): Promise<FleetEvent> {
+  emit(body: EventBody): Promise<RunnerEvent> {
     const event = this.build(body);
     const post: PendingPost = {
       payload: JSON.stringify(event),
@@ -123,7 +130,7 @@ export class EventSink {
   }
 
   /** Emit several events as one ndjson batch request. Never rejects. */
-  emitBatch(bodies: EventBody[]): Promise<FleetEvent[]> {
+  emitBatch(bodies: EventBody[]): Promise<RunnerEvent[]> {
     if (bodies.length === 0) return Promise.resolve([]);
     const events = bodies.map((body) => this.build(body));
     const post: PendingPost = {

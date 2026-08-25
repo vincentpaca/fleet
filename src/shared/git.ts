@@ -16,3 +16,13 @@ export function gitValue(args: string[], cwd?: string): string | undefined {
   const out = res.status === 0 ? res.stdout.trim() : '';
   return out === '' ? undefined : out;
 }
+
+/**
+ * Executes a gh CLI subcommand, returning stdout; throws on any failure.
+ * The one seam both sides inject in tests instead of spawning a real gh
+ * (#128 — it used to be defined twice): the runner's PR plumbing
+ * (src/runner/git.ts) and the daemon's rung verification
+ * (src/daemon/verify.ts). Sync on purpose today; #117 may add an async
+ * variant on the daemon side, as a second type, not a redesign of this one.
+ */
+export type GhRunner = (args: string[]) => string;

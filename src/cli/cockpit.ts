@@ -35,7 +35,6 @@ import {
   fetchBoardJobs,
   followJobEvents,
   jobCounts,
-  makeCol,
   parseAnswerLine,
   renderBanner,
   renderContextStrip,
@@ -44,17 +43,15 @@ import {
   renderRosterRows,
   renderTableHeader,
   sortJobs,
-  visualClip,
-  visualLength,
   answerJob,
   cancelJob,
-  type BoardDecision,
-  type BoardEvent,
   type BoardJob,
   type ContextInfo,
   type FrameOpts,
   type RosterRow,
 } from './board.ts';
+import { makeCol, visualClip, visualLength } from './ansi.ts';
+import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { gitValue } from '../shared/git.ts';
 import { daemonHealthy, daemonTarget, describeTarget, fleetConfigFiles } from './client.ts';
 import { logsNoColor } from './format.ts';
@@ -84,7 +81,7 @@ export type CockpitModel = {
   selection: number;
   view: CockpitView;
   /** The selected job's events, oldest first. */
-  tail: BoardEvent[];
+  tail: FleetEvent[];
   /** Lines scrolled back from the end of the tail; 0 follows the tail. */
   tailScroll: number;
   /** What the operator has typed but not submitted. */
@@ -695,7 +692,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
   const context = detectContext(deps.cwd);
   const endpoint = describeTarget(env, { cwd: deps.cwd });
   const history = new InputHistory();
-  const decisions = new Map<string, BoardDecision>();
+  const decisions = new Map<string, PendingDecision>();
   const model: CockpitModel = {
     jobs: [],
     selection: -1, // nothing to select until the first poll lands

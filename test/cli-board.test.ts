@@ -18,13 +18,11 @@ import {
   renderRosterRows,
   renderTableHeader,
   sortJobs,
-  visualClip,
-  visualLength,
-  type BoardDecision,
-  type BoardEvent,
   type BoardJob,
 } from '../src/cli/board.ts';
-import { startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
+import { visualClip, visualLength } from '../src/cli/ansi.ts';
+import type { FleetEvent, PendingDecision } from '../src/shared/events.ts';
+import { startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
 
 /** The roster as text, the way a pane would show it. */
 function roster(jobs: BoardJob[], selection = -1, width = 100, now = 0, pulseOn = false): string {
@@ -238,7 +236,7 @@ test('the selection marker lands on the selected row and nowhere else', () => {
 // ── Event lines ───────────────────────────────────────────────────────────────
 
 test('renderEventLines: a decision becomes a card, and its answer names the question', () => {
-  const events: BoardEvent[] = [
+  const events: FleetEvent[] = [
     { seq: 0, type: 'state', state: 'running' },
     { seq: 1, type: 'think', text: 'reading the schema' },
     {
@@ -258,8 +256,62 @@ test('renderEventLines: a decision becomes a card, and its answer names the ques
   assert.match(renderEventLines([{ seq: 9, type: 'tool_use' }], 100, true).join('\n'), /\[9\] tool_use/);
 });
 
+test('renderEventLines: exact output for every event type, color and noColor (#128 characterization)', () => {
+  // Byte-for-byte pins captured before the rendering paths were unified: the
+  // cockpit pane convention must not drift when the shared rendering core
+  // changes. If a change here is deliberate, update the pin and say why in
+  // the commit. Same battery as the formatEvent pin in cli-ops.test.ts.
+  const expectedColor = [
+    '\x1b[90m[1]\x1b[0m \x1b[90m→\x1b[0m \x1b[32mrunning\x1b[0m',
+    '\x1b[90m[2]\x1b[0m \x1b[90m→\x1b[0m \x1b[33mblocked\x1b[0m',
+    '\x1b[90m[3]\x1b[0m \x1b[90mphase\x1b[0m \x1b[90msetup\x1b[0m',
+    '\x1b[90m[4]\x1b[0m \x1b[90mplanning the change\x1b[0m',
+    '\x1b[90m[5]\x1b[0m \x1b[90mtool_use Read: {"file_path":"/p/a.ts","limit":5}\x1b[0m',
+    '\x1b[90m[6]\x1b[0m \x1b[90mplain line\x1b[0m',
+    '\x1b[90m[7]\x1b[0m \x1b[90mprogress\x1b[0m',
+    '\x1b[90m[8]\x1b[0m \x1b[1;33m?\x1b[0m \x1b[1mWhich way?\x1b[0m',
+    '     \x1b[33m[a]\x1b[0m Left\x1b[33m ★\x1b[0m',
+    '     \x1b[33m[b]\x1b[0m Right',
+    '     \x1b[33m[c]\x1b[0m c',
+    '     \x1b[33manswer: type an option id below — a | b | c\x1b[0m',
+    '\x1b[90m[9]\x1b[0m \x1b[32m✓\x1b[0m \x1b[90m"Which way?"\x1b[0m → \x1b[32m[a]\x1b[0m\x1b[90m by vince\x1b[0m',
+    '\x1b[90m[10]\x1b[0m \x1b[32m✓\x1b[0m answer: \x1b[90m(free text)\x1b[0m',
+    '\x1b[90m[11]\x1b[0m \x1b[32m✓\x1b[0m answer: \x1b[90m(free text)\x1b[0m',
+    '\x1b[90m[12]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36mpr-open\x1b[0m status=\x1b[36mREADY\x1b[0m',
+    '\x1b[90m[13]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36m?\x1b[0m status=\x1b[36mPARTIAL\x1b[0m',
+    '\x1b[90m[14]\x1b[0m \x1b[90mpair\x1b[0m',
+  ];
+  const expectedNoColor = [
+    '[1] → running',
+    '[2] → blocked',
+    '[3] phase setup',
+    '[4] planning the change',
+    '[5] tool_use Read: {"file_path":"/p/a.ts","limit":5}',
+    '[6] plain line',
+    '[7] progress',
+    '[8] ? Which way?',
+    '     [a] Left ★',
+    '     [b] Right',
+    '     [c] c',
+    '     answer: type an option id below — a | b | c',
+    '[9] ✓ "Which way?" → [a] by vince',
+    '[10] ✓ answer: (free text)',
+    '[11] ✓ answer: (free text)',
+    '[12] settle rung=pr-open status=READY',
+    '[13] settle rung=? status=PARTIAL',
+    '[14] pair',
+  ];
+  const battery = EVENT_BATTERY as FleetEvent[];
+  assert.deepEqual(renderEventLines(battery, 100, false), expectedColor);
+  assert.deepEqual(renderEventLines(battery, 100, true), expectedNoColor);
+  // Width applies to every line, including card lines, without reordering.
+  const narrow = renderEventLines(battery, 40, false);
+  assert.equal(narrow[4], '\x1b[90m[5]\x1b[0m \x1b[90mtool_use Read: {"file_path":"/p/a.t…\x1b[0m');
+  assert.equal(narrow[11], '     \x1b[33manswer: type an option id below — …\x1b[0m');
+});
+
 test('renderEventLines: every line is clipped to width', () => {
-  const events: BoardEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
+  const events: FleetEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
   for (const line of renderEventLines(events, 60, true)) assert.ok(line.length <= 60);
 });
 
@@ -382,7 +434,7 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   });
   t.after(daemon.close);
   const env = { FLEET_DAEMON_URL: daemon.url };
-  const cache = new Map<string, BoardDecision>();
+  const cache = new Map<string, PendingDecision>();
 
   const first = await fetchBoardJobs(env, cache);
   const second = await fetchBoardJobs(env, cache);

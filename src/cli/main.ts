@@ -21,9 +21,10 @@ import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
-import { parseAnswerLine, renderBanner, detectColorLevel } from './board.ts';
+import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision } from './board.ts';
 import { runCockpit } from './cockpit.ts';
-import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
+import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
+import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
 import {
   runSetupInfra,
@@ -1358,28 +1359,14 @@ type LedgerEntry = {
   at: string;
 };
 
-type ResumeDecision = {
-  id: string;
-  question: string;
-  options: Array<{ id: string; label?: string; recommended?: boolean }>;
-};
-
 /** Fetch the pending decision for a blocked job, or undefined if none. */
-async function fetchResumeDecision(jobId: string): Promise<ResumeDecision | undefined> {
-  let decision: ResumeDecision | undefined;
-  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events`, undefined, (line) => {
-    try {
-      const ev = JSON.parse(line) as { type: string; id?: string; question?: string; options?: Array<{ id: string; label?: string; recommended?: boolean }> };
-      if (ev.type === 'decision' && ev.id && ev.question && ev.options) {
-        decision = { id: ev.id, question: ev.question, options: ev.options };
-      }
-      if (ev.type === 'answer') decision = undefined; // answered elsewhere
-    } catch {
-      // ignore malformed event lines
-    }
-  });
-  if (res.status !== 200) {
-    console.error(`${jobId}: warning: events fetch returned HTTP ${res.status} — decision may not be shown`);
+async function fetchResumeDecision(jobId: string): Promise<PendingDecision | undefined> {
+  // Same reduction as the board's roster (fetchPendingDecision), on resume's
+  // transport: daemonCall fails fast on network errors — never stale data.
+  const { status, decision } = await fetchPendingDecision(jobId, (reqPath, onLine) =>
+    daemonCall('GET', reqPath, undefined, onLine));
+  if (status !== 200) {
+    console.error(`${jobId}: warning: events fetch returned HTTP ${status} — decision may not be shown`);
     return undefined;
   }
   return decision;
@@ -1427,7 +1414,7 @@ async function cmdResume(args: string[]): Promise<number> {
   type ResumeResult = {
     entry: LedgerEntry;
     job?: Job;
-    decision?: ResumeDecision;
+    decision?: PendingDecision;
     unknown?: boolean;   // true: 404 or non-200 from daemon
     fetchError?: string; // set when unknown=true and the cause was a non-404 error
   };
