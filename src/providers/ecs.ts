@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { CloudCliRunner, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
-import { isMissingResourceError, runnerEnv, materializationEnv } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempFile } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -35,8 +35,8 @@ export type EcsConfig = {
   securityGroups: string[];
   /**
    * ECS capacity provider to use for run-task (preferred over launchType when set).
-   * When set, buildRunTaskArgs emits --capacity-provider-strategy so managed scaling
-   * fires. When absent, falls back to --launch-type launchType (EC2 default).
+   * When set, buildRunTaskInput emits capacityProviderStrategy so managed scaling
+   * fires. When absent, falls back to launchType (EC2 default).
    */
   capacityProvider?: string;
   /** Fallback launch type when capacityProvider is not set. Default "EC2". */
@@ -417,8 +417,16 @@ export class EcsProvider implements Provider {
     this.#aws = options.aws ?? awsCli;
   }
 
-  /** argv after `aws` — pure function, unit-tested without AWS. */
-  buildRunTaskArgs(spec: LaunchSpec): string[] {
+  /**
+   * The `--cli-input-json` payload for run-task — pure function, unit-tested
+   * without AWS. Every parameter, including the overrides block that carries
+   * the manifest env and the runner token, rides in this JSON: on argv the
+   * values would be world-readable in `ps` for the CLI's lifetime and land in
+   * shell/audit logs (#126). Field names follow the RunTask API shape.
+   * `startedBy: fleet:<jobId>` must survive exactly — #147's reconcile sweep
+   * keys on it to tell fleet tasks from everything else on the cluster.
+   */
+  buildRunTaskInput(spec: LaunchSpec): Record<string, unknown> {
     const env: Record<string, string> = {
       ...runnerEnv(spec, CONTAINER_WORKSPACE),
       ...materializationEnv(spec),
@@ -438,41 +446,46 @@ export class EcsProvider implements Provider {
     // ECS task-level override values must be strings.
     if (spec.resources?.cpu != null) overrides.cpu = String(spec.resources.cpu);
     if (spec.resources?.memory != null) overrides.memory = String(spec.resources.memory);
+    const input: Record<string, unknown> = {
+      cluster: this.config.cluster,
+      taskDefinition: this.config.taskDefinition,
+      startedBy: `fleet:${spec.jobId}`,
+      overrides,
+    };
     // Prefer capacity-provider strategy so managed ASG scaling fires (defect #2).
-    // Fall back to --launch-type only when no capacity provider is configured
+    // Fall back to launchType only when no capacity provider is configured
     // (env-var overrides, tests, legacy SSM configs that predate this fix).
-    const launchArgs: string[] = this.config.capacityProvider
-      ? [
-          "--capacity-provider-strategy",
-          `capacityProvider=${this.config.capacityProvider},weight=1,base=0`,
-        ]
-      : ["--launch-type", this.config.launchType];
-    const args = [
-      "ecs",
-      "run-task",
-      "--cluster",
-      this.config.cluster,
-      "--task-definition",
-      this.config.taskDefinition,
-      ...launchArgs,
-      "--started-by",
-      `fleet:${spec.jobId}`,
-      "--overrides",
-      JSON.stringify(overrides),
-      "--output",
-      "json",
-    ];
+    // The API rejects a request carrying both.
+    if (this.config.capacityProvider) {
+      input.capacityProviderStrategy = [
+        { capacityProvider: this.config.capacityProvider, weight: 1, base: 0 },
+      ];
+    } else {
+      input.launchType = this.config.launchType;
+    }
     if (this.config.subnets.length > 0) {
-      const network = {
+      input.networkConfiguration = {
         awsvpcConfiguration: {
           subnets: this.config.subnets,
           securityGroups: this.config.securityGroups,
           assignPublicIp: this.config.assignPublicIp,
         },
       };
-      args.push("--network-configuration", JSON.stringify(network));
     }
-    return withRegion(args, this.config.region);
+    return input;
+  }
+
+  /**
+   * argv after `aws` for run-task: the path to the input file, plus --region
+   * (#138) — a routing flag, not a secret, kept on argv so region handling
+   * stays uniform with every other builder in this file. All parameters — and
+   * every secret — live in the file (#126).
+   */
+  buildRunTaskArgs(inputPath: string): string[] {
+    return withRegion(
+      ["ecs", "run-task", "--cli-input-json", `file://${inputPath}`, "--output", "json"],
+      this.config.region,
+    );
   }
 
   /**
@@ -492,7 +505,7 @@ export class EcsProvider implements Provider {
    * to the deployment's ECR and this provider registers a task-definition
    * revision for it, refuse at dispatch: a silent fallback to the pinned
    * image would run the job in an environment the manifest explicitly
-   * versioned away from. buildRunTaskArgs deliberately never reads spec.image.
+   * versioned away from. buildRunTaskInput deliberately never reads spec.image.
    */
   checkImageOverride(image: string): void {
     throw new Error(
@@ -542,7 +555,15 @@ export class EcsProvider implements Provider {
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {
-    const stdout = await this.#cli(this.buildRunTaskArgs(spec), ECS_RUN_TASK_TIMEOUT_MS);
+    // The run-task parameters ride a 0600 file (#126); the CLI reads it while
+    // the command runs, and the finally deletes it on success and failure alike.
+    const input = writeSecretTempFile("fleet-ecs-run-", JSON.stringify(this.buildRunTaskInput(spec)));
+    let stdout: string;
+    try {
+      stdout = await this.#cli(this.buildRunTaskArgs(input.path), ECS_RUN_TASK_TIMEOUT_MS);
+    } finally {
+      input.cleanup();
+    }
     const result = JSON.parse(stdout) as { tasks?: { taskArn?: string }[]; failures?: unknown[] };
     const taskArn = result.tasks?.[0]?.taskArn;
     if (!taskArn) {

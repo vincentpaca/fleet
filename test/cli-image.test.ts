@@ -454,6 +454,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
   test('docker-provider job runs gate → fake harness → decision → answer → settle', async (t) => {
     const { FleetDaemon } = await import('../src/daemon/server.ts');
     const { DockerProvider } = await import('../src/providers/docker.ts');
+    const { writeSecretTempFile } = await import('../src/providers/provider.ts');
     const { promisify } = await import('node:util');
     const { execFile } = await import('node:child_process');
 
@@ -481,15 +482,21 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
       name: 'docker',
       async launch(spec: Parameters<typeof innerProvider.launch>[0]) {
         const hostSpec = { ...spec, daemonUrl: spec.daemonUrl.replace('127.0.0.1', dockerHostAddr) };
-        const args = innerProvider.buildRunArgs(hostSpec);
-        // Insert host resolution before the image tag.
-        const imageIdx = args.indexOf(tag);
-        if (imageIdx < 0) throw new Error(`image tag ${tag} not found in docker run args`);
-        args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
-        const { stdout } = await runCmd('docker', args);
-        const containerId = stdout.trim();
-        if (!containerId) throw new Error('docker run returned no container id');
-        return { handle: containerId };
+        // Env rides a 0600 temp file, never argv (#126) — same as the real launch().
+        const envFile = writeSecretTempFile('fleet-env-', innerProvider.envFileContents(hostSpec));
+        try {
+          const args = innerProvider.buildRunArgs(hostSpec, envFile.path);
+          // Insert host resolution before the image tag.
+          const imageIdx = args.indexOf(tag);
+          if (imageIdx < 0) throw new Error(`image tag ${tag} not found in docker run args`);
+          args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
+          const { stdout } = await runCmd('docker', args);
+          const containerId = stdout.trim();
+          if (!containerId) throw new Error('docker run returned no container id');
+          return { handle: containerId };
+        } finally {
+          envFile.cleanup();
+        }
       },
       terminate(handle: string) { return innerProvider.terminate(handle); },
     };

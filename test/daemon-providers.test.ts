@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DockerProvider } from "../src/providers/docker.ts";
 import {
   AWS_CLI_TIMEOUT_MS,
@@ -27,6 +27,7 @@ import {
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
+import { writeSecretTempFile } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, op, tempHome, until } from "./daemon-helpers.ts";
@@ -42,28 +43,21 @@ const SPEC: LaunchSpec = {
   workOrder: WORK_ORDER,
 };
 
-test("DockerProvider builds a docker run command with env-injected config", () => {
+test("DockerProvider builds a docker run command with env via --env-file, never argv (#126)", () => {
   const provider = new DockerProvider();
-  const args = provider.buildRunArgs(SPEC);
+  const args = provider.buildRunArgs(SPEC, "/private/fleet-env/payload");
 
   assert.deepEqual(args.slice(0, 2), ["run", "-d"]);
   assert.ok(args.includes("--name") && args.includes("fleet-job-abc123"));
   assert.ok(args.includes(`fleet.job=${SPEC.jobId}`));
 
-  // Env pairs: every FLEET_* injected, workspace fixed inside the container.
-  const envPairs = args.filter((_, i) => args[i - 1] === "-e");
-  assert.ok(envPairs.includes(`FLEET_JOB_ID=${SPEC.jobId}`));
-  assert.ok(envPairs.includes(`FLEET_DAEMON_URL=${SPEC.daemonUrl}`));
-  assert.ok(envPairs.includes(`FLEET_RUNNER_TOKEN=${SPEC.runnerToken}`));
-  assert.ok(envPairs.includes("FLEET_WORKSPACE=/workspace"));
-  assert.ok(envPairs.includes("EXAMPLE_TOKEN=abc"));
-
-  // Manifest and sync travel base64-encoded.
-  const manifestPair = envPairs.find((pair) => pair.startsWith("FLEET_MANIFEST_JSON="));
-  assert.ok(manifestPair);
-  const decoded = JSON.parse(Buffer.from(manifestPair.split("=")[1], "base64").toString());
-  assert.deepEqual(decoded, MANIFEST);
-  assert.ok(envPairs.some((pair) => pair.startsWith("FLEET_SYNC_JSON=")));
+  // The whole env rides the file; no value on argv, where `ps` would show it
+  // to every process on the host for the container-create duration (#126).
+  assert.equal(args[args.indexOf("--env-file") + 1], "/private/fleet-env/payload");
+  assert.ok(!args.includes("-e"));
+  for (const secret of [SPEC.runnerToken, "EXAMPLE_TOKEN=abc", "FLEET_MANIFEST_JSON"]) {
+    assert.ok(args.every((arg) => !arg.includes(secret)), `argv leaks ${secret}`);
+  }
 
   // Image then runner command, at the end.
   const imageIdx = args.indexOf("ghcr.io/acme/fleet-runner:1");
@@ -74,9 +68,38 @@ test("DockerProvider builds a docker run command with env-injected config", () =
   assert.ok(!args.includes("-v") && !args.includes("--mount"));
 });
 
+test("DockerProvider env file carries every FLEET_* var and the operator env", () => {
+  const provider = new DockerProvider();
+  const lines = provider.envFileContents(SPEC).split("\n").filter((line) => line.length > 0);
+
+  assert.ok(lines.includes(`FLEET_JOB_ID=${SPEC.jobId}`));
+  assert.ok(lines.includes(`FLEET_DAEMON_URL=${SPEC.daemonUrl}`));
+  assert.ok(lines.includes(`FLEET_RUNNER_TOKEN=${SPEC.runnerToken}`));
+  assert.ok(lines.includes("FLEET_WORKSPACE=/workspace"));
+  assert.ok(lines.includes("EXAMPLE_TOKEN=abc"));
+
+  // Manifest and sync travel base64-encoded.
+  const manifestLine = lines.find((line) => line.startsWith("FLEET_MANIFEST_JSON="));
+  assert.ok(manifestLine);
+  const decoded = JSON.parse(Buffer.from(manifestLine.split("=")[1], "base64").toString());
+  assert.deepEqual(decoded, MANIFEST);
+  assert.ok(lines.some((line) => line.startsWith("FLEET_SYNC_JSON=")));
+});
+
+test("DockerProvider refuses an env value with a newline — --env-file cannot carry it", () => {
+  // The env-file format is line-delimited with no quoting: a multiline value
+  // would silently truncate into a bogus second entry. Refuse loudly rather
+  // than launch a container with corrupted env.
+  const provider = new DockerProvider();
+  assert.throws(
+    () => provider.envFileContents({ ...SPEC, env: { BAD_VALUE: "line1\nline2" } }),
+    /BAD_VALUE.*newline/,
+  );
+});
+
 test("DockerProvider falls back to the default image when the spec has none", () => {
   const provider = new DockerProvider({ defaultImage: "node:22" });
-  const args = provider.buildRunArgs({ ...SPEC, image: undefined });
+  const args = provider.buildRunArgs({ ...SPEC, image: undefined }, "/tmp/envfile");
   assert.ok(args.includes("node:22"));
 });
 
@@ -110,9 +133,9 @@ test("ecsConfigFromFleetConfig treats missing subnets/security_groups as empty",
   // Bridge-mode tasks omit these; ecsConfigFromFleetConfig must not throw.
   assert.deepEqual(config.subnets, []);
   assert.deepEqual(config.securityGroups, []);
-  // Missing subnets → no --network-configuration added in buildRunTaskArgs.
+  // Missing subnets → no networkConfiguration added in buildRunTaskInput.
   const provider = new EcsProvider(config);
-  assert.ok(!provider.buildRunTaskArgs(SPEC).includes("--network-configuration"));
+  assert.ok(!("networkConfiguration" in provider.buildRunTaskInput(SPEC)));
 });
 
 test("parseFleetConfigSsmResponse extracts the nested Parameter.Value JSON", () => {
@@ -168,7 +191,7 @@ test("ecsConfigFromEnv reads FLEET_ECS_* and names missing required vars", () =>
   assert.equal(config.assignPublicIp, "DISABLED");
 });
 
-test("EcsProvider builds an aws ecs run-task command with env overrides", () => {
+test("EcsProvider builds the run-task input JSON with env overrides; argv carries only the file (#126)", () => {
   const provider = new EcsProvider({
     cluster: "fleet-cluster",
     taskDefinition: "fleet-runner:3",
@@ -178,15 +201,16 @@ test("EcsProvider builds an aws ecs run-task command with env overrides", () => 
     launchType: "EC2",
     assignPublicIp: "DISABLED",
   });
-  const args = provider.buildRunTaskArgs(SPEC);
+  const input = provider.buildRunTaskInput(SPEC);
 
-  assert.deepEqual(args.slice(0, 2), ["ecs", "run-task"]);
-  assert.equal(args[args.indexOf("--cluster") + 1], "fleet-cluster");
-  assert.equal(args[args.indexOf("--task-definition") + 1], "fleet-runner:3");
-  assert.equal(args[args.indexOf("--launch-type") + 1], "EC2");
-  assert.equal(args[args.indexOf("--started-by") + 1], `fleet:${SPEC.jobId}`);
+  assert.equal(input.cluster, "fleet-cluster");
+  assert.equal(input.taskDefinition, "fleet-runner:3");
+  assert.equal(input.launchType, "EC2");
+  // The startedBy stamp must survive the move off argv exactly: #147's future
+  // reconcile sweep keys on `fleet:<jobId>` to find fleet-owned tasks.
+  assert.equal(input.startedBy, `fleet:${SPEC.jobId}`);
 
-  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as {
+  const overrides = input.overrides as {
     containerOverrides: { name: string; environment: { name: string; value: string }[] }[];
   };
   assert.equal(overrides.containerOverrides[0].name, "runner");
@@ -203,11 +227,22 @@ test("EcsProvider builds an aws ecs run-task command with env overrides", () => 
   // target (first real cloud job, #9).
   assert.ok(envByName.FLEET_WORK_ORDER_JSON, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
 
-  const network = JSON.parse(args[args.indexOf("--network-configuration") + 1]) as {
+  const network = input.networkConfiguration as {
     awsvpcConfiguration: { subnets: string[]; securityGroups: string[]; assignPublicIp: string };
   };
   assert.deepEqual(network.awsvpcConfiguration.subnets, ["subnet-aaa", "subnet-bbb"]);
   assert.equal(network.awsvpcConfiguration.assignPublicIp, "DISABLED");
+
+  // argv itself names only the input file — no env value rides it (#126).
+  const args = provider.buildRunTaskArgs("/private/fleet-ecs-run/payload");
+  assert.deepEqual(args, [
+    "ecs",
+    "run-task",
+    "--cli-input-json",
+    "file:///private/fleet-ecs-run/payload",
+    "--output",
+    "json",
+  ]);
 });
 
 test("EcsProvider omits network configuration when no subnets are configured", () => {
@@ -220,16 +255,15 @@ test("EcsProvider omits network configuration when no subnets are configured", (
     launchType: "EC2",
     assignPublicIp: "DISABLED",
   });
-  assert.ok(!provider.buildRunTaskArgs(SPEC).includes("--network-configuration"));
+  assert.ok(!("networkConfiguration" in provider.buildRunTaskInput(SPEC)));
 });
 
-test("DockerProvider includes FLEET_WORK_ORDER_JSON in env", () => {
+test("DockerProvider includes FLEET_WORK_ORDER_JSON in the env file", () => {
   const provider = new DockerProvider();
-  const args = provider.buildRunArgs(SPEC);
-  const envPairs = args.filter((_, i) => args[i - 1] === "-e");
-  const orderPair = envPairs.find((pair) => pair.startsWith("FLEET_WORK_ORDER_JSON="));
-  assert.ok(orderPair, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
-  const decoded = JSON.parse(Buffer.from(orderPair.split("=")[1], "base64").toString());
+  const lines = provider.envFileContents(SPEC).split("\n");
+  const orderLine = lines.find((line) => line.startsWith("FLEET_WORK_ORDER_JSON="));
+  assert.ok(orderLine, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
+  const decoded = JSON.parse(Buffer.from(orderLine.split("=")[1], "base64").toString());
   assert.deepEqual(decoded, WORK_ORDER);
 });
 
@@ -693,7 +727,7 @@ test("terminate treats a dead pid with a recorded start time as already gone", a
 
 test("DockerProvider adds --cpus and --memory when resources are specified", () => {
   const provider = new DockerProvider();
-  const args = provider.buildRunArgs({ ...SPEC, resources: { cpu: 1024, memory: 2048 } });
+  const args = provider.buildRunArgs({ ...SPEC, resources: { cpu: 1024, memory: 2048 } }, "/tmp/envfile");
 
   // --cpus: 1024 ECS units = 1.000 vCPU cores.
   const cpusIdx = args.indexOf("--cpus");
@@ -705,72 +739,67 @@ test("DockerProvider adds --cpus and --memory when resources are specified", () 
   assert.ok(memIdx !== -1, "--memory flag must be present");
   assert.equal(args[memIdx + 1], "2048m");
 
-  // Flags come before the env section (before first -e).
-  const firstEnvIdx = args.indexOf("-e");
-  assert.ok(cpusIdx < firstEnvIdx && memIdx < firstEnvIdx);
+  // Flags come before the env section (before --env-file).
+  const envFileIdx = args.indexOf("--env-file");
+  assert.ok(cpusIdx < envFileIdx && memIdx < envFileIdx);
 });
 
 test("DockerProvider omits resource flags when no resources are specified", () => {
   const provider = new DockerProvider();
-  const args = provider.buildRunArgs({ ...SPEC, resources: undefined });
+  const args = provider.buildRunArgs({ ...SPEC, resources: undefined }, "/tmp/envfile");
   assert.ok(!args.includes("--cpus") && !args.includes("--memory"));
 });
 
 test("DockerProvider omits --cpus when only memory is specified", () => {
   const provider = new DockerProvider();
-  const args = provider.buildRunArgs({ ...SPEC, resources: { memory: 512 } });
+  const args = provider.buildRunArgs({ ...SPEC, resources: { memory: 512 } }, "/tmp/envfile");
   assert.ok(!args.includes("--cpus"));
   assert.ok(args.includes("--memory"));
   assert.equal(args[args.indexOf("--memory") + 1], "512m");
 });
 
-test("EcsProvider.buildRunTaskArgs adds task-level cpu/memory overrides when resources are specified", () => {
+test("EcsProvider.buildRunTaskInput adds task-level cpu/memory overrides when resources are specified", () => {
   const provider = new EcsProvider({
     cluster: "c", taskDefinition: "t", containerName: "runner",
     subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
     capacityTiers: [],
   });
-  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { cpu: 2048, memory: 4096 } });
-  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as {
-    cpu?: string; memory?: string; containerOverrides: unknown[];
-  };
+  const input = provider.buildRunTaskInput({ ...SPEC, resources: { cpu: 2048, memory: 4096 } });
+  const overrides = input.overrides as { cpu?: string; memory?: string; containerOverrides: unknown[] };
   // ECS task-level override values must be strings.
   assert.equal(overrides.cpu, "2048");
   assert.equal(overrides.memory, "4096");
 });
 
-test("EcsProvider.buildRunTaskArgs omits task-level cpu/memory when no resources are specified", () => {
+test("EcsProvider.buildRunTaskInput omits task-level cpu/memory when no resources are specified", () => {
   const provider = new EcsProvider({
     cluster: "c", taskDefinition: "t", containerName: "runner",
     subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
     capacityTiers: [],
   });
-  const args = provider.buildRunTaskArgs({ ...SPEC, resources: undefined });
-  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  const overrides = provider.buildRunTaskInput({ ...SPEC, resources: undefined }).overrides as Record<string, unknown>;
   assert.ok(!("cpu" in overrides));
   assert.ok(!("memory" in overrides));
 });
 
-test("EcsProvider.buildRunTaskArgs sets only cpu override when only cpu is specified", () => {
+test("EcsProvider.buildRunTaskInput sets only cpu override when only cpu is specified", () => {
   const provider = new EcsProvider({
     cluster: "c", taskDefinition: "t", containerName: "runner",
     subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
     capacityTiers: [],
   });
-  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { cpu: 1024 } });
-  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  const overrides = provider.buildRunTaskInput({ ...SPEC, resources: { cpu: 1024 } }).overrides as Record<string, unknown>;
   assert.equal(overrides.cpu, "1024");
   assert.ok(!("memory" in overrides));
 });
 
-test("EcsProvider.buildRunTaskArgs sets only memory override when only memory is specified", () => {
+test("EcsProvider.buildRunTaskInput sets only memory override when only memory is specified", () => {
   const provider = new EcsProvider({
     cluster: "c", taskDefinition: "t", containerName: "runner",
     subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
     capacityTiers: [],
   });
-  const args = provider.buildRunTaskArgs({ ...SPEC, resources: { memory: 2048 } });
-  const overrides = JSON.parse(args[args.indexOf("--overrides") + 1]) as Record<string, unknown>;
+  const overrides = provider.buildRunTaskInput({ ...SPEC, resources: { memory: 2048 } }).overrides as Record<string, unknown>;
   assert.ok(!("cpu" in overrides));
   assert.equal(overrides.memory, "2048");
 });
@@ -846,9 +875,9 @@ test("EcsProvider.checkResources delegates to checkResourceFit with the config t
 
 // --- Defect #34 fixes: capacity-provider strategy + non-loopback daemon URL ---
 
-test("EcsProvider.buildRunTaskArgs uses --capacity-provider-strategy when capacityProvider is set", () => {
+test("EcsProvider.buildRunTaskInput uses capacityProviderStrategy when capacityProvider is set", () => {
   // This is the defect #34 fix: run-task must use capacity-provider strategy so
-  // ECS managed scaling fires; --launch-type EC2 bypasses it entirely.
+  // ECS managed scaling fires; launchType EC2 bypasses it entirely.
   const provider = new EcsProvider({
     cluster: "fleet-cluster",
     taskDefinition: "fleet-runner:3",
@@ -860,33 +889,27 @@ test("EcsProvider.buildRunTaskArgs uses --capacity-provider-strategy when capaci
     capacityTiers: [],
     capacityProvider: "fleet-ec2",
   });
-  const args = provider.buildRunTaskArgs(SPEC);
+  const input = provider.buildRunTaskInput(SPEC);
 
-  // Must use --capacity-provider-strategy, not --launch-type.
-  assert.ok(args.includes("--capacity-provider-strategy"), "must include --capacity-provider-strategy");
-  assert.ok(!args.includes("--launch-type"), "must not include --launch-type when capacityProvider is set");
-
-  // The strategy value must name the provider with weight and base.
-  const strategyIdx = args.indexOf("--capacity-provider-strategy");
-  const strategyVal = args[strategyIdx + 1];
-  assert.ok(strategyVal.includes("fleet-ec2"), `strategy must name the capacity provider; got: ${strategyVal}`);
-  assert.ok(strategyVal.includes("weight=1"), `strategy must include weight; got: ${strategyVal}`);
-  assert.ok(strategyVal.includes("base=0"), `strategy must include base; got: ${strategyVal}`);
+  // Must use capacityProviderStrategy, not launchType — the API rejects both at once.
+  assert.deepEqual(input.capacityProviderStrategy, [
+    { capacityProvider: "fleet-ec2", weight: 1, base: 0 },
+  ]);
+  assert.ok(!("launchType" in input), "must not include launchType when capacityProvider is set");
 });
 
-test("EcsProvider.buildRunTaskArgs uses --launch-type when no capacityProvider is set", () => {
+test("EcsProvider.buildRunTaskInput uses launchType when no capacityProvider is set", () => {
   // Backwards-compat path: env-var configs and legacy SSM configs without
-  // capacity_provider fall back to the original --launch-type flag.
+  // capacity_provider fall back to the original launch type.
   const provider = new EcsProvider({
     cluster: "c", taskDefinition: "t", containerName: "runner",
     subnets: [], securityGroups: [], launchType: "EC2", assignPublicIp: "DISABLED",
     capacityTiers: [],
     // no capacityProvider
   });
-  const args = provider.buildRunTaskArgs(SPEC);
-  assert.ok(!args.includes("--capacity-provider-strategy"), "must not include strategy when capacityProvider absent");
-  assert.ok(args.includes("--launch-type"), "must fall back to --launch-type");
-  assert.equal(args[args.indexOf("--launch-type") + 1], "EC2");
+  const input = provider.buildRunTaskInput(SPEC);
+  assert.ok(!("capacityProviderStrategy" in input), "must not include strategy when capacityProvider absent");
+  assert.equal(input.launchType, "EC2");
 });
 
 test("ecsConfigFromFleetConfig reads capacity_provider field", () => {
@@ -1206,14 +1229,16 @@ test("EcsProvider run-task and stop-task carry the fleet_config region (#138)", 
   assert.equal(config.region, "ap-southeast-1");
   const provider = new EcsProvider(config);
 
-  const runArgs = provider.buildRunTaskArgs(SPEC);
+  // Region rides argv, not the input file (#126 x #138): it is a routing
+  // flag, not a secret, and stays uniform with every other aws builder.
+  const runArgs = provider.buildRunTaskArgs("/private/fleet-ecs-run/payload");
   assert.equal(runArgs[runArgs.indexOf("--region") + 1], "ap-southeast-1");
   const stopArgs = provider.buildStopTaskArgs("arn:aws:ecs:ap-southeast-1:111122223333:task/fleet/t1");
   assert.equal(stopArgs[stopArgs.indexOf("--region") + 1], "ap-southeast-1");
 
   // No region in the config → no --region flag, same argv as before #138.
   const legacy = new EcsProvider(ECS_CONFIG);
-  assert.ok(!legacy.buildRunTaskArgs(SPEC).includes("--region"));
+  assert.ok(!legacy.buildRunTaskArgs("/private/fleet-ecs-run/payload").includes("--region"));
   assert.ok(!legacy.buildStopTaskArgs("handle").includes("--region"));
 });
 
@@ -1411,7 +1436,8 @@ const RETAINED_WORKSPACE_NOTE = "workspace retained at";
 // Stub docker binary: records every invocation's argv (one space-joined line
 // per call) to $FLEET_STUB_DOCKER_LOG, answers `run` with a unique fake
 // container id, and — for the daemon round-trips below — execs the container
-// command with the `-e KEY=VALUE` pairs exported, like a real `docker run`.
+// command with the `--env-file` vars exported, like a real `docker run`.
+// The file is read while the stub runs, before the provider deletes it (#126).
 const STUB_DOCKER = `#!/bin/sh
 printf '%s\\n' "$*" >> "$FLEET_STUB_DOCKER_LOG"
 case "$1" in
@@ -1426,6 +1452,11 @@ case "$1" in
     while [ $# -gt 0 ]; do
       case "$1" in
         -e) export "\${2%%=*}=\${2#*=}"; shift 2 ;;
+        --env-file)
+          while IFS= read -r kv || [ -n "$kv" ]; do
+            [ -n "$kv" ] && export "$kv"
+          done < "$2"
+          shift 2 ;;
         --name|--label|--cpus|--memory) shift 2 ;;
         -d) detached=1; shift ;;
         *) break ;;
@@ -1441,11 +1472,14 @@ case "$1" in
 esac
 `;
 
-/** Put the stub docker first on PATH for this test; returns the argv log path. */
-function stubDockerOnPath(t: { after: (fn: () => void | Promise<void>) => void }): string {
+/** Put a stub docker first on PATH for this test; returns the argv log path. */
+function stubDockerOnPath(
+  t: { after: (fn: () => void | Promise<void>) => void },
+  script: string = STUB_DOCKER,
+): string {
   const dir = mkdtempSync(join(tmpdir(), "fleet-stub-docker-"));
   const log = join(dir, "docker-argv.log");
-  writeFileSync(join(dir, "docker"), STUB_DOCKER, { mode: 0o755 });
+  writeFileSync(join(dir, "docker"), script, { mode: 0o755 });
   const prevPath = process.env.PATH;
   const prevLog = process.env.FLEET_STUB_DOCKER_LOG;
   process.env.PATH = `${dir}:${prevPath}`;
@@ -1465,6 +1499,139 @@ function argvCalls(log: string): string[][] {
     .filter((line) => line.length > 0)
     .map((line) => line.split(" "));
 }
+
+// --- Manifest secrets off argv (#126) ------------------------------------------
+// While `docker run`/`aws ecs run-task` executes, its argv is world-readable in
+// `ps`. Secrets must ride a 0600 temp file the substrate reads during the call
+// and the provider deletes right after — on the failure path too.
+
+test("writeSecretTempFile writes 0600 inside a fresh 0700 dir; cleanup removes both", () => {
+  const { path, cleanup } = writeSecretTempFile("fleet-secret-test-", "SECRET_TOKEN=shh\n");
+  try {
+    assert.equal(readFileSync(path, "utf8"), "SECRET_TOKEN=shh\n");
+    assert.equal(statSync(path).mode & 0o777, 0o600, "the payload must be owner-only");
+    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700, "the directory must be owner-only");
+  } finally {
+    cleanup();
+  }
+  assert.ok(!existsSync(path) && !existsSync(dirname(path)), "cleanup must remove file and dir");
+});
+
+// Stub docker for the #126 launch tests: copies the env file's content and
+// captures its (and its directory's) permission bits at the moment docker
+// runs — the provider deletes the file right after, so assertions must read
+// the copies. `ls -l | cut -c 1-10` is the portable way to read mode bits.
+const SECRETS_STUB_DOCKER = `#!/bin/sh
+printf '%s\\n' "$*" >> "$FLEET_STUB_DOCKER_LOG"
+if [ "$1" = "run" ]; then
+  grab=0
+  for a in "$@"; do
+    if [ "$grab" = 1 ]; then
+      cp "$a" "$FLEET_STUB_DOCKER_LOG.env"
+      ls -l "$a" | cut -c 1-10 > "$FLEET_STUB_DOCKER_LOG.mode"
+      ls -ld "\${a%/*}" | cut -c 1-10 > "$FLEET_STUB_DOCKER_LOG.dirmode"
+      grab=0
+    fi
+    [ "$a" = "--env-file" ] && grab=1
+  done
+  echo deadbeef000000000001
+fi
+exit 0
+`;
+
+// Stub docker whose `rm` succeeds (launch's pre-run cleanup) but whose `run`
+// fails — the shape of a docker daemon rejecting the create.
+const FAILING_RUN_STUB_DOCKER = `#!/bin/sh
+printf '%s\\n' "$*" >> "$FLEET_STUB_DOCKER_LOG"
+[ "$1" = "rm" ] && exit 0
+echo "docker: create failed" >&2
+exit 125
+`;
+
+test("DockerProvider.launch keeps env off argv; docker reads a 0600 file deleted after (#126)", async (t) => {
+  const log = stubDockerOnPath(t, SECRETS_STUB_DOCKER);
+  const { handle } = await new DockerProvider().launch(SPEC);
+  assert.equal(handle, "deadbeef000000000001");
+
+  const runCall = argvCalls(log).find((call) => call[0] === "run");
+  assert.ok(runCall, "docker run was invoked");
+  // The ps window (#126): no env value anywhere on the docker argv.
+  assert.ok(!runCall.includes("-e"));
+  assert.ok(runCall.every((arg) => !arg.includes(SPEC.runnerToken)), "runner token leaked into argv");
+
+  // The env reached docker through the file...
+  const delivered = readFileSync(`${log}.env`, "utf8");
+  assert.ok(delivered.includes(`FLEET_RUNNER_TOKEN=${SPEC.runnerToken}`));
+  assert.ok(delivered.includes("EXAMPLE_TOKEN=abc"));
+  // ...which was 0600 inside a 0700 directory while docker could read it...
+  assert.equal(readFileSync(`${log}.mode`, "utf8").trim(), "-rw-------");
+  assert.equal(readFileSync(`${log}.dirmode`, "utf8").trim(), "drwx------");
+  // ...and is gone once launch resolves.
+  const envPath = runCall[runCall.indexOf("--env-file") + 1];
+  assert.ok(!existsSync(envPath), "env file must not outlive the launch");
+});
+
+test("DockerProvider.launch deletes the env file when docker run fails (#126)", async (t) => {
+  const log = stubDockerOnPath(t, FAILING_RUN_STUB_DOCKER);
+  await assert.rejects(new DockerProvider().launch(SPEC));
+  const runCall = argvCalls(log).find((call) => call[0] === "run");
+  assert.ok(runCall, "docker run was attempted");
+  const envPath = runCall[runCall.indexOf("--env-file") + 1];
+  assert.ok(!existsSync(envPath), "env file must be deleted on the failure path too");
+});
+
+test("EcsProvider.launch feeds run-task from a 0600 input file, keeps secrets off argv, deletes it (#126)", async () => {
+  let argv: string[] = [];
+  let inputPath = "";
+  let fileMode = 0;
+  let dirMode = 0;
+  let input: {
+    startedBy?: string;
+    overrides?: { containerOverrides: { environment: { name: string; value: string }[] }[] };
+  } = {};
+  const provider = ecsWith(async (args) => {
+    argv = args;
+    const fileArg = args[args.indexOf("--cli-input-json") + 1];
+    assert.match(fileArg, /^file:\/\//);
+    inputPath = fileArg.slice("file://".length);
+    fileMode = statSync(inputPath).mode & 0o777;
+    dirMode = statSync(dirname(inputPath)).mode & 0o777;
+    input = JSON.parse(readFileSync(inputPath, "utf8")) as typeof input;
+    return JSON.stringify({ tasks: [{ taskArn: "arn:aws:ecs:us-east-1:1:task/fleet/t1" }] });
+  });
+
+  const { handle } = await provider.launch(SPEC);
+  assert.equal(handle, "arn:aws:ecs:us-east-1:1:task/fleet/t1");
+
+  // The ps window (#126): no env value or overrides JSON anywhere on argv.
+  assert.ok(argv.every((arg) => !arg.includes(SPEC.runnerToken)), "runner token leaked into argv");
+  assert.ok(!argv.includes("--overrides"));
+
+  // The parameters reached the CLI through an owner-only file...
+  assert.equal(fileMode, 0o600);
+  assert.equal(dirMode, 0o700);
+  // ...with the startedBy stamp intact — #147's reconcile sweep keys on it —
+  assert.equal(input.startedBy, `fleet:${SPEC.jobId}`);
+  // ...and the env overrides complete.
+  const env = Object.fromEntries(
+    (input.overrides?.containerOverrides[0].environment ?? []).map((e) => [e.name, e.value]),
+  );
+  assert.equal(env.FLEET_RUNNER_TOKEN, SPEC.runnerToken);
+  assert.equal(env.EXAMPLE_TOKEN, "abc");
+
+  assert.ok(!existsSync(inputPath), "input file must be deleted after a successful launch");
+});
+
+test("EcsProvider.launch deletes the input file when run-task fails (#126)", async () => {
+  let inputPath = "";
+  const provider = ecsWith(async (args) => {
+    inputPath = args[args.indexOf("--cli-input-json") + 1].slice("file://".length);
+    throw new Error("ThrottlingException");
+  });
+  await assert.rejects(provider.launch(SPEC), /ThrottlingException/);
+  assert.ok(inputPath.length > 0, "run-task was attempted");
+  assert.ok(!existsSync(inputPath), "input file must be deleted on the failure path too");
+});
 
 // Narrow a daemon JSON response down to its job record (runtime-checked).
 type JobView = { id: string; state: string; marker?: string };
@@ -1699,7 +1866,7 @@ test("EcsProvider.checkImageOverride refuses the computed job image, naming it a
   );
 });
 
-test("EcsProvider.buildRunTaskArgs never leaks spec.image into run-task — the refusal is the contract", () => {
+test("EcsProvider.buildRunTaskInput never leaks spec.image into run-task — the refusal is the contract", () => {
   const provider = new EcsProvider({
     cluster: "c",
     taskDefinition: "pinned-task-def",
@@ -1710,10 +1877,10 @@ test("EcsProvider.buildRunTaskArgs never leaks spec.image into run-task — the 
     assignPublicIp: "DISABLED",
     capacityTiers: [],
   });
-  // If someone wires spec.image into the argv without the ECR push and a
-  // task-definition revision, ECS would reject or (worse) half-honor it —
+  // If someone wires spec.image into the run-task input without the ECR push
+  // and a task-definition revision, ECS would reject or (worse) half-honor it —
   // dispatch must keep using the pinned task definition only.
-  const args = provider.buildRunTaskArgs({ ...SPEC, image: "fleet-job:abc123def4567890" });
-  assert.equal(args.includes("fleet-job:abc123def4567890"), false);
-  assert.equal(args[args.indexOf("--task-definition") + 1], "pinned-task-def");
+  const input = provider.buildRunTaskInput({ ...SPEC, image: "fleet-job:abc123def4567890" });
+  assert.equal(JSON.stringify(input).includes("fleet-job:abc123def4567890"), false);
+  assert.equal(input.taskDefinition, "pinned-task-def");
 });
