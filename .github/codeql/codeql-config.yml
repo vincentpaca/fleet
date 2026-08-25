@@ -1,0 +1,19 @@
+# CodeQL scope, in git so a reviewer sees it in the diff.
+#
+# paths-ignore is a scope statement, not a silencer. These two trees are the
+# build harness (test/packaging.test.ts owns that boundary): never shipped,
+# never run against untrusted input. A finding in them is a scanner artefact,
+# not a vulnerability. Everything a user can run stays in scope.
+#
+# test/analyzer-scope.test.ts fails if this list grows past those two, so
+# excluding shipped code to make an alert go away costs a visible edit there.
+name: fleet
+
+# Matches the query suite default setup ran (`extended`). Changing it changes
+# the backlog; do that as its own PR, not as a side effect.
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  - test
+  - fixtures

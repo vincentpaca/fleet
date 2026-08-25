@@ -31,12 +31,18 @@ export type Answer = { option?: string; text?: string };
 type PausableMeter = { block(now?: number): void; resume(now?: number): void };
 
 export class DecisionWatcher {
-  /** Number of decisions raised so far (valid ones only). */
+  /**
+   * Number of decisions raised so far (valid ones only). Seeded past the
+   * highest existing decision id on re-entry (issue #110) so that ids stay
+   * unique across park/resume generations — a fresh runner's first decision
+   * must not recycle d1 and pick up the old answer from the daemon's log.
+   */
   count = 0;
   readonly intervalMs: number;
   private readonly sink: EventSink;
   private readonly outDir: string;
   private stopped = false;
+  private abort: AbortController | null = null;
   private readonly decisionPath: string;
   private loop: Promise<void> = Promise.resolve();
   /** Raw content seen failing JSON.parse last tick — tolerates one mid-write read. */
@@ -56,6 +62,8 @@ export class DecisionWatcher {
     wallClock?: WallClockTimer;
     idle?: IdleTimer;
     blockHotMs?: number;
+    /** Seed the decision counter (e.g. past the highest prior id on re-entry). */
+    decisionSeed?: number;
   }) {
     this.sink = opts.sink;
     this.outDir = join(opts.workspace, '.fleet', 'out');
@@ -65,18 +73,34 @@ export class DecisionWatcher {
       (meter): meter is PausableMeter => meter !== undefined,
     );
     this.blockHotMs = opts.blockHotMs;
+    if (opts.decisionSeed !== undefined) this.count = opts.decisionSeed;
     let resolve!: (id: string) => void;
     this.parked = new Promise<string>((r) => { resolve = r; });
     this.parkResolve = resolve;
   }
 
   start(): void {
-    this.loop = this.run();
+    // The loop must never become an orphaned rejection (issue #109): a
+    // crash is recorded to stderr and the watcher winds down instead of
+    // killing the whole runner at rejection time.
+    this.loop = this.run().catch((err) => {
+      this.stopped = true;
+      console.error(
+        `runner: decision watcher crashed: ${String(err instanceof Error ? err.message : err)}`,
+      );
+    });
   }
 
-  /** Stop watching; resolves when the loop has fully wound down. */
+  /** Stop watching; resolves when the loop has fully wound down.
+   *
+   *  Aborts any in-flight long-poll fetch so the loop winds down promptly
+   *  instead of waiting out the daemon's 25s hold (or ~300s on a dead
+   *  connection). Without this, a cancel or settle that calls stop() while
+   *  a decision is pending blocks until the fetch resolves — long past the
+   *  provider's stop grace. */
   async stop(): Promise<void> {
     this.stopped = true;
+    this.abort?.abort();
     await this.loop;
   }
 
@@ -134,7 +158,17 @@ export class DecisionWatcher {
       join(this.outDir, `answer-${id}.json`),
       JSON.stringify(answer, null, 2) + '\n',
     );
-    rmSync(this.decisionPath, { force: true });
+    // Decision-file write contract: the harness MUST write decision.json
+    // atomically (write-to-temp then rename). A slow or non-atomic writer
+    // may replace the file between this read and the delete — so re-validate
+    // the content before removing: if the file changed, a newer decision is
+    // already staged and must not be discarded.
+    try {
+      const current = readFileSync(this.decisionPath, 'utf8');
+      if (current === raw) rmSync(this.decisionPath, { force: true });
+    } catch {
+      // Already gone — nothing to delete.
+    }
   }
 
   private async reject(errors: unknown): Promise<void> {
@@ -166,8 +200,13 @@ export class DecisionWatcher {
       parkTimer = setTimeout(() => {
         this.parkResolve(id);
         this.stopped = true;
+        this.abort?.abort();
       }, this.blockHotMs);
     }
+
+    // AbortController so stop() / block_hot can cancel the in-flight fetch
+    // immediately instead of waiting for the daemon's long-poll to expire.
+    this.abort = new AbortController();
 
     try {
       while (!this.stopped) {
@@ -175,8 +214,10 @@ export class DecisionWatcher {
         try {
           response = await fetch(url, {
             headers: { 'x-fleet-runner-token': this.sink.token },
+            signal: this.abort.signal,
           });
         } catch {
+          if (this.stopped) return null;
           await delay(this.intervalMs);
           continue;
         }
@@ -188,7 +229,8 @@ export class DecisionWatcher {
       }
       return null;
     } finally {
-      if (parkTimer !== null) clearTimeout(parkTimer);
+      clearTimeout(parkTimer);
+      this.abort = null;
       // Resume the meters whether an answer was received, the watcher was
       // stopped, or the block_hot timer fired.
       for (const meter of this.meters) meter.resume();

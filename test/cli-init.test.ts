@@ -20,6 +20,14 @@ test('init scaffolds .fleet/ and the manifest passes lint', async () => {
   const { ok, errors } = validateManifest(manifest);
   assert.equal(ok, true, JSON.stringify(errors));
 
+  // #134: the scaffold writes the documented limits explicitly — the happy-path
+  // manifest must never again be the one that keeps blocked containers hot.
+  assert.deepEqual(
+    manifest.limits,
+    { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
+    'init writes the documented limit defaults',
+  );
+
   const setupMode = fs.statSync(setupPath).mode & 0o111;
   assert.notEqual(setupMode, 0, 'setup.sh is executable');
   assert.ok(fs.readFileSync(setupPath, 'utf8').startsWith('#!'), 'setup.sh has a shebang');

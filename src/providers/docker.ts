@@ -4,7 +4,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { LaunchSpec, Provider } from "./provider.ts";
-import { runnerEnv, materializationEnv } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempFile } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -15,9 +15,16 @@ export type DockerProviderOptions = {
   runnerCmd?: string[];
 };
 
-const DEFAULT_IMAGE = "node:22";
+const DEFAULT_IMAGE = "node:24";
 const DEFAULT_RUNNER_CMD = ["node", "/opt/fleet/src/runner/main.ts"];
 const CONTAINER_WORKSPACE = "/workspace";
+
+/**
+ * SIGTERM-to-SIGKILL grace given to a container being terminated. Must exceed
+ * the runner's cancel deadline (FLEET_CANCEL_DEADLINE_MS, 20s) so the teardown
+ * finishes its WIP push and settle rather than being cut off mid-push.
+ */
+const STOP_GRACE_SECONDS = 25;
 
 export class DockerProvider implements Provider {
   readonly name = "docker";
@@ -29,33 +36,99 @@ export class DockerProvider implements Provider {
     this.#runnerCmd = options.runnerCmd ?? DEFAULT_RUNNER_CMD;
   }
 
-  /** argv after `docker` — pure function, unit-tested without a docker daemon. */
-  buildRunArgs(spec: LaunchSpec): string[] {
-    const env: Record<string, string> = {
-      ...runnerEnv(spec, CONTAINER_WORKSPACE),
-      ...materializationEnv(spec),
-    };
+  /**
+   * argv after `docker` — pure function, unit-tested without a docker daemon.
+   * Env travels via `--env-file <envFile>` (see envFileContents), never as
+   * `-e KEY=VALUE` argv: values on argv are world-readable in `ps` for the
+   * container-create duration (#126).
+   */
+  buildRunArgs(spec: LaunchSpec, envFile: string): string[] {
     const args = ["run", "-d", "--name", `fleet-${spec.jobId}`, "--label", `fleet.job=${spec.jobId}`];
     // Resource constraints from manifest limits.resources.
     // cpu is in ECS units (1024 = 1 vCPU); --cpus takes fractional cores.
     if (spec.resources?.cpu != null) args.push("--cpus", (spec.resources.cpu / 1024).toFixed(3));
     // memory is in MiB; Docker --memory accepts a number + unit suffix.
     if (spec.resources?.memory != null) args.push("--memory", `${spec.resources.memory}m`);
-    for (const [key, value] of Object.entries(env).sort(([a], [b]) => a.localeCompare(b))) {
-      args.push("-e", `${key}=${value}`);
-    }
+    args.push("--env-file", envFile);
     args.push(spec.image ?? this.#defaultImage, ...this.#runnerCmd);
     return args;
   }
 
+  /**
+   * The `--env-file` payload: one KEY=VALUE line per var, sorted. Docker's
+   * env-file format is line-delimited with no quoting, so a value containing a
+   * newline cannot travel through it — refuse loudly rather than silently
+   * truncate into a bogus second entry. Fleet's own payloads are base64 or
+   * URLs (never multiline); only operator-supplied env could trip this.
+   */
+  envFileContents(spec: LaunchSpec): string {
+    const env: Record<string, string> = {
+      ...runnerEnv(spec, CONTAINER_WORKSPACE),
+      ...materializationEnv(spec),
+    };
+    const lines = Object.entries(env)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => {
+        if (value.includes("\n") || value.includes("\r")) {
+          throw new Error(`env ${key} contains a newline — docker --env-file is line-delimited and cannot carry it`);
+        }
+        return `${key}=${value}`;
+      });
+    return lines.join("\n") + "\n";
+  }
+
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {
-    const { stdout } = await run("docker", this.buildRunArgs(spec));
-    const containerId = stdout.trim();
-    if (containerId.length === 0) throw new Error("docker run returned no container id");
-    return { handle: containerId };
+    // Remove any stale container from a prior run (parked-then-resumed, crashed
+    // re-entry) before launching: `docker run --name fleet-<jobId>` fails with
+    // "already in use" when the old container still owns the name. `rm -f`
+    // succeeds even when no container exists, so there is no race to guard.
+    await run("docker", ["rm", "-f", `fleet-${spec.jobId}`]);
+    // Env rides a 0600 file (#126); docker reads it while the command runs,
+    // and the finally deletes it on success and failure alike. The residual
+    // exposure is honest and smaller: a running container's env is still
+    // visible to root/docker-group via `docker inspect` — the fix removes the
+    // world-readable `ps` window, not the host root's view.
+    const envFile = writeSecretTempFile("fleet-env-", this.envFileContents(spec));
+    try {
+      const { stdout } = await run("docker", this.buildRunArgs(spec, envFile.path));
+      const containerId = stdout.trim();
+      if (containerId.length === 0) throw new Error("docker run returned no container id");
+      return { handle: containerId };
+    } finally {
+      envFile.cleanup();
+    }
+  }
+
+  /**
+   * Containers are launched under a deterministic name (see buildRunArgs), so
+   * a handle lost to a daemon crash is derivable (#115): `docker stop`/`rm`
+   * accept the name as readily as the id.
+   */
+  deriveHandle(jobId: string): string {
+    return `fleet-${jobId}`;
   }
 
   async terminate(handle: string): Promise<void> {
-    await run("docker", ["rm", "-f", handle]);
+    // Stop before remove (#111). `docker rm -f` is SIGKILL with no grace: the
+    // runner's cancel teardown — kill the harness tree, push the WIP, settle —
+    // never gets a signal, so on the default local provider a cancel silently
+    // threw away everything uncommitted. `stop -t` sends SIGTERM and waits,
+    // which is the grace the teardown is written against.
+    //
+    // Failure is ignored, never rethrown: this call is also the post-settle
+    // reaper (#120), where the container has already exited and `stop` has
+    // nothing to do. Only the removal below decides whether terminate failed.
+    try {
+      await run("docker", ["stop", "-t", String(STOP_GRACE_SECONDS), handle]);
+    } catch {
+      // Already gone, already stopped, or refusing to stop — `rm -f` settles it.
+    }
+    try {
+      await run("docker", ["rm", "-f", handle]);
+    } catch (error) {
+      // Idempotent termination (#122): `rm -f` exits non-zero when the
+      // container is already gone; cancel must still succeed.
+      if (!isMissingResourceError(error)) throw error;
+    }
   }
 }

@@ -29,6 +29,20 @@ const stubbornHarness = fileURLToPath(new URL('../fixtures/stubborn-harness.mjs'
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 
+/**
+ * Poll until `done()` holds. Every wait in this file is on a real child process
+ * reaching a state, and a fixed sleep is a bet on how fast that machine boots
+ * node — the bet these tests used to lose under load. Bounded, so a genuine
+ * hang still fails, and with the state named so the failure says which.
+ */
+async function waitFor(done: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done()) {
+    assert.ok(Date.now() < deadline, `timed out after ${timeoutMs}ms waiting for ${what}`);
+    await sleep(25);
+  }
+}
+
 /** A bare remote seeded with main — the job branch and the partial push land here. */
 function makeRemote(): string {
   const dir = mkdtempSync(join(tmpdir(), 'fleet-stall-git-'));
@@ -164,7 +178,12 @@ test('stall: silent harness is killed at limits.idle, partial work pushed, idle 
 test('stall: a harness that ignores SIGTERM and leaks a stdout holder is still settled', async () => {
   const token = 'stall-token-kill';
   const daemon = await startMockDaemon({ token });
-  const workspace = writeWorkspace({ idle: '2s' });
+  // 5s, not the 2s the other cases use. This fixture has to get two cold node
+  // processes up and beating before the kill lands, and at 2s + 500ms grace the
+  // child's boot was racing that deadline — the test failed as "the child never
+  // beat", which says nothing about the kill path it exists to check. The
+  // threshold value is irrelevant to that path; the headroom is not.
+  const workspace = writeWorkspace({ idle: '5s' });
   const { child, exitCode } = spawnRunner({
     FLEET_JOB_ID: 'job-stall-kill',
     FLEET_DAEMON_URL: daemon.url,
@@ -174,12 +193,20 @@ test('stall: a harness that ignores SIGTERM and leaks a stdout holder is still s
     FLEET_WALL_CLOCK_GRACE_MS: '500',
   });
   try {
+    // Prove the tree is up and beating BEFORE the kill, not after it. Asserting
+    // this from the post-mortem heartbeat files made a slow fixture boot look
+    // identical to a runner that killed nothing.
+    await waitFor(
+      () => heartbeat(workspace, 'harness') !== '' && heartbeat(workspace, 'child') !== '',
+      'the harness and its stdout-holding child to beat at least once',
+    );
+
     // A runner that signals only the shell's pid, or that skips the SIGKILL
     // escalation, waits on this harness forever — so the failure mode under
     // test is "never settles", and the assertion has to be a bounded race.
     const outcome = await Promise.race([
       exitCode.then((code) => `exit ${code}`),
-      sleep(20_000).then(() => 'still running'),
+      sleep(30_000).then(() => 'still running'),
     ]);
     assert.equal(outcome, 'exit 1', 'the stall path must terminate the harness tree and settle');
 
@@ -216,8 +243,10 @@ test('stall: a harness that ignores SIGTERM and leaks a stdout holder is still s
 test('stall: a chatty harness runs past the idle threshold and completes', async () => {
   const token = 'stall-token-2';
   const daemon = await startMockDaemon({ token });
-  // 1s threshold, ~2.4s of runtime: only a window that resets on output survives.
-  const workspace = writeWorkspace({ idle: '1s' });
+  // 2s threshold, ~2.4s of runtime with output every 300ms: only a window that
+  // resets on output survives, and a spurious failure now needs a 2s scheduler
+  // stall in line delivery rather than a 1s one.
+  const workspace = writeWorkspace({ idle: '2s' });
   try {
     const scriptPath = resolve(workspace, 'chatty.js');
     writeFileSync(
@@ -257,8 +286,8 @@ test('stall: a chatty harness runs past the idle threshold and completes', async
 test('stall: time spent blocked on a decision is excluded from the idle window', async () => {
   const token = 'stall-token-3';
   const daemon = await startMockDaemon({ token });
-  // 2s threshold; the answer arrives at 3s, so total elapsed exceeds it while
-  // silent-and-unblocked time never does.
+  // 2s threshold; the answer arrives 3s after the block, so total elapsed
+  // exceeds it while silent-and-unblocked time never does.
   const workspace = writeWorkspace({ idle: '2s' });
   try {
     const decision = JSON.stringify({
@@ -275,6 +304,11 @@ test('stall: time spent blocked on a decision is excluded from the idle window',
         `const fs = require('node:fs');`,
         `const path = require('node:path');`,
         `const out = path.join(process.cwd(), '.fleet', 'out');`,
+        // One line before the ask, so the idle window is reset at a point this
+        // test controls. Without it the window covers runner boot, and a slow
+        // boot alone could cross the threshold before the job ever blocked —
+        // cancelling as stalled and failing on the exemption it never reached.
+        `process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'About to ask.' }] } }) + '\\n');`,
         `fs.writeFileSync(path.join(out, 'decision.json'), ${JSON.stringify(decision)});`,
         `const ap = path.join(out, 'answer-d1.json');`,
         `function poll() {`,
@@ -294,6 +328,13 @@ test('stall: time spent blocked on a decision is excluded from the idle window',
       FLEET_WALL_CLOCK_GRACE_MS: '300',
     });
 
+    // The exemption is about time spent BLOCKED, so the 3s has to be measured
+    // from the block — not from dispatch. Sleeping 3s from here made the test a
+    // race against runner boot, which is what it kept losing.
+    await waitFor(
+      () => daemon.events.some((e) => e.type === 'decision'),
+      'the runner to report the decision',
+    );
     await sleep(3000);
     daemon.answer('d1', { option: 'yes' });
 

@@ -19,9 +19,35 @@ export type HarnessPlan = {
 // (#35's first run analyzed the wrong protocol from stale training data).
 const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite', 'WebSearch', 'WebFetch'];
 
+/**
+ * The output contract (issue #81), injected into every job's prompt by the
+ * runner so it holds on every repo — including one with no fleet playbook at
+ * all. Repo playbooks (like this repo's agents/dev.md) may add detail, but the
+ * load-bearing instruction is this one. Pinned verbatim by
+ * test/runner-harness.test.ts: rewording it is a deliberate contract change.
+ */
+export const OUTPUT_CONTRACT =
+  'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.';
+
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
 export function parseVersion(output: string): string | undefined {
   return output.match(/\d+\.\d+\.\d+/)?.[0];
+}
+
+/** Numeric components of a dotted version string. */
+function versionNums(v: string): number[] {
+  return v.split('.').map((n) => Number(n));
+}
+
+/** Compare two numeric version arrays. Returns <0, 0, or >0. */
+function compareVersion(a: number[], b: number[]): number {
+  for (let i = 0; i < 3; i++) {
+    const ai = a[i] !== undefined ? a[i] : 0;
+    const bi = b[i] !== undefined ? b[i] : 0;
+    if (ai > bi) return 1;
+    if (ai < bi) return -1;
+  }
+  return 0;
 }
 
 /**
@@ -31,16 +57,10 @@ export function parseVersion(output: string): string | undefined {
  */
 export function versionSatisfies(actual: string, requirement: string): boolean | undefined {
   const want = requirement.trim();
-  const nums = (v: string) => v.split('.').map((n) => Number(n));
   if (want.startsWith('>=')) {
     const min = parseVersion(want);
     if (!min) return undefined;
-    const [a, b] = [nums(actual), nums(min)];
-    for (let i = 0; i < 3; i++) {
-      if ((a[i] ?? 0) > (b[i] ?? 0)) return true;
-      if ((a[i] ?? 0) < (b[i] ?? 0)) return false;
-    }
-    return true;
+    return compareVersion(versionNums(actual), versionNums(min)) >= 0;
   }
   if (/^\d+(\.\d+)*$/.test(want)) return actual === want || actual.startsWith(`${want}.`);
   return undefined;
@@ -53,10 +73,34 @@ export type HarnessInputs = {
   override?: string;
   /** Actual CLI version when measurable (runner probes `claude --version`). */
   actualVersion?: string;
+  /**
+   * Followthrough continuation (issue #80): the adopted PR and branch from the
+   * work order. The prompt tells the agent to address that PR's feedback with
+   * gh itself — no runner-side feedback plumbing exists on purpose.
+   */
+  continues?: { pr: number; branch: string };
 };
 
+/** Append version-drift notes when an actual version is measurable and required. */
+function checkVersionNotes(actualVersion: string | undefined, required: string | undefined, notes: string[]): void {
+  if (!required || !actualVersion) return;
+  const satisfied = versionSatisfies(actualVersion, required);
+  if (satisfied === false) notes.push(`harness cli ${actualVersion} violates manifest cli_version ${required}`);
+  if (satisfied === undefined) notes.push(`cannot evaluate cli_version requirement "${required}" against ${actualVersion}`);
+}
+
+/** Build the followthrough continuation clause, or empty string. */
+function continuationClause(continues: { pr: number; branch: string } | undefined): string {
+  if (!continues) return '';
+  return (
+    ` -- followthrough on PR #${continues.pr} (branch ${continues.branch}):` +
+    ` read that PR's review comments and failing checks with gh (gh pr view ${continues.pr} --comments; gh pr checks ${continues.pr})` +
+    ` and address them. Push fixes to the same branch so the PR updates in place; never open a new PR.`
+  );
+}
+
 /** Build the launch line, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, target, override, actualVersion }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, target, override, actualVersion, continues }: HarnessInputs): HarnessPlan | undefined {
   if (override) return { cmd: override, notes: [] };
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
@@ -64,11 +108,7 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion 
   const notes: string[] = [];
 
   const required = typeof harness.cli_version === 'string' ? harness.cli_version : undefined;
-  if (required && actualVersion) {
-    const satisfied = versionSatisfies(actualVersion, required);
-    if (satisfied === false) notes.push(`harness cli ${actualVersion} violates manifest cli_version ${required}`);
-    if (satisfied === undefined) notes.push(`cannot evaluate cli_version requirement "${required}" against ${actualVersion}`);
-  }
+  checkVersionNotes(actualVersion, required, notes);
 
   if (cli !== 'claude-code') return undefined; // adapters for other CLIs arrive with demand
 
@@ -80,7 +120,10 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion 
   const name = first.path.split('/').pop()?.replace(/\.md$/, '');
   if (!name) return undefined;
 
-  const prompt = JSON.stringify(`/${name} ${target}`);
+  // The output contract (#81) rides on every prompt, continuation included: a
+  // followthrough that produces a report instead of commits still owes its
+  // deliverables to the artifact lane.
+  const prompt = JSON.stringify(`/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`);
   const tools = CLAUDE_ALLOWED_TOOLS.map((tool) => JSON.stringify(tool)).join(' ');
   return {
     cmd: `claude -p ${prompt} --output-format stream-json --verbose --allowedTools ${tools}`,

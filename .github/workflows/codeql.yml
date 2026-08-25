@@ -1,0 +1,50 @@
+# CodeQL as an in-repo workflow rather than default setup, because default
+# setup cannot exclude paths and this repo needs to: three of its alerts were
+# in test/, which ships to nobody. Scope lives in .github/codeql/.
+#
+# Job names stay `Analyze (<language>)` — the same names default setup used —
+# so nothing that watches check names has to change. The context main's branch
+# protection requires is `CodeQL`, which code scanning posts when the SARIF
+# upload lands; that is unchanged by the move, but verify it on the PR before
+# merging.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, the cadence default setup ran on.
+    - cron: '31 7 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Uploading results; reading run metadata for the `actions` analysis.
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # `javascript-typescript` covers both; default setup listed them apart.
+        language: [actions, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+      - uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        with:
+          category: /language:${{ matrix.language }}

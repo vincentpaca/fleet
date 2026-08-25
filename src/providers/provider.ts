@@ -1,4 +1,7 @@
 // Provider contract: how the daemon launches and terminates job sandboxes.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** Resource requirements from manifest limits.resources. */
 export type ResourceRequest = {
@@ -30,19 +33,83 @@ export type LaunchSpec = {
    * wiping the out/ channel so the status-driven harness finds it immediately.
    */
   reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
+  /**
+   * Re-entry decision seed (issue #110): the highest decision ordinal already
+   * used in the job's event log, passed so the fresh runner numbers from there
+   * and decision ids stay unique across park/resume generations.
+   */
+  reentryDecisionSeed?: number;
 };
 
 export interface Provider {
   readonly name: string;
   launch(spec: LaunchSpec): Promise<{ handle: string }>;
+  /**
+   * Stop the sandbox named by `handle`.
+   *
+   * Termination is idempotent (#122): a sandbox that is already gone resolves
+   * successfully instead of throwing. Cancel and the crash backstops are
+   * Fleet's structural spend control — their correctness must not depend on
+   * the substrate — so "not found" from docker or ECS counts as success
+   * (`isMissingResourceError`). Transient substrate failures may be retried
+   * once, bounded, before surfacing.
+   */
   terminate(handle: string): Promise<void>;
+  /**
+   * Optional: rebuild the terminate-able handle for a job from its id alone
+   * (#115). A daemon crash between `launch` resolving and the handle being
+   * persisted leaves a live sandbox the record cannot name — and Provider has
+   * no list op, so without this the container is unkillable. Providers that
+   * name sandboxes deterministically (docker: fleet-<jobId>) implement it;
+   * providers whose handles are substrate-assigned (ECS task ARNs) omit it.
+   * Purely a name derivation: it must not claim the sandbox exists.
+   */
+  deriveHandle?(jobId: string): string;
   /**
    * Optional: validate that the requested resources fit within the offered capacity.
    * Throws with the exact requested vs available numbers when the request cannot be served.
    * Called at dispatch time before launch() so failures surface immediately.
    */
   checkResources?(resources: ResourceRequest): void;
+  /**
+   * Optional: validate that launch() can honor a per-job image override
+   * (LaunchSpec.image carrying the CLI-built two-layer job image, #49).
+   * Throws with what to do instead when it cannot — a substrate that pins its
+   * image (the ECS runner task definition) must refuse at dispatch, before a
+   * job record exists, rather than silently run the job on the wrong image.
+   * Absent means the override is honored (docker uses it directly; process
+   * runs on the host, where no image applies by construction).
+   */
+  checkImageOverride?(image: string): void;
+  /**
+   * Optional: settle whatever a previous daemon's death left behind (#123).
+   * Called once by the daemon entrypoint after it starts serving. The process
+   * provider re-runs workspace disposition for runners whose exit handler
+   * died with the old daemon; container providers have no equivalent — the
+   * substrate outlives the daemon and owns the sandbox lifecycle.
+   */
+  recover?(): void | Promise<void>;
+  /**
+   * Optional: list every live sandbox on the substrate attributable to a fleet
+   * job, keyed by the job id the launch stamped on it (#147). This is the
+   * reconcile sweep's evidence: a launch that succeeded substrate-side while
+   * the CLI wedged past its budget leaves a running, billing sandbox with no
+   * stored handle, and only the substrate can say it exists. Implementations
+   * must return the complete set (pagination handled inside) — an orphan past
+   * page one is exactly the one nobody is watching. ECS implements it via the
+   * run-task `startedBy: fleet:<jobId>` stamp; providers whose substrate has
+   * no such listing omit it and the daemon's reconcile is a no-op.
+   */
+  listJobSandboxes?(): Promise<JobSandbox[]>;
 }
+
+/**
+ * One live sandbox attributable to a fleet job (#147): the job id its launch
+ * stamped on it, and the handle terminate() accepts. A named type — an inline
+ * object in a return annotation reads as a function body to Lizard and hides
+ * the function from the complexity gate (see registry.ts on LaunchHalf).
+ */
+export type JobSandbox = { jobId: string; handle: string };
 
 /**
  * Operator access to the daemon without public ingress (`docs/decisions.md#d12`).
@@ -71,9 +138,41 @@ export type TunnelOpener = (localPort: number) => Promise<TunnelEndpoint>;
 /**
  * Shells out to a cloud's own CLI and returns stdout. Every provider that talks
  * to its cloud by shelling out takes one of these, so tests can drive the real
- * command construction without the cloud.
+ * command construction without the cloud. Callers doing real work pass the
+ * call's kill budget as `timeoutMs`; the default runner kills the child process
+ * at it, so a wedged CLI can neither hang the caller nor keep the event loop
+ * alive long after the caller has given up.
  */
-export type CloudCliRunner = (args: string[]) => Promise<string>;
+export type CloudCliRunner = (args: string[], timeoutMs?: number) => Promise<string>;
+
+/**
+ * Whether a terminate() failure means the sandbox was already gone (#122).
+ * Termination is idempotent by contract, so providers treat these as success:
+ * `docker rm -f` names the container on stderr; the ECS API raises
+ * TaskNotFoundException or reports the task already stopped. Matches both the
+ * error message and any captured stderr, because execFile reports the child's
+ * output separately from its message.
+ */
+export function isMissingResourceError(error: unknown): boolean {
+  const err = error as { message?: unknown; stderr?: unknown };
+  const text = `${String(err?.message ?? "")} ${typeof err?.stderr === "string" ? err.stderr : ""}`;
+  return /No such container|TaskNotFoundException|already stopped/i.test(text);
+}
+
+/**
+ * Materialise secret payload for a CLI shell-out as a file instead of argv
+ * (#126): anything on argv is world-readable in `ps` for the child's lifetime,
+ * and lands in any shell/audit logging that captures command lines. The file
+ * lives alone in a fresh mkdtemp directory (0700) with mode 0600. Callers must
+ * run `cleanup()` in a finally — the secret must not outlive the command on
+ * either the success or the failure path.
+ */
+export function writeSecretTempFile(prefix: string, content: string): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const path = join(dir, "payload");
+  writeFileSync(path, content, { mode: 0o600 });
+  return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
 /** FLEET_* env every provider injects into the sandbox. */
 export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, string> {
@@ -86,6 +185,10 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     // Re-entry answer: runner writes this to out/answer-<id>.json after wiping out/.
     ...(spec.reentryAnswer !== undefined
       ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
+      : {}),
+    // Re-entry decision seed: keep ids unique across generations (issue #110).
+    ...(spec.reentryDecisionSeed !== undefined
+      ? { FLEET_REENTRY_DECISION_SEED: String(spec.reentryDecisionSeed) }
       : {}),
   };
 }

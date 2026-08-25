@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createIfAbsent } from '../shared/fs.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
@@ -238,10 +239,7 @@ export const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in re
 export function ensureFleetGitignore(fleetDir: string, required: string[]): void {
   fs.mkdirSync(fleetDir, { recursive: true });
   const gitignorePath = path.join(fleetDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    fs.writeFileSync(gitignorePath, FLEET_GITIGNORE);
-    return;
-  }
+  if (createIfAbsent(gitignorePath, FLEET_GITIGNORE)) return;
   let current = fs.readFileSync(gitignorePath, 'utf8');
   for (const entry of required) {
     const lines = current.split('\n').map((l) => l.trim());
@@ -273,15 +271,11 @@ export function writeScaffold(
   written.push(`wrote ${manifestPath}`);
 
   const setupPath = path.join(fleetDir, 'setup.sh');
-  if (fs.existsSync(setupPath)) {
-    written.push(`kept existing ${setupPath}`);
-  } else {
-    fs.writeFileSync(setupPath, setupScript ?? SETUP_STUB, { mode: 0o755 });
-    written.push(`wrote ${setupPath}`);
-  }
+  const wroteSetup = createIfAbsent(setupPath, setupScript ?? SETUP_STUB, { mode: 0o755 });
+  written.push(`${wroteSetup ? 'wrote' : 'kept existing'} ${setupPath}`);
 
   const gitkeepPath = path.join(fleetDir, 'out', '.gitkeep');
-  if (!fs.existsSync(gitkeepPath)) fs.writeFileSync(gitkeepPath, '');
+  createIfAbsent(gitkeepPath, '');
   written.push(`wrote ${gitkeepPath}`);
 
   // The whole default set, not just `.env`: a hand-written .fleet/.gitignore
@@ -290,7 +284,7 @@ export function writeScaffold(
   // operator happened to run first.
   ensureFleetGitignore(fleetDir, FLEET_GITIGNORE.split('\n').filter(Boolean));
   const dotEnvExamplePath = path.join(fleetDir, '.env.example');
-  if (!fs.existsSync(dotEnvExamplePath)) fs.writeFileSync(dotEnvExamplePath, DOT_ENV_EXAMPLE);
+  createIfAbsent(dotEnvExamplePath, DOT_ENV_EXAMPLE);
   return written;
 }
 
@@ -688,9 +682,13 @@ function indented(stderr: string): string {
   return text === '' ? '' : `${text.split('\n').map((line) => `  ${line}`).join('\n')}\n`;
 }
 
+/** Pattern to read the `name = "..."` from a Terraform root module — hoisted so Lizard
+ *  does not misparse the regex as a division operator and corrupt the function boundary. */
+const TF_NAME_PATTERN = /^\s*name\s*=\s*"([^"]+)"/m;
+
 /** The deployment name the generated root module was written with, for messages. */
 export function generatedName(mainTf: string): string | undefined {
-  const match = mainTf.match(/^\s*name\s*=\s*"([^"]+)"/m);
+  const match = mainTf.match(TF_NAME_PATTERN);
   return match?.[1];
 }
 
@@ -802,6 +800,7 @@ type RepoManifest = {
   env?: { vars: string[] };
   harness: { cli: string; commands: Array<{ path: string; critic: string }> };
   gates: { pickup: string; default_finish: string };
+  limits: { idle: string; block_hot: string; decision_timeout: string };
 };
 
 /**
@@ -896,6 +895,9 @@ export function repoManifest(answers: Answers): RepoManifest {
     // Phase 1 ships one runner adapter, so the CLI is shown rather than asked.
     harness: { cli: 'claude-code', commands: [{ path: answers.command_path, critic: answers.critic }] },
     gates: { pickup: answers.pickup, default_finish: 'merge-ready' },
+    // Not interviewed: these are the documented defaults (src/shared/time.ts),
+    // written out so the manifest shows the cost model instead of hiding it.
+    limits: { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
   };
   if (sync.length > 0) manifest.workspace.sync = sync;
   if (vars.length > 0) manifest.env = { vars };

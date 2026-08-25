@@ -25,11 +25,12 @@ Two consequences worth knowing before you debug anything: the resolution reads t
 
 ## Dispatch
 
-```
+```sh
 fleet delegate <target> [--mode <assess|implement|investigate|followthrough|review|compare>] [--finish <rung>]
 ```
 
 - Default mode is `implement`. Use `assess` first when readiness is uncertain — it is read-only and cheap.
+- A PR target — `pr/<n>` or a full GitHub PR URL — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. This implies `--mode followthrough` and refuses non-open PRs before dispatching.
 - The command prints a job id. Report it to the human immediately with one line about what was dispatched.
 - Sync files and env vars are read from the current shell and repo; if `delegate` fails naming a missing var or file, relay that verbatim.
 
@@ -37,7 +38,7 @@ fleet delegate <target> [--mode <assess|implement|investigate|followthrough|revi
 
 Poll rather than block, so you stay responsive:
 
-```
+```sh
 fleet status <jobId>     # state: queued | running | blocked | done | cancelled
 fleet logs <jobId> --after <lastSeq>
 ```
@@ -54,10 +55,10 @@ A `decision` event carries: a question, two or more options with stable ids, exa
 2. NEVER answer yourself, never pick the recommendation silently, never let a timeout choose. This is the one thing Fleet's whole design exists to prevent, and the sandbox cannot reach the answer API to do it for you.
 3. Post the human's choice:
 
-```
-fleet answer <jobId> --option <id> [--text "supplement"]
-fleet answer <jobId> --text "free text answer"
-```
+   ```sh
+   fleet answer <jobId> --option <id> [--text "supplement"]
+   fleet answer <jobId> --text "free text answer"
+   ```
 
 4. Resume watching.
 
@@ -67,7 +68,7 @@ Report the settle event's status-first report to the human, leading with its `st
 
 If the settle's `produced[]` contains entries with `type: "file"`, the job delivered artifacts. List them to the human and offer to fetch them:
 
-```
+```sh
 fleet artifacts <jobId>               # list artifact paths and sizes
 fleet artifacts <jobId> get <path>    # stream artifact to stdout
 fleet artifacts <jobId> get <path> -o <dir>  # save to dir/<filename>

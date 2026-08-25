@@ -14,7 +14,6 @@ import type { ServerResponse } from 'node:http';
 import {
   BANNER_MIN_ROWS,
   COCKPIT_FOOTER_KEYS,
-  COCKPIT_VERBS,
   InputHistory,
   MIN_COLUMNS,
   SCROLL_LINES,
@@ -27,7 +26,9 @@ import {
   windowTail,
   type CockpitModel,
 } from '../src/cli/cockpit.ts';
-import { renderRosterRows, sortJobs, visualLength, type BoardEvent, type BoardJob } from '../src/cli/board.ts';
+import { renderRosterRows, sortJobs, type BoardJob } from '../src/cli/board.ts';
+import { visualLength } from '../src/cli/ansi.ts';
+import type { FleetEvent } from '../src/shared/events.ts';
 import { readTunnelRecord, pidAlive, portAccepts, probeDaemonHealth } from '../src/cli/connect.ts';
 import {
   CLI,
@@ -69,7 +70,7 @@ const RUNNING: BoardJob = {
   lastActivity: { text: 'reading the schema', at: '2026-01-01T00:04:00Z' },
 };
 
-const TAIL: BoardEvent[] = [
+const TAIL: FleetEvent[] = [
   { seq: 0, type: 'state', state: 'running' },
   { seq: 1, type: 'think', text: 'reading the schema' },
   {
@@ -175,7 +176,7 @@ test('the tail renders only in the drill-down, verbatim, windowed to its end', (
   assert.match(tail, /\[rename\] Rename to \/api\/v2/);
   assert.match(tail, /answer: type an option id below — keep \| rename/, 'the tail card says how to answer too');
   // Windowed, not re-rendered whole: a long history still shows its end.
-  const long: BoardEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
+  const long: FleetEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
   const drilled = frame(model({ view: 'job', tail: long }));
   assert.match(drilled.join('\n'), /line 4999/, 'the newest event is on screen');
   assert.doesNotMatch(drilled.join('\n'), /line 0\b/, 'the oldest is not');
@@ -385,12 +386,6 @@ test('splitKeys turns one read into the keys it actually contains', () => {
 });
 
 // ---------- the command line ----------
-
-test('the verbs are the CLI verbs', () => {
-  for (const verb of ['delegate', 'answer', 'logs', 'attach', 'cancel']) {
-    assert.ok(COCKPIT_VERBS.includes(verb), `${verb} must be typeable in the cockpit`);
-  }
-});
 
 test('delegate: target, mode, and a missing target', () => {
   assert.deepEqual(parseCockpitInput('delegate 61'), { kind: 'delegate', target: '61' });
@@ -697,8 +692,11 @@ test('a dispatch the CLI would refuse is refused in the cockpit too, and says wh
   // And it stays put. This daemon answers no /health, so the tunnel check is
   // failing in the same seconds — background notices must not talk over what the
   // operator just did, or a refused command reads as an unrelated port message.
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  assert.match(cockpit.frame(), /unknown mode "conquer"/, 'the refusal is still the thing on screen');
+  // No fixed sleep: wait for the first tunnel probe to settle (the header strip
+  // stops saying "tunnel:…"), so any notice it could post has had its chance,
+  // then judge the refusal on the settled frame.
+  await noLongerShows(cockpit, 'tunnel:…');
+  await nowShows(cockpit, 'unknown mode "conquer"', 'the refusal is still the thing on screen');
   assert.doesNotMatch(cockpit.frame(), /accepts connections/, 'the tunnel note waited its turn');
   // The cockpit survives it: a refused command is a notice, not an exit.
   assert.match(cockpit.frame(), /› _/, 'and the line is ready for the next command');
@@ -751,6 +749,50 @@ test("a blocked job's decision is answered from the cockpit, and never by the co
   await until(() => answered !== undefined, `the answer to reach the daemon\n${cockpit.output()}`);
   assert.deepEqual(JSON.parse(answered ?? '{}'), { option: 'keep' });
   await shows(cockpit, 'answered job-blk');
+  assert.equal(await cockpit.quit(), 0);
+});
+
+test("answering one decision does not refetch the other blocked jobs' logs (#125)", async (t) => {
+  const decisionOf = (id: string, option: string) => [
+    { job: id, seq: 0, type: 'decision', id: 'd1', question: `Proceed on ${id}?`, options: [{ id: option, label: 'Go', recommended: true }, { id: 'halt', label: 'Halt' }] },
+    { job: id, seq: 1, type: 'state', state: 'blocked' },
+  ];
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jobs: [
+          { id: 'job-a', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '1' } },
+          { id: 'job-b', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '2' } },
+        ],
+      }),
+    'GET /jobs/job-a/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, decisionOf('job-a', 'go')),
+    'GET /jobs/job-b/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, decisionOf('job-b', 'go')),
+    'POST /jobs/job-a/answer': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { ok: true }),
+  });
+  t.after(daemon.close);
+
+  const cockpit = startCockpit({ cwd: makeTempDir('fleet-cockpit-'), env: { FLEET_DAEMON_URL: daemon.url } });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+
+  await shows(cockpit, 'Proceed on job-b?', "both jobs' decision cards");
+  // Decision reads are the plain (non-follow) event GETs; the drill-down's own
+  // tail follows with ?follow=1 and must not count here.
+  const decisionReads = (id: string): number =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith(`/jobs/${id}/events`) && !r.url.includes('follow=1')).length;
+  assert.equal(decisionReads('job-b'), 1, "job-b's log was read once to render its card");
+
+  // Answer the selected job (job-a, first blocked row) with its option id.
+  cockpit.type('go\r');
+  await shows(cockpit, 'answered job-a');
+
+  // Let two full poll cycles land: the cache decides what gets refetched now.
+  const pollsAtAnswer = daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith('/jobs') && !r.url.includes('/events')).length;
+  await waitFor(cockpit, 'two more board polls', () =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url.startsWith('/jobs') && !r.url.includes('/events')).length >= pollsAtAnswer + 2);
+
+  // The answer invalidated job-a's cached decision only: job-b's whole event
+  // log must not be re-read because a different job was answered.
+  assert.equal(decisionReads('job-b'), 1, "answering job-a must not refetch job-b's log");
   assert.equal(await cockpit.quit(), 0);
 });
 
@@ -942,6 +984,136 @@ test('with no tunnel there, the cockpit opens one and takes it down on the way o
   await until(() => !pidAlive(launcherPid), 'the forward launcher to be gone');
   await until(() => !pidAlive(holderPid), 'the process holding the forward to be gone');
   assert.equal(await portAccepts('127.0.0.1', localPort), false, 'the port is free again');
+});
+
+// ---------- a delegate that has to build its image (#121) ----------
+
+/**
+ * A `docker` on PATH whose `image inspect` always misses (the image is never
+ * cached) and whose `build` records its own pid and argv, prints a line the way
+ * a real build streams progress, then runs `buildScript`. The pid is what lets
+ * a test prove the build was actually killed rather than orphaned.
+ */
+function fakeDockerBin(buildScript: string): { bin: string; log: string } {
+  const bin = makeTempDir('fleet-fake-docker-');
+  const log = path.join(bin, 'docker-calls.log');
+  fs.writeFileSync(
+    path.join(bin, 'docker'),
+    `#!/bin/sh
+case "$1" in
+  build)
+    echo "$$ $*" >> "${log}"
+    echo "RAW_DOCKER_BUILD_OUTPUT step 1/3"
+    ${buildScript}
+    ;;
+  image) exit 1 ;;
+  *) exit 0 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return { bin, log };
+}
+
+/** scaffold(), with harness.cli_version pinned so delegate takes the two-layer image path. */
+function scaffoldColdImage(): string {
+  const cwd = scaffold();
+  const manifestPath = path.join(cwd, '.fleet', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.harness.cli_version = '9.9.9';
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+  return cwd;
+}
+
+test('a cold-image delegate builds off the key queue: keys and polls keep working, a second dispatch is refused, and ^C kills the build', async (t) => {
+  // The build sleeps far longer than any timeout here, so every assertion below
+  // happens WHILE it runs. On the blocked-queue code (#121) the synchronous
+  // build froze the whole event loop — no key, no poll, no repaint, no ^C —
+  // and this test times out instead of passing.
+  const docker = fakeDockerBin('exec sleep 120');
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+    'POST /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 201, { job: { id: 'job-new', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+  const cockpit = startCockpit({
+    cwd: scaffoldColdImage(),
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${docker.bin}:${process.env.PATH}` },
+  });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+  await shows(cockpit, 'no jobs', 'the empty board');
+
+  cockpit.type('delegate APP-123\r');
+  await waitFor(cockpit, 'the docker build to start', () => fs.existsSync(docker.log));
+  const buildPid = Number(fs.readFileSync(docker.log, 'utf8').trim().split(' ')[0]);
+  t.after(() => {
+    try {
+      process.kill(buildPid, 'SIGKILL');
+    } catch {
+      // already dead — the good case
+    }
+  });
+
+  // The loop is alive mid-build: a typed command is parsed, run, and painted.
+  cockpit.type('help\r');
+  await nowShows(cockpit, 'answer <id> [note]', 'the help line, typed mid-build');
+  // And the background keeps breathing: the daemon poll continues.
+  const pollsAtBuildStart = daemon.requests.filter((r) => r.method === 'GET' && r.url === '/jobs').length;
+  await waitFor(cockpit, 'polling to continue during the build', () =>
+    daemon.requests.filter((r) => r.method === 'GET' && r.url === '/jobs').length >= pollsAtBuildStart + 2);
+
+  // A second delegate while one is building is refused with a reason — not
+  // queued behind it, not a second build racing the first for the same tag.
+  cockpit.type('delegate 99\r');
+  await nowShows(cockpit, 'still dispatching APP-123', 'the refusal');
+  assert.equal(
+    fs.readFileSync(docker.log, 'utf8').trim().split('\n').length,
+    1,
+    'exactly one build, however many times delegate is typed',
+  );
+
+  // The cockpit owns the alternate screen: docker's own bytes never reach it.
+  assert.ok(!cockpit.output().includes('RAW_DOCKER_BUILD_OUTPUT'), 'raw build output leaked to the terminal');
+  // Build-before-POST still holds: no job exists while the image does not.
+  assert.equal(daemon.requests.filter((r) => r.method === 'POST').length, 0, 'no job before the image is ready');
+
+  // ^C mid-build leaves cleanly — and takes the build down with it, so an
+  // abandoned dispatch is not minutes of orphaned docker.
+  assert.equal(await cockpit.quit(), 0, '^C must work during a build');
+  await until(() => !pidAlive(buildPid), 'the docker build to be killed with the view');
+  assert.equal(daemon.requests.filter((r) => r.method === 'POST').length, 0, 'an aborted build creates no job');
+});
+
+test('a delegate whose build finishes posts the job with the tag it just built', async (t) => {
+  const docker = fakeDockerBin('exit 0');
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+    'POST /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 201, { job: { id: 'job-new', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+  const cockpit = startCockpit({
+    cwd: scaffoldColdImage(),
+    env: { FLEET_DAEMON_URL: daemon.url, PATH: `${docker.bin}:${process.env.PATH}` },
+  });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+  await shows(cockpit, 'no jobs', 'the empty board');
+
+  cockpit.type('delegate APP-123\r');
+  await shows(cockpit, 'job-new queued — APP-123', 'the dispatched job');
+
+  const posted = daemon.requests.filter((r) => r.method === 'POST' && r.url === '/jobs');
+  assert.equal(posted.length, 1, 'exactly one dispatch');
+  const body = JSON.parse(posted[0].body);
+  assert.match(body.image, /^fleet-job:[0-9a-f]{16}$/, 'the computed tag rides the dispatch');
+  assert.ok(
+    fs.readFileSync(docker.log, 'utf8').includes(`-t ${body.image}`),
+    'the daemon got exactly the tag the build produced',
+  );
+  // Even a successful build keeps its bytes off the cockpit screen.
+  assert.ok(!cockpit.output().includes('RAW_DOCKER_BUILD_OUTPUT'), 'raw build output leaked to the terminal');
+  assert.equal(await cockpit.quit(), 0);
 });
 
 // ---------- the command surface ----------

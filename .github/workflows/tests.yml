@@ -1,8 +1,8 @@
 # CI for every PR and for main. Two jobs:
 #   test      — the full node --test suite, including the sanitized, packaging,
-#               harness-mirrors, and cloud-agnostic gates.
-#   terraform — fmt + validate on the infra unit (the first slice of #48;
-#               plan-level checks need credentials and live there).
+#               harness-mirrors, and cloud-agnostic gates, instrumented for
+#               coverage and reported to Codacy.
+#   terraform — fmt, validate, and each unit's plan-level tests.
 name: tests
 
 on:
@@ -25,11 +25,30 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    # Read here rather than only in the upload step: a secret cannot be tested
+    # in a step-level `if`, and the upload has to be skippable — see below.
+    #
+    # Two tokens because Codacy has two kinds and they are not interchangeable.
+    # A project token is scoped to one repository; an account token is scoped to
+    # you and needs the org and repo named alongside it. Passing an account
+    # token where a project token is expected fails with "Request URL not found",
+    # which reads like a broken URL and is actually the wrong credential. The
+    # action accepts either input and derives org and repo from GITHUB_REPOSITORY
+    # for the account case, so whichever one exists is the one used.
+    #
+    # Concatenated into one variable, and deliberately not named after either
+    # token. The reporter reads CODACY_PROJECT_TOKEN and CODACY_API_TOKEN from
+    # the environment itself, so exporting the unset one as an empty string —
+    # which is what a missing secret expands to — makes it fail with "Empty
+    # argument for --project-token" even when the other token is fine. The
+    # tokens reach the step through `with:` only.
+    env:
+      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}${{ secrets.CODACY_API_TOKEN }}
     steps:
       # Third-party actions are pinned to a commit, not a tag: a tag is a
       # mutable pointer in someone else's repo. Dependabot moves the pins
       # (.github/dependabot.yml) so pinned does not become stale.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -40,7 +59,70 @@ jobs:
       - run: |
           git config --global user.name fleet-ci
           git config --global user.email ci@example.com
-      - run: npm test
+      # The same suite `npm test` runs, instrumented. One run, not two: the spec
+      # reporter still writes the readable result to the log, and the lcov
+      # reporter writes coverage.lcov beside it.
+      - run: npm run coverage
+
+      # Skipped, not failed, when the token is absent. Dependabot pull requests
+      # and forks get no repository secrets, so this step cannot succeed there,
+      # and a check that goes red for a missing secret is a check people learn
+      # to ignore. Coverage is a report here: Codacy's coverage threshold is off
+      # (-1), so nothing about this can block a merge until someone sets one.
+      #
+      # Codacy publishes an action for this and it is not used, because it runs
+      # `bash <(curl -Ls .../codacy-coverage-reporter/master/get.sh)` twice — a
+      # mutable ref piped into a shell, in a job holding this token. Pinning the
+      # action to a SHA pinned the wrapper and nothing that executed. One run
+      # also died on that fetch alone (`curl: (35) Recv failure`). A version and
+      # a checksum in this file cost a manual bump and buy a job that runs the
+      # same binary every time.
+      #
+      # Never fails the job. This is a reporting step: the suite above already
+      # decided whether the code is good, and a rejected token or a Codacy
+      # outage says nothing about that. Skipping the step when there is no token
+      # and then going red when the upload breaks would be the same mistake with
+      # extra steps.
+      - id: codacy
+        if: env.HAS_CODACY_TOKEN != ''
+        continue-on-error: true
+        # Not named CODACY_PROJECT_TOKEN or CODACY_API_TOKEN on purpose: the
+        # reporter reads both of those from the environment, and a missing secret
+        # expands to an empty string rather than being absent, which it rejects
+        # outright. Only the token that exists reaches the command line.
+        env:
+          PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}
+          # Bump both together. There is no updater for this pair — that is the
+          # cost of not using the action, and it is the cheaper side of the trade.
+          REPORTER_VERSION: '14.1.3'
+          REPORTER_SHA512: '73a6c93fc5db509fd0423d6e545759c3f61d8360ee12054e32a9277daab6add0da6c6639248f6ed6c0042366440293ebc0b6144325aef52c5d3d4b230d65eb17'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o codacy-reporter \
+            "https://github.com/codacy/codacy-coverage-reporter/releases/download/${REPORTER_VERSION}/codacy-coverage-reporter-linux"
+          echo "${REPORTER_SHA512}  codacy-reporter" | sha512sum -c -
+          chmod +x codacy-reporter
+
+          if [ -n "${PROJECT_TOKEN}" ]; then
+            auth="--project-token ${PROJECT_TOKEN}"
+          else
+            auth="--api-token ${API_TOKEN} --organization-provider gh --username ${{ github.repository_owner }} --project-name ${{ github.event.repository.name }}"
+          fi
+
+          # --language because the report covers .ts plus two .mjs files, which
+          # the reporter reads as two languages and then uploads only the first
+          # of. No --partial: one report, so there is nothing to finalise.
+          ./codacy-reporter report --language TypeScript -r coverage.lcov ${auth}
+
+      # continue-on-error rewrites the step's own conclusion to success, so a
+      # rejected token reads as a clean run everywhere except the log — coverage
+      # quietly stops arriving and the job still looks fine. `outcome` keeps the
+      # real result. Surfaced as a warning annotation, which shows on the run
+      # without pretending the tests failed.
+      - if: steps.codacy.outcome == 'failure'
+        run: |
+          echo "::warning title=Coverage not reported::Codacy rejected the upload; the tests above are unaffected. See the previous step's log."
 
   terraform:
     runs-on: ubuntu-latest
@@ -52,7 +134,7 @@ jobs:
     env:
       TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.tf-plugin-cache
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       - run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
       - run: terraform fmt -check -recursive infra/

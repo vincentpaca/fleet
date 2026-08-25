@@ -300,3 +300,58 @@ test('doctor: a unix-socket daemon has no tunnel and gets no tunnel section', as
   assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
   assert.ok(!res.stdout.includes('tunnel:'), `no tunnel section: ${res.stdout}`);
 });
+
+// ── Orphaned cloud tasks (#147) ──────────────────────────────────────────────
+// doctor triggers the daemon's reconcile sweep on demand and lists what it
+// found: a task billing behind a terminal job is spend nothing else surfaces
+// until the runner's own wall-clock cap fires.
+
+test('doctor: lists the orphaned tasks the daemon reconcile sweep reports (#147)', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    },
+    'POST /reconcile': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        orphans: [
+          { job: 'job-orphan-1', handle: 'arn:aws:ecs:ap-southeast-1:111122223333:task/fleet-cluster/0001', stopped: true },
+          { job: 'job-orphan-2', handle: 'arn:aws:ecs:ap-southeast-1:111122223333:task/fleet-cluster/0002', stopped: false },
+        ],
+      }));
+    },
+  });
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 1, `orphans are findings: ${res.stdout}`);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 2, `one finding per orphan:\n${res.stderr}`);
+  // The stopped orphan: was billing, the sweep ended it — say so, name both ids.
+  assert.match(lines[0], /orphaned task stopped/);
+  assert.match(lines[0], /task\/fleet-cluster\/0001/);
+  assert.match(lines[0], /job-orphan-1/);
+  // The unstopped one is still spending; the finding must not read as resolved.
+  assert.match(lines[1], /orphaned task still running/);
+  assert.match(lines[1], /task\/fleet-cluster\/0002/);
+  assert.match(lines[1], /job-orphan-2/);
+});
+
+test('doctor: a daemon that predates the reconcile endpoint stays clean (#147)', async (t) => {
+  // startMockDaemon answers unknown routes with 404 — exactly what an older
+  // daemon does. Not knowing is not a defect; doctor must not invent one.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.match(res.stdout, /doctor: clean/);
+});

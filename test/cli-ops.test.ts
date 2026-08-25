@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
-import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
+import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
 import { TERSE_RESULT_MAX } from '../src/shared/tool-text.ts';
 import { translateLine } from '../src/runner/translate.ts';
@@ -50,6 +50,47 @@ test('formatEvent: color mode produces ANSI codes; noColor suppresses them', () 
   assert.match(formatEvent(stateEvent, true), /\[0\] state → running/);
   assert.match(formatEvent(settleReady, true), /rung=done status=READY/);
   assert.match(formatEvent(settlePartial, true), /status=PARTIAL/);
+});
+
+test('formatEvent: exact output for every event type, color and noColor (#128 characterization)', () => {
+  // Byte-for-byte pins captured before the rendering paths were unified: the
+  // plain-line convention (`fleet logs` / `fleet attach`) must not drift when
+  // the shared rendering core changes. If a change here is deliberate, update
+  // the pin and say why in the commit.
+  const expectedColor = [
+    '\x1b[1m[1] state → running\x1b[0m',
+    '\x1b[1m[2] state → blocked reason=decision marker=parked\x1b[0m',
+    '[3] phase setup',
+    '\x1b[2m[4] think planning the change\x1b[0m',
+    '[5] log tool_use Read file_path=/p/a.ts',
+    '[6] log plain line',
+    '[7] progress 42%',
+    '\x1b[33m[8] decision d1: Which way?\n  - a (recommended): Left\n  - b: Right\n  - c\n  answer with: fleet answer <jobId> --option <id> [--text s]\x1b[0m',
+    '[9] answer d1 → a "go left" by vince',
+    '[10] answer d9 → (free text) "freeform"',
+    '[11] answer undefined → (free text)',
+    '\x1b[32m[12] settle rung=pr-open status=READY next: review it\x1b[0m',
+    '\x1b[31m[13] settle rung=? status=PARTIAL\x1b[0m',
+    '[14] pair {"minutes":3}',
+  ];
+  const expectedNoColor = [
+    '[1] state → running',
+    '[2] state → blocked reason=decision marker=parked',
+    '[3] phase setup',
+    '[4] think planning the change',
+    '[5] log tool_use Read file_path=/p/a.ts',
+    '[6] log plain line',
+    '[7] progress 42%',
+    '[8] decision d1: Which way?\n  - a (recommended): Left\n  - b: Right\n  - c\n  answer with: fleet answer <jobId> --option <id> [--text s]',
+    '[9] answer d1 → a "go left" by vince',
+    '[10] answer d9 → (free text) "freeform"',
+    '[11] answer undefined → (free text)',
+    '[12] settle rung=pr-open status=READY next: review it',
+    '[13] settle rung=? status=PARTIAL',
+    '[14] pair {"minutes":3}',
+  ];
+  assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, false)), expectedColor);
+  assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, true)), expectedNoColor);
 });
 
 test('formatEvent: settle green for READY, red for non-READY (ANSI code check)', () => {
@@ -326,6 +367,8 @@ test('logs: default (narrative) filters tool_use/tool_result; --tools includes t
 test('attach follows long-poll cycles until the job reaches a terminal state', async (t) => {
   let calls = 0;
   const daemon = await startMockDaemon({
+    // attach probes the job before following (#124), so a typo'd id fails fast.
+    'GET /jobs/job-1': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { job: RUNNING_JOB }),
     'GET /jobs/job-1/events': (req: MockRequest, res: ServerResponse) => {
       calls += 1;
       const params = new URL(req.url, 'http://x').searchParams;
@@ -403,6 +446,46 @@ test('cancel posts to the cancel endpoint', async (t) => {
   assert.match(res.stdout, /cancelled job-1/);
   assert.equal(daemon.requests.length, 1);
   assert.equal(daemon.requests[0].method, 'POST');
+});
+
+// ── artifacts get --out: readable failures, never an ENOENT stack (#125) ─────
+
+/** Mock daemon serving one artifact, the shape the real one returns. */
+function artifactDaemon(): ReturnType<typeof startMockDaemon> {
+  return startMockDaemon({
+    'GET /jobs/job-1/artifacts/report.md': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, { path: 'report.md', content: Buffer.from('# hi\n').toString('base64'), bytes: 5 }),
+  });
+}
+
+test('artifacts get --out creates a missing directory instead of crashing on ENOENT', async (t) => {
+  const daemon = await artifactDaemon();
+  t.after(daemon.close);
+
+  const outDir = path.join(makeTempDir('fleet-art-'), 'not', 'yet', 'there');
+  const res = await runCli(['artifacts', 'job-1', 'get', 'report.md', '--out', outDir], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /saved to /);
+  const { readFileSync } = await import('node:fs');
+  assert.equal(readFileSync(path.join(outDir, 'report.md'), 'utf8'), '# hi\n');
+});
+
+test('artifacts get --out that cannot be written is a one-line failure, exit 1, no stack', async (t) => {
+  const daemon = await artifactDaemon();
+  t.after(daemon.close);
+
+  // --out names an existing *file*: mkdir/write must fail, readably.
+  const blocked = path.join(makeTempDir('fleet-art-'), 'blocked');
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(blocked, 'i am a file');
+  const res = await runCli(['artifacts', 'job-1', 'get', 'report.md', '--out', blocked], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /artifacts get: cannot write /);
+  assert.doesNotMatch(res.stderr, /node:internal|at .*\.ts:\d/, 'no stack trace');
 });
 
 test('status prints friendly empty-state with delegate hint when no jobs', async (t) => {

@@ -5,12 +5,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { ServerResponse } from 'node:http';
 import {
-  ENTER_ALT,
   FLEET_BANNER,
-  RESTORE_SEQ,
   answerJob,
   cancelJob,
+  clampTailScroll,
   fetchBoardJobs,
+  invalidateDecision,
   jobCounts,
   parseAnswerLine,
   renderBanner,
@@ -20,13 +20,11 @@ import {
   renderRosterRows,
   renderTableHeader,
   sortJobs,
-  visualClip,
-  visualLength,
-  type BoardDecision,
-  type BoardEvent,
   type BoardJob,
 } from '../src/cli/board.ts';
-import { startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
+import { visualClip, visualLength } from '../src/cli/ansi.ts';
+import type { FleetEvent, PendingDecision } from '../src/shared/events.ts';
+import { startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
 
 /** The roster as text, the way a pane would show it. */
 function roster(jobs: BoardJob[], selection = -1, width = 100, now = 0, pulseOn = false): string {
@@ -176,6 +174,7 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
       },
     },
     { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' } },
+    { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'notes' }, artifacts: 3 },
   ];
   assert.equal(roster(jobs, 0, 80), [
     '▶ !! job-blk                 blocked    assess      docs               ',
@@ -185,7 +184,26 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
     '     answer: type an option id below — go | wait',
     '',
     '  ●  job-run                 running    implement   app                ',
+    '  ·  job-done                done       assess      notes                3 files',
   ].join('\n'));
+});
+
+test('a done row shows its delivered-artifact count; empty or live rows do not (#81)', () => {
+  // The delivery guarantee has to be visible where the job reads as finished:
+  // a done job with files waiting must not look identical to an empty-handed one.
+  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'docs' }, artifacts: 3 };
+  assert.match(roster([done]), /job-done.*3 files/);
+  // Singular for one file — "1 files" reads as a bug.
+  assert.match(roster([{ ...done, artifacts: 1 }]), /job-done.*1 file(?!s)/);
+  // Zero or unknown: no marker at all, not "0 files".
+  assert.doesNotMatch(roster([{ ...done, artifacts: 0 }]), /file/);
+  assert.doesNotMatch(roster([{ ...done, artifacts: undefined }]), /file/);
+  // A live job never carries the marker: its settle has not happened, so any
+  // count on it would be stale data wearing a delivery badge.
+  assert.doesNotMatch(roster([{ ...done, state: 'running' }]), /file/);
+  // A cancelled job that still delivered artifacts shows them — partial
+  // delivery is exactly when the operator needs to know files exist.
+  assert.match(roster([{ ...done, state: 'cancelled', reason: 'stall' }]), /job-done.*3 files/);
 });
 
 test('the blocked marker pulses, and only the blocked one', () => {
@@ -220,7 +238,7 @@ test('the selection marker lands on the selected row and nowhere else', () => {
 // ── Event lines ───────────────────────────────────────────────────────────────
 
 test('renderEventLines: a decision becomes a card, and its answer names the question', () => {
-  const events: BoardEvent[] = [
+  const events: FleetEvent[] = [
     { seq: 0, type: 'state', state: 'running' },
     { seq: 1, type: 'think', text: 'reading the schema' },
     {
@@ -240,17 +258,95 @@ test('renderEventLines: a decision becomes a card, and its answer names the ques
   assert.match(renderEventLines([{ seq: 9, type: 'tool_use' }], 100, true).join('\n'), /\[9\] tool_use/);
 });
 
+test('renderEventLines: exact output for every event type, color and noColor (#128 characterization)', () => {
+  // Byte-for-byte pins captured before the rendering paths were unified: the
+  // cockpit pane convention must not drift when the shared rendering core
+  // changes. If a change here is deliberate, update the pin and say why in
+  // the commit. Same battery as the formatEvent pin in cli-ops.test.ts.
+  const expectedColor = [
+    '\x1b[90m[1]\x1b[0m \x1b[90m→\x1b[0m \x1b[32mrunning\x1b[0m',
+    '\x1b[90m[2]\x1b[0m \x1b[90m→\x1b[0m \x1b[33mblocked\x1b[0m',
+    '\x1b[90m[3]\x1b[0m \x1b[90mphase\x1b[0m \x1b[90msetup\x1b[0m',
+    '\x1b[90m[4]\x1b[0m \x1b[90mplanning the change\x1b[0m',
+    '\x1b[90m[5]\x1b[0m \x1b[90mtool_use Read: {"file_path":"/p/a.ts","limit":5}\x1b[0m',
+    '\x1b[90m[6]\x1b[0m \x1b[90mplain line\x1b[0m',
+    '\x1b[90m[7]\x1b[0m \x1b[90mprogress\x1b[0m',
+    '\x1b[90m[8]\x1b[0m \x1b[1;33m?\x1b[0m \x1b[1mWhich way?\x1b[0m',
+    '     \x1b[33m[a]\x1b[0m Left\x1b[33m ★\x1b[0m',
+    '     \x1b[33m[b]\x1b[0m Right',
+    '     \x1b[33m[c]\x1b[0m c',
+    '     \x1b[33manswer: type an option id below — a | b | c\x1b[0m',
+    '\x1b[90m[9]\x1b[0m \x1b[32m✓\x1b[0m \x1b[90m"Which way?"\x1b[0m → \x1b[32m[a]\x1b[0m\x1b[90m by vince\x1b[0m',
+    '\x1b[90m[10]\x1b[0m \x1b[32m✓\x1b[0m answer: \x1b[90m(free text)\x1b[0m',
+    '\x1b[90m[11]\x1b[0m \x1b[32m✓\x1b[0m answer: \x1b[90m(free text)\x1b[0m',
+    '\x1b[90m[12]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36mpr-open\x1b[0m status=\x1b[36mREADY\x1b[0m',
+    '\x1b[90m[13]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36m?\x1b[0m status=\x1b[36mPARTIAL\x1b[0m',
+    '\x1b[90m[14]\x1b[0m \x1b[90mpair\x1b[0m',
+  ];
+  const expectedNoColor = [
+    '[1] → running',
+    '[2] → blocked',
+    '[3] phase setup',
+    '[4] planning the change',
+    '[5] tool_use Read: {"file_path":"/p/a.ts","limit":5}',
+    '[6] plain line',
+    '[7] progress',
+    '[8] ? Which way?',
+    '     [a] Left ★',
+    '     [b] Right',
+    '     [c] c',
+    '     answer: type an option id below — a | b | c',
+    '[9] ✓ "Which way?" → [a] by vince',
+    '[10] ✓ answer: (free text)',
+    '[11] ✓ answer: (free text)',
+    '[12] settle rung=pr-open status=READY',
+    '[13] settle rung=? status=PARTIAL',
+    '[14] pair',
+  ];
+  const battery = EVENT_BATTERY as FleetEvent[];
+  assert.deepEqual(renderEventLines(battery, 100, false), expectedColor);
+  assert.deepEqual(renderEventLines(battery, 100, true), expectedNoColor);
+  // Width applies to every line, including card lines, without reordering.
+  const narrow = renderEventLines(battery, 40, false);
+  assert.equal(narrow[4], '\x1b[90m[5]\x1b[0m \x1b[90mtool_use Read: {"file_path":"/p/a.t…\x1b[0m');
+  assert.equal(narrow[11], '     \x1b[33manswer: type an option id below — …\x1b[0m');
+});
+
 test('renderEventLines: every line is clipped to width', () => {
-  const events: BoardEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
+  const events: FleetEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
   for (const line of renderEventLines(events, 60, true)) assert.ok(line.length <= 60);
 });
 
-// ── Chrome ────────────────────────────────────────────────────────────────────
-
-test('ENTER_ALT and RESTORE_SEQ export the correct ANSI sequences', () => {
-  assert.equal(ENTER_ALT, '\x1b[?1049h\x1b[?25l', 'ENTER_ALT enters the alternate screen and hides the cursor');
-  assert.equal(RESTORE_SEQ, '\x1b[?25h\x1b[?1049l', 'RESTORE_SEQ shows the cursor and leaves the alternate screen');
+test('clampTailScroll agrees with the full render it replaces, at every proposal', () => {
+  // The cockpit used to render the entire tail per PgUp keypress just to learn
+  // the scroll ceiling (#125). The cheap count must clamp exactly like
+  // min(proposed, total lines − 1) over renderEventLines — the battery includes
+  // multi-line decision cards, so a per-event line count that drifted from the
+  // renderer's would fail here.
+  const battery = EVENT_BATTERY as FleetEvent[];
+  const total = renderEventLines(battery, 1_000, true).length;
+  for (const proposed of [-5, 0, 1, 3, total - 1, total, total + 50]) {
+    assert.equal(
+      clampTailScroll(battery, proposed),
+      Math.max(0, Math.min(proposed, total - 1)),
+      `proposal ${proposed} (total ${total} lines)`,
+    );
+  }
+  assert.equal(clampTailScroll([], 7), 0, 'an empty tail has nowhere to scroll');
 });
+
+test('invalidateDecision drops exactly one job\'s cached decisions', () => {
+  const decision: PendingDecision = { id: 'd1', question: 'q', options: [{ id: 'a' }, { id: 'b' }] };
+  const cache = new Map<string, PendingDecision>([
+    ['job-a@2026-01-01T00:00:00Z', decision],
+    ['job-a@2026-01-02T00:00:00Z', decision],
+    ['job-b@2026-01-01T00:00:00Z', decision],
+  ]);
+  invalidateDecision(cache, 'job-a');
+  assert.deepEqual([...cache.keys()], ['job-b@2026-01-01T00:00:00Z'], 'only the answered job is dropped');
+});
+
+// ── Chrome ────────────────────────────────────────────────────────────────────
 
 test('FLEET_BANNER is exactly 4 lines and under 30 chars wide', () => {
   const lines = FLEET_BANNER.split('\n');
@@ -369,7 +465,7 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   });
   t.after(daemon.close);
   const env = { FLEET_DAEMON_URL: daemon.url };
-  const cache = new Map<string, BoardDecision>();
+  const cache = new Map<string, PendingDecision>();
 
   const first = await fetchBoardJobs(env, cache);
   const second = await fetchBoardJobs(env, cache);
@@ -383,6 +479,33 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   assert.equal(reads, 2, 'a changed job is re-read');
   assert.equal(third.jobs![0].decision?.question, 'question 2');
   assert.equal(cache.size, 1, 'the cache is pruned to what is on the board');
+});
+
+test('fetchBoardJobs carries the artifact count from the stored settle (#81)', async (t) => {
+  // The daemon listing already stores the settle; the count must come from it
+  // without any per-job event read — and an empty produced[] must map to no
+  // count at all, not zero.
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        jobs: [
+          {
+            id: 'job-art', state: 'done',
+            settle: { outcome: { produced: [{ id: 'a.md', type: 'file', title: 'a.md' }, { id: 'b.csv', type: 'file', title: 'b.csv' }], findings: 0, decisions: 0 } },
+          },
+          { id: 'job-empty', state: 'done', settle: { outcome: { produced: [], findings: 0, decisions: 0 } } },
+          { id: 'job-nosettle', state: 'running' },
+        ],
+      }),
+  });
+  t.after(daemon.close);
+
+  const result = await fetchBoardJobs({ FLEET_DAEMON_URL: daemon.url });
+  assert.ok(result.ok, `fetchBoardJobs failed: ${result.error}`);
+  const byId = new Map(result.jobs!.map((j) => [j.id, j]));
+  assert.equal(byId.get('job-art')?.artifacts, 2);
+  assert.equal(byId.get('job-empty')?.artifacts, undefined, 'empty produced[] maps to no count');
+  assert.equal(byId.get('job-nosettle')?.artifacts, undefined);
 });
 
 test('fetchBoardJobs reports an unreachable daemon rather than throwing', async () => {

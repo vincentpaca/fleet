@@ -4,10 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, createDraftPr, composeDraftPrText, gitCredentialEnv } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -109,6 +110,49 @@ test('gitCredentialEnv wires gh as the github.com helper only when a token exist
   assert.equal(injected.GIT_CONFIG_KEY_0, 'credential.https://github.com.helper');
   assert.equal(injected.GIT_CONFIG_VALUE_0, '!gh auth git-credential');
   assert.deepEqual(gitCredentialEnv({ GITHUB_TOKEN: 't' }), injected, 'both token spellings gh honors');
+});
+
+test('gitCredentialEnv merges with inherited GIT_CONFIG_* instead of clobbering it (#139)', () => {
+  const inherited = {
+    GH_TOKEN: 't',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'fleet.inherited',
+    GIT_CONFIG_VALUE_0: 'kept',
+  };
+  const injected = gitCredentialEnv(inherited);
+  assert.equal(injected.GIT_CONFIG_COUNT, '2', 'the count grows past the inherited entries');
+  assert.equal(injected.GIT_CONFIG_KEY_1, 'credential.https://github.com.helper', 'the helper lands at the next free index');
+  assert.equal(injected.GIT_CONFIG_VALUE_1, '!gh auth git-credential');
+  assert.equal(injected.GIT_CONFIG_KEY_0, undefined, 'slot 0 stays the environment\'s — never rewritten');
+
+  // git must resolve BOTH configs from the merged env — the inherited entry
+  // was clobbered wholesale before #139.
+  const env = { ...process.env, ...inherited, ...injected };
+  const keptValue = execFileSync('git', ['config', '--get', 'fleet.inherited'], { encoding: 'utf8', env }).trim();
+  assert.equal(keptValue, 'kept', 'the inherited config still resolves');
+  const helper = execFileSync('git', ['config', '--get', 'credential.https://github.com.helper'], { encoding: 'utf8', env }).trim();
+  assert.equal(helper, '!gh auth git-credential', 'the injected helper resolves too');
+});
+
+test('setupWorkspace never duplicates .git/info/exclude entries already present (#139)', () => {
+  // Every launch gets a fresh workspace today, so duplicates cannot pile up —
+  // but nothing structural guarantees that, so the append is idempotent.
+  // Byte-diff: pre-seed the exclude file with exactly what setup would write
+  // and assert setup leaves it byte-identical.
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const excludeFile = join(workspace, '.git', 'info', 'exclude');
+  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
+  const seeded = '.fleet/out/\n.fleet/order.json\n.env.fleet\n';
+  writeFileSync(excludeFile, seeded);
+
+  setupWorkspace(workspace, opts(remote));
+
+  assert.equal(
+    readFileSync(excludeFile, 'utf8'),
+    seeded,
+    'exclude must be byte-identical — no entry appended twice',
+  );
 });
 
 test('git accepts the injected credential config — key names are real, not typos', () => {
@@ -216,6 +260,80 @@ test('setupWorkspace reentry: checks out existing branch with WIP, no collision'
   assert.match(files, /final\.txt/);
 });
 
+// --- Branch adoption (issue #80): followthrough continues an existing PR branch ---
+
+test('setupWorkspace adoption: checks out the adopted branch, never a fresh job branch', () => {
+  const remote = makeRemote();
+
+  // A prior job delivered on its own branch (the branch the PR points at).
+  const ws1 = makeWorkspace();
+  const { branch } = setupWorkspace(ws1, opts(remote)); // fleet/APP-7-job-1
+  writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
+  assert.equal(pushWork(ws1, 'APP-7', 'job-1', true), 'pushed');
+
+  // The followthrough job adopts that branch.
+  const ws2 = makeWorkspace();
+  const result = setupWorkspace(ws2, {
+    url: remote, jobId: 'job-2', target: 'APP-7',
+    name: 'Operator One', email: 'op@example.com',
+    adoptBranch: branch,
+  });
+  assert.equal(result.branch, branch, 'the adopted branch is the job branch');
+  assert.equal(readFileSync(join(ws2, 'delivered.txt'), 'utf8'), 'v1\n', 'the delivered work is checked out');
+
+  // The bug this catches: adoption falling back to the fresh-branch path would
+  // push fleet/APP-7-job-2 — stranding the PR and tripping the claim guard.
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(!refs.includes('fleet/APP-7-job-2'), 'no fresh branch may be created on adoption');
+
+  // Work pushes to the SAME branch, so the PR updates in place.
+  writeFileSync(join(ws2, 'fix.txt'), 'review feedback addressed\n');
+  assert.equal(pushWork(ws2, 'APP-7', 'job-2', true), 'pushed');
+  const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
+  assert.match(files, /delivered\.txt/);
+  assert.match(files, /fix\.txt/);
+});
+
+test('remoteMovedBeyond judges delivery against the adopted tip, not against base', () => {
+  const remote = makeRemote();
+  const ws1 = makeWorkspace();
+  const { branch } = setupWorkspace(ws1, opts(remote));
+  writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
+  pushWork(ws1, 'APP-7', 'job-1', true);
+
+  const ws2 = makeWorkspace();
+  setupWorkspace(ws2, { url: remote, jobId: 'job-2', target: 'APP-7', name: 'Operator One', email: 'op@example.com', adoptBranch: branch });
+  const adoptedTip = getHeadSha(ws2);
+
+  // The bug this catches: the adopted branch is ALWAYS ahead of base (the
+  // original job's commits), so an ahead-of-base test would let a do-nothing
+  // followthrough claim delivery.
+  assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), false, 'nothing pushed yet — no movement');
+
+  writeFileSync(join(ws2, 'fix.txt'), 'fix\n');
+  pushWork(ws2, 'APP-7', 'job-2', true);
+  assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), true, 'a pushed fix moves the branch beyond the adopted tip');
+
+  // Unknown SHA or unreachable remote: never claim movement it cannot prove.
+  assert.equal(remoteMovedBeyond(ws2, branch, '0'.repeat(40)), false);
+});
+
+test('findOpenPr queries gh for the branch head and reports the PR, or undefined', () => {
+  const calls: string[][] = [];
+  const workspace = makeWorkspace();
+  const withList = (out: string) => (args: string[]): string => {
+    calls.push(args);
+    return out;
+  };
+  const found = findOpenPr(workspace, 'fleet/APP-7-job-1', withList('[{"url":"https://github.com/acme/example-app/pull/41","number":41}]\n'));
+  assert.deepEqual(found, { url: 'https://github.com/acme/example-app/pull/41', number: 41 });
+  assert.deepEqual(calls[0], ['pr', 'list', '--head', 'fleet/APP-7-job-1', '--state', 'open', '--json', 'url,number', '--limit', '1']);
+  assert.ok(calls.every((c) => c[1] !== 'create'), 'a continuation settle must never create a PR');
+
+  // No open PR for the branch (closed since dispatch): undefined, not a throw.
+  assert.equal(findOpenPr(workspace, 'fleet/APP-7-job-1', withList('[]\n')), undefined);
+});
+
 test('composeDraftPrText: full report renders per the delivery standard, never a bare number', () => {
   const { title, body } = composeDraftPrText({
     target: '18',
@@ -301,4 +419,33 @@ test('remoteHasHead answers only for this HEAD, not for "the branch moved"', () 
   const gone = mkdtempSync(join(tmpdir(), 'fleet-git-gone-'));
   run(workspace, ['remote', 'set-url', 'origin', join(gone, 'nope.git')]);
   assert.equal(remoteHasHead(workspace, branch), false);
+});
+
+test('a push that hangs is SIGKILLed at its bound and throws a timeout that names it (#152)', async () => {
+  // A working remote first: a timeout on a live connection must never fire.
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  setupWorkspace(workspace, opts(remote));
+  writeFileSync(join(workspace, 'half-done.txt'), 'wip\n');
+  assert.equal(pushWip(workspace, 'block_hot expired', 30_000), 'pushed');
+
+  // Then the black-holed remote from the issue: a server that accepts the
+  // connection and never answers. Without the bound, git push waits on it
+  // forever — and because these calls are execFileSync, so does the caller's
+  // whole event loop: on pre-#152 code this test wedges instead of failing
+  // an assertion.
+  const server = createServer(() => { /* hold every request open */ });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  assert.ok(addr !== null && typeof addr === 'object');
+  run(workspace, ['remote', 'set-url', 'origin', `http://127.0.0.1:${addr.port}/repo.git`]);
+  writeFileSync(join(workspace, 'half-done.txt'), 'more wip\n');
+  const started = Date.now();
+  assert.throws(
+    () => pushWip(workspace, 'cancelled: SIGTERM', 1_500),
+    /git push timed out after 1500ms/,
+    'the error must name the timeout so the teardown log can distinguish a hang from a rejection',
+  );
+  assert.ok(Date.now() - started < 10_000, 'the hang must be cut at the bound, not ride it out');
+  await new Promise<void>((resolve) => server.close(() => resolve()));
 });

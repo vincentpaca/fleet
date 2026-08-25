@@ -93,7 +93,11 @@ test('resolveDeployment falls back to the SSM parameter when the captured file p
     asked.push(args);
     return JSON.stringify({ Parameter: { Value: JSON.stringify(FULL_CONFIG) } });
   });
-  assert.deepEqual(asked, [['ssm', 'get-parameter', '--name', '/fleet/fleet-config', '--output', 'json']]);
+  // --with-decryption is load-bearing: the parameter is a SecureString, and
+  // without it the call returns ciphertext and the parse fails, not the read.
+  assert.deepEqual(asked, [
+    ['ssm', 'get-parameter', '--name', '/fleet/fleet-config', '--with-decryption', '--output', 'json'],
+  ]);
   assert.match(deployment.source, /SSM parameter \/fleet\/fleet-config/);
   assert.equal(deployment.config.daemon_container_name, 'fleet-daemon');
   // daemon_url lives only in the local file — the SSM read must not drop it.

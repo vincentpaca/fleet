@@ -1,10 +1,21 @@
 # Fleet
 
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/771617780d6943a18b5acc2d0125536c)](https://app.codacy.com/gh/vincentpaca/fleet/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![Codacy Badge](https://app.codacy.com/project/badge/Coverage/771617780d6943a18b5acc2d0125536c)](https://app.codacy.com/gh/vincentpaca/fleet/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
+
 **Fleet lets you delegate the harness you already use, detach from it, and safely pick it up anywhere.**
 
 If you run something like `/dev-sprint TICKET-123` in Claude Code locally today, Fleet runs that same command on compute you control — your Docker, your cloud account — and hands you back a pull request. You dispatch, close the laptop, answer a question from another machine if the agent gets stuck, and review the result. Same repo, same config, same behavior, without your machine in the loop.
 
 Everything runs in your account with your credentials. There is no hosted service and no third-party control plane.
+
+## Install
+
+```sh
+npm install -g github:<org>/fleet
+```
+
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. Fleet is not on the npm registry yet — see [Status](#status). One caveat: first-time infrastructure bring-up (`fleet setup infra` and `images/build.sh` in the quick start below) does run from a Fleet checkout, because the Terraform unit and image sources ship by git, not in the npm package.
 
 ## What Fleet owns
 
@@ -41,9 +52,10 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
 5. The job ends as a draft pull request (or a report with downloadable artifacts, for investigation work). A human merges it. Fleet never merges and never deploys.
 
-From an empty checkout that is the whole path:
+From a machine that has never seen Fleet, that is the whole path:
 
 ```sh
+npm install -g github:<org>/fleet
 fleet setup repo        # interview → .fleet/manifest.json (fleet init for the placeholder scaffold)
 fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
 <fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
@@ -77,7 +89,7 @@ Honest, per our own rules:
 
 - **The local loop is real and dogfooded.** Fleet develops itself: tickets on this repo are delegated to Fleet, run headless, and come back as PRs — including most of the features in this README. Process and Docker providers work end to end; park/resume, wall-clock caps, artifacts, and the cockpit are all live and tested.
 - **The AWS path is written but has never completed a real job.** An external review identified four concrete substrate defects (daemon reachability, capacity-provider launch, scale-to-zero vs. the daemon's own service, missing daemon image) — tracked as open issues, being fixed before the first live run. The Phase-1 exit scenario will land as a repeatable acceptance test, not a demo.
-- **Not yet published to npm** — deliberately, until the cloud path is exercised for real. The version you can't install is the version we won't overstate.
+- **Not on the npm registry yet** — deliberately, until the cloud path is exercised for real. The documented install is straight from the repo (`npm install -g github:<org>/fleet`), which ships exactly what a registry publish would (`test/packaging.test.ts` and `test/packaging-install.test.ts` gate it); the registry name is a later call.
 
 ## Using Fleet vs. building Fleet
 
@@ -87,7 +99,7 @@ Users consume three things: the npm package (CLI, daemon, runner, schemas), a Te
 
 Start with [AGENTS.md](AGENTS.md) — build/test mechanics, the invariants that break if you're not looking, the delivery standard for commits and PRs. The deeper context: [docs/architecture.md](docs/architecture.md) (how it works), [docs/decisions.md](docs/decisions.md) (why it works that way — settled calls are reopened with a human, not relitigated in code), [docs/roadmap.md](docs/roadmap.md) (phases and exit criteria). Work is tracked as GitHub issues, which reference those docs and must carry acceptance criteria before the pickup gate lets anyone — human or agent — start them.
 
-```
+```sh
 npm install
 npm test
 ```
@@ -98,4 +110,4 @@ Rules the schemas enforce, because prose rules get ignored: every command names 
 
 Fleet is **source-available** under the [PolyForm Shield License 1.0.0](LICENSE.md): use it, modify it, self-host it — commercially included — and contribute back. The one thing the license forbids is offering a product or service that competes with Fleet. It is not an OSI open-source license, deliberately; the same terms protect [AutoGPT's platform](https://github.com/Significant-Gravitas/AutoGPT) and [Micro](https://m3o.org/company/licensing.html).
 
-Required Notice: Copyright © 2026 the Fleet maintainers (github.com/<org>/fleet)
+Required Notice: Copyright © 2026 the Fleet maintainers (`github.com/<org>/fleet`)

@@ -10,7 +10,7 @@
 // per-request — see test/daemon-boot-log.test.ts.
 import { mkdirSync } from "node:fs";
 import { fleetHome } from "../shared/home.ts";
-import { FleetDaemon } from "./server.ts";
+import { loadOrCreateOperatorToken, FleetDaemon } from "./server.ts";
 import { ProcessProvider } from "../providers/process.ts";
 import { DockerProvider } from "../providers/docker.ts";
 import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm } from "../providers/ecs.ts";
@@ -108,18 +108,44 @@ if (port !== undefined) {
 }
 if (!tcpHost) tcpHost = "127.0.0.1";
 
+// Operator secret for /jobs/* (issue #133): generated on first boot,
+// persisted 0600 at $FLEET_HOME/operator-token, read by the CLI over the
+// socket and over an SSM tunnel alike. Every real daemon enforces it —
+// there is no credential-free deployment of the /jobs/* surface.
+const provider = await buildProvider(choice, home);
 const daemon = new FleetDaemon({
   home,
-  provider: await buildProvider(choice, home),
+  provider,
   port,
   bindHost,
   tcpHost,
+  operatorToken: loadOrCreateOperatorToken(home),
 });
 
 const { socketPath: sock, port: boundPort } = await daemon.start();
 // Same `fleet daemon: ` prefix as the lines above: one filter on a log stream
 // must not drop the line that says the daemon is up.
 console.log(`fleet daemon: listening on ${sock}${boundPort !== null ? ` and ${bindHost}:${boundPort} (advertising ${tcpHost})` : ""}`);
+
+// Only after start() holds the home lock: settle what a previous daemon's
+// death orphaned (#123). Quiet unless it acts, and never on stdout — the boot
+// lines above are a pinned contract (test/daemon-boot-log.test.ts).
+await provider.recover?.();
+
+// Same slot, cloud side (#147): stop any task whose startedBy names a job the
+// registry holds terminal — a wedged run-task or a failed stop-task leaves one
+// running and billing with no stored handle. No-op for providers without a
+// sandbox listing; a sweep failure must not take the daemon down with it.
+try {
+  for (const orphan of (await daemon.reconcileOrphans()).orphans) {
+    console.error(
+      `fleet: reconcile ${orphan.stopped ? "stopped" : "could not stop"} ` +
+      `orphaned task ${orphan.handle} (job ${orphan.job})`,
+    );
+  }
+} catch (error) {
+  console.error(`fleet: orphan reconcile failed at boot: ${String(error)}`);
+}
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {

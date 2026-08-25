@@ -1,6 +1,6 @@
 # The operator-independence drill
 
-The phase-1 exit criterion ([roadmap](roadmap.md#phase-1--first-real-delegated-run-in-progress)), executed as a repeatable acceptance drill. It proves the one claim everything else rests on: **no local process is load-bearing**. A job blocks on a real decision, the dispatching machine disappears, the job parks to zero cost, a *different* machine answers, the job re-enters and delivers a PR, and the cluster returns to zero.
+The phase-1 exit criterion ([roadmap](roadmap.md#phase-1--first-real-delegated-run)), executed as a repeatable acceptance drill. It proves the one claim everything else rests on: **no local process is load-bearing**. A job blocks on a real decision, the dispatching machine disappears, the job parks to zero cost, a *different* machine answers, the job re-enters and delivers a PR, and the cluster returns to zero.
 
 Run it against a live deployment after any change to the daemon, the runner lifecycle, or an infra unit. [The harness drill](#the-harness-drill) below is its companion: the same claim from the operator's side of the pipe, exercised through a live coding-harness session.
 
@@ -22,6 +22,7 @@ Run it against a live deployment after any change to the daemon, the runner life
    *Check:* the event log shows the WIP push and park; `aws ecs list-tasks` lists only the daemon task; the job branch on origin carries the WIP commit.
 5. **Answer from machine B.**
    - Checkout path: recreate the deployment pointer, connect, answer:
+
      ```sh
      mkdir -p .fleet/infra/aws
      aws ssm get-parameter --name /<name>/fleet-config --query Parameter.Value --output text \
@@ -32,7 +33,9 @@ Run it against a live deployment after any change to the daemon, the runner life
      fleet connect   # in its own tab
      fleet answer <job> --option <id>
      ```
+
    - Console-shell path (no checkout): port-forward in one tab, answer with curl in another:
+
      ```sh
      aws ssm start-session --target "ecs:<cluster>_<task-id>_<runtime-id>" \
        --document-name AWS-StartPortForwardingSessionToRemoteHost \
@@ -40,6 +43,7 @@ Run it against a live deployment after any change to the daemon, the runner life
      curl -X POST http://127.0.0.1:19000/jobs/<job>/answer \
        -H 'content-type: application/json' -d '{"option":"<id>"}'
      ```
+
    *Check:* the event log records the answer; the daemon relaunches the job — state `running`, a fresh task id, capacity scaling out again if it had drained.
 6. **Let it finish.** Re-entry checks out the job branch (WIP intact) and re-invokes the harness with the answer injected.
    *Check:* settle event, state `done`, a draft PR carrying the branch's work.
@@ -53,13 +57,13 @@ The other half of the same claim. The drill above proves no local *process* is l
 
 It needs a live session with a human in it, so it is a human drill by construction: no test can stand in for "the agent asked me, and did not answer for me".
 
-### Preconditions
+### What it needs
 
 - A repo with `.fleet/manifest.json`, `fleet lint` clean, and a reachable daemon (`fleet status` responds).
 - A ticket that will genuinely block, as above.
 - The skill installed: `fleet setup harness`. *Check:* the command names the harness and the path; the file at that path opens with `name: fleet-delegate`.
 
-### The drill
+### The steps
 
 1. **Trigger by intent, not by name.** In a fresh session, say *"delegate issue N to fleet"* — never `/fleet-delegate` or "use the fleet skill". The skill's `description` is the whole trigger mechanism, and naming the skill bypasses exactly what is being tested.
    *Check:* the session loads the skill (Claude Code names it; Codex and OpenCode show it in the transcript) and dispatches without being told the commands.

@@ -1,4 +1,5 @@
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -47,6 +48,20 @@ resource "aws_vpc" "this" {
   enable_dns_hostnames = true
 
   tags = merge(local.tags, { Name = var.name })
+}
+
+# Every VPC ships a default security group that allows all traffic between its
+# members. Nothing in Fleet uses it — every resource here names its own SG — but
+# it stays permissive unless something claims it, so anything later launched into
+# this VPC without an explicit SG lands in an allow-all group. Adopting it with
+# no rules closes that (Checkov CKV2_AWS_12). Only when Fleet owns the VPC:
+# adopting an operator's default SG would silently change their other workloads.
+resource "aws_default_security_group" "this" {
+  count = local.create_vpc ? 1 : 0
+
+  vpc_id = aws_vpc.this[0].id
+
+  tags = merge(local.tags, { Name = "${var.name}-default-locked" })
 }
 
 resource "aws_internet_gateway" "this" {
@@ -207,6 +222,16 @@ resource "aws_ecr_repository" "runner" {
     scan_on_push = true
   }
 
+  # KMS rather than the AES256 default (Checkov CKV_AWS_136). Deliberately the
+  # AWS-managed ECR key, not the CMK above: images are rebuildable from this
+  # repo, so there is nothing here worth the key-policy surface a CMK adds.
+  encryption_configuration {
+    encryption_type = "KMS"
+  }
+
+  # image_tag_mutability stays MUTABLE. images/build.sh owns the :runner and
+  # :daemon tags that infra/aws/ pins by name and re-pushes them on every build;
+  # IMMUTABLE makes the second push fail. See docs/decisions.md.
   tags = local.tags
 }
 
@@ -217,6 +242,10 @@ resource "aws_ecr_repository" "project" {
 
   image_scanning_configuration {
     scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "KMS"
   }
 
   tags = local.tags
@@ -318,6 +347,14 @@ resource "aws_iam_role_policy" "daemon_ssm_config" {
         Action   = ["ssm:GetParameter"]
         Resource = aws_ssm_parameter.fleet_config.arn
       },
+      {
+        # The parameter is a SecureString, so reading it is two authorizations:
+        # ssm:GetParameter above and kms:Decrypt here. Scoped to decrypt only —
+        # the daemon never writes the parameter.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = aws_kms_key.fleet.arn
+      },
     ]
   })
 }
@@ -408,9 +445,17 @@ resource "aws_launch_template" "instances" {
     name = aws_iam_instance_profile.instance.name
   }
 
+  # IMDSv2 is required and the hop limit is 1, so a job's container cannot
+  # reach IMDS and assume the *instance* role — the escalation Fleet's
+  # permission split exists to prevent (#157, docs/decisions.md#d16). The old
+  # "containers need the instance role via IMDS" claim was checked and is
+  # false: nothing job-side reads IMDS. Task credentials come from the ECS
+  # credential endpoint at 169.254.170.2 (not IMDS, works at hop limit 1),
+  # image pulls use the execution role resolved by the ECS agent on the host,
+  # and ECS exec is the host's SSM agent. Pinned in test/infra-aws.test.ts.
   metadata_options {
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2 # containers need the instance role via IMDS
+    http_put_response_hop_limit = 1
   }
 
   user_data = base64encode(<<-EOT
@@ -497,10 +542,69 @@ resource "aws_ecs_cluster_capacity_providers" "this" {
   }
 }
 
+# --- KMS (customer-managed key for state at rest) --------------------------------
+# EFS, the log groups and the fleet-config parameter are all encrypted by default
+# with an AWS-managed key, which the operator cannot rotate, audit by policy, or
+# revoke. One CMK covers all three so those things are the operator's to control
+# (Checkov CKV_AWS_184 / CKV_AWS_158, Opengrep aws-efs-filesystem-encrypted-with-cmk).
+#
+# Deletion window is 30 days, deliberately not 7: the key is the only way to read
+# a job's history, and a fat-fingered destroy should be recoverable for longer
+# than a weekend.
+
+resource "aws_kms_key" "fleet" {
+  description             = "${var.name}: EFS state, log groups, fleet-config parameter"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  # CloudWatch Logs encrypts with the key itself rather than through a caller's
+  # credentials, so the log service needs its own grant. Scoped by
+  # kms:EncryptionContext so it can only be used for this deployment's groups —
+  # a bare logs.* principal would let any log group in the account use this key.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AccountFullControl"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "CloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.${data.aws_region.current.region}.amazonaws.com" }
+        Action = [
+          "kms:Encrypt*",
+          "kms:Decrypt*",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:Describe*",
+        ]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/${var.name}/*"
+          }
+        }
+      },
+    ]
+  })
+
+  tags = merge(local.tags, { Name = var.name })
+}
+
+resource "aws_kms_alias" "fleet" {
+  name          = "alias/${var.name}"
+  target_key_id = aws_kms_key.fleet.key_id
+}
+
 # --- EFS (FLEET_HOME durable state) ---------------------------------------------
 
 resource "aws_efs_file_system" "fleet_home" {
-  encrypted = true
+  encrypted  = true
+  kms_key_id = aws_kms_key.fleet.arn
 
   lifecycle_policy {
     transition_to_ia = "AFTER_30_DAYS"
@@ -517,17 +621,50 @@ resource "aws_efs_mount_target" "fleet_home" {
   security_groups = [aws_security_group.efs.id]
 }
 
+# The daemon container runs as uid 1000 (`USER node` in images/daemon/Dockerfile),
+# but EFS creates its filesystem root as root:root 0755 — unwritable at uid 1000.
+# The access point fixes ownership structurally: it roots the daemon's mount at
+# /fleet-home (created 1000:1000 on first mount) and forces every NFS request to
+# posix uid/gid 1000, so no by-hand chown is baked into any deploy path (#156,
+# docs/decisions.md#d16).
+#
+# Upgrading a deployment that predates this: state already written at the EFS
+# filesystem root is NOT visible through the access point until an operator
+# moves it into /fleet-home — see infra/aws/README.md.
+resource "aws_efs_access_point" "fleet_home" {
+  file_system_id = aws_efs_file_system.fleet_home.id
+
+  posix_user {
+    uid = 1000
+    gid = 1000
+  }
+
+  root_directory {
+    path = "/fleet-home"
+
+    creation_info {
+      owner_uid   = 1000
+      owner_gid   = 1000
+      permissions = "0755"
+    }
+  }
+
+  tags = merge(local.tags, { Name = "${var.name}-home" })
+}
+
 # --- CloudWatch logs -------------------------------------------------------------
 
 resource "aws_cloudwatch_log_group" "daemon" {
   name              = "/${var.name}/daemon"
   retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.fleet.arn
   tags              = local.tags
 }
 
 resource "aws_cloudwatch_log_group" "runner" {
   name              = "/${var.name}/runner"
   retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.fleet.arn
   tags              = local.tags
 }
 
@@ -554,6 +691,14 @@ resource "aws_ecs_task_definition" "runner" {
       essential = true
       cpu       = var.runner_cpu
       memory    = var.runner_memory
+
+      # Seconds between SIGTERM and SIGKILL when the daemon cancels a job
+      # (#111). The runner's cancel teardown kills the harness tree, pushes the
+      # work in progress and settles inside FLEET_CANCEL_DEADLINE_MS (20s); past
+      # this timeout ECS kills it mid-push and the uncommitted work is gone.
+      # Pinned rather than left to the ECS default so raising the runner's
+      # deadline cannot silently outgrow it.
+      stopTimeout = 30
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -584,9 +729,25 @@ resource "aws_ecs_task_definition" "runner" {
 # reads at apply time is the copy that rots. test/cloud-agnostic.test.ts fails a
 # unit that writes the map more than once.
 locals {
+  # Valid Fargate memory values (MiB) per task CPU value. Consumed by the
+  # daemon task definition's precondition (below) that holds the pairing.
+  fargate_memory_mib = {
+    256  = [512, 1024, 2048]
+    512  = range(1024, 4096 + 1, 1024)
+    1024 = range(2048, 8192 + 1, 1024)
+    2048 = range(4096, 16384 + 1, 1024)
+    4096 = range(8192, 30720 + 1, 1024)
+  }
+
   fleet_config = {
     provider = "ecs"
     cluster  = aws_ecs_cluster.this.name
+    # The region every aws CLI call against this deployment must name (#138):
+    # the operator picked it at setup, and relying on the caller's ambient
+    # AWS_REGION instead turns a wrong default into "the daemon service is not
+    # up". The daemon's own boot-time SSM read is the one caller that still
+    # runs ambient — inside the task, ECS sets AWS_REGION to this value.
+    region = data.aws_region.current.region
     # capacity_provider replaces launch_type: run-task uses --capacity-provider-strategy
     # so ECS managed scaling fires and the ASG scales out for each job.
     capacity_provider = aws_ecs_capacity_provider.ec2.name
@@ -617,9 +778,15 @@ locals {
 }
 
 resource "aws_ssm_parameter" "fleet_config" {
-  name  = local.fleet_config_ssm_path
-  type  = "String"
-  value = jsonencode(local.fleet_config)
+  name = local.fleet_config_ssm_path
+  # SecureString under the deployment's CMK. The contents are not secrets — task
+  # definition family, cluster name, subnet ids — but they are a complete map of
+  # how to dispatch a job into this account, and a String parameter is readable
+  # by anything holding ssm:GetParameter on the path. Readers must pass
+  # --with-decryption and hold kms:Decrypt (see daemon_ssm_config below).
+  type   = "SecureString"
+  key_id = aws_kms_key.fleet.arn
+  value  = jsonencode(local.fleet_config)
 
   tags = local.tags
 }
@@ -643,12 +810,30 @@ resource "aws_ecs_task_definition" "daemon" {
   task_role_arn      = aws_iam_role.daemon.arn
   execution_role_arn = aws_iam_role.task_execution.arn
 
+  lifecycle {
+    # The Fargate cpu↔memory pairing: a precondition, not a variable
+    # validation, because it reads both variables and cross-variable
+    # validation needs terraform 1.9 while this module still supports 1.5.
+    # Each variable's own validation holds its independent bounds; this holds
+    # the pairing Fargate would otherwise reject at apply.
+    precondition {
+      condition     = contains(local.fargate_memory_mib[var.daemon_cpu], var.daemon_memory)
+      error_message = "daemon_memory=${var.daemon_memory} is not a valid Fargate memory for daemon_cpu=${var.daemon_cpu}. Valid: 256→512/1024/2048; 512→1024-4096; 1024→2048-8192; 2048→4096-16384; 4096→8192-30720 (1024-MiB steps above cpu 256)."
+    }
+  }
+
   volume {
     name = "fleet-home"
 
     efs_volume_configuration {
       file_system_id     = aws_efs_file_system.fleet_home.id
       transit_encryption = "ENABLED"
+
+      # The access point roots the mount at /fleet-home owned 1000:1000 and
+      # forces posix uid/gid 1000 — what lets the daemon container drop root.
+      authorization_config {
+        access_point_id = aws_efs_access_point.fleet_home.id
+      }
     }
   }
 

@@ -9,7 +9,7 @@
 # mock_provider makes the plan free and offline — no credentials, no API calls,
 # no state — while keeping the part that rejects the value: the real provider
 # schema. Run it as part of the infra pre-release checklist (see the unit
-# README) — by hand for now: CI's terraform job runs fmt and validate only.
+# README); CI's terraform job runs it too (.github/workflows/tests.yml).
 #
 #   terraform -chdir=infra/aws init -backend=false -input=false
 #   terraform -chdir=infra/aws test
@@ -97,6 +97,43 @@ run "public_subnets_give_the_daemon_a_public_ip" {
     error_message = "connect_hint's --target is not an SSM session target: it must be ecs:<cluster>_<taskId>_<runtimeId>, and the API rejects commas and slashes"
   }
 
+  # Region rides fleet_config (#138): every `aws` call the CLI and daemon make
+  # against this deployment names it explicitly, instead of trusting the
+  # caller's ambient AWS_REGION — which, wrong, turns into the misleading "the
+  # daemon service is not up". Asserted through the output, which is the same
+  # local the SSM parameter publishes (test/cloud-agnostic.test.ts holds the
+  # one-copy rule); the parameter's own value is unknown at plan.
+  assert {
+    condition     = output.fleet_config.region == "us-east-1"
+    error_message = "fleet_config must carry the deployment's region, or every consumer falls back to the caller's ambient AWS_REGION"
+  }
+
+  # The daemon container runs as uid 1000 (#156), and EFS creates its
+  # filesystem root as root:root — so FLEET_HOME is writable only through the
+  # access point: rooted at /fleet-home, created 1000:1000, every NFS request
+  # forced to posix uid/gid 1000. Any drift in these numbers is a daemon that
+  # boots and cannot write a single job.
+  assert {
+    condition = (
+      aws_efs_access_point.fleet_home.posix_user[0].uid == 1000 &&
+      aws_efs_access_point.fleet_home.posix_user[0].gid == 1000 &&
+      aws_efs_access_point.fleet_home.root_directory[0].path == "/fleet-home" &&
+      aws_efs_access_point.fleet_home.root_directory[0].creation_info[0].owner_uid == 1000 &&
+      aws_efs_access_point.fleet_home.root_directory[0].creation_info[0].owner_gid == 1000 &&
+      aws_efs_access_point.fleet_home.root_directory[0].creation_info[0].permissions == "0755"
+    )
+    error_message = "the FLEET_HOME access point must be rooted at /fleet-home as uid/gid 1000 (0755), or the non-root daemon cannot write its state"
+  }
+
+  # The access point only matters if the daemon's volume actually mounts
+  # through it. The id itself is unknown at plan, but the block's presence is
+  # in the configuration: no authorization_config means the mount lands on the
+  # root:root filesystem root and the uid-1000 daemon cannot write it.
+  assert {
+    condition     = length(tolist(aws_ecs_task_definition.daemon.volume)[0].efs_volume_configuration[0].authorization_config) == 1
+    error_message = "the daemon's fleet-home volume must mount through the EFS access point (authorization_config), or uid 1000 lands on an unwritable root"
+  }
+
   # The middle field is the task *id*, and the hint's TASK holds an ARN — the
   # slashes in which the API rejects just as it rejects the commas above. The
   # check above cannot see it, because a shell variable collapses to a
@@ -142,4 +179,87 @@ run "reused_vpc_plans_against_the_operators_subnets" {
     condition     = length(aws_efs_mount_target.fleet_home) == 2
     error_message = "one EFS mount target per operator-supplied subnet, or the daemon cannot mount FLEET_HOME from every subnet it may land in"
   }
+}
+
+# --- variable validation (#138) ----------------------------------------------
+# Constraints that fail at plan, not apply. Each run below feeds the unit a
+# value AWS would reject only after money was spent, and expects the named
+# variable's validation (or the task definition's precondition) to reject it
+# first. A validation that stops failing these is a validation someone deleted.
+
+run "nine_azs_would_collide_public_and_private_cidrs" {
+  command = plan
+
+  variables {
+    az_count = 10
+  }
+
+  expect_failures = [var.az_count]
+}
+
+run "a_zero_instance_cap_can_never_run_a_job" {
+  command = plan
+
+  variables {
+    max_instances = 0
+  }
+
+  expect_failures = [var.max_instances]
+}
+
+run "daemon_cpu_must_be_a_fargate_value" {
+  command = plan
+
+  variables {
+    daemon_cpu = 300
+  }
+
+  expect_failures = [var.daemon_cpu]
+}
+
+run "daemon_memory_outside_the_fargate_range_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    daemon_memory = 128
+  }
+
+  expect_failures = [var.daemon_memory]
+}
+
+# 4096 MiB is a valid Fargate memory — for cpu 512 and up. With the default
+# cpu 256 it is an invalid pairing, which only the cross-variable precondition
+# on the daemon task definition can see (the module supports terraform 1.5,
+# where a variable validation cannot read another variable).
+run "daemon_cpu_memory_pairing_is_held_by_the_precondition" {
+  command = plan
+
+  variables {
+    daemon_cpu    = 256
+    daemon_memory = 4096
+  }
+
+  expect_failures = [aws_ecs_task_definition.daemon]
+}
+
+run "offered_capacity_must_be_positive" {
+  command = plan
+
+  variables {
+    offered_cpu_units  = 0
+    offered_memory_mib = 0
+  }
+
+  expect_failures = [var.offered_cpu_units, var.offered_memory_mib]
+}
+
+run "spot_split_knobs_hold_their_api_bounds" {
+  command = plan
+
+  variables {
+    on_demand_base_capacity         = -1
+    on_demand_percentage_above_base = 150
+  }
+
+  expect_failures = [var.on_demand_base_capacity, var.on_demand_percentage_above_base]
 }

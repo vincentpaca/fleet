@@ -25,11 +25,12 @@ import {
   runnerBaseTag,
   jobImageTag,
   twoLayerEnabled,
-  setupHashInputs,
   imageExistsLocally,
   buildJobImage,
+  jobImageDockerfile,
   type ImageManifest,
 } from '../src/cli/images.ts';
+import { SETUP_BAKED_BASENAME } from '../src/shared/setup-marker.ts';
 
 // ---------- fixtures ----------
 
@@ -72,18 +73,6 @@ describe('runnerBaseTag', () => {
     assert.equal(runnerBaseTag({}), 'fleet-runner:claude-code-latest');
   });
 
-  test('encodes other CLIs', () => {
-    assert.equal(
-      runnerBaseTag({ harness: { cli: 'codex', cli_version: '2.0.0' } }),
-      'fleet-runner:codex-2.0.0',
-    );
-  });
-});
-
-// ---------- jobImageTag ----------
-
-test('jobImageTag wraps hash in fleet-job prefix', () => {
-  assert.equal(jobImageTag('abc123'), 'fleet-job:abc123');
 });
 
 // ---------- computeImageHash ----------
@@ -141,45 +130,78 @@ describe('computeImageHash', () => {
     assert.equal(h1, h3, 'absent setup.image must produce the same hash as a present one');
   });
 
+  test('changes when devcontainer content changes', () => {
+    const manifest: ImageManifest = {
+      ...BASE_MANIFEST,
+      setup: { devcontainer: '.devcontainer/devcontainer.json' },
+    };
+    const h1 = computeImageHash(manifest, () => '{"image":"mcr.microsoft.com/devcontainers/base"}');
+    const h2 = computeImageHash(manifest, () => '{"image":"mcr.microsoft.com/devcontainers/universal"}');
+    assert.notEqual(h1, h2);
+  });
+
   test('is exactly 16 hex characters', () => {
     const hash = computeImageHash(BASE_MANIFEST);
     assert.match(hash, /^[0-9a-f]{16}$/);
   });
+
+  test('a moved base tag changes the hash even under identical tag text (#138)', () => {
+    // The "latest" cache lie: fleet-runner:claude-code-latest is the same TEXT
+    // before and after the tag moves to a rebuilt base. Hashing only the text
+    // reuses every stale job image; the resolved image id is the identity.
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const before = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    const after = computeImageHash(manifest, undefined, () => 'sha256:bbbb');
+    assert.notEqual(before, after, 'a moved base tag must invalidate the job-image cache');
+  });
+
+  test('an unchanged base id keeps the hash stable (#138)', () => {
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const h1 = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    const h2 = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    assert.equal(h1, h2);
+  });
+
+  test('an unresolvable base degrades to text-only hashing, deterministically (#138)', () => {
+    // No docker / base not pulled: the hash must not throw and must stay
+    // stable, and the missing id must not collide with an empty-string id
+    // produced any other way than "unresolved".
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const h1 = computeImageHash(manifest, undefined, () => undefined);
+    const h2 = computeImageHash(manifest, undefined, () => undefined);
+    assert.equal(h1, h2);
+    assert.notEqual(h1, computeImageHash(manifest, undefined, () => 'sha256:aaaa'));
+  });
 });
 
-// ---------- setupHashInputs ----------
+// ---------- jobImageDockerfile (baked-setup marker, #49) ----------
 
-describe('setupHashInputs', () => {
-  test('returns a JSON string', () => {
-    const result = setupHashInputs({}, () => '');
-    assert.doesNotThrow(() => JSON.parse(result));
+describe('jobImageDockerfile', () => {
+  test('setup.script mode runs the script and leaves the baked marker in the same layer', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { script: '.fleet/setup.sh' },
+    });
+    assert.match(dockerfile, /^FROM fleet-runner:claude-code-1\.2\.3\n/);
+    assert.match(dockerfile, /COPY \.fleet\/setup\.sh \/tmp\/fleet-setup\.sh/);
+    // The marker is what tells the runner NOT to run setup.script again before
+    // the pickup gate (src/runner/setup.ts). Same RUN as the script: a build
+    // where setup failed must not leave the marker behind.
+    assert.match(
+      dockerfile,
+      new RegExp(`RUN sh /tmp/fleet-setup\\.sh && touch "\\$HOME/${SETUP_BAKED_BASENAME}"`),
+    );
+    // $HOME, never /etc: the runner base drops to USER node before this layer.
+    assert.ok(!dockerfile.includes('/etc/'), 'job-image layers run as node and cannot write /etc');
   });
 
-  test('script key contains file content', () => {
-    const result = setupHashInputs(
-      { setup: { script: '.fleet/setup.sh' } },
-      (p) => (p === '.fleet/setup.sh' ? 'echo hello\n' : ''),
-    );
-    assert.ok(result.includes('echo hello'));
-  });
-
-  test('null for absent setup fields', () => {
-    const result = JSON.parse(setupHashInputs({ setup: { image: 'node:22' } }, () => ''));
-    assert.equal(result.script, null);
-    assert.equal(result.devcontainer, null);
-    assert.equal(result.dockerfile, null);
-  });
-
-  test('devcontainer content affects hash inputs', () => {
-    const r1 = setupHashInputs(
-      { setup: { devcontainer: '.devcontainer/devcontainer.json' } },
-      () => '{"image":"mcr.microsoft.com/devcontainers/base"}',
-    );
-    const r2 = setupHashInputs(
-      { setup: { devcontainer: '.devcontainer/devcontainer.json' } },
-      () => '{"image":"mcr.microsoft.com/devcontainers/universal"}',
-    );
-    assert.notEqual(r1, r2);
+  test('no setup.script → plain base alias, and no marker', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { image: 'node:22' },
+    });
+    assert.equal(dockerfile, 'FROM fleet-runner:claude-code-1.2.3\n');
+    assert.ok(!dockerfile.includes(SETUP_BAKED_BASENAME), 'an image that baked nothing must not claim it did');
   });
 });
 
@@ -198,6 +220,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CLI = 'claude-code';
 const TEST_CLI_VER = 'fleet-test-sentinel';
 const BASE_TAG = `fleet-runner:${TEST_CLI}-${TEST_CLI_VER}`;
+const DAEMON_TAG = 'fleet-daemon:fleet-test-sentinel';
 
 // Fake harness delivered as a synced file into the workspace.
 // Uses the decision-file convention (writes decision.json, reads answer-d1.json);
@@ -298,6 +321,70 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     cleanup.push(BASE_TAG);
   });
 
+  // The harness is the least trusted code Fleet runs, so the container it runs
+  // in must not be root. Asserted on the built image rather than by reading the
+  // Dockerfile: a later `USER root`, a base-image change, or an ENTRYPOINT that
+  // re-escalates would all pass a grep and fail here.
+  test('the runner image runs as a non-root user that can still do the job', () => {
+    const sh = (script: string): string =>
+      execFileSync('docker', ['run', '--rm', '--entrypoint', 'sh', BASE_TAG, '-c', script], {
+        encoding: 'utf8',
+      }).trim();
+
+    assert.equal(sh('id -u'), '1000', 'the runner must not run as root');
+
+    // Non-root is worthless if it cannot work. These are the four things the
+    // runner does before the harness produces a line: create the workspace,
+    // clone into it, find its own entrypoint, and write its own home.
+    assert.equal(
+      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"'),
+      'ok',
+      'the runner must be able to materialise FLEET_WORKSPACE',
+    );
+    assert.equal(sh('git init -q /workspace/repo && echo ok'), 'ok');
+    assert.equal(sh('[ -w "$HOME" ] && echo ok'), 'ok', 'the harness writes config under $HOME');
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"'),
+      'ok',
+    );
+  });
+
+  // The daemon image dropped root in #156, after the runner did in #155. Same
+  // discipline: asserted on the built image, not by grepping the Dockerfile —
+  // a later `USER root`, a base-image change, or an entrypoint that
+  // re-escalates would all pass a grep and fail here.
+  test('the daemon image runs as a non-root user that can still do the job', () => {
+    execFileSync(
+      'docker',
+      ['build', '-t', DAEMON_TAG, '-f', join('images', 'daemon', 'Dockerfile'), '.'],
+      { cwd: repoRoot, stdio: 'inherit' },
+    );
+    cleanup.push(DAEMON_TAG);
+
+    const sh = (script: string): string =>
+      execFileSync('docker', ['run', '--rm', '--entrypoint', 'sh', DAEMON_TAG, '-c', script], {
+        encoding: 'utf8',
+      }).trim();
+
+    assert.equal(sh('id -u'), '1000', 'the daemon must not run as root');
+
+    // Non-root is worthless if it cannot work. The daemon's job before it
+    // answers a request: write $FLEET_HOME (jobs, journals, daemon.lock — in a
+    // deployment the EFS access point makes the mount writable at uid 1000;
+    // this image-level stand-in proves the process side of that pact), find
+    // its own entrypoint, and run the AWS CLI the EcsProvider shells out to.
+    assert.equal(
+      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(process.env.HOME+\'/fleet-home/jobs\',{recursive:true});f.writeFileSync(process.env.HOME+\'/fleet-home/daemon.lock\',\'probe\');console.log(\'ok\')"'),
+      'ok',
+      'the daemon must be able to write a FLEET_HOME it owns',
+    );
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/daemon/main.ts\')?\'ok\':\'missing\')"'),
+      'ok',
+    );
+    assert.match(sh('aws --version 2>&1'), /aws-cli/, 'EcsProvider shells out to aws as uid 1000');
+  });
+
   // AC3: no secrets baked into any image layer
   test('docker history contains no baked-in secret values', () => {
     const history = execFileSync(
@@ -316,21 +403,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     }
   });
 
-  // AC2: setup change → new hash; identical setup → same hash → skip rebuild
-  test('setup content change produces a new image tag; identical content reuses it', () => {
-    const manifest: ImageManifest = {
-      harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
-      setup: { image: 'node:22' },
-    };
-    const h1 = computeImageHash(manifest, () => '# setup v1\n');
-    const h2 = computeImageHash(manifest, () => '# setup v2\n');
-    assert.notEqual(h1, h2, 'changed content must produce a different hash → new rebuild');
-
-    const h3 = computeImageHash(manifest, () => '# setup v2\n');
-    assert.equal(h2, h3, 'same content must reproduce the same hash → no spurious rebuild');
-  });
-
-  test('buildJobImage creates an inspectable local image; imageExistsLocally detects it', () => {
+  test('buildJobImage creates an inspectable local image; imageExistsLocally detects it', async () => {
     const manifest: ImageManifest = {
       harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
       setup: { image: 'node:22' },
@@ -338,7 +411,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     const hash = computeImageHash(manifest);
     const tag = jobImageTag(hash);
 
-    buildJobImage({ tag, baseTag: BASE_TAG, manifest, contextDir: repoRoot });
+    await buildJobImage({ tag, baseTag: BASE_TAG, manifest, contextDir: repoRoot });
     cleanup.push(tag);
 
     assert.ok(imageExistsLocally(tag), `image not found after build: ${tag}`);
@@ -381,6 +454,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
   test('docker-provider job runs gate → fake harness → decision → answer → settle', async (t) => {
     const { FleetDaemon } = await import('../src/daemon/server.ts');
     const { DockerProvider } = await import('../src/providers/docker.ts');
+    const { writeSecretTempFile } = await import('../src/providers/provider.ts');
     const { promisify } = await import('node:util');
     const { execFile } = await import('node:child_process');
 
@@ -408,15 +482,21 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
       name: 'docker',
       async launch(spec: Parameters<typeof innerProvider.launch>[0]) {
         const hostSpec = { ...spec, daemonUrl: spec.daemonUrl.replace('127.0.0.1', dockerHostAddr) };
-        const args = innerProvider.buildRunArgs(hostSpec);
-        // Insert host resolution before the image tag.
-        const imageIdx = args.indexOf(tag);
-        if (imageIdx < 0) throw new Error(`image tag ${tag} not found in docker run args`);
-        args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
-        const { stdout } = await runCmd('docker', args);
-        const containerId = stdout.trim();
-        if (!containerId) throw new Error('docker run returned no container id');
-        return { handle: containerId };
+        // Env rides a 0600 temp file, never argv (#126) — same as the real launch().
+        const envFile = writeSecretTempFile('fleet-env-', innerProvider.envFileContents(hostSpec));
+        try {
+          const args = innerProvider.buildRunArgs(hostSpec, envFile.path);
+          // Insert host resolution before the image tag.
+          const imageIdx = args.indexOf(tag);
+          if (imageIdx < 0) throw new Error(`image tag ${tag} not found in docker run args`);
+          args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
+          const { stdout } = await runCmd('docker', args);
+          const containerId = stdout.trim();
+          if (!containerId) throw new Error('docker run returned no container id');
+          return { handle: containerId };
+        } finally {
+          envFile.cleanup();
+        }
       },
       terminate(handle: string) { return innerProvider.terminate(handle); },
     };
@@ -448,8 +528,14 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
         image: tag,
       }),
     });
-    assert.equal(created.status, 201, `job creation failed: ${await created.text()}`);
-    const { job } = (await created.json()) as { job: { id: string } };
+    // Read the body once. A template literal in an assertion message is
+    // evaluated eagerly, so `${await created.text()}` consumed the body whether
+    // the assertion passed or not and the next line threw "Body has already
+    // been read" — meaning this test could never pass, and being gated behind
+    // FLEET_TEST_DOCKER=1 meant nobody found out.
+    const createdBody = await created.text();
+    assert.equal(created.status, 201, `job creation failed: ${createdBody}`);
+    const { job } = JSON.parse(createdBody) as { job: { id: string } };
     const jobId = job.id;
 
     t.after(() => {

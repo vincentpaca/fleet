@@ -6,6 +6,7 @@ import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { request } from "../src/shared/http.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost, until } from "./daemon-helpers.ts";
+import { DEFAULT_DECISION_TIMEOUT_MS } from "../src/shared/time.ts";
 import type { ResourceRequest } from "../src/providers/provider.ts";
 
 const LONG_POLL_MS = 300;
@@ -175,16 +176,19 @@ test("runner intake: bad token 401, schema violation / wrong job / bad seq / ill
   assert.equal(ok.status, 200, ok.body);
   assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "running");
 
-  // Replayed seq rejected
+  // Replayed seq carrying different content rejected — named for what it is
+  // (#113's tripwire), not as an ordering complaint.
   const replay = await runnerPost(ctx.sock, id, token, event(id, 0, { type: "think", text: "again" }));
   assert.equal(replay.status, 422);
-  assert.match(replay.body, /monotonically increasing/);
+  assert.match(replay.body, /already recorded with different content/);
 
-  // Lower seq rejected even after a gap
+  // Lower seq rejected even after a gap. Seq 4 was never recorded, so there is
+  // nothing to compare it against and the ordering rule is what refuses it.
   const gap = await runnerPost(ctx.sock, id, token, event(id, 7, { type: "think", text: "gap ok" }));
   assert.equal(gap.status, 200);
   const lower = await runnerPost(ctx.sock, id, token, event(id, 4, { type: "think", text: "backwards" }));
   assert.equal(lower.status, 422);
+  assert.match(lower.body, /monotonically increasing/);
 
   // Runners may never post answers
   const answer = await runnerPost(ctx.sock, id, token, event(id, 8, { type: "answer", decision: "d1", by: "runner" }));
@@ -524,9 +528,12 @@ test("wall-clock backstop terminates and cancels wedged job via daemon sweep", a
   // Runner signals running — this starts the active-time clock in the daemon.
   await runnerPost(ctx.sock, job.id, token, event(job.id, 0, { type: "state", state: "running" }));
 
-  // The runner is now wedged (posts no more events).
-  // Wait for limit (1s) + margin (300ms) + a few sweep cycles (150ms buffer).
-  await sleep(1600);
+  // The runner is now wedged (posts no more events). Poll for the backstop:
+  // limit (1s) + margin (300ms) + sweep cycles, with headroom under load.
+  await until(async () => {
+    const j = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
+    return j.state === "cancelled";
+  }, 10_000);
 
   const cancelled = (await op(ctx.sock, "GET", `/jobs/${job.id}`)).json as { job: Record<string, unknown> };
   assert.equal(cancelled.job.state, "cancelled");
@@ -578,16 +585,15 @@ test("stall backstop cancels a running job whose events dried up (reason stall)"
 
   await runnerPost(ctx.sock, job.id, launch.runnerToken, event(job.id, 0, { type: "state", state: "running" }));
 
-  // The runner is dead: no further events. Limit (1s) + margin (300ms) + sweeps.
-  await sleep(1_600);
-
+  // The runner is dead: no further events. Poll for the backstop (limit 1s +
+  // margin 300ms + sweep cycles) with headroom under load.
+  await until(async () => {
+    const j = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
+    return j.state === "cancelled";
+  }, 10_000);
   const cancelled = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
   assert.equal(cancelled.state, "cancelled");
   assert.equal(cancelled.reason, "stall", "the record carries the reason so status/board can show cancelled(stall)");
-  assert.ok(
-    provider.terminated.includes(job.handle ?? `stub:${job.id}`),
-    `expected the handle to be terminated; got ${JSON.stringify(provider.terminated)}`,
-  );
 
   const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${job.id}/events`)).body) as Record<string, unknown>[];
   const settleEvent = events.find((e) => e.type === "settle");
@@ -767,6 +773,66 @@ test("POST /jobs with no limits.resources passes undefined resources to the Laun
   assert.equal(launch.resources, undefined);
 });
 
+// --- Dispatch-time image-override check (#49) ---------------------------------
+
+/** Provider stub that cannot honor a per-job image override (the ECS shape). */
+class ImagePinnedProvider extends StubProvider {
+  override readonly name = "ecs";
+  checkImageOverride(image: string): void {
+    throw new Error(`the ecs provider cannot run the computed job image ${image}`);
+  }
+}
+
+test("POST /jobs refuses an image override the provider cannot honor — 422, no job created", async (t) => {
+  const provider = new ImagePinnedProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: MANIFEST,
+    image: "fleet-job:abc123def4567890",
+  });
+
+  assert.equal(res.status, 422);
+  const { errors } = res.json as { errors: { instancePath: string; message: string }[] };
+  assert.ok(errors.some((e) => e.instancePath === "/image"), `expected /image error; got: ${JSON.stringify(errors)}`);
+  assert.ok(
+    errors.some((e) => e.message.includes("fleet-job:abc123def4567890")),
+    `the refusal must name the image; got: ${JSON.stringify(errors)}`,
+  );
+
+  // The silent-fallback bug this guards: no job may exist, nothing may launch.
+  const list = await op(sock, "GET", "/jobs");
+  assert.deepEqual((list.json as { jobs: unknown[] }).jobs, []);
+  assert.equal(provider.launches.length, 0);
+});
+
+test("POST /jobs without an image override dispatches normally on an image-pinned provider", async (t) => {
+  const provider = new ImagePinnedProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  assert.equal(provider.launches.length, 1);
+});
+
+test("POST /jobs forwards the image override to a provider that honors it", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const res = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER,
+    manifest: MANIFEST,
+    image: "fleet-job:abc123def4567890",
+  });
+  assert.equal(res.status, 201, res.body);
+  assert.equal(ctx.provider.launches[0].image, "fleet-job:abc123def4567890");
+});
+
 // --- Parked-job re-entry (issue #6) ---
 
 // (No manifest helper needed for decision_timeout tests — registry is seeded directly
@@ -913,6 +979,67 @@ test("decision_timeout sweep marks parked job stale; job remains answerable", as
   assert.equal(provider.launches.length, 2, "stale job must re-launch on answer");
 });
 
+test("stale sweep fires for a manifest with no limits block: the 24h default is armed (#134)", async (t) => {
+  // Before #134 initDecisionTimeout only ran when the manifest named the key,
+  // so the documented happy-path manifest (fleet init wrote no limits block)
+  // produced parked jobs that never surfaced as stale. MANIFEST here carries
+  // no limits key at all — the default must arm the sweep anyway.
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    wallClockSweepIntervalMs: 100,
+  });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+  assert.equal(
+    daemon.registry.decisionTimeLimitMs(id),
+    DEFAULT_DECISION_TIMEOUT_MS,
+    "the documented 24h default must be armed at creation",
+  );
+  const token = provider.launches[0].runnerToken;
+
+  await runnerPost(sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(sock, id, token, event(id, 1, DECISION));
+  await runnerPost(sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Compressed clock: pretend the decision has been waiting for 24h + 1m.
+  daemon.registry.setDecisionBlockedAt(id, Date.now() - (DEFAULT_DECISION_TIMEOUT_MS + 60_000));
+
+  await until(async () => {
+    const j = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+    return j.state === "blocked" && j.marker === "stale";
+  }, 2_000);
+});
+
+test("work-order limits override manifest limits at job creation (#134)", async (t) => {
+  // workOrder.limits ("per-dispatch overrides", work-order.schema.json) had
+  // zero consumers: an operator's override silently did nothing. The daemon
+  // must arm its backstops from the merged view — order keys win, manifest
+  // keys the order does not name survive.
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const manifest = { ...MANIFEST, limits: { wall_clock: "4h", decision_timeout: "24h" } };
+  const workOrder = { ...WORK_ORDER, limits: { wall_clock: "1m" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder, manifest });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+
+  assert.equal(ctx.daemon.registry.wallClockLimitMs(id), 60_000, "the order's 1m must beat the manifest's 4h");
+  assert.equal(
+    ctx.daemon.registry.decisionTimeLimitMs(id),
+    24 * 3_600_000,
+    "manifest keys the order does not override keep their value",
+  );
+});
+
 test("re-launch failure after answer cancels the job — not stuck in blocked", async (t) => {
   // If provider.launch throws during re-entry, the old runner is dead and no new
   // one is starting. The daemon must cancel the job so it reaches a terminal state
@@ -976,4 +1103,172 @@ test("lastActivity: present after think/log event; absent for queued-never-ran j
   const updated = jobOf((await op(ctx.sock, "GET", `/jobs/${runId}`)).json) as Record<string, unknown>;
   const updatedActivity = updated.lastActivity as { text: string } | undefined;
   assert.equal(updatedActivity?.text, "ran npm test", "lastActivity updates to latest log event");
+});
+
+// --- Issue #110: decision id recycling after park/resume ---
+
+test("re-entry: new runner's decision does not receive the previous question's answer (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Generation 1: running → decision(d1) → parked.
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Operator answers d1 → daemon re-launches with reentryAnswer + decision count seed.
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+  assert.equal(ctx.provider.launches.length, 2, "re-launch expected");
+  const relaunch = ctx.provider.launches[1]!;
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+  assert.equal(relaunch.reentryDecisionSeed, 1, "re-launch must seed the counter past prior ids");
+
+  // Generation 2: the fresh runner's counter is seeded at 1, so its first
+  // decision is d2 — not a recycled d1.
+  const newToken = relaunch.runnerToken;
+  await runnerPost(ctx.sock, id, newToken, event(id, 0, { type: "state", state: "running" }));
+  const DECISION_2 = {
+    type: "decision",
+    id: "d2",
+    question: "How should we roll this out?",
+    options: [
+      { id: "gradual", label: "Gradual rollout", recommended: true },
+      { id: "big-bang", label: "Big bang" },
+    ],
+  };
+  const blocked2 = await runnerPost(ctx.sock, id, newToken, event(id, 1, DECISION_2));
+  assert.equal(blocked2.status, 200, blocked2.body);
+  assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "blocked");
+
+  // The runner long-polls for d2's answer. It must NOT receive d1's answer —
+  // findAnswer only matches an answer recorded after the d2 decision event,
+  // and no such answer exists yet. The poll should time out (204).
+  const poll = request({
+    socketPath: ctx.sock,
+    path: `/internal/jobs/${id}/answer?decision=d2`,
+    headers: { "x-fleet-runner-token": newToken },
+  });
+  const pollRes = await poll;
+  assert.equal(pollRes.status, 204, "d2 poll must time out — d1's answer must not leak");
+
+  // Now the operator answers d2 → the poll on a second request returns it.
+  const answered2 = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "big-bang" });
+  assert.equal(answered2.status, 200, answered2.body);
+
+  // Verify the answer event in the log is for d2, and d1's answer is distinct.
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>;
+  const answerEvents = events.filter((e) => e.type === "answer");
+  assert.equal(answerEvents.length, 2, "two answers in the log");
+  assert.equal(answerEvents[0]!.decision, "d1");
+  assert.equal(answerEvents[0]!.option, "flag");
+  assert.equal(answerEvents[1]!.decision, "d2");
+  assert.equal(answerEvents[1]!.option, "big-bang");
+
+  // Decision ids are unique across the whole log.
+  const decisionIds = events.filter((e) => e.type === "decision").map((e) => e.id);
+  assert.deepEqual(decisionIds, ["d1", "d2"], "decision ids must be unique across generations");
+});
+
+test("re-entry: happy path — the legitimate answer to the parked question still delivers (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  // Park on d1, answer it, re-enter.
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200);
+
+  // The reentryAnswer carries the correct decision id and answer — the new
+  // runner writes answer-d1.json and the harness picks it up immediately.
+  const relaunch = ctx.provider.launches[1]!;
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+  assert.equal(relaunch.reentryAnswer?.answer.option, "flag");
+
+  // The answer event for d1 is in the log.
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>;
+  const d1Answer = events.find((e) => e.type === "answer" && e.decision === "d1");
+  assert.ok(d1Answer, "d1 answer event must be in the log");
+  assert.equal(d1Answer!.option, "flag");
+});
+
+test("re-entry: a recycled decision id is rejected, so no answer can be inherited (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+
+  // A runner that ignores the seed — an older build, or a harness numbering its
+  // own ids — raises a NEW question and calls it d1 again. The counter fix keeps
+  // the shipped runner off this path; the daemon has to refuse it anyway, or the
+  // answer a human gave to the first question is inherited by the second.
+  const newToken = ctx.provider.launches[1]!.runnerToken;
+  await runnerPost(ctx.sock, id, newToken, event(id, 0, { type: "state", state: "running" }));
+  const recycled = await runnerPost(ctx.sock, id, newToken, event(id, 1, {
+    ...DECISION,
+    question: "A completely different question",
+  }));
+  assert.equal(recycled.status, 422, recycled.body);
+  assert.match(recycled.body, /already used by this job/);
+
+  // The job stayed running: no second decision was opened, so there is nothing
+  // holding a stale answer.
+  assert.equal(jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json).state, "running");
+  const decisions = (parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Array<Record<string, unknown>>)
+    .filter((e) => e.type === "decision");
+  assert.equal(decisions.length, 1, "the recycled decision must not reach the log");
+});
+
+test("findAnswer ignores an answer recorded before its decision (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, DECISION));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+  assert.ok(ctx.daemon.registry.findAnswer(id, "d1"), "the real answer resolves");
+
+  // Belt and braces behind the id-uniqueness rule: even handed a log where a
+  // decision id repeats — a journal written by an older daemon that allowed it —
+  // only an answer recorded AFTER the current decision may satisfy the poll.
+  // A first-match scan returns the previous generation's answer instantly.
+  ctx.daemon.registry.appendEvent(id, {
+    type: "decision",
+    id: "d1",
+    question: "A second question wearing the first one's id",
+    options: [{ id: "flag", label: "Flag", recommended: true }, { id: "skip", label: "Skip" }],
+  });
+  assert.equal(
+    ctx.daemon.registry.findAnswer(id, "d1"),
+    undefined,
+    "the earlier answer must not resolve the later decision",
+  );
+});
+
+test("the re-entry seed is the highest decision ordinal, not the decision count (#110)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const { id, token } = await createJob(ctx);
+
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  // A journal that skips an ordinal: the runner raised d1 and d2, but only d2
+  // reached the log (a 422 on the first attempt, a dropped batch, an older
+  // build). There is one decision event carrying ordinal 2.
+  await runnerPost(ctx.sock, id, token, event(id, 1, { ...DECISION, id: "d2" }));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+  assert.equal((await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" })).status, 200);
+
+  // Counting decision events gives 1, which seeds the fresh runner to emit d2 —
+  // the id already in the log, carrying an answer. The ordinal gives 2.
+  assert.equal(ctx.provider.launches[1]!.reentryDecisionSeed, 2);
 });

@@ -10,8 +10,9 @@
  * on the process path.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
+import { createIfAbsent } from "../shared/fs.ts";
 
 /**
  * Write manifest, work order, and synced files from env-var payloads into the
@@ -27,13 +28,16 @@ import { dirname, join, resolve, sep } from "node:path";
 export function materializeWorkspace(workspace: string): void {
   const fleetDir = join(workspace, ".fleet");
   const manifestPath = join(fleetDir, "manifest.json");
-  if (existsSync(manifestPath)) return; // already there (ProcessProvider path)
 
   const manifestB64 = process.env.FLEET_MANIFEST_JSON;
   if (!manifestB64) return; // no env-based materialisation requested
 
   mkdirSync(join(fleetDir, "out"), { recursive: true });
-  writeFileSync(manifestPath, Buffer.from(manifestB64, "base64").toString("utf8"));
+  // The manifest is the marker for "this workspace is already staged", so the
+  // create is also the test: if it was there, the ProcessProvider wrote it and
+  // everything below it belongs to that staging too.
+  const decoded = Buffer.from(manifestB64, "base64").toString("utf8");
+  if (!createIfAbsent(manifestPath, decoded)) return;
 
   const orderB64 = process.env.FLEET_WORK_ORDER_JSON;
   if (orderB64) {
@@ -46,11 +50,17 @@ export function materializeWorkspace(workspace: string): void {
       string,
       string
     >;
+    const root = resolve(workspace);
     for (const [rel, b64] of Object.entries(sync)) {
-      const target = resolve(workspace, rel);
-      // Reject any path that escapes the workspace (security invariant).
-      if (target !== workspace && !target.startsWith(workspace + sep)) {
-        console.error(`runner: materializeWorkspace: dropping path-traversal sync entry: ${rel}`);
+      const target = resolve(root, rel);
+      // Strict containment (#139): the target must live *inside* the workspace.
+      // The old guard (`target !== workspace && !startsWith`) admitted the
+      // workspace root itself, so a sync key of "." reached writeFileSync(root)
+      // and crashed EISDIR before any EventSink existed — an opaque
+      // pre-running death. Root and escape are the same rejection: neither is
+      // a file inside the workspace.
+      if (!target.startsWith(root + sep)) {
+        console.error(`runner: materializeWorkspace: dropping sync entry "${rel}" — resolves to the workspace root or escapes it (${target})`);
         continue;
       }
       mkdirSync(dirname(target), { recursive: true });

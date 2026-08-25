@@ -36,10 +36,19 @@ export type RequestOptions = {
   socketPath?: string;
   host?: string;
   port?: number;
+  /** Extra headers merged into the request; caller keys win. */
   headers?: Record<string, string>;
   body?: string;
+  /** Socket-level timeout; defaults to DEFAULT_TIMEOUT_MS so a call cannot hang forever. */
   timeoutMs?: number;
+  /** Called once per complete NDJSON line as chunks arrive (streaming reads). */
+  onLine?: (line: string) => void;
+  /** Abort the call, closing the socket. */
+  signal?: AbortSignal;
 };
+
+/** Applied when a caller passes no timeoutMs: long polls fit, hangs do not. */
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export type HttpResponse = {
   status: number;
@@ -62,21 +71,47 @@ export function request(opts: RequestOptions): Promise<HttpResponse> {
       host: opts.socketPath ? undefined : (opts.host ?? "127.0.0.1"),
       port: opts.socketPath ? undefined : opts.port,
       headers: opts.headers,
+      signal: opts.signal,
       // No pooling: a keep-alive connection to a restarted daemon's stale
       // socket would EPIPE; each call opens a fresh connection.
       agent: false,
     },
     (res) => {
-      readBody(res)
-        .then((body) => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }))
-        .catch(reject);
+      if (!opts.onLine) {
+        readBody(res)
+          .then((body) => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }))
+          .catch(reject);
+        return;
+      }
+      // Streaming mode: hand each complete NDJSON line to the caller as it
+      // arrives, and still resolve with the full body once the response ends.
+      let full = "";
+      let pending = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk: string) => {
+        full += chunk;
+        pending += chunk;
+        let nl = pending.indexOf("\n");
+        while (nl !== -1) {
+          const line = pending.slice(0, nl).trim();
+          pending = pending.slice(nl + 1);
+          if (line !== "") opts.onLine(line);
+          nl = pending.indexOf("\n");
+        }
+      });
+      res.on("end", () => {
+        const tail = pending.trim();
+        if (tail !== "") opts.onLine(tail);
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: full });
+      });
+      res.on("error", reject);
     },
   );
-  if (opts.timeoutMs) {
-    req.setTimeout(opts.timeoutMs, () => req.destroy(new Error(`request timed out: ${opts.path}`)));
-  }
+  req.setTimeout(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, () =>
+    req.destroy(new Error(`request timed out: ${opts.path}`)),
+  );
   req.on("error", reject);
-  req.end(opts.body ?? undefined);
+  req.end(opts.body);
   return promise;
 }
 

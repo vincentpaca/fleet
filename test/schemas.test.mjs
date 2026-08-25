@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
   validateManifest,
   validateWorkOrder,
+  manifestSchema,
   jobStates,
 } from '../src/validate.mjs';
 
@@ -65,6 +66,46 @@ test('work order rejects non-targetable finish rungs', () => {
     assert.equal(validateWorkOrder({ ...base, finish: rung }).ok, false, `${rung} must not be targetable in v1`);
   }
   assert.equal(validateWorkOrder({ ...base, finish: 'merge-ready' }).ok, true);
+});
+
+test('work order continues (#80): additive, followthrough-only, both fields required', () => {
+  const ft = { mode: 'followthrough', target: '80', finish: 'merge-ready' };
+  const c = { pr: 77, branch: 'fleet/77-job-abc' };
+  assert.equal(validateWorkOrder(ft).ok, true, 'orders without continues must stay valid — the field is additive');
+  assert.equal(validateWorkOrder({ ...ft, continues: c }).ok, true, 'followthrough may carry continues');
+  // The bug this catches: adoption leaking into other modes — an implement
+  // dispatch carrying continues would bypass the claim guard by design.
+  assert.equal(validateWorkOrder({ ...ft, mode: 'implement', continues: c }).ok, false, 'continues is followthrough-only');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77 } }).ok, false, 'branch is required');
+  assert.equal(validateWorkOrder({ ...ft, continues: { branch: 'x' } }).ok, false, 'pr is required');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 0, branch: 'x' } }).ok, false, 'pr must be >= 1');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: '77', branch: 'x' } }).ok, false, 'pr must be a number, not a string');
+  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77, branch: '' } }).ok, false, 'branch must be non-empty');
+  assert.equal(validateWorkOrder({ ...ft, continues: { ...c, extra: true } }).ok, false, 'unknown continues fields are rejected');
+});
+
+test('wall_clock forbids zero in both schemas (#134): an instant death sentence is a typo', () => {
+  const m = read('examples/full.manifest.json');
+  m.limits.wall_clock = '0m';
+  assert.equal(validateManifest(m).ok, false, 'manifest wall_clock "0m" must fail');
+  m.limits.wall_clock = '0s';
+  assert.equal(validateManifest(m).ok, false, 'manifest wall_clock "0s" must fail');
+  m.limits.wall_clock = '90m';
+  assert.equal(validateManifest(m).ok, true, 'a real budget still validates');
+
+  const base = { mode: 'implement', target: 'APP-123', finish: 'implemented' };
+  assert.equal(validateWorkOrder({ ...base, limits: { wall_clock: '0m' } }).ok, false, 'order wall_clock "0m" must fail');
+  assert.equal(validateWorkOrder({ ...base, limits: { wall_clock: '1m' } }).ok, true, 'a real override still validates');
+});
+
+test('limit defaults have exactly one source of truth (#134): no "default" annotations in the schema', () => {
+  // Ajv is built without useDefaults, so a "default" annotation here is inert —
+  // a second, false source of truth beside src/shared/time.ts. The descriptions
+  // name the defaults and where they live; the annotation must stay deleted.
+  const props = manifestSchema.properties.limits.properties;
+  for (const key of ['wall_clock', 'idle', 'block_hot', 'decision_timeout']) {
+    assert.equal('default' in props[key], false, `manifest limits.${key} must carry no inert "default" annotation`);
+  }
 });
 
 test('job state machine transitions are closed over declared states', () => {

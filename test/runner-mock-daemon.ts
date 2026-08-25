@@ -32,7 +32,11 @@ export type MockDaemon = {
   close(): Promise<void>;
 };
 
-export async function startMockDaemon(opts: { token: string }): Promise<MockDaemon> {
+export async function startMockDaemon(opts: {
+  token: string;
+  /** Hold each artifact upload this long before answering — simulates a slow settle (#139). */
+  artifactDelayMs?: number;
+}): Promise<MockDaemon> {
   const events: PostedEvent[] = [];
   const artifacts: PostedArtifact[] = [];
   const rejected: { event: unknown; errors: unknown }[] = [];
@@ -67,8 +71,9 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
         const { ok, errors } = validateEvent(event);
         const seq = (event as PostedEvent).seq;
         if (!ok || typeof seq !== 'number' || seq <= lastSeq) {
-          rejected.push({ event, errors: ok ? ['seq not monotonic'] : errors });
-          res.writeHead(422).end(JSON.stringify({ errors }));
+          const rejectErrors = ok ? [`seq must be monotonically increasing: got ${seq} after ${lastSeq}`] : errors;
+          rejected.push({ event, errors: rejectErrors });
+          res.writeHead(422).end(JSON.stringify({ errors: rejectErrors }));
           return;
         }
         lastSeq = seq;
@@ -81,17 +86,43 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
     if (req.method === 'POST' && /^\/internal\/jobs\/[^/]+\/artifacts$/.test(url.pathname)) {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
+      if (opts.artifactDelayMs !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, opts.artifactDelayMs));
+      }
       artifacts.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as PostedArtifact);
       res.writeHead(200).end(JSON.stringify({ stored: true }));
       return;
     }
 
     if (req.method === 'GET' && /^\/internal\/jobs\/[^/]+\/answer$/.test(url.pathname)) {
-      const decision = url.searchParams.get('decision') ?? '';
-      const answer = answers.get(decision);
+      const decisionId = url.searchParams.get('decision') ?? '';
+      // Match the real Registry.findAnswer (#110): only an answer recorded
+      // AFTER the decision event with the same id counts. Scanning the event
+      // log (not just a Map) prevents the mock from masking id-recycling bugs.
+      let decisionSeq = -1;
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i]!;
+        if (e.type === 'decision' && e.id === decisionId) {
+          decisionSeq = e.seq as number;
+          break;
+        }
+      }
+      const logAnswer = decisionSeq >= 0
+        ? events.find(
+            (e) => e.type === 'answer' && e.decision === decisionId && (e.seq as number) > decisionSeq,
+          )
+        : undefined;
+      // Fall back to staged answers (set via mock.answer()) for tests that
+      // don't post answer events through the operator endpoint.
+      const answer = logAnswer
+        ? { option: logAnswer.option as string | undefined, text: logAnswer.text as string | undefined }
+        : answers.get(decisionId);
       if (answer) {
+        const body: Record<string, unknown> = {};
+        if (answer.option !== undefined) body.option = answer.option;
+        if (answer.text !== undefined) body.text = answer.text;
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(answer));
+        res.end(JSON.stringify(body));
       } else {
         // Real daemon holds up to 25s; the mock returns an empty cycle
         // immediately and lets the runner re-poll.

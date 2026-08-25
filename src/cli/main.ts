@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // fleet — operator CLI. Exit codes: 0 ok, 1 failure, 2 usage.
-import { parseArgs } from 'node:util';
+import { parseArgs, promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,14 +15,16 @@ import {
   listRetainedRecords,
   readRetainedRecord,
   retainedDir,
+  type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
-import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, DaemonTargetError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
-import { parseAnswerLine, renderBanner, detectColorLevel } from './board.ts';
+import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
-import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent, type FleetEvent } from './format.ts';
+import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
+import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
 import {
   runSetupInfra,
@@ -41,6 +43,7 @@ import {
   runnerBaseTag,
   jobImageTag,
   imageExistsLocally,
+  localImageIdAsync,
   buildJobImage,
   pushToEcr,
   type ImageManifest,
@@ -87,6 +90,11 @@ Commands:
   delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
+                                           A PR target (pr/<n> or a GitHub PR URL) implies
+                                           --mode followthrough: the job adopts the PR's head
+                                           branch, addresses its review comments and failing
+                                           checks, and pushes to the same branch so the PR
+                                           updates in place. Open PRs only.
                                            When harness.cli_version is set, computes the per-repo
                                            job image hash, builds on miss, passes tag to daemon.
   image build [--manifest path] [--push] [--registry ECR_URI] [--region AWS_REGION]
@@ -123,7 +131,8 @@ Commands:
 Flags:
   --version                                Print version and exit
 
-Daemon address: FLEET_DAEMON_URL env → .fleet/infra/<provider>/fleet-config.json (daemon_url) → unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).`;
+Daemon address: FLEET_DAEMON_URL env → .fleet/infra/<provider>/fleet-config.json (daemon_url) → unix socket at $FLEET_HOME/daemon.sock (default ~/.fleet).
+A config daemon_url must be loopback — that file travels with the repo, and dispatch sends secrets to whatever it names. FLEET_ALLOW_REMOTE_DAEMON=1 overrides, on your own authority.`;
 
 class UsageError extends Error {}
 class CliError extends Error {}
@@ -154,6 +163,9 @@ function readJsonFile(file: string, what: string): unknown {
 }
 
 type AjvError = { instancePath: string; message?: string };
+type DaemonApiError = { errors?: AjvError[]; error?: string };
+/** Hoisted so that inline /\s+/ regexes do not trigger a Lizard tokeniser misparse. */
+const WORDS_RE = /\s+/;
 
 function formatFindings(file: string, errors: AjvError[]): string[] {
   return errors.map((e) => `${file}: ${e.instancePath || '/'} ${e.message ?? 'invalid'}`);
@@ -178,6 +190,10 @@ function initManifest(): unknown {
       commands: [{ path: '.claude/commands/dev-sprint.md', critic: 'code-reviewer' }],
     },
     gates: { pickup: 'node .fleet/check-ready.js', default_finish: 'merge-ready' },
+    // The documented defaults (src/shared/time.ts), written out so the cost
+    // model is visible in the file the operator edits — absent keys get the
+    // same values, but an invisible default is how #134 happened.
+    limits: { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
   };
 }
 
@@ -468,6 +484,76 @@ function loadPresets(): Record<string, ModePreset> {
   return presets.modes;
 }
 
+/** `pr/<n>` or a full GitHub PR URL → the PR number; anything else is not a PR target. */
+function parsePrTarget(target: string): number | undefined {
+  const short = target.match(/^pr\/(\d+)$/);
+  if (short) return Number(short[1]);
+  const url = target.match(/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)(?:[/?#].*)?$/);
+  if (url) return Number(url[1]);
+  return undefined;
+}
+
+/**
+ * gh, asynchronously. The delegate path runs on the cockpit's live event loop
+ * (#121): a spawnSync over the network would freeze every keypress — including
+ * the ^C that ends the wait — for as long as GitHub takes to answer.
+ */
+const execFileAsync = promisify(execFile);
+
+/** Run `gh pr view` and return its stdout, failing with gh's own first stderr line. */
+async function ghPrViewJson(target: string, ref: string, signal?: AbortSignal): Promise<string> {
+  try {
+    const raw = await execFileAsync(
+      'gh',
+      ['pr', 'view', ref, '--json', 'number,state,headRefName,title,closingIssuesReferences'],
+      { encoding: 'utf8', signal },
+    );
+    return raw.stdout;
+  } catch (err) {
+    const reason = ((err as { stderr?: string }).stderr ?? '').trim().split('\n')[0] || errorMessage(err);
+    fail(`cannot resolve PR target ${target} via gh: ${reason}`);
+  }
+}
+
+/**
+ * Resolve a PR target via gh at dispatch (#80): the head branch the job will
+ * adopt, the PR title, and the linked issue when exactly one is derivable.
+ * Refuses non-open PRs — a merged or closed PR has no branch to continue, and
+ * the refusal must land BEFORE any POST reaches the daemon.
+ */
+async function resolvePrTarget(target: string, prNumber: number, signal?: AbortSignal): Promise<{
+  number: number;
+  branch: string;
+  title?: string;
+  issue?: number;
+}> {
+  // A full URL goes to gh verbatim (it names the repo); pr/<n> resolves
+  // against the current checkout's repo, like every other gh call here.
+  const ref = target.startsWith('https://') ? target : String(prNumber);
+  const stdout = await ghPrViewJson(target, ref, signal);
+  let pr: { number?: unknown; state?: unknown; headRefName?: unknown; title?: unknown; closingIssuesReferences?: unknown };
+  try {
+    pr = JSON.parse(stdout);
+  } catch {
+    fail(`cannot resolve PR target ${target}: gh returned unparseable JSON`);
+  }
+  if (typeof pr.number !== 'number' || typeof pr.headRefName !== 'string' || pr.headRefName === '') {
+    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  }
+  if (pr.state !== 'OPEN') {
+    fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — followthrough continues only open PRs`);
+  }
+  const linked = Array.isArray(pr.closingIssuesReferences) && pr.closingIssuesReferences.length === 1
+    ? (pr.closingIssuesReferences[0] as { number?: unknown })?.number
+    : undefined;
+  return {
+    number: pr.number,
+    branch: pr.headRefName,
+    ...(typeof pr.title === 'string' && pr.title !== '' ? { title: pr.title } : {}),
+    ...(typeof linked === 'number' ? { issue: linked } : {}),
+  };
+}
+
 /** A dispatch as asked for, with somewhere to put its progress. */
 type DelegateRequest = {
   target: string;
@@ -476,7 +562,32 @@ type DelegateRequest = {
   manifestPath?: string;
   log: (line: string) => void;
   warn: (line: string) => void;
+  /**
+   * Docker build progress, streamed raw. `fleet delegate` writes it through to
+   * its own stdout; the cockpit passes nothing — it owns the alternate screen,
+   * so the build is captured silently and surfaces only in a failure (#121).
+   */
+  buildOutput?: (chunk: string) => void;
+  /** Aborting interrupts the slow externals (gh resolution, docker build). */
+  signal?: AbortSignal;
 };
+
+/**
+ * Resolve an issue title via gh at dispatch. Best-effort: gh unavailable, a
+ * non-issue target, or an abort all degrade to no title, never an empty one.
+ */
+async function resolveIssueTitle(target: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const raw = await execFileAsync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
+      encoding: 'utf8',
+      signal,
+    });
+    const title = raw.stdout.trim();
+    return title === '' ? undefined : title;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * One dispatch, however it was asked for. `fleet delegate` parses flags and
@@ -487,7 +598,7 @@ type DelegateRequest = {
  * same words for the same problem.
  */
 async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; state: string }> {
-  const target = req.target;
+  let target = req.target;
   const manifestPath = req.manifestPath ?? path.join('.fleet', 'manifest.json');
 
   const rawManifest = readJsonFile(manifestPath, 'manifest');
@@ -496,25 +607,37 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // Safe: validated against manifest.schema.json just above.
   const manifest = rawManifest as Manifest;
 
+  // Typed PR target (#80): pr/<n> or a GitHub PR URL implies followthrough and
+  // adopts the PR's head branch. Resolved via gh — and refused when the PR is
+  // not open — before anything is posted.
+  const prNumber = parsePrTarget(target);
+  let continues: { pr: number; branch: string } | undefined;
+  let prTitle: string | undefined;
+  if (prNumber !== undefined) {
+    if (req.mode !== undefined && req.mode !== 'followthrough') {
+      fail(`a PR target implies --mode followthrough; it cannot be dispatched as ${req.mode}`);
+    }
+    const resolved = await resolvePrTarget(target, prNumber, req.signal);
+    continues = { pr: resolved.number, branch: resolved.branch };
+    prTitle = resolved.title;
+    // Lineage on the board: the linked issue when exactly one is derivable,
+    // else the PR reference itself.
+    target = resolved.issue !== undefined ? String(resolved.issue) : `pr/${resolved.number}`;
+    req.log(`fleet: continuing PR #${resolved.number} (branch ${resolved.branch})`);
+  }
+
   const modes = loadPresets();
-  const modeName = req.mode ?? 'implement';
+  const modeName = req.mode ?? (continues !== undefined ? 'followthrough' : 'implement');
   const preset = modes[modeName];
   if (!preset) fail(`unknown mode "${modeName}" — available: ${Object.keys(modes).join(', ')}`);
 
   const flagFinish = req.finish;
 
   // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
-  let issueTitle: string | undefined;
-  if (/^\d+$/.test(target)) {
-    try {
-      const raw = spawnSync('gh', ['issue', 'view', target, '--json', 'title', '--jq', '.title'], {
-        encoding: 'utf8',
-      });
-      if (raw.status === 0) {
-        const t = raw.stdout.trim();
-        if (t) issueTitle = t;
-      }
-    } catch { /* gh unavailable or not a real issue — proceed without title */ }
+  // A PR target already resolved its title from the PR — one gh call, one truth.
+  let issueTitle: string | undefined = prTitle;
+  if (issueTitle === undefined && /^\d+$/.test(target)) {
+    issueTitle = await resolveIssueTitle(target, req.signal);
   }
 
   const workOrder: Record<string, unknown> = {
@@ -525,6 +648,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     report: preset.report ?? 'status-first',
   };
   if (issueTitle !== undefined) workOrder.title = issueTitle;
+  if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);
   if (!orderCheck.ok) fail(formatFindings('work order', orderCheck.errors).join('\n'));
 
@@ -567,15 +691,26 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
 
   // Two-layer image model (#5): when harness.cli_version is set, compute the
   // per-repo job image hash, build the image if it doesn't exist locally, and
-  // pass the computed tag to the daemon as an image override.
+  // pass the computed tag to the daemon as an image override. Everything docker
+  // here is async (#121): this can be minutes of build on the cockpit's event
+  // loop, and the build must still complete before the POST below — that
+  // ordering is what makes an abort mid-build leave no orphan job.
   let imageOverride: string | undefined;
   if (twoLayerEnabled(rawManifest as ImageManifest)) {
-    const hash = computeImageHash(rawManifest as ImageManifest);
+    const imageManifest = rawManifest as ImageManifest;
+    const base = runnerBaseTag(imageManifest);
+    const baseId = await localImageIdAsync(base, req.signal);
+    const hash = computeImageHash(imageManifest, undefined, () => baseId);
     const tag = jobImageTag(hash);
-    const base = runnerBaseTag(rawManifest as ImageManifest);
-    if (!imageExistsLocally(tag)) {
+    if (await localImageIdAsync(tag, req.signal) === undefined) {
       req.log(`fleet: building job image ${tag} from ${base} ...`);
-      buildJobImage({ tag, baseTag: base, manifest: rawManifest as ImageManifest });
+      await buildJobImage({
+        tag,
+        baseTag: base,
+        manifest: imageManifest,
+        onOutput: req.buildOutput,
+        signal: req.signal,
+      });
       req.log(`fleet: job image ready: ${tag}`);
     } else {
       req.log(`fleet: job image exists (${tag}), skipping build`);
@@ -626,6 +761,8 @@ async function cmdDelegate(args: string[]): Promise<number> {
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,
     log: (line) => console.log(line),
     warn: (line) => console.error(line),
+    // This surface owns its stdout, so build progress streams straight through.
+    buildOutput: (chunk) => process.stdout.write(chunk),
   });
   console.log(`${created.jobId} ${created.state}`);
   if (values.watch === true) return followJob(created.jobId, true);
@@ -681,7 +818,7 @@ async function cmdImageBuild(args: string[]): Promise<number> {
   } else {
     console.log(`building job image: ${tag}`);
     console.log(`  base: ${base}`);
-    buildJobImage({ tag, baseTag: base, manifest: imageManifest });
+    await buildJobImage({ tag, baseTag: base, manifest: imageManifest, onOutput: (chunk) => process.stdout.write(chunk) });
     console.log(`built: ${tag}`);
   }
 
@@ -702,47 +839,40 @@ async function cmdImageBuild(args: string[]): Promise<number> {
 // ---------- job event rendering ----------
 // formatEvent, logsNoColor, FleetEvent — imported from ./format.ts
 
-/** Print one NDJSON event line from the daemon. Returns the parsed event on success. */
-function printEventLine(line: string, noColor: boolean): FleetEvent | undefined {
-  try {
-    const event: FleetEvent = JSON.parse(line);
-    console.log(formatEvent(event, noColor));
-    return event;
-  } catch {
-    console.log(line); // never crash on a malformed daemon line
-    return undefined;
-  }
-}
-
 // ---------- daemon-backed commands ----------
+
+type OnLine = (line: string) => void;
 
 async function daemonCall(
   method: string,
   reqPath: string,
   body?: unknown,
-  onLine?: (line: string) => void,
+  onLine?: OnLine,
 ): Promise<DaemonResponse> {
   try {
     return await request(method, reqPath, body, { onLine });
   } catch (err) {
+    // Target resolution itself refused (bad FLEET_DAEMON_URL, untrusted
+    // daemon_url — #125/#135): its message is the whole story, and asking
+    // describeTarget below would only throw the same thing again.
+    if (err instanceof DaemonTargetError) fail(err.message);
     // A TCP address means a port-forward is carrying this call, and a dead
     // session is the likeliest cause (#57) — say where to look, not just what broke.
-    const hint =
-      daemonTarget().kind === 'tcp'
-        ? '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state'
-        : '';
+    const tcpHint = '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state';
+    const hint = daemonTarget().kind === 'tcp' ? tcpHint : '';
     fail(`cannot reach daemon at ${describeTarget()}: ${errorMessage(err)}${hint}`);
   }
 }
 
 /** What a rejected daemon call says, as lines. Shared so every surface says it identically. */
 function daemonFailureMessage(res: DaemonResponse, what: string): string {
-  // Daemon API contract: schema failures return {errors: [...ajv error objects]};
-  // non-schema failures (409 not-blocked, 422 bad option) return {error: string}.
-  const body = res.json as { errors?: AjvError[]; error?: string } | undefined;
+  // Daemon API contract: schema failures return an errors array; non-schema
+  // failures (409 not-blocked, 422 bad option) return an error string.
+  const body = res.json as DaemonApiError | undefined;
   if (body && Array.isArray(body.errors)) return formatFindings(what, body.errors).join('\n');
-  if (body && typeof body.error === 'string') return `${what} failed: ${body.error}`;
-  return `${what} failed: daemon returned ${res.status}${res.body ? ` ${res.body.trim()}` : ''}`;
+  if (body && typeof body.error === 'string') return what + ' failed: ' + body.error;
+  const tail = res.body ? ' ' + res.body.trim() : '';
+  return what + ' failed: daemon returned ' + res.status + tail;
 }
 
 function daemonFailure(res: DaemonResponse, what: string): number {
@@ -829,51 +959,89 @@ async function cmdLogs(args: string[]): Promise<number> {
 /**
  * Read one answer line from stdin for a pending decision.
  * Grammar: "<option-id> [supplementary text]" | "text: <free text>" | "" (skip).
+ * The signal closes the prompt when the watch ends: a readline waiting on
+ * stdin would otherwise hold the process open after the job settled.
  */
-async function readAnswerLine(prompt: string): Promise<{ option?: string; text?: string } | undefined> {
+async function readAnswerLine(
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<{ option?: string; text?: string } | undefined> {
   const readline = await import('node:readline/promises'); // lazy: only in interactive watch mode
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   try {
-    return parseAnswerLine(await rl.question(prompt));
+    return parseAnswerLine(await rl.question(prompt, signal === undefined ? {} : { signal }));
+  } catch (err) {
+    if (signal?.aborted) return undefined; // the watch ended while the prompt was open
+    throw err;
   } finally {
     rl.close();
   }
 }
 
 /**
- * Follow a job to a terminal state, printing events. With answerMode, pending
- * decisions are answered from stdin between poll cycles. Watching is a view,
- * never a lifeline: disconnecting changes nothing for the job.
+ * Follow a job to a terminal state, printing events; with answerMode, pending
+ * decisions are answered from stdin as they arrive.
+ *
+ * One follow implementation in the codebase (#124): resume from the last
+ * daemon seq (`?after=`), reconnect-on-error and the anti-spin pause against
+ * an immediate-close peer all come from the board's `followJobEvents` — a
+ * transient tunnel blip used to exit an overnight `--watch` with code 1 here.
+ * This layer owns only what attach adds: printing, the answer prompt, and
+ * stopping at a terminal state. Watching is a view, never a lifeline:
+ * disconnecting changes nothing for the job.
  */
 async function followJob(jobId: string, answerMode: boolean): Promise<number> {
-  let after: number | undefined;
-  let terminal = false;
-  let pendingDecision: FleetEvent | undefined;
-  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY ?? false);
+  // A job the daemon does not know must refuse now: the follow loop treats
+  // every failure as transient, and would retry a typo'd id forever.
+  const probe = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}`);
+  if (probe.status !== 200) return daemonFailure(probe, 'attach');
 
-  while (!terminal) {
-    const query = after === undefined ? '?follow=1' : `?after=${after}&follow=1`;
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, (line) => {
-      const event = printEventLine(line, noColor);
-      if (!event) return;
-      if (typeof event.seq === 'number') after = event.seq;
-      if (event.type === 'decision') pendingDecision = event;
-      if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
-      if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
-        terminal = true;
-      }
-    });
-    if (res.status !== 200) return daemonFailure(res, 'attach');
-    if (!terminal && answerMode && pendingDecision) {
-      const ids = (pendingDecision.options ?? []).map((o) => o.id).join(' | ');
-      const answer = await readAnswerLine(`answer [${ids}] ("<id> [note]" or "text: ..." or empty to keep waiting): `);
-      if (answer) {
+  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY === true);
+  const done = new AbortController();
+  let pendingDecision: FleetEvent | undefined;
+  let prompting = false;
+
+  // The prompt runs beside the stream, not instead of it: events keep printing
+  // while the operator types, and an answer landing from another surface (the
+  // 'answer' event below) simply ends the wait for one here.
+  const promptLoop = async (): Promise<void> => {
+    if (prompting) return;
+    prompting = true;
+    try {
+      while (pendingDecision !== undefined && !done.signal.aborted) {
+        const ids = (pendingDecision.options ?? []).map((o) => o.id).join(' | ');
+        const answer = await readAnswerLine(
+          `answer [${ids}] ("<id> [note]" or "text: ..." or empty to keep waiting): `,
+          done.signal,
+        );
+        if (done.signal.aborted) return;
+        if (!answer) continue; // keep waiting: the decision is still open, ask again
         const posted = await daemonCall('POST', `/jobs/${encodeURIComponent(jobId)}/answer`, answer);
-        if (posted.status !== 200) daemonFailure(posted, 'answer'); // print and keep watching
+        if (posted.status !== 200) console.error(daemonFailureMessage(posted, 'answer')); // print and keep watching
         else pendingDecision = undefined;
       }
+    } finally {
+      prompting = false;
     }
-  }
+  };
+
+  await followJobEvents(
+    jobId,
+    (event) => {
+      console.log(formatEvent(event, noColor));
+      if (event.type === 'decision') {
+        pendingDecision = event;
+        // A failed answer POST must not kill the watch — print it and keep watching.
+        if (answerMode) void promptLoop().catch((err) => console.error(errorMessage(err)));
+      }
+      if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
+      if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
+        done.abort();
+      }
+    },
+    process.env as Record<string, string | undefined>,
+    done.signal,
+  );
   return EXIT_OK;
 }
 
@@ -911,6 +1079,54 @@ async function cmdCancel(args: string[]): Promise<number> {
 
 // ---------- artifacts ----------
 
+async function cmdArtifactsList(jobId: string): Promise<number> {
+  const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts');
+  if (res.status !== 200) return daemonFailure(res, 'artifacts');
+  const body = res.json as { artifacts?: { path: string; bytes: number }[] };
+  if (!body.artifacts || body.artifacts.length === 0) {
+    console.log('no artifacts');
+    return EXIT_OK;
+  }
+  for (const artifact of body.artifacts) {
+    console.log(artifact.path + '  ' + artifact.bytes + ' bytes');
+  }
+  return EXIT_OK;
+}
+
+async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
+  const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
+  const artifactPath = getPos[0];
+  // Encode each path segment separately so slashes are preserved.
+  const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
+  const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodedPath);
+  if (res.status !== 200) return daemonFailure(res, 'artifacts get');
+  // Daemon returns JSON {path, content (base64), bytes, sha256}.
+  const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
+  if (!body.content) fail('artifacts get: daemon returned no content');
+  const buffer = Buffer.from(body.content, 'base64');
+  // Verify end-to-end integrity; the daemon stamps sha256 at store time.
+  if (body.sha256) {
+    const actual = createHash('sha256').update(buffer).digest('hex');
+    if (actual !== body.sha256) fail('artifacts get: sha256 mismatch for ' + artifactPath + ' — content corrupted in transit');
+  }
+  if (typeof values.out === 'string') {
+    const filename = path.basename(artifactPath);
+    const outPath = path.join(values.out, filename);
+    // A missing --out directory is created, and anything else unwritable is a
+    // one-line failure — not an unhandled ENOENT stack (#125).
+    try {
+      fs.mkdirSync(values.out, { recursive: true });
+      fs.writeFileSync(outPath, buffer);
+    } catch (err) {
+      fail('artifacts get: cannot write ' + outPath + ': ' + errorMessage(err));
+    }
+    console.log('saved to ' + outPath);
+  } else {
+    process.stdout.write(buffer);
+  }
+  return EXIT_OK;
+}
+
 async function cmdArtifacts(args: string[]): Promise<number> {
   if (args.length === 0 || (args.length === 1 && (args[0] === '--help' || args[0] === '-h'))) {
     console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
@@ -921,49 +1137,9 @@ async function cmdArtifacts(args: string[]): Promise<number> {
     console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
     return EXIT_USAGE;
   }
-
-  if (!subcommand || subcommand === 'list') {
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts`);
-    if (res.status !== 200) return daemonFailure(res, 'artifacts');
-    const body = res.json as { artifacts?: { path: string; bytes: number }[] };
-    if (!body.artifacts || body.artifacts.length === 0) {
-      console.log('no artifacts');
-      return EXIT_OK;
-    }
-    for (const artifact of body.artifacts) {
-      console.log(`${artifact.path}  ${artifact.bytes} bytes`);
-    }
-    return EXIT_OK;
-  }
-
-  if (subcommand === 'get') {
-    const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
-    const artifactPath = getPos[0];
-    // Encode each path segment separately so slashes are preserved.
-    const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts/${encodedPath}`);
-    if (res.status !== 200) return daemonFailure(res, 'artifacts get');
-    // Daemon returns JSON {path, content (base64), bytes, sha256}.
-    const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
-    if (!body.content) fail('artifacts get: daemon returned no content');
-    const buffer = Buffer.from(body.content, 'base64');
-    // Verify end-to-end integrity; the daemon stamps sha256 at store time.
-    if (body.sha256) {
-      const actual = createHash('sha256').update(buffer).digest('hex');
-      if (actual !== body.sha256) fail(`artifacts get: sha256 mismatch for ${artifactPath} — content corrupted in transit`);
-    }
-    if (typeof values.out === 'string') {
-      const filename = path.basename(artifactPath);
-      const outPath = path.join(values.out, filename);
-      fs.writeFileSync(outPath, buffer);
-      console.log(`saved to ${outPath}`);
-    } else {
-      process.stdout.write(buffer);
-    }
-    return EXIT_OK;
-  }
-
-  console.error(`fleet artifacts: unknown subcommand: ${subcommand}`);
+  if (!subcommand || subcommand === 'list') return cmdArtifactsList(jobId);
+  if (subcommand === 'get') return cmdArtifactsGet(jobId, rest);
+  console.error('fleet artifacts: unknown subcommand: ' + subcommand);
   return EXIT_USAGE;
 }
 
@@ -988,7 +1164,10 @@ async function cmdConnect(args: string[]): Promise<number> {
       home: fleetHome(),
       port,
       detach: values.detach === true,
-      selfPath: fileURLToPath(new URL('./main.ts', import.meta.url)),
+      // bin.mjs, not main.ts: the detached child must start the same way the
+      // bin does, because a .ts entry cannot be spawned from an npm-installed
+      // copy (type stripping is refused under node_modules — see bin.mjs).
+      selfPath: fileURLToPath(new URL('./bin.mjs', import.meta.url)),
       log: (line) => console.log(line),
       warn: (line) => console.error(`fleet connect: ${line}`),
     });
@@ -1010,7 +1189,7 @@ async function cmdCockpit(): Promise<number> {
     home: fleetHome(),
     env: process.env as Record<string, string | undefined>,
     delegate: (req) =>
-      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn }),
+      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn, signal: req.signal }),
   });
 }
 
@@ -1025,7 +1204,7 @@ const INTERPRETERS = new Set(['node', 'bash', 'sh', 'python', 'python3', 'ruby',
  * Returns undefined when no file can be identified (e.g. "sh -c '...'").
  */
 function gateScriptFile(pickup: string): string | undefined {
-  const tokens = pickup.trim().split(/\s+/);
+  const tokens = pickup.trim().split(WORDS_RE);
   let skipNext = false;
   for (const token of tokens) {
     if (skipNext) { skipNext = false; continue; }
@@ -1063,6 +1242,38 @@ async function doctorTunnel(home: string): Promise<{ notes: string[]; findings: 
     home,
     resolveEndpoint,
   });
+}
+
+/**
+ * Orphaned cloud tasks for doctor (#147): ask the daemon to run its reconcile
+ * sweep now and report what it found. The daemon owns the sweep — only its
+ * registry can say which jobs are terminal — so doctor is a trigger and a
+ * reporter, the same relationship the tunnel check has with the deployment.
+ * Every orphan is a finding: a stopped one was billing until this run, an
+ * unstopped one still is. Silent when no daemon answers (the tunnel section
+ * already reports that) and when the daemon predates the endpoint (404) —
+ * not knowing is not a defect.
+ */
+async function doctorOrphans(): Promise<{ notes: string[]; findings: string[] }> {
+  let res: DaemonResponse;
+  try {
+    res = await request('POST', '/reconcile');
+  } catch {
+    return { notes: [], findings: [] };
+  }
+  if (res.status === 404) return { notes: [], findings: [] };
+  if (res.status !== 200) {
+    return { notes: [`orphan reconcile: daemon answered ${res.status} — sweep not run`], findings: [] };
+  }
+  const orphans = (res.json as { orphans?: { job: string; handle: string; stopped: boolean }[] })?.orphans ?? [];
+  return {
+    notes: [],
+    findings: orphans.map((orphan) =>
+      orphan.stopped
+        ? `orphaned task stopped: ${orphan.handle} (job ${orphan.job} was terminal; its task was still running and billing)`
+        : `orphaned task still running: ${orphan.handle} (job ${orphan.job} is terminal but stop-task failed) — rerun fleet doctor, or stop it in the cloud console`,
+    ),
+  };
 }
 
 async function cmdDoctor(args: string[]): Promise<number> {
@@ -1120,7 +1331,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     if (scriptFile !== undefined && !fs.existsSync(scriptFile)) {
       findings.push(`gate script missing: ${scriptFile}`);
     } else {
-      const tokens = pickup.trim().split(/\s+/);
+      const tokens = pickup.trim().split(WORDS_RE);
       const gateRes = spawnSync(tokens[0], tokens.slice(1), { encoding: 'utf8' });
       const code = gateRes.error !== undefined ? -1 : (gateRes.status ?? -1);
       // Exit 2 = "cannot evaluate" (no target) — expected without a dispatch target; not a defect.
@@ -1163,6 +1374,13 @@ async function cmdDoctor(args: string[]): Promise<number> {
     );
   }
 
+  // 8. Orphaned cloud tasks (#147): run the daemon's reconcile sweep on demand
+  //    and list what it found — a task billing behind a terminal job is exactly
+  //    the spend nothing else surfaces until the runner's wall-clock cap.
+  const orphans = await doctorOrphans();
+  for (const note of orphans.notes) console.log(note);
+  findings.push(...orphans.findings);
+
   if (findings.length === 0) {
     console.log('doctor: clean');
     return EXIT_OK;
@@ -1172,6 +1390,27 @@ async function cmdDoctor(args: string[]): Promise<number> {
 }
 
 // ---------- resume-push ----------
+
+/**
+ * Resolve a retained record after verifying the record and workspace still
+ * exist. Prints the appropriate error and returns undefined on any problem so
+ * cmdResumePush can exit without duplicating the checks.
+ */
+function loadRetainedWorkspace(home: string, jobId: string): RetainedRecord | undefined {
+  const record = readRetainedRecord(home, jobId);
+  if (record === undefined) {
+    console.error('no retained workspace for job ' + jobId + ' (looked in ' + retainedDir(home) + ')');
+    console.error('container jobs keep their workspace inside the stopped task, not on this host');
+    return undefined;
+  }
+  if (!fs.existsSync(record.workspace)) {
+    clearRetainedRecord(home, jobId);
+    console.error('retained workspace is gone: ' + record.workspace);
+    console.error('record dropped; nothing is recoverable from this host');
+    return undefined;
+  }
+  return record;
+}
 
 /**
  * Retry the work push from a workspace the runner kept because its push failed
@@ -1186,18 +1425,8 @@ function cmdResumePush(args: string[]): number {
   const { positionals } = parseCommand(args, {}, 1, 1);
   const jobId = positionals[0];
   const home = fleetHome();
-  const record = readRetainedRecord(home, jobId);
-  if (record === undefined) {
-    console.error(`no retained workspace for job ${jobId} (looked in ${retainedDir(home)})`);
-    console.error('container jobs keep their workspace inside the stopped task, not on this host');
-    return EXIT_FAILURE;
-  }
-  if (!fs.existsSync(record.workspace)) {
-    clearRetainedRecord(home, jobId);
-    console.error(`retained workspace is gone: ${record.workspace}`);
-    console.error('record dropped; nothing is recoverable from this host');
-    return EXIT_FAILURE;
-  }
+  const record = loadRetainedWorkspace(home, jobId);
+  if (!record) return EXIT_FAILURE;
   const { target, branch } = record;
   if (!target || !branch) {
     // The request file existed but did not parse: the workspace was kept on
@@ -1250,56 +1479,38 @@ type LedgerEntry = {
   at: string;
 };
 
-type ResumeDecision = {
-  id: string;
-  question: string;
-  options: Array<{ id: string; label?: string; recommended?: boolean }>;
-};
-
 /** Fetch the pending decision for a blocked job, or undefined if none. */
-async function fetchResumeDecision(jobId: string): Promise<ResumeDecision | undefined> {
-  let decision: ResumeDecision | undefined;
-  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events`, undefined, (line) => {
-    try {
-      const ev = JSON.parse(line) as { type: string; id?: string; question?: string; options?: Array<{ id: string; label?: string; recommended?: boolean }> };
-      if (ev.type === 'decision' && ev.id && ev.question && ev.options) {
-        decision = { id: ev.id, question: ev.question, options: ev.options };
-      }
-      if (ev.type === 'answer') decision = undefined; // answered elsewhere
-    } catch {
-      // ignore malformed event lines
-    }
-  });
-  if (res.status !== 200) {
-    console.error(`${jobId}: warning: events fetch returned HTTP ${res.status} — decision may not be shown`);
+async function fetchResumeDecision(jobId: string): Promise<PendingDecision | undefined> {
+  // Same reduction as the board's roster (fetchPendingDecision), on resume's
+  // transport: daemonCall fails fast on network errors — never stale data.
+  const { status, decision } = await fetchPendingDecision(jobId, (reqPath, onLine) =>
+    daemonCall('GET', reqPath, undefined, onLine));
+  if (status !== 200) {
+    console.error(`${jobId}: warning: events fetch returned HTTP ${status} — decision may not be shown`);
     return undefined;
   }
   return decision;
 }
 
-/**
- * Read the local dispatch ledger, fetch live state for every entry, and print
- * a reconnect-oriented summary: blocked/stale first with open decisions, then
- * active, then a tail of recent terminal jobs.
- */
-async function cmdResume(args: string[]): Promise<number> {
-  const { values } = parseCommand(args, { answer: { type: 'boolean' } }, 0, 0);
-  const answerMode = values.answer === true;
+/** One ledger entry with its live state: the job, or why there is none. */
+type ResumeResult = {
+  entry: LedgerEntry;
+  job?: Job;
+  decision?: PendingDecision;
+  unknown?: boolean;   // true: 404 or non-200 from daemon
+  fetchError?: string; // set when unknown=true and the cause was a non-404 error
+};
 
-  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
-  if (!fs.existsSync(ledgerPath)) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
+/** Parse the ledger's JSONL lines. A missing file or no parseable lines → []. */
+function readLedgerEntries(ledgerPath: string): LedgerEntry[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(ledgerPath, 'utf8');
+  } catch {
+    return [];
   }
-
-  const rawLedger = fs.readFileSync(ledgerPath, 'utf8').trim();
-  if (!rawLedger) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
-  }
-
   const entries: LedgerEntry[] = [];
-  for (const line of rawLedger.split('\n')) {
+  for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
@@ -1308,98 +1519,149 @@ async function cmdResume(args: string[]): Promise<number> {
       // ignore malformed ledger lines
     }
   }
+  return entries;
+}
 
-  if (entries.length === 0) {
-    console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
-    return EXIT_OK;
-  }
+/** Reads resume keeps in flight at once: enough to hide latency, few enough not to dogpile a tunnel. */
+const RESUME_FETCH_LIMIT = 6;
 
-  // Fetch live state for each entry. daemonCall fails fast (exit 1) on network
-  // errors — never report stale data. 404 = daemon doesn't know this job.
-  type ResumeResult = {
-    entry: LedgerEntry;
-    job?: Job;
-    decision?: ResumeDecision;
-    unknown?: boolean;   // true: 404 or non-200 from daemon
-    fetchError?: string; // set when unknown=true and the cause was a non-404 error
-  };
-
-  const results: ResumeResult[] = [];
-  for (const entry of entries) {
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(entry.jobId)}`);
-    if (res.status === 404) {
-      results.push({ entry, unknown: true });
-    } else if (res.status !== 200) {
-      // Surface other daemon errors; include the job in the output as unknown so
-      // it is never silently dropped from the summary table.
-      const errBody = res.json as { error?: string } | undefined;
-      const msg = errBody?.error ?? `HTTP ${res.status}`;
-      results.push({ entry, unknown: true, fetchError: msg });
-    } else {
-      const body = res.json as { job: Job };
-      const rr: ResumeResult = { entry, job: body.job };
-      if (body.job.state === 'blocked') {
-        rr.decision = await fetchResumeDecision(entry.jobId);
-      }
-      results.push(rr);
+/** Run `fn` over `items` with at most `limit` in flight; results stay in item order. */
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next;
+      next += 1;
+      results[i] = await fn(items[i]);
     }
-  }
-
-  // Sort priority: stale-blocked → blocked → running/queued → terminal → unknown.
-  const sortKey = (rr: ResumeResult): number => {
-    if (rr.unknown) return 100;
-    if (!rr.job) return 90;
-    const { state, marker } = rr.job;
-    if (state === 'blocked' && marker === 'stale') return 0;
-    if (state === 'blocked') return 1;
-    if (state === 'running' || state === 'queued') return 2;
-    return 10; // terminal
   };
-  results.sort((a, b) => sortKey(a) - sortKey(b));
+  await Promise.all(Array.from({ length: Math.min(limit, Math.max(1, items.length)) }, worker));
+  return results;
+}
 
-  const ACTIVE_STATES = new Set(['blocked', 'running', 'queued']);
+/**
+ * Live state for one ledger entry. daemonCall fails fast (exit 1) on network
+ * errors — never report stale data. 404 = daemon doesn't know this job; other
+ * daemon errors surface on the row rather than silently dropping it.
+ */
+async function fetchResumeResult(entry: LedgerEntry): Promise<ResumeResult> {
+  const res = await daemonCall('GET', `/jobs/${encodeURIComponent(entry.jobId)}`);
+  if (res.status === 404) return { entry, unknown: true };
+  if (res.status !== 200) {
+    const errBody = res.json as { error?: string } | undefined;
+    return { entry, unknown: true, fetchError: errBody?.error ?? `HTTP ${res.status}` };
+  }
+  const body = res.json as { job: Job };
+  const rr: ResumeResult = { entry, job: body.job };
+  if (body.job.state === 'blocked') rr.decision = await fetchResumeDecision(entry.jobId);
+  return rr;
+}
+
+/** Sort priority: stale-blocked → blocked → running/queued → terminal → unknown. */
+function resumeSortKey(rr: ResumeResult): number {
+  if (rr.unknown) return 100;
+  if (!rr.job) return 90;
+  const { state, marker } = rr.job;
+  if (state === 'blocked' && marker === 'stale') return 0;
+  if (state === 'blocked') return 1;
+  if (state === 'running' || state === 'queued') return 2;
+  return 10; // terminal
+}
+
+/**
+ * Rewrite the ledger without the entries the daemon confirmed terminal (#125):
+ * the file is append-only at dispatch and nothing else prunes it, so resume
+ * used to pay one round trip per job ever dispatched from this checkout.
+ * Unknown-to-daemon entries stay — they may live on another daemon (the
+ * entry's daemonUrl says which), and dropping them would lose the only local
+ * pointer. Best-effort: a failed rewrite costs speed on the next resume, never
+ * truth (remote is truth; the ledger holds no status fields at all).
+ */
+function pruneLedger(ledgerPath: string, results: ResumeResult[]): number {
+  const settled = (rr: ResumeResult): boolean =>
+    rr.job !== undefined && TERMINAL_STATES.includes(rr.job.state);
+  const keep = results.filter((rr) => !settled(rr));
+  if (keep.length === results.length) return 0;
+  try {
+    fs.writeFileSync(ledgerPath, keep.map((rr) => `${JSON.stringify(rr.entry)}\n`).join(''));
+  } catch {
+    return 0; // hygiene only — the listing above already reported the live truth
+  }
+  return results.length - keep.length;
+}
+
+const ACTIVE_STATES = new Set(['blocked', 'running', 'queued']);
+
+/** One blocked job's open decision, with how to answer it. */
+function printResumeDecision(jobId: string, dec: PendingDecision): void {
+  console.log(`  ? ${dec.question}`);
+  for (const opt of dec.options) {
+    const rec = opt.recommended ? ' (recommended)' : '';
+    const label = opt.label ? `: ${opt.label}` : '';
+    console.log(`    - ${opt.id}${rec}${label}`);
+  }
+  console.log(`  run: fleet answer ${jobId} --option <id>  |  fleet resume --answer`);
+}
+
+/**
+ * Print the resume summary from sorted results: active jobs (blocked first)
+ * with open decisions, a tail of recent terminal jobs, then entries the daemon
+ * does not know (with daemonUrl context, so the user knows which daemon was
+ * asked and where the job may actually live). Returns the first blocked
+ * result, which is what --answer drops into.
+ */
+function printResumeResults(results: ResumeResult[]): ResumeResult | undefined {
   const active = results.filter((rr) => !rr.unknown && rr.job && ACTIVE_STATES.has(rr.job.state));
   const terminal = results.filter((rr) => !rr.unknown && rr.job && !ACTIVE_STATES.has(rr.job.state));
   const unknown = results.filter((rr) => rr.unknown);
 
   let firstBlocked: ResumeResult | undefined;
-
-  // Active jobs (blocked first, then running/queued).
   for (const rr of active) {
     const job = rr.job!;
     console.log(formatJob(job));
     if (rr.decision) {
       if (!firstBlocked) firstBlocked = rr;
-      const dec = rr.decision;
-      console.log(`  ? ${dec.question}`);
-      for (const opt of dec.options) {
-        const rec = opt.recommended ? ' (recommended)' : '';
-        const label = opt.label ? `: ${opt.label}` : '';
-        console.log(`    - ${opt.id}${rec}${label}`);
-      }
-      console.log(`  run: fleet answer ${job.id} --option <id>  |  fleet resume --answer`);
+      printResumeDecision(job.id, rr.decision);
     } else if (job.state === 'blocked' && !firstBlocked) {
       firstBlocked = rr;
     }
   }
 
   // Recent terminal tail (last 5, oldest first within the tail).
-  const recentTerminal = terminal.slice(-5);
-  for (const rr of recentTerminal) {
-    console.log(formatJob(rr.job!));
-  }
+  for (const rr of terminal.slice(-5)) console.log(formatJob(rr.job!));
 
-  // Unknown-to-daemon entries (404 or daemon error). Include daemonUrl so the
-  // user knows which daemon was queried and where the job may actually live.
   for (const rr of unknown) {
     const reason = rr.fetchError ? `error: ${rr.fetchError}` : 'unknown to daemon';
     console.log(`${rr.entry.jobId}  ${reason}  target=${rr.entry.target}  daemon=${describeTarget()}  delegated=${rr.entry.at}`);
   }
+  return firstBlocked;
+}
 
-  if (active.length === 0 && terminal.length === 0 && unknown.length === 0) {
+/**
+ * Read the local dispatch ledger, fetch live state for every entry (a few at a
+ * time), print a reconnect-oriented summary — blocked/stale first with open
+ * decisions, then active, then a tail of recent terminal jobs — and prune the
+ * confirmed-terminal entries so resume time stays bounded by live jobs, not by
+ * lifetime dispatch count (#125).
+ */
+async function cmdResume(args: string[]): Promise<number> {
+  const { values } = parseCommand(args, { answer: { type: 'boolean' } }, 0, 0);
+  const answerMode = values.answer === true;
+
+  const ledgerPath = path.join('.fleet', 'dispatched.jsonl');
+  const entries = readLedgerEntries(ledgerPath);
+  if (entries.length === 0) {
     console.log('no dispatched jobs — delegate one with: fleet delegate <target>');
     return EXIT_OK;
   }
+
+  const results = await mapWithLimit(entries, RESUME_FETCH_LIMIT, fetchResumeResult);
+  const pruned = pruneLedger(ledgerPath, results); // ledger order, before the display sort
+  results.sort((a, b) => resumeSortKey(a) - resumeSortKey(b));
+
+  const firstBlocked = printResumeResults(results);
+  if (pruned > 0) console.log(`(pruned ${pruned} settled job${pruned === 1 ? '' : 's'} from ${ledgerPath})`);
 
   // --answer: drop into interactive answer loop on the first blocked job.
   if (answerMode) {
@@ -1514,6 +1776,12 @@ export async function main(argv: string[]): Promise<number> {
       return EXIT_USAGE;
     }
     if (err instanceof CliError) {
+      console.error(err.message);
+      return EXIT_FAILURE;
+    }
+    // Daemon-address resolution refused outside a daemonCall (the cockpit's
+    // startup, doctor's tunnel section): still a one-line failure, not a stack.
+    if (err instanceof DaemonTargetError) {
       console.error(err.message);
       return EXIT_FAILURE;
     }

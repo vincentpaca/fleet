@@ -14,6 +14,10 @@
 // legitimate dispatch, not a defect — they pass with a note. An unrecognized
 // mode is treated as strict; the gate never relaxes on a guess. A missing
 // target fails in every mode: nothing can be gated blind.
+// Exception (#80): a followthrough order carrying `continues` adopts an
+// existing PR's branch, so it verifies that PR (exists, open, head matches)
+// instead of issue readiness — the deliverable is the PR, and its issue is
+// often already closed.
 //
 // Target resolution order: first argument, $FLEET_TARGET, .fleet/order.json
 // target. Mode resolution order: $FLEET_MODE, .fleet/order.json mode, else
@@ -37,6 +41,30 @@ import { execFileSync } from 'node:child_process';
  */
 export const REPORT_ONLY_MODES = new Set(['assess', 'investigate', 'review', 'compare']);
 
+/** Strip a leading "#" from a target like "#42" → "42". */
+const STRIP_HASH = /^#/;
+/** Issue number: only digits. */
+const IS_ISSUE_NUM = /^\d+$/;
+/** Required "## Acceptance" heading in strict-mode issue bodies. */
+const ACCEPTANCE_HEADING = /^##\s+Acceptance\b/m;
+/** Extract the name field from a GitHub label object; used with Array.map(). */
+function labelName(l) { return l.name; }
+/** Normalise a caught error to a message string. */
+function errMsg(err) { return err instanceof Error ? err.message : String(err); }
+
+/** Verify the PR facts for a followthrough continuation. */
+function evaluateFollowthrough({ issue, jobId, continues, prState, prHead, branches }) {
+  const findings = [];
+  if (prState === undefined || prState.toUpperCase() !== 'OPEN') {
+    findings.push(`PR #${continues.pr} is ${prState ?? 'unknown'}, not open`);
+  }
+  if (prHead !== continues.branch) {
+    findings.push(`PR #${continues.pr} head is ${prHead ?? 'unknown'}, not the adopted branch ${continues.branch}`);
+  }
+  findings.push(...claimFindings({ issue, jobId, branches, adopted: continues.branch }));
+  return { ready: findings.length === 0, findings };
+}
+
 /**
  * Pure readiness decision — fixture-testable, no network.
  * Report-only modes short-circuit: they need a target and nothing else, so the
@@ -46,10 +74,19 @@ export const REPORT_ONLY_MODES = new Set(['assess', 'investigate', 'review', 'co
  * runner pushes fleet/<issue>-<jobId> at creation BEFORE the gate runs, and a
  * parked job re-enters onto its existing branch — neither may trip the
  * collision guard.
- * @param {{ mode?: string, state?: string, labels?: string[], body?: string, branches?: string[], issue: string, jobId?: string }} facts
+ *
+ * Followthrough continuation (#80): a followthrough order carrying `continues`
+ * checks the PR it adopts — exists, open, head matches the adopted branch —
+ * INSTEAD of issue readiness: the issue behind a delivered PR is often closed
+ * and never re-labelled, and the deliverable is the PR itself. The adopted
+ * branch is excluded from the claim guard exactly like a job's own branch;
+ * every other claimant still blocks, and an implement dispatch (no continues)
+ * still trips on the adopted branch — adoption is deliberate.
+ * @param {{ mode?: string, state?: string, labels?: string[], body?: string, branches?: string[], issue: string, jobId?: string, continues?: { pr: number, branch: string }, prState?: string, prHead?: string }} facts
  * @returns {{ ready: boolean, findings: string[], note?: string }}
  */
-export function evaluate({ mode, state, labels = [], body = '', branches = [], issue, jobId }) {
+export function evaluate(facts) {
+  const { mode, state, labels = [], body = '', branches = [], issue, jobId, continues, prState, prHead } = facts;
   if (REPORT_ONLY_MODES.has(mode)) {
     return {
       ready: true,
@@ -58,22 +95,32 @@ export function evaluate({ mode, state, labels = [], body = '', branches = [], i
     };
   }
   const findings = [];
+  if (mode === 'followthrough' && continues) {
+    // Absent PR facts fail closed, same rule as absent issue facts below.
+    return evaluateFollowthrough({ issue, jobId, continues, prState, prHead, branches });
+  }
   if (state !== undefined && state.toUpperCase() !== 'OPEN') {
     findings.push(`issue ${issue} is ${state}, not open`);
   }
   if (!labels.includes('ready')) {
     findings.push(`issue ${issue} lacks the "ready" label`);
   }
-  if (!/^##\s+Acceptance\b/m.test(body)) {
+  if (!ACCEPTANCE_HEADING.test(body)) {
     findings.push(`issue ${issue} body has no "## Acceptance" section`);
   }
+  findings.push(...claimFindings({ issue, jobId, branches }));
+  return { ready: findings.length === 0, findings };
+}
+
+/** The claim-collision guard: fleet/<issue>-* branches other than the job's own (and, on adoption, the adopted branch). */
+function claimFindings({ issue, jobId, branches, adopted }) {
   const prefix = `fleet/${issue}-`;
   const own = jobId ? `${prefix}${jobId}` : undefined;
-  const taken = branches.filter((b) => b.startsWith(prefix) && b !== own);
+  const taken = branches.filter((b) => b.startsWith(prefix) && b !== own && b !== adopted);
   if (taken.length > 0) {
-    findings.push(`branch already claims this issue: ${taken.join(', ')}`);
+    return [`branch already claims this issue: ${taken.join(', ')}`];
   }
-  return { ready: findings.length === 0, findings };
+  return [];
 }
 
 /**
@@ -103,6 +150,71 @@ function resolveMode(order) {
   return 'implement';
 }
 
+/** The staged order's continuation, when well-formed; anything else is undefined (strict path). */
+function resolveContinues(order) {
+  const c = order.continues;
+  if (c && typeof c.pr === 'number' && typeof c.branch === 'string' && c.branch !== '') {
+    return { pr: c.pr, branch: c.branch };
+  }
+  return undefined;
+}
+
+/** origin's fleet/<issue>-* branches, for the claim guard. */
+function claimBranches(issue) {
+  const lsRemote = execFileSync('git', ['ls-remote', '--heads', 'origin', `fleet/${issue}-*`], {
+    encoding: 'utf8',
+  });
+  return lsRemote
+    .split('\n')
+    .map((line) => line.split('\t')[1] ?? '')
+    .filter(Boolean)
+    .map((ref) => ref.replace('refs/heads/', ''));
+}
+
+/** Fetch and assemble issue facts for the strict-mode check. Throws on gh failure. */
+function buildIssueFacts(issue, mode) {
+  const view = JSON.parse(
+    execFileSync('gh', ['issue', 'view', issue, '--json', 'state,labels,body'], { encoding: 'utf8' }),
+  );
+  // Query the remote directly rather than trusting local refs — the gate
+  // owns its own freshness (evaluate against live state, never a stale copy).
+  return {
+    issue, mode, jobId: process.env.FLEET_JOB_ID,
+    state: view.state,
+    labels: view.labels.map(labelName),
+    body: view.body ?? '',
+    branches: claimBranches(issue),
+  };
+}
+
+/**
+ * Followthrough continuation (#80): check the adopted PR instead of issue readiness.
+ * Always calls process.exit(); extracting this keeps main() under the CCN threshold.
+ */
+function handleContinues(mode, target, continues) {
+  const issue = target.replace(STRIP_HASH, '');
+  try {
+    const pr = JSON.parse(
+      execFileSync('gh', ['pr', 'view', String(continues.pr), '--json', 'state,headRefName'], { encoding: 'utf8' }),
+    );
+    const facts = {
+      mode, issue, jobId: process.env.FLEET_JOB_ID, continues,
+      prState: pr.state, prHead: pr.headRefName,
+      branches: IS_ISSUE_NUM.test(issue) ? claimBranches(issue) : [],
+    };
+    const { ready, findings } = evaluate(facts);
+    if (ready) {
+      console.log(`gate: PR #${continues.pr} is open on ${continues.branch} — continuation ready`);
+      process.exit(0);
+    }
+    for (const finding of findings) console.error(`gate: ${finding}`);
+    process.exit(1);
+  } catch (err) {
+    console.error(`gate: cannot evaluate PR #${continues.pr}: ${errMsg(err)}`);
+    process.exit(2);
+  }
+}
+
 function main() {
   const order = readOrder();
   const target = resolveTarget(order);
@@ -116,37 +228,26 @@ function main() {
     console.log(`gate: ${evaluate({ mode, issue: target }).note}`);
     process.exit(0);
   }
-  const issue = target.replace(/^#/, '');
-  if (!/^\d+$/.test(issue)) {
+  // Followthrough continuation (#80): the dispatch adopts an existing PR's
+  // branch, so the gate checks that PR instead of issue readiness. The claim
+  // guard still runs when the target is an issue number — a rival job branch
+  // other than the adopted one still blocks.
+  const continues = mode === 'followthrough' ? resolveContinues(order) : undefined;
+  if (continues) {
+    handleContinues(mode, target, continues);
+    return; // handleContinues always exits; return satisfies control-flow analysis
+  }
+  const issue = target.replace(STRIP_HASH, '');
+  if (!IS_ISSUE_NUM.test(issue)) {
     console.error(`gate: ${mode} mode requires a ready GitHub issue; target "${target}" is not an issue number`);
     process.exit(2);
   }
 
   let facts;
   try {
-    const view = JSON.parse(
-      execFileSync('gh', ['issue', 'view', issue, '--json', 'state,labels,body'], { encoding: 'utf8' }),
-    );
-    // Query the remote directly rather than trusting local refs — the gate
-    // owns its own freshness (evaluate against live state, never a stale copy).
-    const lsRemote = execFileSync('git', ['ls-remote', '--heads', 'origin', `fleet/${issue}-*`], {
-      encoding: 'utf8',
-    });
-    facts = {
-      issue,
-      mode,
-      jobId: process.env.FLEET_JOB_ID,
-      state: view.state,
-      labels: view.labels.map((l) => l.name),
-      body: view.body ?? '',
-      branches: lsRemote
-        .split('\n')
-        .map((line) => line.split('\t')[1] ?? '')
-        .filter(Boolean)
-        .map((ref) => ref.replace('refs/heads/', '')),
-    };
+    facts = buildIssueFacts(issue, mode);
   } catch (err) {
-    console.error(`gate: cannot evaluate issue ${issue}: ${err instanceof Error ? err.message : err}`);
+    console.error(`gate: cannot evaluate issue ${issue}: ${errMsg(err)}`);
     process.exit(2);
   }
 

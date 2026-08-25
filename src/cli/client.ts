@@ -1,9 +1,13 @@
 // Fleet daemon HTTP client: unix socket ($FLEET_HOME/daemon.sock) or FLEET_DAEMON_URL.
-// node:http because fetch() cannot speak unix sockets.
-import http from 'node:http';
+// A thin layer over ../shared/http.ts — the one http.request wrapper in the
+// codebase, with connection pooling disabled there (a kept-alive socket to a
+// restarted daemon's stale unix socket would EPIPE).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fleetHome, operatorTokenPath } from '../shared/home.ts';
+
+import { request as httpRequest } from '../shared/http.ts';
 
 export type DaemonResponse = {
   status: number;
@@ -27,11 +31,45 @@ export type RequestOptions = {
    * otherwise the socket outlives the reason for it.
    */
   signal?: AbortSignal;
+  /** Extra request headers merged over the built-ins; caller keys win. */
+  headers?: Record<string, string>;
 };
 
 export type Target =
   | { kind: 'socket'; socketPath: string }
   | { kind: 'tcp'; host: string; port: number; basePath: string };
+
+/**
+ * A daemon address that cannot be used: unparseable, a scheme this client
+ * cannot speak, or a repo-named target the trust check refuses (#135). Its
+ * message is the whole story — main.ts prints it and exits 1 instead of
+ * letting a raw TypeError stack out of `new URL` (#125).
+ */
+export class DaemonTargetError extends Error {}
+
+/** Hosts that are this machine. Loopback is the daemon-target trust boundary (#135). */
+export const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+/**
+ * The boot-generated operator secret gating /jobs/* (issue #133), read once
+ * per process from $FLEET_HOME/operator-token. Undefined when the file is
+ * absent — socket-only deployments from before the secret existed, and tests
+ * against daemons constructed without operatorToken, keep working.
+ */
+const operatorTokenCache = new Map<string, string | undefined>();
+export function readOperatorToken(env: Record<string, string | undefined> = process.env): string | undefined {
+  const tokenPath = operatorTokenPath(fleetHome(env));
+  if (operatorTokenCache.has(tokenPath)) return operatorTokenCache.get(tokenPath);
+  let token: string | undefined;
+  try {
+    const raw = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (raw !== '') token = raw;
+  } catch {
+    // No token file: nothing to attach.
+  }
+  operatorTokenCache.set(tokenPath, token);
+  return token;
+}
 
 /** One captured deployment description: the file it came from, and its contents. */
 export type FleetConfigFile = { path: string; config: Record<string, unknown> };
@@ -89,38 +127,145 @@ export function configDaemonUrl(config: Record<string, unknown>): URL | undefine
  *   2. .fleet/infra/<provider>/fleet-config.json — daemon_url field
  *   3. Unix socket at $FLEET_HOME/daemon.sock
  */
-export function daemonTarget(
-  env: Record<string, string | undefined> = process.env,
-  opts: { cwd?: string } = {},
-): Target {
-  // 1. Explicit env override.
-  const url = env.FLEET_DAEMON_URL;
-  if (url) {
-    const u = new URL(url);
-    return {
-      kind: 'tcp',
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 80,
-      basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
-    };
+/** Convert a URL object to a TCP target, stripping trailing slashes from the base path. */
+function urlToTcpTarget(u: URL): Target {
+  return {
+    kind: 'tcp',
+    host: u.hostname,
+    port: u.port ? Number(u.port) : 80,
+    basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
+  };
+}
+
+/**
+ * Parse an operator-supplied daemon URL, failing readably instead of letting
+ * `new URL` throw a raw TypeError (#125). http only: src/shared/http.ts is
+ * node:http — an https:// value used to be silently spoken as plain HTTP to
+ * port 80, which is worse than a refusal.
+ */
+function parseHttpUrl(raw: string, source: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new DaemonTargetError(`${source} is not a valid URL: "${raw}"`);
   }
+  if (u.protocol !== 'http:') {
+    throw new DaemonTargetError(
+      `${source} must be an http:// URL — Fleet's client speaks plain HTTP over loopback or a tunnel (got "${raw}")`,
+    );
+  }
+  return u;
+}
+
+/**
+ * The trust check on a repo-named daemon address (#135, item 1). The config
+ * file travels with the checkout, so a cloned malicious repo chooses where
+ * `fleet delegate` POSTs its secret-bearing payload (env vars, synced files).
+ * Loopback is safe — the only way off this machine from there is a tunnel the
+ * operator opened. Anything else is refused unless the operator explicitly
+ * takes responsibility with FLEET_ALLOW_REMOTE_DAEMON=1. https is refused
+ * outright: this client cannot speak it (src/shared/http.ts is node:http).
+ */
+function assertTrustedDaemonUrl(u: URL, configPath: string, env: Record<string, string | undefined>): void {
+  if (u.protocol !== 'http:') {
+    throw new DaemonTargetError(
+      `daemon_url in ${configPath} is ${u.protocol}// — Fleet's client speaks plain HTTP only; point it at a loopback tunnel (http://127.0.0.1:<port>)`,
+    );
+  }
+  if (LOOPBACK_HOSTS.has(u.hostname)) return;
+  if (env.FLEET_ALLOW_REMOTE_DAEMON === '1') return;
+  throw new DaemonTargetError(
+    `refusing daemon_url ${u.origin} from ${configPath}: it is not loopback, and dispatch sends secrets `
+    + `(env vars, synced files) over plain HTTP to whatever daemon this repo-controlled file names. `
+    + `If you trust that address, set FLEET_ALLOW_REMOTE_DAEMON=1.`,
+  );
+}
+
+/**
+ * Say — loudly, once — when a checkout's config names a daemon_url this
+ * machine has never used for it (#135). The record lives under FLEET_HOME,
+ * never under .fleet/: the repo is the untrusted party here, and a state file
+ * it can rewrite is no state at all. Read/write failures fail open to warning
+ * again next run — the safe direction.
+ */
+function warnFirstSeenDaemonUrl(
+  u: URL,
+  configPath: string,
+  cwd: string,
+  env: Record<string, string | undefined>,
+): void {
+  const file = path.join(fleetHome(env), 'seen-daemon-urls.json');
+  let seen: Record<string, string[]> = {};
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) seen = raw as Record<string, string[]>;
+  } catch {
+    // first run, or an unreadable record: treat everything as unseen
+  }
+  const urls = Array.isArray(seen[cwd]) ? seen[cwd] : [];
+  if (urls.includes(u.href)) return;
+  console.error(
+    `fleet: NOTE: first use of daemon_url ${u.href} (from ${configPath}) in this checkout — `
+    + `fleet commands will talk to it, and dispatch sends secrets to it.`,
+  );
+  seen[cwd] = [...urls, u.href];
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(seen, null, 2)}\n`);
+  } catch {
+    // unrecordable: warn again next run rather than never again
+  }
+}
+
+/** The uncached resolution behind {@link daemonTarget}. */
+function resolveDaemonTarget(env: Record<string, string | undefined>, cwd: string): Target {
+  // 1. Explicit env override — the operator's own environment, so it is the
+  //    override channel: validated for shape and scheme, not for loopback.
+  const url = env.FLEET_DAEMON_URL;
+  if (url) return urlToTcpTarget(parseHttpUrl(url, 'FLEET_DAEMON_URL'));
 
   // 2. Per-deployment fleet-config.json (written by `fleet setup infra` (#13) or by hand).
   //    Scan .fleet/infra/<provider>/fleet-config.json for a daemon_url field; first wins.
-  for (const { config } of fleetConfigFiles(opts.cwd ?? process.cwd())) {
+  //    This file arrives with the checkout, so it gets the trust check (#135).
+  for (const { path: configPath, config } of fleetConfigFiles(cwd)) {
     const u = configDaemonUrl(config);
     if (!u) continue;
-    return {
-      kind: 'tcp',
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 80,
-      basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
-    };
+    assertTrustedDaemonUrl(u, configPath, env);
+    warnFirstSeenDaemonUrl(u, configPath, cwd, env);
+    return urlToTcpTarget(u);
   }
 
   // 3. Unix socket at $FLEET_HOME.
   const home = env.FLEET_HOME ?? path.join(os.homedir(), '.fleet');
   return { kind: 'socket', socketPath: path.join(home, 'daemon.sock') };
+}
+
+/**
+ * Memoized for the life of the process, the same bargain as the operator
+ * token above (#125): `request` resolves the target on every call, and the
+ * cockpit's 2-second poll was re-walking `.fleet/infra/*` with sync fs reads
+ * on its resident loop. Safe because nothing changes a resolution mid-process:
+ * `fleet setup infra` writes fleet-config.json and exits without resolving
+ * again, and the cockpit deliberately holds one address for its lifetime — its
+ * tunnel is bound to it. Keyed on every input resolution reads (env vars and
+ * cwd), so a test or caller with a different environment gets its own entry.
+ * Failed resolutions are not cached: a refusal must repeat, not vanish.
+ */
+const targetCache = new Map<string, Target>();
+
+export function daemonTarget(
+  env: Record<string, string | undefined> = process.env,
+  opts: { cwd?: string } = {},
+): Target {
+  const cwd = opts.cwd ?? process.cwd();
+  const key = [env.FLEET_DAEMON_URL ?? '', env.FLEET_HOME ?? '', env.FLEET_ALLOW_REMOTE_DAEMON ?? '', cwd]
+    .join('\u0000');
+  const cached = targetCache.get(key);
+  if (cached !== undefined) return cached;
+  const target = resolveDaemonTarget(env, cwd);
+  targetCache.set(key, target);
+  return target;
 }
 
 export function describeTarget(
@@ -150,7 +295,7 @@ export async function daemonHealthy(
   }
 }
 
-export function request(
+export async function request(
   method: string,
   reqPath: string,
   body?: unknown,
@@ -158,56 +303,36 @@ export function request(
 ): Promise<DaemonResponse> {
   const target = daemonTarget(opts.env ?? process.env, { cwd: opts.cwd });
   const payload = body === undefined ? undefined : JSON.stringify(body);
-  const requestOptions: http.RequestOptions = {
+  // /jobs/* requires the operator secret (issue #133); attaching it to every
+  // request is harmless for /health and /internal/*, which ignore it.
+  const token = readOperatorToken(opts.env ?? process.env);
+  const authHeaders: Record<string, string> = token !== undefined
+    ? { 'x-fleet-operator-token': token }
+    : {};
+  const res = await httpRequest({
     method,
     path: target.kind === 'tcp' ? `${target.basePath}${reqPath}` : reqPath,
-    headers: payload === undefined
-      ? { accept: 'application/json' }
-      : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
+    ...(target.kind === 'tcp'
+      ? { host: target.host, port: target.port }
+      : { socketPath: target.socketPath }),
+    headers: {
+      accept: 'application/json',
+      ...(payload === undefined
+        ? {}
+        : { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) }),
+      ...authHeaders,
+      ...opts.headers,
+    },
+    body: payload,
+    timeoutMs: opts.timeoutMs,
     signal: opts.signal,
-  };
-  if (target.kind === 'tcp') {
-    requestOptions.host = target.host;
-    requestOptions.port = target.port;
-  } else {
-    requestOptions.socketPath = target.socketPath;
+    onLine: opts.onLine,
+  });
+  let json: unknown;
+  try {
+    json = res.body === '' ? undefined : JSON.parse(res.body);
+  } catch {
+    json = undefined; // non-JSON body (e.g. an ndjson dump); caller reads body directly
   }
-
-  const { promise, resolve, reject } = Promise.withResolvers<DaemonResponse>();
-  const req = http.request(requestOptions, (res) => {
-    let full = '';
-    let pending = '';
-    res.setEncoding('utf8');
-    res.on('data', (chunk: string) => {
-      full += chunk;
-      if (!opts.onLine) return;
-      pending += chunk;
-      let nl = pending.indexOf('\n');
-      while (nl !== -1) {
-        const line = pending.slice(0, nl).trim();
-        pending = pending.slice(nl + 1);
-        if (line !== '') opts.onLine(line);
-        nl = pending.indexOf('\n');
-      }
-    });
-    res.on('end', () => {
-      const tail = pending.trim();
-      if (opts.onLine && tail !== '') opts.onLine(tail);
-      let json: unknown;
-      try {
-        json = full === '' ? undefined : JSON.parse(full);
-      } catch {
-        json = undefined;
-      }
-      resolve({ status: res.statusCode ?? 0, body: full, json });
-    });
-    res.on('error', reject);
-  });
-  req.setTimeout(opts.timeoutMs ?? 60_000, () => {
-    req.destroy(new Error('daemon request timed out'));
-  });
-  req.on('error', reject);
-  if (payload !== undefined) req.write(payload);
-  req.end();
-  return promise;
+  return { status: res.status, body: res.body, json };
 }
