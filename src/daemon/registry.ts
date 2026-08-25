@@ -242,7 +242,16 @@ type JobInternal = {
 type JobEntry = {
   record: JobRecord;
   internal: JobInternal;
-  events: StoredEvent[];
+  /**
+   * The in-memory event log, or null when it has been evicted (issue #118).
+   * Terminal jobs evict: their journal never changes again, so keeping every
+   * settled job's events resident makes daemon memory grow with lifetime usage,
+   * not with live work. The file on disk stays the source of truth — readers
+   * that still need a settled job's history (`?after=`, replay) re-read it on
+   * demand via `#eventsOf`. `lastSeq` is only meaningful while events is
+   * non-null; an append to an evicted entry consults the journal (`#nextSeq`).
+   */
+  events: StoredEvent[] | null;
   lastSeq: number;
   /** True when in-memory state diverged from job.json but the persist is deferred (coalescing). */
   dirty: boolean;
@@ -346,12 +355,9 @@ export class Registry extends EventEmitter {
       return null;
     }
 
-    const eventsPath = join(dir, "events.jsonl");
-    let events: StoredEvent[];
+    let events: StoredEvent[] | null;
     try {
-      events = existsSync(eventsPath)
-        ? (parseNdjson(readFileSync(eventsPath, "utf8")) as StoredEvent[])
-        : [];
+      events = this.#loadBootJournal(id, raw.state);
     } catch (err) {
       this.#quarantine(jobsRoot, id, `events.jsonl corrupt: ${String(err)}`);
       return null;
@@ -363,9 +369,10 @@ export class Registry extends EventEmitter {
       record: publicFields(merged),
       internal: internalFields(merged),
       events,
-      lastSeq: events.length > 0 ? events[events.length - 1].seq : -1,
+      lastSeq: events !== null && events.length > 0 ? events[events.length - 1].seq : -1,
       dirty: false,
     };
+    if (events !== null) this.#restartClocks(id, entry.internal);
     if (launch.migrate) {
       // Migrate now, not later. The next event rewrites job.json WITHOUT these
       // fields, so a legacy job that is read but not migrated loses its launch
@@ -374,6 +381,61 @@ export class Registry extends EventEmitter {
       this.#writeLaunchJson(entry);
     }
     return entry;
+  }
+
+  /**
+   * A job's journal for boot, or null when the job is terminal. Settled jobs'
+   * event files are NOT read at boot (issue #118): they never change again, so
+   * parsing them buys nothing, and on an EFS-backed home the sync reads delay
+   * the socket bind by the whole lifetime history. Throws when the journal is
+   * corrupt beyond a truncated trailing line — the caller quarantines.
+   */
+  #loadBootJournal(id: string, state: string): StoredEvent[] | null {
+    if (isTerminal(state as JobState)) return null;
+    return this.#readJournal(id);
+  }
+
+  /** Parse the job's events.jsonl from disk; [] when the file does not exist. */
+  #readJournal(id: string): StoredEvent[] {
+    const path = join(jobDir(this.home, id), "events.jsonl");
+    if (!existsSync(path)) return [];
+    return parseNdjson(readFileSync(path, "utf8")) as StoredEvent[];
+  }
+
+  /**
+   * The job's full event log: the resident array for live jobs, a fresh read
+   * of the journal for evicted (settled) ones. Consumers see the exact daemon
+   * seqs either way — the file is the authoritative log they were stamped into.
+   */
+  #eventsOf(entry: JobEntry): StoredEvent[] {
+    return entry.events ?? this.#readJournal(entry.record.id);
+  }
+
+  /**
+   * Restart a job's wall-clock and idle clocks from boot time (issue #116).
+   * Both are persisted as absolute timestamps, so the gap between the daemon's
+   * last write and this boot — the daemon's own downtime — would otherwise be
+   * billed to the job: the first sweep after a 90-minute outage reads a healthy
+   * job as 90 minutes over budget or 90 minutes silent, and cancels it.
+   * Accumulated active time already banked stays; only the open segment and
+   * the silence measurement restart. In-memory only: the values converge to
+   * disk on the entry's next persist, and re-forgiving a span on a crashy boot
+   * under-bills, which is the safe direction.
+   */
+  #restartClocks(id: string, internal: JobInternal, now = Date.now()): void {
+    const skipped = Math.max(
+      internal.wallClockActiveSince !== null ? now - internal.wallClockActiveSince : 0,
+      internal.lastEventAt !== null ? now - internal.lastEventAt : 0,
+    );
+    if (internal.wallClockActiveSince !== null) internal.wallClockActiveSince = now;
+    if (internal.lastEventAt !== null) internal.lastEventAt = now;
+    // Audit trail for real outages; a quick restart is not worth a line per job.
+    if (skipped >= 60_000) {
+      console.error(
+        `fleet: job ${id} — clocks restarted from boot; ` +
+        `${Math.round(skipped / 60_000)}m of daemon downtime not billed`,
+      );
+    }
   }
 
   /**
@@ -476,7 +538,9 @@ export class Registry extends EventEmitter {
    * re-read at boot (issue #118's cost requirement); the trusted snapshot wins.
    */
   #reconcile(id: string, entry: JobEntry): void {
-    if (isTerminal(entry.record.state)) return;
+    // Evicted entries are terminal by construction; the guard keeps the type
+    // honest and the settled-journals-stay-unread promise (#118) visible here.
+    if (isTerminal(entry.record.state) || entry.events === null) return;
     if (!this.#applyEffectsFn) return;
     const journalState = journalDerivedState(entry.events);
     if (journalState === null || journalState === entry.record.state) return;
@@ -631,8 +695,16 @@ export class Registry extends EventEmitter {
     Object.assign(entry.record, patch);
     if (patch.marker === undefined && "marker" in patch) delete entry.record.marker;
     entry.record.updatedAt = new Date().toISOString();
+    // A settled job's events leave memory (#118): the journal never changes
+    // again, and the file on disk keeps serving replay via #eventsOf.
+    if (isTerminal(entry.record.state)) entry.events = null;
     this.#persist(entry);
     return entry.record;
+  }
+
+  /** Whether the job's events are resident in memory (test seam for #118 eviction). */
+  eventsRetained(id: string): boolean {
+    return this.#entry(id).events !== null;
   }
 
   clearMarker(id: string): void {
@@ -674,7 +746,7 @@ export class Registry extends EventEmitter {
     const stored: StoredEvent = {
       ...event,
       job: id,
-      seq: entry.lastSeq + 1,
+      seq: this.#nextSeq(entry),
       at: typeof event.at === "string" ? event.at : new Date().toISOString(),
     } as StoredEvent;
     const { ok, errors } = validateEvent(stored);
@@ -682,8 +754,10 @@ export class Registry extends EventEmitter {
     const dir = jobDir(this.home, id);
     mkdirSync(dir, { recursive: true });
     appendFileSync(join(dir, "events.jsonl"), `${JSON.stringify(stored)}\n`);
-    entry.events.push(stored);
-    entry.lastSeq = stored.seq;
+    if (entry.events !== null) {
+      entry.events.push(stored);
+      entry.lastSeq = stored.seq;
+    }
     // Liveness for the stall backstop (issue #39): the daemon's own clock, not
     // the event's `at` — that one is stamped by the runner, whose container
     // clock may be skewed against the daemon's.
@@ -698,8 +772,29 @@ export class Registry extends EventEmitter {
     return stored;
   }
 
+  /**
+   * The authoritative seq the next appended event gets. Evicted entries carry
+   * no usable lastSeq, so the rare daemon append to a settled job consults the
+   * journal — never restart a job's seq sequence.
+   */
+  #nextSeq(entry: JobEntry): number {
+    if (entry.events !== null) return entry.lastSeq + 1;
+    const events = this.#readJournal(entry.record.id);
+    return (events.length > 0 ? events[events.length - 1]!.seq : -1) + 1;
+  }
+
   eventsAfter(id: string, after: number): StoredEvent[] {
-    return this.#entry(id).events.filter((event) => event.seq > after);
+    const events = this.#eventsOf(this.#entry(id));
+    // Sorted by seq: binary-search the first index past `after` instead of
+    // filtering the whole log per request (#118).
+    let lo = 0;
+    let hi = events.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (events[mid]!.seq > after) hi = mid;
+      else lo = mid + 1;
+    }
+    return events.slice(lo);
   }
 
   /**
@@ -713,7 +808,7 @@ export class Registry extends EventEmitter {
    */
   findEventByRunnerSeq(id: string, runnerSeq: number): StoredEvent | undefined {
     const entry = this.#entry(id);
-    return entry.events.find(
+    return this.#eventsOf(entry).find(
       (event) => event.runnerSeq === runnerSeq && event.seq > entry.internal.runnerSeqEpoch,
     );
   }
@@ -726,25 +821,27 @@ export class Registry extends EventEmitter {
    * a stale answer from an earlier generation.
    */
   findAnswer(id: string, decisionId: string): StoredEvent | undefined {
-    const events = this.#entry(id).events;
+    const events = this.#eventsOf(this.#entry(id));
     // Locate the LAST decision event with this id — if ids are unique across
     // generations (the runner-side seed), there is only one; if they collide,
     // the most recent decision is the one currently open.
-    let decisionSeq = -1;
+    let decisionIndex = -1;
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i]!;
       if (e.type === "decision" && e.id === decisionId) {
-        decisionSeq = e.seq;
+        decisionIndex = i;
         break;
       }
     }
-    if (decisionSeq < 0) return undefined;
-    return events.find(
-      (event) =>
-        event.type === "answer" &&
-        event.decision === decisionId &&
-        event.seq > decisionSeq,
-    );
+    if (decisionIndex < 0) return undefined;
+    // Scan forward from the decision, not from the log's start (#118): this
+    // lookup wakes on every event of a polled job, and position past the last
+    // matching decision already implies seq > decisionSeq.
+    for (let i = decisionIndex + 1; i < events.length; i++) {
+      const event = events[i]!;
+      if (event.type === "answer" && event.decision === decisionId) return event;
+    }
+    return undefined;
   }
 
   /**
@@ -762,7 +859,7 @@ export class Registry extends EventEmitter {
   decisionSeed(id: string): number {
     let seed = 0;
     let seen = 0;
-    for (const event of this.#entry(id).events) {
+    for (const event of this.#eventsOf(this.#entry(id))) {
       if (event.type !== "decision") continue;
       seen += 1;
       const ordinal = /^d(\d+)$/.exec(String(event.id))?.[1];
@@ -773,7 +870,7 @@ export class Registry extends EventEmitter {
 
   /** True when a decision with this id is already in the job's log (#110). */
   hasDecision(id: string, decisionId: string): boolean {
-    return this.#entry(id).events.some(
+    return this.#eventsOf(this.#entry(id)).some(
       (event) => event.type === "decision" && event.id === decisionId,
     );
   }

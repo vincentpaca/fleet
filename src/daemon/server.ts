@@ -39,6 +39,25 @@ export const RANK: Record<JobState, number> = {
   cancelled: 4,
 };
 
+/**
+ * How many settled jobs GET /jobs returns by default (#118). Without a bound
+ * the listing grows with lifetime usage — every consumer is a polling view
+ * (board, cockpit, `fleet status`) that cares about live work and recent
+ * history, so the default carries every live job plus the most recently
+ * updated settled ones; `?all=1` keeps the full history reachable.
+ */
+export const LIST_TERMINAL_LIMIT = 50;
+
+/** Every live job, plus the LIST_TERMINAL_LIMIT most recently updated settled ones. */
+function boundJobList(jobs: JobRecord[], all: boolean): JobRecord[] {
+  if (all) return jobs;
+  const settled = jobs
+    .filter((job) => isTerminal(job.state))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, LIST_TERMINAL_LIMIT);
+  return [...jobs.filter((job) => !isTerminal(job.state)), ...settled];
+}
+
 export type DaemonOptions = {
   home: string;
   provider: Provider;
@@ -304,7 +323,7 @@ export class FleetDaemon {
    */
   async #routeJobs(url: URL, method: string, parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.#operatorAuthorized(req)) return sendJson(res, 401, { error: "unauthorized" });
-    if (parts.length === 1) return this.#routeJobCollection(method, req, res);
+    if (parts.length === 1) return this.#routeJobCollection(url, method, req, res);
     const job = this.registry.getJob(parts[1] ?? "");
     if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[1]}` });
     if (parts.length === 2 && method === "GET") return sendJson(res, 200, { job: publicJob(job) });
@@ -312,11 +331,10 @@ export class FleetDaemon {
   }
 
   /** Handle POST /jobs and GET /jobs (the collection, not a specific job). */
-  async #routeJobCollection(method: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async #routeJobCollection(url: URL, method: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (method === "POST") return this.#createJob(req, res);
     if (method === "GET") {
-      const jobs = this.registry
-        .listJobs()
+      const jobs = boundJobList(this.registry.listJobs(), url.searchParams.get("all") === "1")
         .sort((a, b) => RANK[a.state] - RANK[b.state] || a.createdAt.localeCompare(b.createdAt))
         .map(publicJob);
       return sendJson(res, 200, { jobs });
