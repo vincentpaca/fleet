@@ -18,12 +18,10 @@ import {
   renderRosterRows,
   renderTableHeader,
   sortJobs,
-  visualClip,
-  visualLength,
-  type BoardDecision,
-  type BoardEvent,
   type BoardJob,
 } from '../src/cli/board.ts';
+import { visualClip, visualLength } from '../src/cli/ansi.ts';
+import type { FleetEvent, PendingDecision } from '../src/shared/events.ts';
 import { startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
 
 /** The roster as text, the way a pane would show it. */
@@ -238,7 +236,7 @@ test('the selection marker lands on the selected row and nowhere else', () => {
 // ── Event lines ───────────────────────────────────────────────────────────────
 
 test('renderEventLines: a decision becomes a card, and its answer names the question', () => {
-  const events: BoardEvent[] = [
+  const events: FleetEvent[] = [
     { seq: 0, type: 'state', state: 'running' },
     { seq: 1, type: 'think', text: 'reading the schema' },
     {
@@ -303,7 +301,7 @@ test('renderEventLines: exact output for every event type, color and noColor (#1
     '[13] settle rung=? status=PARTIAL',
     '[14] pair',
   ];
-  const battery = EVENT_BATTERY as BoardEvent[];
+  const battery = EVENT_BATTERY as FleetEvent[];
   assert.deepEqual(renderEventLines(battery, 100, false), expectedColor);
   assert.deepEqual(renderEventLines(battery, 100, true), expectedNoColor);
   // Width applies to every line, including card lines, without reordering.
@@ -313,7 +311,7 @@ test('renderEventLines: exact output for every event type, color and noColor (#1
 });
 
 test('renderEventLines: every line is clipped to width', () => {
-  const events: BoardEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
+  const events: FleetEvent[] = [{ seq: 0, type: 'log', text: 'a '.repeat(80) }];
   for (const line of renderEventLines(events, 60, true)) assert.ok(line.length <= 60);
 });
 
@@ -436,7 +434,7 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   });
   t.after(daemon.close);
   const env = { FLEET_DAEMON_URL: daemon.url };
-  const cache = new Map<string, BoardDecision>();
+  const cache = new Map<string, PendingDecision>();
 
   const first = await fetchBoardJobs(env, cache);
   const second = await fetchBoardJobs(env, cache);

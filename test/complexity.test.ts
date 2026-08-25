@@ -63,8 +63,6 @@ const TARGETS = ['src', '.fleet'];
  * When a number here looks absurd, measure the function by hand first.
  */
 const FUNCTION_BASELINE = [
-  // renderEventLines: switch over 7 event types + operators = CCN 21; genuine.
-  'src/cli/board.ts::renderEventLines',
   // cmdDoctor: checks ~10 env/tool prerequisites = CCN 39, NLOC 83; genuine.
   'src/cli/main.ts::cmdDoctor',
   // cmdLint: two try/catch loops + git check = CCN 15; genuine.
@@ -79,7 +77,6 @@ const FUNCTION_BASELINE = [
 
 /** Files already over FILE_NLOC_LIMIT. Same bargain as FUNCTION_BASELINE. */
 const FILE_BASELINE = [
-  'src/cli/board.ts',
   'src/cli/cockpit.ts',
   'src/cli/main.ts',
   'src/cli/setup.ts',

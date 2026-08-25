@@ -26,7 +26,9 @@ import {
   windowTail,
   type CockpitModel,
 } from '../src/cli/cockpit.ts';
-import { renderRosterRows, sortJobs, visualLength, type BoardEvent, type BoardJob } from '../src/cli/board.ts';
+import { renderRosterRows, sortJobs, type BoardJob } from '../src/cli/board.ts';
+import { visualLength } from '../src/cli/ansi.ts';
+import type { FleetEvent } from '../src/shared/events.ts';
 import { readTunnelRecord, pidAlive, portAccepts, probeDaemonHealth } from '../src/cli/connect.ts';
 import {
   CLI,
@@ -68,7 +70,7 @@ const RUNNING: BoardJob = {
   lastActivity: { text: 'reading the schema', at: '2026-01-01T00:04:00Z' },
 };
 
-const TAIL: BoardEvent[] = [
+const TAIL: FleetEvent[] = [
   { seq: 0, type: 'state', state: 'running' },
   { seq: 1, type: 'think', text: 'reading the schema' },
   {
@@ -174,7 +176,7 @@ test('the tail renders only in the drill-down, verbatim, windowed to its end', (
   assert.match(tail, /\[rename\] Rename to \/api\/v2/);
   assert.match(tail, /answer: type an option id below — keep \| rename/, 'the tail card says how to answer too');
   // Windowed, not re-rendered whole: a long history still shows its end.
-  const long: BoardEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
+  const long: FleetEvent[] = Array.from({ length: 5_000 }, (_, i) => ({ seq: i, type: 'log', text: `line ${i}` }));
   const drilled = frame(model({ view: 'job', tail: long }));
   assert.match(drilled.join('\n'), /line 4999/, 'the newest event is on screen');
   assert.doesNotMatch(drilled.join('\n'), /line 0\b/, 'the oldest is not');

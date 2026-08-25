@@ -8,15 +8,11 @@
 //
 // Zero dependencies: hand-rolled ANSI; erasable TS only.
 import { request } from './client.ts';
-import { formatJobState, formatLogText } from './format.ts';
+import { formatJobState, formatLogText, renderEvent } from './format.ts';
+import { makeCol, visualClip, visualLength, type ColFn } from './ansi.ts';
+import { optionId, type FleetEvent, type PendingDecision } from '../shared/events.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-export type BoardDecision = {
-  id: string;
-  question: string;
-  options: Array<{ id: string; label?: string; recommended?: boolean }>;
-};
 
 export type BoardJob = {
   id: string;
@@ -28,7 +24,7 @@ export type BoardJob = {
   createdAt?: string;
   updatedAt?: string;
   lastActivity?: { text: string; at: string }; // most recent think/log from the daemon (all jobs)
-  decision?: BoardDecision; // pending decision enriched from event stream
+  decision?: PendingDecision; // pending decision enriched from event stream
   /** Delivered artifacts (settle outcome produced[] length). Settled jobs only. */
   artifacts?: number;
 };
@@ -42,22 +38,6 @@ export type ContextInfo = {
   daemonReachable?: boolean;
   /** Who owns the tunnel carrying this endpoint, when one does — e.g. "tunnel:adopted". */
   tunnel?: string;
-};
-
-/** A parsed event from a job's event stream. */
-export type BoardEvent = {
-  seq: number;
-  type: string;
-  text?: string;
-  id?: string;
-  question?: string;
-  options?: Array<{ id: string; label?: string; recommended?: boolean }>;
-  decision?: string;
-  option?: string;
-  by?: string;
-  state?: string;
-  rung?: string;
-  report?: { status?: string; next_action?: string };
 };
 
 export type FrameOpts = {
@@ -182,71 +162,11 @@ export const ENTER_ALT = '\x1b[?1049h\x1b[?25l';
 /** Show cursor and exit alternate screen buffer. */
 export const RESTORE_SEQ = '\x1b[?25h\x1b[?1049l';
 
-// ── ANSI helpers ──────────────────────────────────────────────────────────────
-
-const RESET = '\x1b[0m';
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-
-function ansi(...codes: number[]): string {
-  return `\x1b[${codes.join(';')}m`;
-}
-
-/** Visible width of a string: ANSI escape sequences occupy no columns. */
-export function visualLength(s: string): number {
-  return s.replace(ANSI_RE, '').length;
-}
-
-/** Build a col() helper bound to a specific noColor flag. */
-export function makeCol(noColor: boolean): (text: string, ...codes: number[]) => string {
-  return (text, ...codes) => noColor ? text : `${ansi(...codes)}${text}${RESET}`;
-}
-
-/** Type alias for the col() helper so it can be used in parameter position
- *  without the inline function type that Lizard misparses as a nested function. */
-type ColFn = ReturnType<typeof makeCol>;
-
-/** Pending-decisions map: decision id → question text. Avoids inline object type in params. */
-type PendingDecisions = Map<string, string>;
-
-/** One option item from a decision; extracted so parameter types stay Lizard-clean. */
-type OptionItem = { id: string; label?: string; recommended?: boolean };
-
-/** Extract the `id` field from an option item; passed to Array.map() by reference. */
-function optionId(o: OptionItem): string { return o.id; }
+// ANSI helpers (makeCol / ColFn / visualLength / visualClip) live in ./ansi.ts
+// (#128); the cockpit imports them from there directly.
 
 /** Numeric-only target: #42 style. Hoisted so no inline regex in function bodies. */
 const IS_NUMERIC = /^\d+$/;
-
-/**
- * Clip a string (which may contain ANSI codes) to at most maxLen visible
- * characters, appending '…' if truncated. Resets open ANSI sequences only
- * when the clipped portion contained any escape codes.
- */
-export function visualClip(s: string, maxLen: number): string {
-  if (visualLength(s) <= maxLen) return s;
-  let out = '';
-  let vLen = 0;
-  const target = maxLen - 1;
-  let i = 0;
-  let hasAnsi = false;
-  while (i < s.length) {
-    // Copy ANSI escape sequences without counting them as visible characters.
-    if (s[i] === '\x1b' && i + 1 < s.length && s[i + 1] === '[') {
-      const end = s.indexOf('m', i + 2);
-      if (end !== -1) {
-        out += s.slice(i, end + 1);
-        i = end + 1;
-        hasAnsi = true;
-        continue;
-      }
-    }
-    if (vLen >= target) break;
-    out += s[i];
-    vLen++;
-    i++;
-  }
-  return `${out}…${hasAnsi ? RESET : ''}`;
-}
 
 // ── Pure frame renderers (new) ────────────────────────────────────────────────
 
@@ -338,97 +258,19 @@ export function renderTableHeader(w: number, noColor: boolean): string {
   return [visualClip(col(header, 90), w), visualClip(col(rule, 90), w)].join('\n');
 }
 
-/** Render the per-option lines for a decision card. */
-function renderOptionLines(options: OptionItem[], col: ColFn, w: number): string[] {
-  const lines: string[] = [];
-  for (const opt of options) {
-    const rec = opt.recommended ? col(' ★', 33) : '';
-    lines.push(visualClip('     ' + col('[' + opt.id + ']', 33) + ' ' + (opt.label ?? opt.id) + rec, w));
-  }
-  return lines;
-}
-
-/** Render the lines for a decision event, tracking the pending question. */
-function renderDecisionLines(
-  ev: BoardEvent,
-  pending: PendingDecisions,
-  col: ColFn,
-  prefix: string,
-  w: number,
-): string[] {
-  if (!ev.id) return [];
-  const question = ev.question ?? '';
-  const options = ev.options ?? [];
-  pending.set(ev.id, question);
-  const out = [visualClip(prefix + ' ' + col('?', 1, 33) + ' ' + col(question, 1), w)];
-  out.push(...renderOptionLines(options, col, w));
-  // Same rule as the roster card: a question on screen states how to answer it, in place.
-  const ids = options.map(optionId).join(' | ');
-  out.push(visualClip('     ' + col('answer: type an option id below — ' + ids, 33), w));
-  return out;
-}
-
-/** Render the single summary line for an answer event. */
-function renderAnswerLine(
-  ev: BoardEvent,
-  pending: PendingDecisions,
-  col: ColFn,
-  prefix: string,
-): string {
-  const dec = ev.decision ? pending.get(ev.decision) : undefined;
-  const qText = dec ? col('"' + dec + '"', 90) : '';
-  const ansText = ev.option ? col('[' + ev.option + ']', 32) : col('(free text)', 90);
-  const byText = ev.by ? col(' by ' + ev.by, 90) : '';
-  if (ev.decision) pending.delete(ev.decision);
-  return qText
-    ? prefix + ' ' + col('✓', 32) + ' ' + qText + ' → ' + ansText + byText
-    : prefix + ' ' + col('✓', 32) + ' answer: ' + ansText + byText;
-}
-
 /**
- * Convert a BoardEvent array to display lines for a job's tail. Decision events
- * become cards — the schema's question and every option, verbatim and never
- * summarised: the operator answers what the job actually asked (D8).
+ * Convert an event array to display lines for a job's tail, in the cockpit's
+ * pane convention, every line clipped to width. The rendering itself is the
+ * one switch in ./format.ts (#128); this owns what is pane-specific — the
+ * pending-decisions map that lets an answer name its question, and clipping.
  */
-export function renderEventLines(events: BoardEvent[], w: number, noColor: boolean): string[] {
+export function renderEventLines(events: FleetEvent[], w: number, noColor: boolean): string[] {
   const col = makeCol(noColor);
-  const lines: string[] = [];
   // Track pending decisions for "question → answer" rendering.
-  const pending: PendingDecisions = new Map();
-
-  for (const ev of events) {
-    const prefix = col('[' + ev.seq + ']', 90);
-    switch (ev.type) {
-      case 'think':
-      case 'log':
-        lines.push(visualClip(prefix + ' ' + col(ev.text ?? '', 90), w));
-        break;
-      case 'phase':
-        lines.push(visualClip(prefix + ' ' + col('phase', 90) + ' ' + col(ev.text ?? '', 90), w));
-        break;
-      case 'state': {
-        const c = ev.state === 'blocked' ? 33 : ev.state === 'running' ? 32 : 90;
-        lines.push(visualClip(prefix + ' ' + col('→', 90) + ' ' + col(ev.state ?? '', c), w));
-        break;
-      }
-      case 'decision':
-        lines.push(...renderDecisionLines(ev, pending, col, prefix, w));
-        break;
-      case 'answer':
-        lines.push(visualClip(renderAnswerLine(ev, pending, col, prefix), w));
-        break;
-      case 'settle':
-        lines.push(visualClip(
-          prefix + ' ' + col('settle', 36) + ' rung=' + col(ev.rung ?? '?', 36) + ' status=' + col(ev.report?.status ?? '?', 36),
-          w,
-        ));
-        break;
-      default:
-        lines.push(visualClip(prefix + ' ' + col(ev.type, 90), w));
-        break;
-    }
-  }
-  return lines;
+  const pending = new Map<string, string>();
+  return events.flatMap((ev) =>
+    renderEvent(ev, { kind: 'pane', col, pending }).map((line) => visualClip(line, w)),
+  );
 }
 
 /**
@@ -538,7 +380,7 @@ export type RosterRow = { jobIndex: number; lines: string[] };
  * end (operator feedback, first parked decision). One renderer for every place
  * a card appears: the roster and the drill-down's pinned card.
  */
-export function decisionCardLines(decision: BoardDecision, w: number, noColor: boolean): string[] {
+export function decisionCardLines(decision: PendingDecision, w: number, noColor: boolean): string[] {
   const col = makeCol(noColor);
   const lines: string[] = [visualClip('     ' + col(decision.question, 1), w)];
   for (const opt of decision.options) {
@@ -641,37 +483,51 @@ type RawJob = {
   settle?: { outcome?: { produced?: unknown[] } };
 };
 
-type WireEvent = {
-  seq?: number;
-  type: string;
-  text?: string;
-  id?: string;
-  question?: string;
-  options?: Array<{ id: string; label?: string; recommended?: boolean }>;
-};
+/** Reduce one raw event line into the latest unanswered decision. */
+function reducePendingDecision(
+  line: string,
+  current: PendingDecision | undefined,
+): PendingDecision | undefined {
+  try {
+    const ev = JSON.parse(line) as FleetEvent;
+    if (ev.type === 'decision' && ev.id && ev.question && ev.options) {
+      return { id: ev.id, question: ev.question, options: ev.options };
+    }
+    if (ev.type === 'answer') return undefined; // already answered elsewhere
+  } catch {
+    // ignore malformed events
+  }
+  return current;
+}
+
+/** Transport for one events read: GET the path, stream body lines, return the status. */
+type EventsGetter = (path: string, onLine: (line: string) => void) => Promise<{ status: number }>;
+
+/**
+ * Read a job's event log and reduce it to the most recent unanswered decision.
+ * The one place that logic lives (#128): the board's roster (and through it
+ * the cockpit) and `fleet resume` both come through here — the caller supplies
+ * the transport, and with it its own error policy.
+ */
+export async function fetchPendingDecision(
+  jobId: string,
+  get: EventsGetter,
+): Promise<{ status: number; decision?: PendingDecision }> {
+  let decision: PendingDecision | undefined;
+  const res = await get(`/jobs/${encodeURIComponent(jobId)}/events`, (line) => {
+    decision = reducePendingDecision(line, decision);
+  });
+  return { status: res.status, decision };
+}
 
 /** Fetch the most recent pending decision for a blocked job from its event log. */
 async function fetchDecision(
   jobId: string,
   env: Record<string, string | undefined>,
-): Promise<BoardDecision | undefined> {
+): Promise<PendingDecision | undefined> {
   try {
-    let decision: BoardDecision | undefined;
-    await request('GET', `/jobs/${encodeURIComponent(jobId)}/events`, undefined, {
-      env,
-      onLine: (line) => {
-        try {
-          const ev = JSON.parse(line) as WireEvent;
-          if (ev.type === 'decision' && ev.id && ev.question && ev.options) {
-            decision = { id: ev.id, question: ev.question, options: ev.options };
-          }
-          if (ev.type === 'answer') decision = undefined; // already answered elsewhere
-        } catch {
-          // ignore malformed events
-        }
-      },
-      timeoutMs: 5_000,
-    });
+    const { decision } = await fetchPendingDecision(jobId, (reqPath, onLine) =>
+      request('GET', reqPath, undefined, { env, onLine, timeoutMs: 5_000 }));
     return decision;
   } catch {
     return undefined;
@@ -703,7 +559,7 @@ function decisionKey(job: BoardJob): string {
  */
 export async function fetchBoardJobs(
   env: Record<string, string | undefined>,
-  cache?: Map<string, BoardDecision>,
+  cache?: Map<string, PendingDecision>,
 ): Promise<{ ok: boolean; jobs?: BoardJob[]; error?: string }> {
   try {
     const res = await request('GET', '/jobs', undefined, { env });
@@ -827,7 +683,7 @@ const FOLLOW_HELD_MS = 250;
  */
 export async function followJobEvents(
   jobId: string,
-  onEvent: (ev: BoardEvent) => void,
+  onEvent: (ev: FleetEvent) => void,
   env: Record<string, string | undefined>,
   signal: AbortSignal,
 ): Promise<void> {
@@ -841,7 +697,7 @@ export async function followJobEvents(
         env,
         onLine: (line) => {
           try {
-            const ev = JSON.parse(line) as BoardEvent;
+            const ev = JSON.parse(line) as FleetEvent;
             if (typeof ev.seq === 'number') after = ev.seq;
             onEvent(ev);
           } catch {
