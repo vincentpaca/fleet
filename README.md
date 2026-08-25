@@ -12,10 +12,10 @@ Everything runs in your account with your credentials. There is no hosted servic
 ## Install
 
 ```sh
-npm install -g github:<org>/fleet
+npm install -g github:vincentpaca/fleet
 ```
 
-That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. Fleet is not on the npm registry yet — see [Status](#status). One caveat: first-time infrastructure bring-up (`fleet setup infra` and `images/build.sh` in the quick start below) does run from a Fleet checkout, because the Terraform unit and image sources ship by git, not in the npm package.
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. One caveat: first-time infrastructure bring-up (`fleet setup infra` and `images/build.sh` in the quick start below) runs from a Fleet checkout, because the Terraform unit and image sources ship by git, not in the npm package.
 
 ## What Fleet owns
 
@@ -40,9 +40,10 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 
 - **Concepts invisible, behavior reliable.** Under the hood there is an evidence ladder, a state machine, six dispatch modes, and five schema contracts. You should experience them as: dispatch works, questions reach you, status never lies, the PR says what was verified. The contracts are the spine, not the face.
 - **Truth before action.** A job that can't prove readiness doesn't start; a claim that wasn't verified doesn't ship. Reports say `PARTIAL` honestly instead of `READY` optimistically, and the daemon verifies claimed rungs mechanically where it can.
-- **Prompt-level permission is not enforcement.** Every rule worth having gets a checkpoint — a schema, a gate, or a test. Until the credential broker lands (Phase 2), Fleet says plainly: sandboxes carry operator credentials, single-operator use only.
+- **Prompt-level permission is not enforcement.** Every rule worth having gets a checkpoint — a schema, a gate, or a test. Until a credential broker exists, Fleet says plainly: sandboxes carry operator credentials; single-operator use only.
 - **Humans are load-bearing, not decorative.** The pickup gate before model spend, the decision protocol mid-run, the merge at the end. Agents cannot answer their own questions — the answer API is unreachable with a job's credentials, by construction.
 - **One vertical path before breadth.** One harness (Claude Code), one cloud unit proven end to end, then adapters and substrates from demand — never speculatively.
+- **Fleet builds Fleet.** This repo's own issues are dispatched through Fleet and come back as reviewed PRs.
 
 ## How it works
 
@@ -55,7 +56,7 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 From a machine that has never seen Fleet, that is the whole path:
 
 ```sh
-npm install -g github:<org>/fleet
+npm install -g github:vincentpaca/fleet
 fleet setup repo        # interview → .fleet/manifest.json (fleet init for the placeholder scaffold)
 fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
 <fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
@@ -83,17 +84,9 @@ The live end-to-end check — a real session, a real block, a human answering �
 
 Run `fleet` with no arguments and you get the cockpit: the live board on top with blocked decisions floating up, the selected job's streaming transcript below it, and a command line at the bottom to dispatch from, answer a question, or cancel — one window instead of three. It adopts the daemon tunnel if one is healthy and opens its own if not, so a dead port-forward stops being something you rebuild by hand. Closing it changes nothing about the jobs; watching is a view, never a lifeline.
 
-## Status
-
-Honest, per our own rules:
-
-- **The local loop is real and dogfooded.** Fleet develops itself: tickets on this repo are delegated to Fleet, run headless, and come back as PRs — including most of the features in this README. Process and Docker providers work end to end; park/resume, wall-clock caps, artifacts, and the cockpit are all live and tested.
-- **The AWS path is written but has never completed a real job.** An external review identified four concrete substrate defects (daemon reachability, capacity-provider launch, scale-to-zero vs. the daemon's own service, missing daemon image) — tracked as open issues, being fixed before the first live run. The Phase-1 exit scenario will land as a repeatable acceptance test, not a demo.
-- **Not on the npm registry yet** — deliberately, until the cloud path is exercised for real. The documented install is straight from the repo (`npm install -g github:<org>/fleet`), which ships exactly what a registry publish would (`test/packaging.test.ts` and `test/packaging-install.test.ts` gate it); the registry name is a later call.
-
 ## Using Fleet vs. building Fleet
 
-Users consume three things: the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/<org>/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness — installed by `fleet setup harness`, never copied by hand. Everything else in this repo — `AGENTS.md`, `agents/`, `.claude/`, `.fleet/`, `test/` — is the harness for building Fleet itself and never ships; the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
+Users consume three things: the npm package (CLI, daemon, runner, schemas), a Terraform unit by git source (`github.com/vincentpaca/fleet//infra/aws`), and a skill file from `integrations/` for their coding harness — installed by `fleet setup harness`, never copied by hand. Everything else in this repo — `AGENTS.md`, `agents/`, `.claude/`, `.fleet/`, `test/` — is the harness for building Fleet itself and never ships; the boundary is the package manifest's `files` allowlist, enforced by `test/packaging.test.ts`.
 
 ## Working on this repo
 
@@ -110,4 +103,4 @@ Rules the schemas enforce, because prose rules get ignored: every command names 
 
 Fleet is **source-available** under the [PolyForm Shield License 1.0.0](LICENSE.md): use it, modify it, self-host it — commercially included — and contribute back. The one thing the license forbids is offering a product or service that competes with Fleet. It is not an OSI open-source license, deliberately; the same terms protect [AutoGPT's platform](https://github.com/Significant-Gravitas/AutoGPT) and [Micro](https://m3o.org/company/licensing.html).
 
-Required Notice: Copyright © 2026 the Fleet maintainers (`github.com/<org>/fleet`)
+Required Notice: Copyright © 2026 the Fleet maintainers (`github.com/vincentpaca/fleet`)
