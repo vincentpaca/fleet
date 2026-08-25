@@ -147,6 +147,54 @@ describe('build', () => {
     assert.deepEqual(find(res.log, 'images/daemon/Dockerfile'), []);
   });
 
+  test('both images build from the pinned base, and --base-image overrides it (#138)', () => {
+    // The default must reach docker as an explicit --build-arg: a tag written
+    // only inside the Dockerfiles would drift from what this script believes
+    // it is building, and the digest print below would report the wrong ref.
+    const res = runBuild([]);
+    assert.equal(res.code, 0, res.stderr);
+    for (const line of find(res.log, 'docker build')) {
+      assert.match(line, /--build-arg BASE_IMAGE=node:24-slim /, `base not pinned: ${line}`);
+    }
+
+    // Digest pinning: the reproducible-build path the digest print feeds.
+    const pinned = runBuild(['--base-image', 'node:24-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000']);
+    assert.equal(pinned.code, 0, pinned.stderr);
+    for (const line of find(pinned.log, 'docker build')) {
+      assert.match(line, /--build-arg BASE_IMAGE=node:24-slim@sha256:0{64} /, `digest pin lost: ${line}`);
+    }
+  });
+
+  test('every build prints the digest its base tag resolved to (#138)', () => {
+    // A stub docker that answers `image inspect` the way a real daemon with the
+    // base pulled would. The digest is the one thing that distinguishes two
+    // builds from a moved tag, so the script must surface it.
+    const binDir = makeTempDir('fleet-build-inspect-');
+    fs.writeFileSync(
+      path.join(binDir, 'docker'),
+      '#!/bin/sh\nprintf \'docker %s\\n\' "$*" >> "$FLEET_FAKE_LOG"\ncase "$2" in inspect) echo "node:24-slim@sha256:feedface" ;; esac\nexit 0\n',
+      { mode: 0o755 },
+    );
+    const res = runBuild(['--runner'], { env: { PATH: `${binDir}:${process.env.PATH ?? ''}` } });
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stdout, /resolved to: node:24-slim@sha256:feedface/);
+  });
+
+  test('a docker that cannot inspect fails no build — the digest print is best-effort (#138)', () => {
+    // A base pulled fresh during this build may hold no local RepoDigest, and
+    // `docker image inspect` on it exits nonzero. Under set -euo pipefail an
+    // unguarded inspect would kill the whole build over a print.
+    const binDir = makeTempDir('fleet-build-noinspect-');
+    fs.writeFileSync(
+      path.join(binDir, 'docker'),
+      '#!/bin/sh\nprintf \'docker %s\\n\' "$*" >> "$FLEET_FAKE_LOG"\ncase "$2" in inspect) exit 1 ;; esac\nexit 0\n',
+      { mode: 0o755 },
+    );
+    const res = runBuild(['--runner'], { env: { PATH: `${binDir}:${process.env.PATH ?? ''}` } });
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(find(res.log, 'docker build').length, 1);
+  });
+
   test("the build context is the Fleet checkout, not the caller's repo", () => {
     // The operator runs this from their own project, which is its own git repo:
     // resolving the context with `git rev-parse` would hand docker that tree.

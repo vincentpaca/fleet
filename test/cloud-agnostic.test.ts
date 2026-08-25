@@ -135,6 +135,10 @@ test('each infra unit self-describes its shape via fleet_config', () => {
     // trimming it silently breaks every consumer.
     for (const key of [
       'provider',
+      // region (#138): every aws call the CLI and daemon make appends
+      // --region from fleet_config; a unit that stops publishing it sends
+      // every consumer back to the caller's ambient region.
+      'region',
       'cluster',
       'runner_task_definition',
       'runner_container_name',

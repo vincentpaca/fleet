@@ -58,6 +58,9 @@ usage: images/build.sh [flags]
                          infra/aws runs; --redeploy-daemon accepts no other)
   --cli HARNESS_CLI      harness CLI baked into the runner base (default: claude-code)
   --version VERSION      harness CLI version (default: latest)
+  --base-image IMAGE     base for both images (default: node:24-slim). Pin a
+                         digest for a reproducible build: node:24-slim@sha256:…
+                         — every build prints the digest the tag resolved to
   --push                 push to the deployment's ECR as :runner / :daemon
   --redeploy-daemon      --push, then force a new deployment of Fleet's daemon service
   --config PATH          fleet-config.json to discover from
@@ -81,6 +84,9 @@ BUILD_DAEMON=0
 PLATFORM="linux/amd64"
 HARNESS_CLI="${HARNESS_CLI:-claude-code}"
 HARNESS_VERSION="${HARNESS_VERSION:-latest}"
+# Kept in step with the Dockerfiles' own ARG default — the script always passes
+# it, so this value is the one a scripted build actually uses.
+BASE_IMAGE="node:24-slim"
 PUSH=0
 REDEPLOY=0
 CONFIG=""
@@ -98,7 +104,7 @@ while [[ $# -gt 0 ]]; do
     # Every value-taking flag routes through one arity check: reading "$2"
     # directly makes a forgotten value exit with bash's "$2: unbound variable"
     # instead of saying which flag is short.
-    --platform|--cli|--version|--config|--repository|--region|--cluster|--service)
+    --platform|--cli|--version|--base-image|--config|--repository|--region|--cluster|--service)
       if [[ $# -lt 2 ]]; then
         echo "error: $1 needs a value" >&2
         exit 1
@@ -107,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         --platform)   PLATFORM="$2" ;;
         --cli)        HARNESS_CLI="$2" ;;
         --version)    HARNESS_VERSION="$2" ;;
+        --base-image) BASE_IMAGE="$2" ;;
         --config)     CONFIG="$2" ;;
         --repository) REPOSITORY="$2" ;;
         --region)     REGION_FLAG="$2" ;;
@@ -245,20 +252,39 @@ fi
 RUNNER_LOCAL_TAG="fleet-runner:${HARNESS_CLI}-${HARNESS_VERSION}"
 DAEMON_LOCAL_TAG="fleet-daemon:local"
 
+# The provenance a tag hides (#138): the tag text stays fixed while its content
+# moves — a rebuilt :latest, a republished node:24-slim. Print what this build
+# actually resolved to, so an operator can pin it (--base-image <ref>@sha256:…)
+# and compare two builds by identity instead of by name. Best-effort by design:
+# an image pulled fresh during this build may carry no local RepoDigest yet.
+print_digests() { # print_digests <built tag>
+  local base_digest image_id
+  base_digest="$(docker image inspect --format '{{join .RepoDigests ", "}}' "$BASE_IMAGE" 2>/dev/null || true)"
+  if [[ -n "$base_digest" ]]; then
+    echo "  base ${BASE_IMAGE} resolved to: ${base_digest}"
+  fi
+  image_id="$(docker image inspect --format '{{.Id}}' "$1" 2>/dev/null || true)"
+  if [[ -n "$image_id" ]]; then
+    echo "  image id: ${image_id}"
+  fi
+}
+
 build_image() { # build_image <local tag> <dockerfile> [build args...]
   local tag="$1" dockerfile="$2"
   shift 2
-  echo "building ${tag} for ${PLATFORM} ..."
-  # ${1+"$@"} not "$@": the daemon build passes no extra args, and bash 3.2
-  # (still /bin/bash on macOS, where an arm64 operator hits this first) treats
-  # an empty "$@" as an unbound variable under set -u.
+  echo "building ${tag} for ${PLATFORM} (base ${BASE_IMAGE}) ..."
+  # ${1+"$@"} not "$@": the daemon build passes no extra args beyond the base,
+  # and bash 3.2 (still /bin/bash on macOS, where an arm64 operator hits this
+  # first) treats an empty "$@" as an unbound variable under set -u.
   docker build \
     --platform "$PLATFORM" \
+    --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
     ${1+"$@"} \
     -t "$tag" \
     -f "${REPO_ROOT}/${dockerfile}" \
     "$REPO_ROOT"
   echo "built ${tag} (${PLATFORM})"
+  print_digests "$tag"
 }
 
 if [[ $BUILD_RUNNER -eq 1 ]]; then

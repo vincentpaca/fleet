@@ -8,8 +8,9 @@
 //     Dockerfile for this layer.
 //   Layer 2 (per-repo job image): fleet-job:<hash>
 //     Built by the CLI at delegate time FROM the runner base, applying
-//     manifest setup (script). Tagged by sha256(baseTag + setupInputs) —
-//     rebuilt only when that hash changes; otherwise the existing tag is
+//     manifest setup (script). Tagged by sha256(baseTag + resolved base image
+//     id + setupInputs) — rebuilt when any of those change (including the
+//     base tag moving to a new image, #138); otherwise the existing tag is
 //     reused and cold start benefits from base-layer caching.
 //
 // Secrets: API keys never bake into either layer. They enter at task start
@@ -92,16 +93,28 @@ export function runnerBaseTag(manifest: ImageManifest): string {
 
 /**
  * Content hash for the per-repo job image.
- * sha256(baseTag + NUL + setupInputs) — first 16 hex chars (64-bit prefix).
+ * sha256(baseTag + NUL + baseImageId + NUL + setupInputs) — first 16 hex chars.
+ *
+ * The base tag TEXT alone is not an identity (#138): "fleet-runner:
+ * claude-code-latest" reads the same before and after the tag moves to a
+ * rebuilt base, so hashing only the text reuses every stale job image under
+ * an unchanged hash. Folding in the tag's resolved docker image id makes a
+ * moved base a new hash — and a rebuild. When docker cannot resolve the tag
+ * (base not pulled yet, no docker in a unit test) the id contributes nothing
+ * and the hash degrades to the old text-only behavior; the build that follows
+ * fails loudly on the missing base anyway.
  */
 export function computeImageHash(
   manifest: ImageManifest,
   readFile?: (path: string) => string,
+  resolveImageId: (tag: string) => string | undefined = localImageId,
 ): string {
   const base = runnerBaseTag(manifest);
   const inputs = setupHashInputs(manifest, readFile);
   return createHash("sha256")
     .update(base)
+    .update("\0")
+    .update(resolveImageId(base) ?? "")
     .update("\0")
     .update(inputs)
     .digest("hex")
@@ -123,12 +136,24 @@ export function twoLayerEnabled(manifest: ImageManifest): boolean {
 
 // ---------- local image check ----------
 
-/** True when the image tag exists in the local Docker daemon. */
-export function imageExistsLocally(tag: string): boolean {
+/**
+ * Resolve a local image tag to its content-addressed docker image id
+ * (sha256:…), or undefined when the local daemon has no such tag (or there is
+ * no docker at all — a spawn failure is indistinguishable and treated the
+ * same). The id is what a tag's text hides: it changes when the tag moves.
+ */
+export function localImageId(tag: string): string | undefined {
   const result = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], {
     stdio: ["ignore", "pipe", "ignore"],
   });
-  return result.status === 0 && (result.stdout?.toString().trim().length ?? 0) > 0;
+  if (result.status !== 0) return undefined;
+  const id = result.stdout?.toString().trim();
+  return id ? id : undefined;
+}
+
+/** True when the image tag exists in the local Docker daemon. */
+export function imageExistsLocally(tag: string): boolean {
+  return localImageId(tag) !== undefined;
 }
 
 // ---------- build ----------

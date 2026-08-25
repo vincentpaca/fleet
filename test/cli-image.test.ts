@@ -144,6 +144,34 @@ describe('computeImageHash', () => {
     const hash = computeImageHash(BASE_MANIFEST);
     assert.match(hash, /^[0-9a-f]{16}$/);
   });
+
+  test('a moved base tag changes the hash even under identical tag text (#138)', () => {
+    // The "latest" cache lie: fleet-runner:claude-code-latest is the same TEXT
+    // before and after the tag moves to a rebuilt base. Hashing only the text
+    // reuses every stale job image; the resolved image id is the identity.
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const before = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    const after = computeImageHash(manifest, undefined, () => 'sha256:bbbb');
+    assert.notEqual(before, after, 'a moved base tag must invalidate the job-image cache');
+  });
+
+  test('an unchanged base id keeps the hash stable (#138)', () => {
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const h1 = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    const h2 = computeImageHash(manifest, undefined, () => 'sha256:aaaa');
+    assert.equal(h1, h2);
+  });
+
+  test('an unresolvable base degrades to text-only hashing, deterministically (#138)', () => {
+    // No docker / base not pulled: the hash must not throw and must stay
+    // stable, and the missing id must not collide with an empty-string id
+    // produced any other way than "unresolved".
+    const manifest: ImageManifest = { harness: { cli: 'claude-code', cli_version: 'latest' } };
+    const h1 = computeImageHash(manifest, undefined, () => undefined);
+    const h2 = computeImageHash(manifest, undefined, () => undefined);
+    assert.equal(h1, h2);
+    assert.notEqual(h1, computeImageHash(manifest, undefined, () => 'sha256:aaaa'));
+  });
 });
 
 // ---------- jobImageDockerfile (baked-setup marker, #49) ----------

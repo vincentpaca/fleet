@@ -34,6 +34,15 @@ variable "az_count" {
   description = "Number of availability zones (and subnets per tier) for the module-created VPC."
   type        = number
   default     = 2
+
+  # Public subnets take cidrsubnet netnums 0..az_count-1 and private subnets
+  # take 8..az_count+7 (main.tf): a ninth AZ hands public subnet 8 and private
+  # subnet 0 the same CIDR, which AWS rejects only at apply. Constraints that
+  # fail at plan, not apply — #9 paid four applies to learn the difference.
+  validation {
+    condition     = var.az_count >= 1 && var.az_count <= 8
+    error_message = "az_count must be between 1 and 8: the module's subnet layout reserves netnums 0-7 for public and 8-15 for private subnets, so a ninth AZ would give a public and a private subnet the same CIDR."
+  }
 }
 
 variable "enable_nat_gateway" {
@@ -54,18 +63,33 @@ variable "max_instances" {
   description = "Maximum size of the ECS container-instance auto scaling group (minimum is always 0 so the cluster scales to zero when idle)."
   type        = number
   default     = 4
+
+  validation {
+    condition     = var.max_instances >= 1
+    error_message = "max_instances must be at least 1: an ASG capped at 0 can never scale out, so every job queues forever."
+  }
 }
 
 variable "on_demand_base_capacity" {
   description = "Number of instances in the auto scaling group that are always launched as on-demand (not spot). Set above zero when you need guaranteed baseline capacity."
   type        = number
   default     = 0
+
+  validation {
+    condition     = var.on_demand_base_capacity >= 0
+    error_message = "on_demand_base_capacity cannot be negative."
+  }
 }
 
 variable "on_demand_percentage_above_base" {
   description = "Percentage of additional instances above on_demand_base_capacity that are on-demand; the remainder are spot. 0 = all spot above the base; 100 = all on-demand."
   type        = number
   default     = 0
+
+  validation {
+    condition     = var.on_demand_percentage_above_base >= 0 && var.on_demand_percentage_above_base <= 100
+    error_message = "on_demand_percentage_above_base is a percentage: it must be between 0 and 100."
+  }
 }
 
 variable "scaling_cooldown_seconds" {
@@ -78,12 +102,22 @@ variable "offered_cpu_units" {
   description = "Maximum CPU (in ECS units, 1024 = 1 vCPU) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default matches a t3.medium (2 vCPU = 2048 units)."
   type        = number
   default     = 2048
+
+  validation {
+    condition     = var.offered_cpu_units > 0
+    error_message = "offered_cpu_units must be positive: a zero (or negative) tier makes the daemon reject every manifest that requests cpu."
+  }
 }
 
 variable "offered_memory_mib" {
   description = "Maximum memory (in MiB) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default leaves ~512 MiB for the ECS agent and OS on a t3.medium (4096 MiB total)."
   type        = number
   default     = 3584
+
+  validation {
+    condition     = var.offered_memory_mib > 0
+    error_message = "offered_memory_mib must be positive: a zero (or negative) tier makes the daemon reject every manifest that requests memory."
+  }
 }
 
 # --- Images -----------------------------------------------------------------
@@ -106,12 +140,26 @@ variable "daemon_cpu" {
   description = "CPU units for the daemon Fargate task (task-level; must be a valid Fargate CPU value: 256, 512, 1024, 2048, or 4096)."
   type        = number
   default     = 256
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096], var.daemon_cpu)
+    error_message = "daemon_cpu must be a Fargate task CPU value: 256, 512, 1024, 2048, or 4096. Fargate rejects anything else at apply."
+  }
 }
 
 variable "daemon_memory" {
   description = "Memory (MiB) for the daemon Fargate task (task-level; must be a valid Fargate memory value for the chosen CPU — e.g. 512-2048 for CPU=256)."
   type        = number
   default     = 512
+
+  # The full cpu↔memory pairing needs both variables and lives as a
+  # precondition on aws_ecs_task_definition.daemon (main.tf): the module still
+  # supports terraform 1.5, and cross-variable validation needs 1.9. This block
+  # holds the bound no pairing escapes.
+  validation {
+    condition     = var.daemon_memory >= 512 && var.daemon_memory <= 30720
+    error_message = "daemon_memory must be between 512 and 30720 MiB — the range Fargate supports across its task CPU values."
+  }
 }
 
 variable "daemon_tcp_port" {

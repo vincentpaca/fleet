@@ -16,8 +16,14 @@
 
 ARG HARNESS_CLI=claude-code
 ARG HARNESS_VERSION=latest
+# BASE_IMAGE exists for digest pinning (#138): a tag is a name, not an
+# identity, and node:24-slim can move under an unchanged Dockerfile. Pass
+# --build-arg BASE_IMAGE=node:24-slim@sha256:<digest> (or images/build.sh
+# --base-image) to build against exactly one base. images/build.sh prints the
+# digest the tag resolved to on every build, so there is always one to pin.
+ARG BASE_IMAGE=node:24-slim
 
-FROM node:24-slim
+FROM ${BASE_IMAGE}
 
 # Re-declare so post-FROM layers can see the build args.
 ARG HARNESS_CLI
@@ -62,11 +68,14 @@ RUN set -eu; \
     fi
 
 # Fleet runner source. No secrets here; secrets enter at runtime only.
+# Lockfiles before source (#138): npm ci depends only on package*.json, and
+# COPYing src/ first busted its layer cache on every source edit — the exact
+# rebuild cost the two-layer image model exists to avoid.
 WORKDIR /opt/fleet
-COPY src/ src/
-COPY schemas/ schemas/
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
+COPY src/ src/
+COPY schemas/ schemas/
 
 # Drop root. A job's harness is the least trusted code Fleet runs — it is an
 # agent executing a work order against a cloned repo — and until now it ran as

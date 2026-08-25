@@ -129,14 +129,52 @@ the right ownership on first mount.
 | `az_count` | `number` | `2` | AZs / subnets per tier for the module-created VPC. |
 | `enable_nat_gateway` | `bool` | `false` | `true`: private subnets behind NAT; `false`: public subnets with public-IP egress. Never any inbound either way. |
 | `instance_type` | `string` | `"t3.medium"` | EC2 instance type for container instances. |
-| `max_instances` | `number` | `4` | ASG maximum (minimum is always 0). |
+| `max_instances` | `number` | `4` | ASG maximum (minimum is always 0; must be ≥ 1). |
+| `on_demand_base_capacity` | `number` | `0` | Instances always launched on-demand before the Spot split applies. See [Spot by default](#spot-by-default). |
+| `on_demand_percentage_above_base` | `number` | `0` | Percentage of capacity above the base that is on-demand (0 = all Spot, 100 = all on-demand). See [Spot by default](#spot-by-default). |
+| `scaling_cooldown_seconds` | `number` | `300` | ASG cooldown between scaling events. Raise it if jobs die to aggressive scale-in. |
+| `offered_cpu_units` | `number` | `2048` | Largest CPU request (ECS units) a single runner task may make; the daemon rejects bigger manifests at dispatch. Size to `instance_type`. |
+| `offered_memory_mib` | `number` | `3584` | Largest memory request (MiB) a single runner task may make; sized to leave headroom for the ECS agent on `instance_type`. |
 | `project_repos` | `list(string)` | `[]` | Extra ECR repositories, one per project image. |
 | `daemon_image` | `string` | `""` | Daemon container image; empty means `<runner repo>:daemon`. |
 | `daemon_cpu` | `number` | `256` | CPU units for the daemon Fargate task (must be a valid Fargate value: 256/512/1024/2048/4096). |
-| `daemon_memory` | `number` | `512` | Memory (MiB) for the daemon Fargate task (must be valid for the chosen CPU). |
+| `daemon_memory` | `number` | `512` | Memory (MiB) for the daemon Fargate task (must be valid for the chosen CPU — the unit rejects an invalid pairing at plan). |
 | `daemon_tcp_port` | `number` | `9000` | TCP port the daemon binds inside its container; operators reach it via SSM port-forward. |
+| `runner_cpu` | `number` | `256` | CPU units reserved for a runner container. |
+| `runner_memory` | `number` | `1024` | Hard memory limit (MiB) for a runner container. |
 | `fleet_home_path` | `string` | `"/var/lib/fleet"` | Container path for `FLEET_HOME` (EFS-backed). |
 | `log_retention_days` | `number` | `30` | CloudWatch log retention. |
+
+### Spot by default
+
+With the defaults — `on_demand_base_capacity = 0` and
+`on_demand_percentage_above_base = 0` — **every worker instance is a Spot
+instance**. That is the cheap end of a real trade-off, and it is deliberate:
+worker capacity exists only while jobs run, and Spot is a fraction of the
+on-demand price for interruptible batch work. The cost is interruption: AWS can
+reclaim a Spot instance with a two-minute warning, and the unit wires no
+lifecycle hook or Capacity Rebalancing, so a reclaim kills any job mid-run. The
+daemon sees the dead task only as a stall and settles the job as cancelled —
+the work is lost and must be re-dispatched by hand.
+
+Five knobs shape the exposure:
+
+- `on_demand_base_capacity` — instances that are always on-demand. Set to 1+
+  for a guaranteed baseline that reclaims cannot touch.
+- `on_demand_percentage_above_base` — the split for everything above the base.
+  `100` makes every worker on-demand: no reclaims, full price. A middle value
+  mixes the fleet so one reclaim wave cannot take every running job.
+- `max_instances` — bounds how many jobs (and therefore how much re-run cost a
+  reclaim wave can create) run at once.
+- `scaling_cooldown_seconds` — reclaims are not the only mid-run killer;
+  aggressive scale-in is the other. Raise this if jobs die while the cluster
+  shrinks.
+- `instance_type` — Spot reclaim rates differ by pool; a less popular type in
+  your region is reclaimed less often.
+
+If a lost job costs you more than the on-demand premium — long jobs, jobs that
+are expensive to re-prompt — set `on_demand_percentage_above_base = 100` and
+pay for certainty.
 
 ## Outputs
 
