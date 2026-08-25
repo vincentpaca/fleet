@@ -8,6 +8,36 @@ import { fileURLToPath } from 'node:url';
 
 export const CLI = fileURLToPath(new URL('../src/cli/main.ts', import.meta.url));
 
+/**
+ * One event of every type the renderers know, plus an unknown one ('pair').
+ * Shared by the characterization tests that pin `formatEvent` (cli-ops) and
+ * `renderEventLines` (cli-board) byte-for-byte: both switches cover the same
+ * vocabulary, so both are pinned against the same battery (#128).
+ */
+export const EVENT_BATTERY = [
+  { seq: 1, type: 'state', state: 'running' },
+  { seq: 2, type: 'state', state: 'blocked', reason: 'decision', marker: 'parked' },
+  { seq: 3, type: 'phase', text: 'setup' },
+  { seq: 4, type: 'think', text: 'planning the change' },
+  { seq: 5, type: 'log', text: 'tool_use Read: {"file_path":"/p/a.ts","limit":5}' },
+  { seq: 6, type: 'log', text: 'plain line' },
+  { seq: 7, type: 'progress', value: 0.42 },
+  {
+    seq: 8, type: 'decision', id: 'd1', question: 'Which way?',
+    options: [
+      { id: 'a', label: 'Left', recommended: true },
+      { id: 'b', label: 'Right' },
+      { id: 'c' },
+    ],
+  },
+  { seq: 9, type: 'answer', decision: 'd1', option: 'a', text: 'go left', by: 'vince' },
+  { seq: 10, type: 'answer', decision: 'd9', text: 'freeform' },
+  { seq: 11, type: 'answer' },
+  { seq: 12, type: 'settle', rung: 'pr-open', report: { status: 'READY', next_action: 'review it' } },
+  { seq: 13, type: 'settle', report: { status: 'PARTIAL' } },
+  { seq: 14, type: 'pair', minutes: 3 },
+];
+
 export type CliResult = { code: number; stdout: string; stderr: string };
 
 export function runCli(

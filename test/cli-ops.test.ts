@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
-import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, type MockRequest } from './cli-helpers.ts';
+import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from '../src/cli/format.ts';
 import { TERSE_RESULT_MAX } from '../src/shared/tool-text.ts';
 import { translateLine } from '../src/runner/translate.ts';
@@ -50,6 +50,47 @@ test('formatEvent: color mode produces ANSI codes; noColor suppresses them', () 
   assert.match(formatEvent(stateEvent, true), /\[0\] state → running/);
   assert.match(formatEvent(settleReady, true), /rung=done status=READY/);
   assert.match(formatEvent(settlePartial, true), /status=PARTIAL/);
+});
+
+test('formatEvent: exact output for every event type, color and noColor (#128 characterization)', () => {
+  // Byte-for-byte pins captured before the rendering paths were unified: the
+  // plain-line convention (`fleet logs` / `fleet attach`) must not drift when
+  // the shared rendering core changes. If a change here is deliberate, update
+  // the pin and say why in the commit.
+  const expectedColor = [
+    '\x1b[1m[1] state → running\x1b[0m',
+    '\x1b[1m[2] state → blocked reason=decision marker=parked\x1b[0m',
+    '[3] phase setup',
+    '\x1b[2m[4] think planning the change\x1b[0m',
+    '[5] log tool_use Read file_path=/p/a.ts',
+    '[6] log plain line',
+    '[7] progress 42%',
+    '\x1b[33m[8] decision d1: Which way?\n  - a (recommended): Left\n  - b: Right\n  - c\n  answer with: fleet answer <jobId> --option <id> [--text s]\x1b[0m',
+    '[9] answer d1 → a "go left" by vince',
+    '[10] answer d9 → (free text) "freeform"',
+    '[11] answer undefined → (free text)',
+    '\x1b[32m[12] settle rung=pr-open status=READY next: review it\x1b[0m',
+    '\x1b[31m[13] settle rung=? status=PARTIAL\x1b[0m',
+    '[14] pair {"minutes":3}',
+  ];
+  const expectedNoColor = [
+    '[1] state → running',
+    '[2] state → blocked reason=decision marker=parked',
+    '[3] phase setup',
+    '[4] think planning the change',
+    '[5] log tool_use Read file_path=/p/a.ts',
+    '[6] log plain line',
+    '[7] progress 42%',
+    '[8] decision d1: Which way?\n  - a (recommended): Left\n  - b: Right\n  - c\n  answer with: fleet answer <jobId> --option <id> [--text s]',
+    '[9] answer d1 → a "go left" by vince',
+    '[10] answer d9 → (free text) "freeform"',
+    '[11] answer undefined → (free text)',
+    '[12] settle rung=pr-open status=READY next: review it',
+    '[13] settle rung=? status=PARTIAL',
+    '[14] pair {"minutes":3}',
+  ];
+  assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, false)), expectedColor);
+  assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, true)), expectedNoColor);
 });
 
 test('formatEvent: settle green for READY, red for non-READY (ANSI code check)', () => {
