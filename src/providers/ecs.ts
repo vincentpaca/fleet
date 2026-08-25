@@ -6,7 +6,7 @@
 // is the unit-tested surface.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { CloudCliRunner, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
+import type { CloudCliRunner, JobSandbox, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
 import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempFile } from "./provider.ts";
 
 const run = promisify(execFile);
@@ -401,6 +401,38 @@ export function ecsTunnelOpener(access: EcsDaemonAccess, aws: CloudCliRunner = a
 
 const CONTAINER_WORKSPACE = "/workspace";
 
+/**
+ * The run-task `startedBy` stamp: `fleet:<jobId>`. One constant for both ends
+ * of the contract — buildRunTaskInput writes it at dispatch, the #147 reconcile
+ * sweep parses it back out of describe-tasks — so the launcher and the sweep
+ * cannot drift on the one string that ties a task to its job.
+ */
+export const STARTED_BY_PREFIX = "fleet:";
+
+/**
+ * ECS DescribeTasks accepts at most 100 task ARNs per call (API constraint —
+ * no plan reaches it; pinned by test/daemon-providers.test.ts).
+ */
+export const DESCRIBE_TASKS_BATCH = 100;
+
+/**
+ * The fleet-launched tasks in an `ecs describe-tasks --output json` response:
+ * every task whose startedBy carries the fleet stamp, mapped to the job id it
+ * names. Tasks started by anything else (the daemon service, an operator's
+ * hand-run task) are not fleet's to touch and are dropped here, before any
+ * caller can conflate them with a job. Pure function — testable without AWS.
+ */
+export function parseFleetTasks(describeJson: string): JobSandbox[] {
+  const parsed = JSON.parse(describeJson) as { tasks?: { taskArn?: string; startedBy?: string }[] };
+  const found: JobSandbox[] = [];
+  for (const task of parsed.tasks ?? []) {
+    if (typeof task.taskArn !== "string" || task.taskArn === "") continue;
+    if (typeof task.startedBy !== "string" || !task.startedBy.startsWith(STARTED_BY_PREFIX)) continue;
+    found.push({ jobId: task.startedBy.slice(STARTED_BY_PREFIX.length), handle: task.taskArn });
+  }
+  return found;
+}
+
 /** EcsProvider construction options. */
 export type EcsProviderOptions = {
   /** Shell-out to `aws`; defaults to the budget-killing awsCli. Injectable for tests. */
@@ -449,7 +481,7 @@ export class EcsProvider implements Provider {
     const input: Record<string, unknown> = {
       cluster: this.config.cluster,
       taskDefinition: this.config.taskDefinition,
-      startedBy: `fleet:${spec.jobId}`,
+      startedBy: `${STARTED_BY_PREFIX}${spec.jobId}`,
       overrides,
     };
     // Prefer capacity-provider strategy so managed ASG scaling fires (defect #2).
@@ -552,6 +584,67 @@ export class EcsProvider implements Provider {
       ],
       this.config.region,
     );
+  }
+
+  /**
+   * argv after `aws` for one page of the cluster's running tasks (#147).
+   * `startedBy` is not a server-side ListTasks filter, so this lists everything
+   * with desired status RUNNING and describe-tasks supplies the startedBy to
+   * filter on client-side. Pure function — unit-tested without AWS.
+   */
+  buildListClusterTasksArgs(startingToken?: string): string[] {
+    return withRegion(
+      [
+        "ecs",
+        "list-tasks",
+        "--cluster",
+        this.config.cluster,
+        "--desired-status",
+        "RUNNING",
+        ...(startingToken !== undefined ? ["--starting-token", startingToken] : []),
+        "--output",
+        "json",
+      ],
+      this.config.region,
+    );
+  }
+
+  /** argv after `aws` for describing a batch of tasks — pure function, unit-tested without AWS. */
+  buildDescribeTasksArgs(taskArns: string[]): string[] {
+    return withRegion(
+      ["ecs", "describe-tasks", "--cluster", this.config.cluster, "--tasks", ...taskArns, "--output", "json"],
+      this.config.region,
+    );
+  }
+
+  /**
+   * Every running task on the cluster that a fleet dispatch started, keyed by
+   * job id (#147). This is the reconcile sweep's evidence, so completeness is
+   * the contract: the AWS CLI auto-paginates ListTasks by default, but a
+   * truncated response (--max-items in someone's alias, a future CLI change)
+   * still carries a continuation token — follow it rather than silently treat
+   * page one as the cluster. describe-tasks is batched at the API's cap.
+   */
+  async listJobSandboxes(): Promise<JobSandbox[]> {
+    const taskArns: string[] = [];
+    let token: string | undefined;
+    do {
+      const page = JSON.parse(await this.#cli(this.buildListClusterTasksArgs(token), AWS_CLI_TIMEOUT_MS)) as {
+        taskArns?: string[];
+        // The raw API spells it nextToken; the CLI's client-side pagination
+        // emits NextToken. Honour both — dropping either loses page two.
+        nextToken?: string;
+        NextToken?: string;
+      };
+      taskArns.push(...(page.taskArns ?? []));
+      token = page.nextToken ?? page.NextToken;
+    } while (token !== undefined);
+    const found: JobSandbox[] = [];
+    for (let i = 0; i < taskArns.length; i += DESCRIBE_TASKS_BATCH) {
+      const batch = taskArns.slice(i, i + DESCRIBE_TASKS_BATCH);
+      found.push(...parseFleetTasks(await this.#cli(this.buildDescribeTasksArgs(batch), AWS_CLI_TIMEOUT_MS)));
+    }
+    return found;
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {
