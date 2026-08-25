@@ -27,8 +27,10 @@ import {
   twoLayerEnabled,
   imageExistsLocally,
   buildJobImage,
+  jobImageDockerfile,
   type ImageManifest,
 } from '../src/cli/images.ts';
+import { SETUP_BAKED_BASENAME } from '../src/shared/setup-marker.ts';
 
 // ---------- fixtures ----------
 
@@ -144,6 +146,37 @@ describe('computeImageHash', () => {
   });
 });
 
+// ---------- jobImageDockerfile (baked-setup marker, #49) ----------
+
+describe('jobImageDockerfile', () => {
+  test('setup.script mode runs the script and leaves the baked marker in the same layer', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { script: '.fleet/setup.sh' },
+    });
+    assert.match(dockerfile, /^FROM fleet-runner:claude-code-1\.2\.3\n/);
+    assert.match(dockerfile, /COPY \.fleet\/setup\.sh \/tmp\/fleet-setup\.sh/);
+    // The marker is what tells the runner NOT to run setup.script again before
+    // the pickup gate (src/runner/setup.ts). Same RUN as the script: a build
+    // where setup failed must not leave the marker behind.
+    assert.match(
+      dockerfile,
+      new RegExp(`RUN sh /tmp/fleet-setup\\.sh && touch "\\$HOME/${SETUP_BAKED_BASENAME}"`),
+    );
+    // $HOME, never /etc: the runner base drops to USER node before this layer.
+    assert.ok(!dockerfile.includes('/etc/'), 'job-image layers run as node and cannot write /etc');
+  });
+
+  test('no setup.script → plain base alias, and no marker', () => {
+    const dockerfile = jobImageDockerfile('fleet-runner:claude-code-1.2.3', {
+      harness: { cli: 'claude-code', cli_version: '1.2.3' },
+      setup: { image: 'node:22' },
+    });
+    assert.equal(dockerfile, 'FROM fleet-runner:claude-code-1.2.3\n');
+    assert.ok(!dockerfile.includes(SETUP_BAKED_BASENAME), 'an image that baked nothing must not claim it did');
+  });
+});
+
 // ---------- imageExistsLocally ----------
 
 test('imageExistsLocally returns false for a non-existent tag', () => {
@@ -159,6 +192,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TEST_CLI = 'claude-code';
 const TEST_CLI_VER = 'fleet-test-sentinel';
 const BASE_TAG = `fleet-runner:${TEST_CLI}-${TEST_CLI_VER}`;
+const DAEMON_TAG = 'fleet-daemon:fleet-test-sentinel';
 
 // Fake harness delivered as a synced file into the workspace.
 // Uses the decision-file convention (writes decision.json, reads answer-d1.json);
@@ -285,6 +319,42 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
       sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"'),
       'ok',
     );
+  });
+
+  // The daemon image dropped root in #156, after the runner did in #155. Same
+  // discipline: asserted on the built image, not by grepping the Dockerfile —
+  // a later `USER root`, a base-image change, or an entrypoint that
+  // re-escalates would all pass a grep and fail here.
+  test('the daemon image runs as a non-root user that can still do the job', () => {
+    execFileSync(
+      'docker',
+      ['build', '-t', DAEMON_TAG, '-f', join('images', 'daemon', 'Dockerfile'), '.'],
+      { cwd: repoRoot, stdio: 'inherit' },
+    );
+    cleanup.push(DAEMON_TAG);
+
+    const sh = (script: string): string =>
+      execFileSync('docker', ['run', '--rm', '--entrypoint', 'sh', DAEMON_TAG, '-c', script], {
+        encoding: 'utf8',
+      }).trim();
+
+    assert.equal(sh('id -u'), '1000', 'the daemon must not run as root');
+
+    // Non-root is worthless if it cannot work. The daemon's job before it
+    // answers a request: write $FLEET_HOME (jobs, journals, daemon.lock — in a
+    // deployment the EFS access point makes the mount writable at uid 1000;
+    // this image-level stand-in proves the process side of that pact), find
+    // its own entrypoint, and run the AWS CLI the EcsProvider shells out to.
+    assert.equal(
+      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(process.env.HOME+\'/fleet-home/jobs\',{recursive:true});f.writeFileSync(process.env.HOME+\'/fleet-home/daemon.lock\',\'probe\');console.log(\'ok\')"'),
+      'ok',
+      'the daemon must be able to write a FLEET_HOME it owns',
+    );
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/daemon/main.ts\')?\'ok\':\'missing\')"'),
+      'ok',
+    );
+    assert.match(sh('aws --version 2>&1'), /aws-cli/, 'EcsProvider shells out to aws as uid 1000');
   });
 
   // AC3: no secrets baked into any image layer

@@ -81,8 +81,47 @@ export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<s
   };
 }
 
-function git(workspace: string, args: string[]): string {
-  return execFileSync('git', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+/**
+ * Bound on the gh calls at settle (#152). Generous — a PR create over a
+ * working connection is seconds — because its only job is to keep a hung gh
+ * from wedging the runner until the daemon's backstop reaps it. Network git
+ * calls take their bound per call instead: the caller knows what budget the
+ * push sits inside (the cancel teardown's slice is far tighter than this).
+ */
+const GH_TIMEOUT_MS = 120_000;
+
+/**
+ * The one chokepoint for git/gh invocations. `timeoutMs` bounds the call with
+ * SIGKILL, not the default SIGTERM: a push hung on a black-holed connection
+ * shrugs off SIGTERM the same way the pickup gate did (#111), and an ignored
+ * kill leaves execFileSync blocked past its own timeout — the wedge the
+ * timeout exists to break. A timed-out call throws an error that names the
+ * timeout, so the log lines built from err.message distinguish "the push
+ * hung" from every other push failure (#152).
+ */
+function runTool(tool: 'git' | 'gh', workspace: string, args: string[], timeoutMs?: number): string {
+  try {
+    return execFileSync(tool, args, {
+      cwd: workspace,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(timeoutMs !== undefined ? { timeout: timeoutMs, killSignal: 'SIGKILL' as const } : {}),
+    });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      throw new Error(`${tool} ${args[0]} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
+}
+
+function git(workspace: string, args: string[], timeoutMs?: number): string {
+  return runTool('git', workspace, args, timeoutMs);
+}
+
+/** Default gh executor for findOpenPr/createDraftPr — bounded (#152). */
+function defaultGhRun(workspace: string): GhRunner {
+  return (args: string[]) => runTool('gh', workspace, args, GH_TIMEOUT_MS);
 }
 
 /** fleet/<target>-<jobId>, target sanitized to git-ref-safe characters. */
@@ -202,31 +241,35 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
  *   delivery exists regardless of who pushed it — #34/#37 attempt runs were
  *   mislabeled "clean" for exactly this.
  * - 'clean': nothing committed anywhere; there is no deliverable.
+ *
+ * `timeoutMs` bounds the network calls only (the push, and the verification
+ * fetch on its failure path) — local add/commit/rev-list cannot hang on a
+ * dead connection and a large tree must not trip a bound meant for one (#152).
  */
-function commitAndPush(workspace: string, message: string, base?: string): 'pushed' | 'delivered' | 'clean' {
+function commitAndPush(workspace: string, message: string, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
   git(workspace, ['add', '-A']);
   const staged = git(workspace, ['status', '--porcelain']).trim();
   if (staged !== '') git(workspace, ['commit', '-q', '-m', message]);
   const ahead = git(workspace, ['rev-list', '--count', '@{upstream}..HEAD']).trim();
   if (staged !== '' || ahead !== '0') {
     try {
-      git(workspace, ['push', '-q']);
+      git(workspace, ['push', '-q'], timeoutMs);
       return 'pushed';
     } catch (err) {
       // Push rejected (e.g. the agent amended after its own push). Fall through:
       // judge delivery by what the remote actually has.
-      if (remoteAheadOfBase(workspace, base)) return 'delivered';
+      if (remoteAheadOfBase(workspace, base, timeoutMs)) return 'delivered';
       throw err;
     }
   }
-  return remoteAheadOfBase(workspace, base) ? 'delivered' : 'clean';
+  return remoteAheadOfBase(workspace, base, timeoutMs) ? 'delivered' : 'clean';
 }
 
 /** Does the remote branch carry commits beyond the base branch? */
-function remoteAheadOfBase(workspace: string, base?: string): boolean {
+function remoteAheadOfBase(workspace: string, base?: string, timeoutMs?: number): boolean {
   if (!base) return false;
   try {
-    git(workspace, ['fetch', '-q', 'origin']);
+    git(workspace, ['fetch', '-q', 'origin'], timeoutMs);
     const branch = git(workspace, ['branch', '--show-current']).trim();
     const count = git(workspace, ['rev-list', '--count', `origin/${base}..origin/${branch}`]).trim();
     return count !== '0';
@@ -236,13 +279,13 @@ function remoteAheadOfBase(workspace: string, base?: string): boolean {
 }
 
 /** The work commit at settle. Pushes partial work too — evidence over tidiness. */
-export function pushWork(workspace: string, target: string, jobId: string, ok: boolean, base?: string): 'pushed' | 'delivered' | 'clean' {
-  return commitAndPush(workspace, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`, base);
+export function pushWork(workspace: string, target: string, jobId: string, ok: boolean, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
+  return commitAndPush(workspace, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`, base, timeoutMs);
 }
 
 /** The WIP commit when a blocked job parks (#6 calls this). */
-export function pushWip(workspace: string, reason: string): 'pushed' | 'clean' {
-  return commitAndPush(workspace, `wip(park): ${reason}`);
+export function pushWip(workspace: string, reason: string, timeoutMs?: number): 'pushed' | 'clean' {
+  return commitAndPush(workspace, `wip(park): ${reason}`, undefined, timeoutMs);
 }
 
 /** HEAD SHA after all commits; used for settle reporting. */
@@ -274,9 +317,9 @@ export function remoteHasHead(workspace: string, branch: string): boolean {
  * are on it. Judging a followthrough by that would claim a rung for doing
  * nothing. `sinceSha` is the adopted branch tip captured at setup.
  */
-export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: string): boolean {
+export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: string, timeoutMs?: number): boolean {
   try {
-    git(workspace, ['fetch', '-q', 'origin', branch]);
+    git(workspace, ['fetch', '-q', 'origin', branch], timeoutMs);
     const count = git(workspace, ['rev-list', '--count', `${sinceSha}..FETCH_HEAD`]).trim();
     return count !== '0';
   } catch {
@@ -291,8 +334,7 @@ export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: s
  * settle instead of creating one. Same GhRunner seam as createDraftPr.
  */
 export function findOpenPr(workspace: string, branch: string, ghRun?: GhRunner): { url: string; number: number } | undefined {
-  const run = ghRun ?? ((args: string[]) =>
-    execFileSync('gh', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const run = ghRun ?? defaultGhRun(workspace);
   const out = run(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url,number', '--limit', '1']);
   const parsed = JSON.parse(out) as { url?: unknown; number?: unknown }[];
   const first = Array.isArray(parsed) ? parsed[0] : undefined;
@@ -358,8 +400,7 @@ export function createDraftPr(workspace: string, opts: {
   body: string;
   ghRun?: GhRunner;
 }): string {
-  const run = opts.ghRun ?? ((args: string[]) =>
-    execFileSync('gh', args, { cwd: workspace, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const run = opts.ghRun ?? defaultGhRun(workspace);
   return run([
     'pr', 'create',
     '--draft',

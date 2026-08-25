@@ -2,7 +2,7 @@
 
 Work is tracked as GitHub issues; this file holds the phase structure and exit criteria the issues roll up to.
 
-## Phase 1 — first real delegated run (in progress)
+## Phase 1 — first real delegated run
 
 **Exit:** a real ticket goes `fleet delegate` from a laptop → the autoscaling group scales from zero → the job blocks on a real decision → the laptop is shut mid-job → the job keeps running → the decision is answered from another machine → a merge-ready PR with green CI exists → the transcript replays from the daemon's event log → the cluster is back at zero instances.
 

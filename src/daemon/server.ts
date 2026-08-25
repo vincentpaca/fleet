@@ -16,7 +16,7 @@ import { operatorTokenPath, socketPath, daemonLockPath, artifactDir, ARTIFACT_PE
 import { parseDurationMs, idleLimitMs, toMinutes, DEFAULT_BACKSTOP_MARGIN_MS } from "../shared/time.ts";
 import { Registry } from "./registry.ts";
 import { HomeLock } from "./lock.ts";
-import type { EffectsMode, JobRecord, StoredEvent } from "./registry.ts";
+import type { EffectsMode, JobRecord, OpenDecision, StoredEvent } from "./registry.ts";
 import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
 import type { JobState, Marker } from "./state.ts";
 import { verifyRung } from "./verify.ts";
@@ -250,6 +250,11 @@ export class FleetDaemon {
       this.#port = typeof address === "object" && address !== null ? address.port : null;
     }
 
+    // Recover the crash-window states no sweep reaches (#115) before the
+    // sweeps arm. After the listeners are up, deliberately: a recovery
+    // re-launch advertises daemonUrl, which needs the TCP port bound.
+    await this.#bootRecover();
+
     // Combined sweep: wall-clock and stall backstops, decision-timeout (stale) marking.
     const sweepMs = this.#options.wallClockSweepIntervalMs ?? 10_000;
     this.#sweepTimer = setInterval(() => {
@@ -470,6 +475,18 @@ export class FleetDaemon {
       }
     }
 
+    // Dispatch-time image-override check (#49): a provider whose image is
+    // pinned by the substrate (ECS) refuses the two-layer job image here,
+    // loudly, before a job record exists — never a silent fallback to an
+    // image the manifest versioned away from.
+    if (imageOverride !== undefined && this.#options.provider.checkImageOverride) {
+      try {
+        this.#options.provider.checkImageOverride(imageOverride);
+      } catch (error) {
+        return sendJson(res, 422, { errors: [{ instancePath: "/image", message: String(error) }] });
+      }
+    }
+
     const id = newId("job");
     const now = new Date().toISOString();
     const record: JobRecord = {
@@ -528,12 +545,61 @@ export class FleetDaemon {
     return done.promise;
   }
 
+  async #answer(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Cheap pre-checks so an obviously wrong answer fails before the body is
+    // read. NOT the real gate: readBody yields the event loop, and a cancel or
+    // a concurrent answer can complete while the body streams (#114).
+    if (job.state !== "blocked") {
+      return sendJson(res, 409, { error: `job is ${job.state}, not blocked` });
+    }
+    if (!this.registry.openDecision(job.id)) {
+      return sendJson(res, 409, { error: "job is blocked but has no open decision" });
+    }
+    const answer = await this.#readAnswerBody(req, res);
+    if (answer === null) return;
+    // Re-check after the await (#114). Everything from here to the claim below
+    // is synchronous — that is what makes the claim atomic under concurrency.
+    const current = this.registry.getJob(job.id);
+    if (!current || current.state !== "blocked") {
+      return sendJson(res, 409, { error: `job is ${current?.state ?? "gone"}, not blocked` });
+    }
+    const decision = this.registry.openDecision(job.id);
+    if (!decision) {
+      return sendJson(res, 409, { error: "job is blocked but has no open decision" });
+    }
+    const invalid = FleetDaemon.#validateAnswer(decision, answer);
+    if (invalid !== null) return sendJson(res, 422, invalid);
+    // Claim the decision: append the answer (journal first — it is the durable
+    // fact every recovery rests on) and consume the open decision before any
+    // further await. A concurrent second answer re-checks above and gets 409;
+    // without the claim both would pass and a parked job would launch twice.
+    this.registry.appendEvent(job.id, {
+      type: "answer",
+      decision: decision.id,
+      ...(answer.option !== undefined ? { option: answer.option } : {}),
+      ...(answer.text !== undefined ? { text: answer.text } : {}),
+      by: "operator",
+    });
+    this.registry.setOpenDecision(job.id, null);
+    this.registry.setDecisionBlockedAt(job.id, null);
+
+    // Parked (or stale) job: the old runner has already exited — re-entry.
+    if (current.marker === "parked" || current.marker === "stale") {
+      return this.#answerParked(current, { decisionId: decision.id, answer }, res);
+    }
+    return this.#answerHot(current, res);
+  }
+
   /**
-   * Parse the answer body fields. Returns {option, text} (either may be
-   * undefined) on success; on validation failure, sends the error response and
-   * returns null so the caller can return early.
+   * Parse and shape-check an answer body. Sends the 400/422 itself and returns
+   * null when the body is unusable. Decision-dependent validation stays in
+   * #answer, against the decision that is open AFTER the body await — the one
+   * the answer will actually claim.
    */
-  async #parseAnswerBody(req: IncomingMessage, res: ServerResponse, decision: { id: string; optionIds: string[] }): Promise<{ option: string | undefined; text: string | undefined } | null> {
+  async #readAnswerBody(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<{ option?: string; text?: string } | null> {
     let body: unknown;
     try {
       body = JSON.parse(await readBody(req));
@@ -545,92 +611,209 @@ export class FleetDaemon {
       sendJson(res, 400, { error: "body must be a JSON object" });
       return null;
     }
-    const rawOption = "option" in body ? body.option : undefined;
-    const rawText = "text" in body ? body.text : undefined;
-    if (rawOption !== undefined && typeof rawOption !== "string") {
-      sendJson(res, 422, { error: "option must be a string" }); return null;
-    }
-    if (rawText !== undefined && typeof rawText !== "string") {
-      sendJson(res, 422, { error: "text must be a string" }); return null;
-    }
-    const option = rawOption as string | undefined;
-    const text = rawText as string | undefined;
-    // An invalid option id is an error, never silently downgraded to free text.
-    if (option !== undefined && !decision.optionIds.includes(option)) {
-      sendJson(res, 422, { error: `option "${option}" does not match the open decision`, options: decision.optionIds });
+    const option = "option" in body ? body.option : undefined;
+    const text = "text" in body ? body.text : undefined;
+    if (option !== undefined && typeof option !== "string") {
+      sendJson(res, 422, { error: "option must be a string" });
       return null;
     }
-    if (option === undefined && (text === undefined || text.length === 0)) {
-      sendJson(res, 422, { error: "answer requires an option id or free text" }); return null;
+    if (text !== undefined && typeof text !== "string") {
+      sendJson(res, 422, { error: "text must be a string" });
+      return null;
     }
-    return { option, text };
+    return {
+      ...(option !== undefined ? { option } : {}),
+      ...(text !== undefined ? { text } : {}),
+    };
   }
 
-  /**
-   * Re-launch a parked or stale job with the operator's answer pre-materialised.
-   * The old runner has already exited; the new container picks up where it left off.
-   */
-  async #relaunchParkedJob(job: JobRecord, decision: { id: string; optionIds: string[] }, option: string | undefined, text: string | undefined, res: ServerResponse): Promise<void> {
-    this.registry.clearMarker(job.id);
-    this.registry.resetRunnerSeq(job.id);
-    const newToken = newRunnerToken();
-    const details = this.registry.getLaunchDetails(job.id);
-    const reAnswer: { option?: string; text?: string } = {};
-    if (option !== undefined) reAnswer.option = option;
-    if (text !== undefined) reAnswer.text = text;
-    // Derive resources from the stored manifest.
-    const storedManifest = details.manifest as { limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
-    const resources = storedManifest?.limits?.resources;
+  /** Decision-dependent answer validation; returns the 422 payload or null. */
+  static #validateAnswer(
+    decision: OpenDecision,
+    answer: { option?: string; text?: string },
+  ): Record<string, unknown> | null {
+    // An invalid option id is an error, never silently downgraded to free text.
+    if (answer.option !== undefined && !decision.optionIds.includes(answer.option)) {
+      return {
+        error: `option "${answer.option}" does not match the open decision`,
+        options: decision.optionIds,
+      };
+    }
+    if (answer.option === undefined && (answer.text === undefined || answer.text.length === 0)) {
+      return { error: "answer requires an option id or free text" };
+    }
+    return null;
+  }
+
+  /** Re-entry response path: relaunch with the answer; 500-and-cancel on failure. */
+  async #answerParked(
+    job: JobRecord,
+    reentry: { decisionId: string; answer: { option?: string; text?: string } },
+    res: ServerResponse,
+  ): Promise<void> {
     try {
-      const { handle } = await this.#options.provider.launch({
-        jobId: job.id, daemonUrl: this.daemonUrl, runnerToken: newToken,
-        image: details.image, env: details.env, sync: details.sync,
-        manifest: details.manifest, workOrder: job.workOrder, resources,
-        reentryAnswer: { decisionId: decision.id, answer: reAnswer },
-        // Seed the new runner's decision counter past prior ids (issue #110).
-        reentryDecisionSeed: this.registry.decisionSeed(job.id),
-      });
-      const updated = this.registry.updateJob(job.id, { handle, runnerToken: newToken });
+      const updated = await this.#launchReentry(job, reentry);
+      if (updated === null) {
+        // The job went terminal while the container launched (#114): the fresh
+        // container is already terminated; do not resurrect the record.
+        const after = this.registry.getJob(job.id);
+        return sendJson(res, 409, { error: `job is ${after?.state ?? "gone"}, no longer answerable` });
+      }
       return sendJson(res, 200, { job: publicJob(updated) });
     } catch (error) {
-      // Re-launch failed: cancel so the job reaches a terminal state.
-      // Leaving it in blocked with no runner and no marker would make it
-      // permanently unrecoverable without manual intervention.
-      this.registry.appendEvent(job.id, { type: "log", text: `re-launch failed after answer: ${String(error)}`, who: "daemon" });
-      this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-failed" });
-      this.registry.updateJob(job.id, { state: "cancelled", reason: "launch-failed" });
+      // Re-launch failed: the old runner is dead and no new one is starting.
+      // Cancel the job so it reaches a terminal state the operator can reason
+      // about — leaving it in blocked with no runner and no marker would make
+      // it permanently unrecoverable without manual intervention.
+      this.#cancelAfterFailedRelaunch(job.id, error);
       return sendJson(res, 500, { error: `re-launch failed: ${String(error)}` });
     }
   }
 
-  async #answer(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (job.state !== "blocked") return sendJson(res, 409, { error: `job is ${job.state}, not blocked` });
-    const decision = this.registry.openDecision(job.id);
-    if (!decision) return sendJson(res, 409, { error: "job is blocked but has no open decision" });
-
-    const input = await this.#parseAnswerBody(req, res, decision);
-    if (!input) return;
-    const { option, text } = input;
-
-    this.registry.appendEvent(job.id, {
-      type: "answer", decision: decision.id,
-      ...(option !== undefined ? { option } : {}),
-      ...(text !== undefined ? { text } : {}),
-      by: "operator",
-    });
-    this.registry.setOpenDecision(job.id, null);
-    this.registry.setDecisionBlockedAt(job.id, null);
-
-    // Parked (or stale) job: re-entry path via a fresh container.
-    if (job.marker === "parked" || job.marker === "stale") {
-      return this.#relaunchParkedJob(job, decision, option, text, res);
-    }
-
-    // Hot job: the existing runner is still alive and polling for its answer.
-    this.registry.clearMarker(job.id);
-    const updated = this.registry.updateJob(job.id, { state: "running" });
-    this.registry.wallClockBecameActive(job.id);
+  /**
+   * Hot job: the existing runner is still alive and polling for its answer.
+   * The blocked → running transition happens here, and it lands in the journal
+   * as a daemon-authored state event (#114): replaying the log alone must
+   * reconstruct the one transition the daemon itself performs. Should the
+   * runner turn out to be mid-park rather than polling (#151's gap), its late
+   * blocked/parked event still lands — running → blocked is legal — and the
+   * answered-park recovery re-launches with this answer.
+   */
+  #answerHot(job: JobRecord, res: ServerResponse): void {
+    const stored = this.registry.appendEvent(job.id, { type: "state", state: "running" });
+    this.#applyEffects(job, stored, "intake");
+    const updated = this.registry.getJob(job.id) ?? job;
     return sendJson(res, 200, { job: publicJob(updated) });
+  }
+
+  /**
+   * Launch a fresh container for a blocked job whose runner has exited, with
+   * the operator's answer pre-materialised so the status-driven harness picks
+   * up where it left off. Shared by the parked/stale answer path, the
+   * answered-park recovery (#151), and boot recovery (#115). The state stays
+   * blocked until the new runner emits state:running (blocked → running is a
+   * valid transition). The runner seq resets so the fresh container starts at 0.
+   *
+   * Ordering is the crash-window contract (#115): the rotated runner token is
+   * persisted BEFORE provider.launch, so a crash after the container started
+   * leaves a record whose token still matches it, and boot recovery can finish
+   * the re-entry instead of stranding a container it cannot authenticate.
+   *
+   * Returns null when the job went terminal during the launch — the fresh
+   * container is terminated and the terminal record left alone (#114).
+   */
+  async #launchReentry(
+    job: JobRecord,
+    reentry: { decisionId: string; answer: { option?: string; text?: string } },
+  ): Promise<JobRecord | null> {
+    this.registry.clearMarker(job.id);
+    this.registry.resetRunnerSeq(job.id);
+    const newToken = newRunnerToken();
+    this.registry.updateJob(job.id, { runnerToken: newToken });
+    const details = this.registry.getLaunchDetails(job.id);
+    // Derive resources from the stored manifest so the provider can apply
+    // any resource overrides declared in manifest.limits.resources.
+    const storedManifest = details.manifest as { limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
+    const { handle } = await this.#options.provider.launch({
+      jobId: job.id,
+      daemonUrl: this.daemonUrl,
+      runnerToken: newToken,
+      image: details.image,
+      env: details.env,
+      sync: details.sync,
+      manifest: details.manifest,
+      workOrder: job.workOrder,
+      resources: storedManifest?.limits?.resources,
+      reentryAnswer: reentry,
+      // Seed the new runner's decision counter past prior ids (issue #110).
+      reentryDecisionSeed: this.registry.decisionSeed(job.id),
+    });
+    // Re-check after the await (#114): a cancel that completed while the
+    // container launched has already settled the job — terminate the fresh
+    // container rather than hanging a live handle on a terminal record.
+    const after = this.registry.getJob(job.id);
+    if (!after || isTerminal(after.state)) {
+      this.#options.provider.terminate(handle).catch(() => {});
+      return null;
+    }
+    return this.registry.updateJob(job.id, { handle });
+  }
+
+  /** A failed re-entry launch ends the job loudly instead of stranding it blocked. */
+  #cancelAfterFailedRelaunch(jobId: string, error: unknown): void {
+    const current = this.registry.getJob(jobId);
+    if (!current || isTerminal(current.state)) return;
+    this.registry.appendEvent(jobId, {
+      type: "log",
+      text: `re-launch failed after answer: ${String(error)}`,
+      who: "daemon",
+    });
+    this.registry.appendEvent(jobId, { type: "state", state: "cancelled", reason: "launch-failed" });
+    this.registry.updateJob(jobId, { state: "cancelled", reason: "launch-failed" });
+  }
+
+  /**
+   * The re-entry a job's journal says it is owed: its most recent decision and
+   * the operator answer recorded for it. Null when there is no decision or the
+   * last one is unanswered. This is the durable fact both recoveries rest on —
+   * #answer appends the answer event BEFORE consuming the open decision, so
+   * any state where the decision is gone has the answer in the journal.
+   */
+  #answeredPendingReentry(jobId: string): { decisionId: string; answer: { option?: string; text?: string } } | null {
+    const events = this.registry.eventsAfter(jobId, -1);
+    let decisionId: string | null = null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.type === "decision") {
+        decisionId = String(events[i]!.id);
+        break;
+      }
+    }
+    if (decisionId === null) return null;
+    const answer = this.registry.findAnswer(jobId, decisionId);
+    if (!answer) return null;
+    return {
+      decisionId,
+      answer: {
+        ...(typeof answer.option === "string" ? { option: answer.option } : {}),
+        ...(typeof answer.text === "string" ? { text: answer.text } : {}),
+      },
+    };
+  }
+
+  /**
+   * The marker gap (#151): the runner stops its answer poll, pushes WIP, and
+   * only then emits blocked/parked — an answer landing in that window takes
+   * the hot path against a runner that is already gone. The park event is the
+   * daemon's liveness fact: a park arriving with no open decision means the
+   * runner parked on a question the operator has already answered, so finish
+   * the re-entry the runner never collected. Deferred with setImmediate so the
+   * recovery runs outside the intake batch that delivered the park event.
+   */
+  #maybeRecoverAnsweredPark(job: JobRecord, nextState: JobState, marker: Marker | undefined): void {
+    if (nextState !== "blocked" || marker !== "parked") return;
+    if (this.registry.openDecision(job.id) !== null) return;
+    setImmediate(() => {
+      this.#recoverAnsweredPark(job).catch(() => {});
+    });
+  }
+
+  /** The answered-park recovery's actual work; re-checks, then re-launches. */
+  async #recoverAnsweredPark(job: JobRecord): Promise<void> {
+    const current = this.registry.getJob(job.id);
+    if (!current || current.state !== "blocked") return;
+    if (this.registry.openDecision(job.id) !== null) return;
+    const pending = this.#answeredPendingReentry(job.id);
+    if (pending === null) return;
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `runner parked after decision ${pending.decisionId} was answered; re-launching with the answer`,
+      who: "daemon",
+    });
+    try {
+      await this.#launchReentry(current, pending);
+    } catch (error) {
+      this.#cancelAfterFailedRelaunch(job.id, error);
+    }
   }
 
   async #cancel(job: JobRecord, res: ServerResponse): Promise<void> {
@@ -898,6 +1081,9 @@ export class FleetDaemon {
       } else if (nextState === "blocked" || isTerminal(nextState)) {
         this.registry.wallClockBecameInactive(job.id);
       }
+      // A park landing on an already-answered decision means the runner parked
+      // through #151's gap; the guard and the recovery live in the helper.
+      this.#maybeRecoverAnsweredPark(job, nextState, marker);
     }
     if (isTerminal(nextState)) this.#applyTerminalState(job, mode);
   }
@@ -1120,6 +1306,150 @@ export class FleetDaemon {
     if (!current || current.state !== "blocked" || current.marker === "stale") return;
     this.registry.appendEvent(job.id, { type: "state", state: "blocked", marker: "stale" });
     this.registry.updateJob(job.id, { marker: "stale" });
+  }
+
+  /**
+   * Boot-time recovery for the crash windows no sweep reaches (#115). The
+   * launch paths persist their intent before `await provider.launch` and the
+   * outcome only after, so a daemon crash between the two leaves a record that
+   * *implies* a container without proving one: a queued job with no handle, a
+   * running job with no handle, a blocked job whose open decision was consumed
+   * but whose re-entry never finished. None of those shapes is reachable by
+   * the wall-clock, idle, or decision sweeps — recover or fail each one loudly
+   * at boot instead of stranding it.
+   */
+  async #bootRecover(): Promise<void> {
+    for (const job of this.registry.listJobs()) {
+      try {
+        await this.#recoverJobAtBoot(job);
+      } catch (error) {
+        this.registry.appendEvent(job.id, {
+          type: "log",
+          text: `boot recovery failed: ${String(error)}`,
+          who: "daemon",
+        });
+      }
+    }
+  }
+
+  /** Route one job to the recovery its crash-window shape implies (#115). */
+  async #recoverJobAtBoot(job: JobRecord): Promise<void> {
+    if (isTerminal(job.state)) return;
+    if (job.state === "queued" && job.handle === undefined) {
+      return this.#resolveLostLaunch(job);
+    }
+    if (job.state === "running" && job.handle === undefined) {
+      return this.#adoptDerivedHandle(job);
+    }
+    if (job.state === "blocked" && this.registry.openDecision(job.id) === null) {
+      return this.#recoverBlockedWithoutDecision(job);
+    }
+  }
+
+  /**
+   * Queued with no handle at boot: #createJob persists the record before
+   * `await provider.launch` and the handle only after, so this job's launch
+   * died with the old daemon — and no sweep covers queued (wall-clock and idle
+   * both skip it), so it would sit forever, indistinguishable in `fleet
+   * status` from a healthy queue. Whether the container actually started is
+   * unknowable (Provider has no list op), so resolve loudly: best-effort
+   * terminate the derivable handle — a no-op when nothing launched
+   * (termination is idempotent, #122), spend control when something did — and
+   * cancel with a reason that says what happened.
+   */
+  async #resolveLostLaunch(job: JobRecord): Promise<void> {
+    const derived = this.#options.provider.deriveHandle?.(job.id);
+    if (derived !== undefined) {
+      await this.#options.provider.terminate(derived).catch(() => {});
+    }
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: "daemon restarted before the launch completed; cancelling",
+      who: "daemon",
+    });
+    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "launch-lost" });
+    this.registry.updateJob(job.id, { state: "cancelled", reason: "launch-lost" });
+  }
+
+  /**
+   * Running with no handle at boot: the launch succeeded — the runner has been
+   * posting events with the token persisted before the launch — but the crash
+   * ate the handle. The job itself is healthy; the fault is that cancel and
+   * both backstops gate on job.handle and would silently skip terminate,
+   * leaving a container Fleet can never kill. Adopt the provider's derivable
+   * handle where one exists; where none does, say so in the journal instead of
+   * letting the gap pass silently.
+   */
+  #adoptDerivedHandle(job: JobRecord): void {
+    const derived = this.#options.provider.deriveHandle?.(job.id);
+    if (derived === undefined) {
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `handle lost in a daemon restart and provider ${job.provider} cannot derive one; Fleet cannot terminate this container`,
+        who: "daemon",
+      });
+      return;
+    }
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `handle lost in a daemon restart; adopted derived handle ${derived}`,
+      who: "daemon",
+    });
+    this.registry.updateJob(job.id, { handle: derived });
+  }
+
+  /**
+   * Blocked with no open decision at boot: the answer path consumes the
+   * decision (durably) before `await provider.launch`, so a crash mid-re-entry
+   * leaves the exact shape #answer 409s as "blocked but has no open decision"
+   * and every sweep skips — the permanently unrecoverable state the re-entry
+   * path exists to prevent, created by the crash window instead. The journal
+   * still holds everything needed: finish the interrupted re-entry from the
+   * recorded answer. A blocked job whose last decision was never answered
+   * instead gets its open decision restored, so the operator can answer it.
+   */
+  async #recoverBlockedWithoutDecision(job: JobRecord): Promise<void> {
+    const pending = this.#answeredPendingReentry(job.id);
+    if (pending === null) return this.#restoreOpenDecision(job);
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `daemon restarted during re-entry for decision ${pending.decisionId}; re-launching with the recorded answer`,
+      who: "daemon",
+    });
+    try {
+      await this.#launchReentry(job, pending);
+    } catch (error) {
+      this.#cancelAfterFailedRelaunch(job.id, error);
+    }
+  }
+
+  /** Reopen the journal's last unanswered decision on the record (#115). */
+  #restoreOpenDecision(job: JobRecord): void {
+    const events = this.registry.eventsAfter(job.id, -1);
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.type !== "decision") continue;
+      const decision = events[i] as StoredEvent & { id: string; question: string; options: { id: string }[] };
+      this.registry.setOpenDecision(job.id, {
+        id: decision.id,
+        question: decision.question,
+        optionIds: decision.options.map((option) => option.id),
+      });
+      // Date the timeout clock from the decision event itself — restoring at
+      // boot must not silently restart the operator's clock (same choice as
+      // replay mode in #applyDecisionEvent).
+      const at = Date.parse(String(decision.at ?? ""));
+      this.registry.setDecisionBlockedAt(job.id, Number.isFinite(at) ? at : Date.now());
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `restored open decision ${decision.id} lost in a daemon restart`,
+        who: "daemon",
+      });
+      return;
+    }
+    // Blocked with no decision anywhere in the journal: nothing to restore or
+    // re-launch. Cancel loudly rather than strand it.
+    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "unrecoverable" });
+    this.registry.updateJob(job.id, { state: "cancelled", reason: "unrecoverable" });
   }
 
   #notify(jobId: string, question: string): void {

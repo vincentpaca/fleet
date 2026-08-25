@@ -20,7 +20,7 @@
         "required": ["state"],
         "properties": {
           "state": { "enum": ["queued", "running", "blocked", "done", "cancelled"] },
-          "reason": { "type": "string", "description": "Why a job cancelled. Rendered verbatim by fleet status and the board as cancelled(<reason>), so keep it a short slug. Emitted today: manifest, git, pickup-gate, harness-cmd, harness-exit, wall-clock, stall (runner); operator-cancel, launch-failed, wall-clock, stall (daemon). Deliberately not an enum: runner and daemon can be different builds, and a rejected event loses the whole cancellation." },
+          "reason": { "type": "string", "description": "Why a job cancelled. Rendered verbatim by fleet status and the board as cancelled(<reason>), so keep it a short slug. Emitted today: manifest, git, setup-script, pickup-gate, harness-cmd, harness-exit, wall-clock, stall (runner); operator-cancel, launch-failed, wall-clock, stall (daemon). Deliberately not an enum: runner and daemon can be different builds, and a rejected event loses the whole cancellation." },
           "marker": { "enum": ["parked", "stale"], "description": "Markers on blocked, not states: parked = WIP committed, task exited; stale = decision_timeout elapsed." },
           "meta": { "$ref": "#/$defs/jobMeta" }
         }

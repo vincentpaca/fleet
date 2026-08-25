@@ -4,7 +4,8 @@
 # EcsProvider for ssm get-parameter and ecs run-task).
 #
 # Secrets NEVER enter this image. Credentials arrive at container start via
-# ECS task roles (IMDS) or -e flags — never in ARG, ENV, or any image layer.
+# the ECS task role (the credential endpoint at 169.254.170.2, not IMDS) or
+# -e flags — never in ARG, ENV, or any image layer.
 #
 # Usage (build): images/build.sh --daemon
 #   (it targets the deployment's architecture and owns the :daemon tag; build by
@@ -49,5 +50,16 @@ ENV FLEET_PORT=9000
 # Health check: daemon must answer /health before the ECS service marks it healthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -sf http://localhost:${FLEET_PORT}/health || exit 1
+
+# Drop root, mirroring images/runner/Dockerfile (Hadolint missing-user /
+# Opengrep missing-user-entrypoint). `node` (uid 1000) ships in the base image;
+# everything above still runs as root because apt, the AWS CLI install, and the
+# /opt/fleet copy write outside $HOME. The daemon's one writable path is
+# $FLEET_HOME: in a deployment that is the EFS mount, reached through an access
+# point that forces posix uid/gid 1000 and owns its root 1000:1000
+# (aws_efs_access_point.fleet_home in infra/aws/main.tf — the two halves of
+# #156 land together or not at all); run locally, the default under $HOME is
+# writable because /home/node belongs to uid 1000.
+USER node
 
 ENTRYPOINT ["node", "src/daemon/main.ts"]

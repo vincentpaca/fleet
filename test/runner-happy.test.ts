@@ -82,6 +82,8 @@ test('full happy path: running → gate ok → harness replay → settle → don
     const types = daemon.events.map((event) => event.type);
     assert.deepEqual(types, [
       'state', // running
+      'log', // setup script announced (#49: runs before the gate when unbaked)
+      'log', // setup outcome (not on disk in this workspace → skipping, observably)
       'log', // pickup gate announced (#39: the gate emits nothing itself)
       'log', // gate passed, harness command
       'log', // system init line
@@ -290,11 +292,12 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.deepEqual(daemon.rejected, []);
 
     const types = daemon.events.map((event) => event.type);
-    // The extra log before settle is the empty-handed note (#81): a failed run
-    // that also delivered nothing says so too.
-    assert.deepEqual(types, ['state', 'log', 'log', 'think', 'log', 'settle', 'state']);
+    // The first two logs are the setup-script announce + skip (#49); the extra
+    // log before settle is the empty-handed note (#81): a failed run that also
+    // delivered nothing says so too.
+    assert.deepEqual(types, ['state', 'log', 'log', 'log', 'log', 'think', 'log', 'settle', 'state']);
 
-    const settle = daemon.events[5];
+    const settle = daemon.events[7];
     assert.equal(settle.rung, undefined, 'no rung claimed on failure');
     assert.deepEqual(settle.outcome, { produced: [], findings: 0, decisions: 0 });
     const report = settle.report;
@@ -303,7 +306,7 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     assert.ok('next_action' in report);
     assert.match(String(report.next_action), /harness exit 2/);
 
-    const cancelled = daemon.events[6];
+    const cancelled = daemon.events[8];
     assert.equal(cancelled.state, 'cancelled');
     assert.equal(cancelled.reason, 'harness-exit');
   } finally {

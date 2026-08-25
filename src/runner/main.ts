@@ -32,6 +32,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
+import { runSetupScript } from './setup.ts';
 import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
@@ -172,6 +173,35 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  // --- Setup script (#49): one-layer images carry no repo setup layer. ---
+  // The two-layer build bakes manifest setup.script into the job image and
+  // leaves a marker; when the marker is absent — the ECS task definition's
+  // pinned :runner image, a bare setup.image, the process provider's host —
+  // the runner runs the script here, after the clone and before the gate, so
+  // the gate probes the environment the manifest actually promised. The
+  // announce line is awaited before the blocking spawnSync for the same
+  // reason the gate's is: it dates the silence the stall backstops measure.
+  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
+  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
+  if (setupScript !== '') {
+    await sink.emit({ type: 'log', text: `setup script: ${setupScript}`, who: 'runner' });
+    const setupOutcome = runSetupScript({
+      workspace,
+      manifest,
+      ...(process.env.FLEET_SETUP_TIMEOUT_MS
+        ? { timeoutMs: parseInt(process.env.FLEET_SETUP_TIMEOUT_MS, 10) || undefined }
+        : {}),
+    });
+    if (setupOutcome.kind !== 'none') {
+      await sink.emit({ type: 'log', text: setupOutcome.note, who: 'runner' });
+    }
+    if (setupOutcome.kind === 'failed') {
+      await settleBlocked(sink, `fix setup script: ${setupOutcome.detail}`);
+      await sink.emit({ type: 'state', state: 'cancelled', reason: 'setup-script' });
+      process.exit(1);
+    }
+  }
+
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
   const gates = (manifest.gates ?? {}) as Record<string, unknown>;
   const pickup = typeof gates.pickup === 'string' ? gates.pickup : '';
@@ -499,21 +529,37 @@ async function main(): Promise<void> {
   // a margin and the teardown room to finish.
   const CANCEL_DEADLINE_MS =
     parseInt(process.env.FLEET_CANCEL_DEADLINE_MS ?? '', 10) || 20_000;
+  // Bounded pushes (#152): every push the runner makes after the harness is
+  // done shells out to git, which hangs without bound on a black-holed remote
+  // or a credential helper waiting on a prompt. execFileSync blocks the event
+  // loop, so a hung push doesn't just eat a budget — it stops the cancel
+  // deadline timer from ever firing, wedging the runner until the provider's
+  // outer SIGKILL. The park and stall paths have no outer deadline at all;
+  // there the wedge lasts until the daemon's backstop reaps the job, and the
+  // backstop cannot push. Generous by default — its only job is to exist.
+  const GIT_TIMEOUT_MS =
+    parseInt(process.env.FLEET_GIT_TIMEOUT_MS ?? '', 10) || 120_000;
   // Killing the harness gets a slice of the cancel budget, not all of it.
   // endHarness and drainOutput default to `graceMs` — the wall-clock grace, 30s
   // — which on a SIGTERM-trapping harness (the case this exists for) exhausts
   // the deadline before the push or the settle is attempted, leaving a cancel
   // that kills the tree and throws the work away. Which is the bug. These two
   // are what is left over from, not what is taken out of, the work that matters:
-  // ~6s to kill, ~2s to drain, the remaining ~12s for the push and the settle.
+  // ~6s to kill, ~2s to drain, ~8s for the push, and the remaining ~4s for
+  // the settle — which outranks the push (#152): the settle is what the
+  // operator reads, the WIP push is best-effort recovery of work that may not
+  // exist. A push that cannot finish in its slice was never going to finish
+  // inside the deadline; failing it buys the settle its window.
   const cancelKillGraceMs = Math.max(500, Math.floor(CANCEL_DEADLINE_MS * 0.15));
   const cancelDrainGraceMs = Math.max(250, Math.floor(CANCEL_DEADLINE_MS * 0.1));
+  const cancelPushTimeoutMs =
+    Math.min(GIT_TIMEOUT_MS, Math.max(1_000, Math.floor(CANCEL_DEADLINE_MS * 0.4)));
   /** Best-effort WIP push: the job is cancelled, but partial work may be
    *  recoverable. pushWip commits and pushes only when there are changes. */
   const cancelPushWip = async (signal: NodeJS.Signals): Promise<void> => {
     if (!gitUrl || !branch) return;
     try {
-      const outcome = pushWip(workspace, `cancelled: ${signal}`);
+      const outcome = pushWip(workspace, `cancelled: ${signal}`, cancelPushTimeoutMs);
       await sink.emit({
         type: 'log',
         text: outcome === 'pushed'
@@ -648,7 +694,7 @@ async function main(): Promise<void> {
 
     if (gitUrl && branch) {
       try {
-        const wipOutcome = pushWip(workspace, `block_hot expired: ${result.decisionId}`);
+        const wipOutcome = pushWip(workspace, `block_hot expired: ${result.decisionId}`, GIT_TIMEOUT_MS);
         await sink.emit({
           type: 'log',
           text: wipOutcome === 'pushed'
@@ -714,13 +760,13 @@ async function main(): Promise<void> {
   let retainedWorkspace: string | undefined;
   if (gitUrl && branch) {
     try {
-      const outcome = pushWork(workspace, target, jobId, exitCode === 0, base);
+      const outcome = pushWork(workspace, target, jobId, exitCode === 0, base, GIT_TIMEOUT_MS);
       workPushed = outcome === 'pushed' || outcome === 'delivered';
       // Adopted branch (#80): 'delivered' means ahead-of-base, which the
       // adopted branch is by construction. Delivery on a continuation is real
       // only when the remote moved beyond the tip this job adopted.
       if (continues !== undefined && adoptedTip !== undefined && outcome !== 'pushed') {
-        workPushed = remoteMovedBeyond(workspace, branch, adoptedTip);
+        workPushed = remoteMovedBeyond(workspace, branch, adoptedTip, GIT_TIMEOUT_MS);
       }
       pushNote = outcome === 'pushed' ? `work pushed to ${branch}`
         : workPushed ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`

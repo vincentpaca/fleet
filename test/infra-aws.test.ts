@@ -83,6 +83,93 @@ export function unguardedIngresses(text: string): string[] {
   return offenders;
 }
 
+/**
+ * IMDS pin (#157). A worker instance's IMDS hands out *instance-role*
+ * credentials, which are broader than any job's task role — and a job is
+ * untrusted code. `http_tokens = "required"` shuts off IMDSv1, and a PUT
+ * response hop limit of 1 keeps the v2 token from crossing the bridge into a
+ * job's container. Neither validate nor the plan smoke can hold this line:
+ * 2 is a perfectly schema-valid hop limit, it just re-opens the escalation
+ * Fleet's permission split exists to prevent. Nothing job-side reads IMDS
+ * (task credentials come from the ECS credential endpoint at 169.254.170.2),
+ * so any launch template loosening either field is a bug, not a need.
+ */
+const LAUNCH_TEMPLATE = /^resource\s+"aws_launch_template"\s+"[A-Za-z0-9_-]+"[^\n]*\{/gm;
+
+export function imdsOffenders(text: string): string[] {
+  const offenders: string[] = [];
+  for (const match of text.matchAll(LAUNCH_TEMPLATE)) {
+    const body = braceBlock(text, text.indexOf('{', match.index));
+    const options = /^\s*metadata_options\s*\{/m.exec(body);
+    if (!options) {
+      offenders.push('launch template with no metadata_options block (IMDSv1 stays enabled by default)');
+      continue;
+    }
+    const optionsBody = braceBlock(body, body.indexOf('{', options.index));
+    if (!/^\s*http_tokens\s*=\s*"required"\s*(#.*)?$/m.test(optionsBody)) {
+      offenders.push('metadata_options without http_tokens = "required" (IMDSv1 answers without a token)');
+    }
+    if (!/^\s*http_put_response_hop_limit\s*=\s*1\s*(#.*)?$/m.test(optionsBody)) {
+      offenders.push('metadata_options without http_put_response_hop_limit = 1 (a container can reach IMDS and assume the instance role)');
+    }
+  }
+  return offenders;
+}
+
+test('every launch template requires IMDSv2 and keeps the hop limit at 1', () => {
+  const offenders: string[] = [];
+  let checked = 0;
+
+  for (const unit of readdirSync(INFRA)) {
+    const unitDir = join(INFRA, unit);
+    if (!statSync(unitDir).isDirectory()) continue;
+
+    for (const name of readdirSync(unitDir)) {
+      if (!name.endsWith('.tf')) continue;
+      const text = readFileSync(join(unitDir, name), 'utf8');
+      checked += [...text.matchAll(LAUNCH_TEMPLATE)].length;
+      for (const offence of imdsOffenders(text)) {
+        offenders.push(`infra/${unit}/${name}: ${offence}`);
+      }
+    }
+  }
+
+  assert.deepStrictEqual(
+    offenders,
+    [],
+    `launch templates that leave IMDS reachable from a job's container:\n${offenders.join('\n')}`,
+  );
+  // The unit ships one launch template; a scan that saw none saw nothing.
+  assert.ok(checked >= 1, 'no launch templates found at all — the scan is looking in the wrong place');
+});
+
+test('the IMDS pin rejects a raised hop limit, optional tokens, and a missing block', () => {
+  // Same discipline as the other gates: untested, the matcher can be widened
+  // to nothing and stay green. Exercise it against each way the escalation
+  // comes back.
+  const template = (body: string): string =>
+    `resource "aws_launch_template" "workers" {\n${body}\n}`;
+  const options = (lines: string): string =>
+    template(`  metadata_options {\n${lines}\n  }`);
+
+  for (const rejected of [
+    options('    http_tokens                 = "required"\n    http_put_response_hop_limit = 2'), // what shipped before #157
+    options('    http_tokens                 = "required"\n    http_put_response_hop_limit = 16'),
+    options('    http_tokens                 = "optional"\n    http_put_response_hop_limit = 1'),
+    options('    http_put_response_hop_limit = 1'), // tokens unset: IMDSv1 default
+    template('  instance_type = "t3.medium"'), // no metadata_options at all
+  ]) {
+    assert.equal(imdsOffenders(rejected).length >= 1, true, `should be rejected: ${JSON.stringify(rejected)}`);
+  }
+
+  for (const accepted of [
+    options('    http_tokens                 = "required"\n    http_put_response_hop_limit = 1'),
+    options('    http_put_response_hop_limit = 1 # one hop: the instance, never a container\n    http_tokens                 = "required"'),
+  ]) {
+    assert.deepEqual(imdsOffenders(accepted), [], `should be accepted: ${JSON.stringify(accepted)}`);
+  }
+});
+
 test('every security-group description is a string the AWS API accepts', () => {
   const offenders: string[] = [];
   let checked = 0;
