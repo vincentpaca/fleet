@@ -15,6 +15,7 @@ import {
   listRetainedRecords,
   readRetainedRecord,
   retainedDir,
+  type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, type DaemonResponse } from './client.ts';
@@ -159,6 +160,9 @@ function readJsonFile(file: string, what: string): unknown {
 }
 
 type AjvError = { instancePath: string; message?: string };
+type DaemonApiError = { errors?: AjvError[]; error?: string };
+/** Hoisted so that inline /\s+/ regexes do not trigger a Lizard tokeniser misparse. */
+const WORDS_RE = /\s+/;
 
 function formatFindings(file: string, errors: AjvError[]): string[] {
   return errors.map((e) => `${file}: ${e.instancePath || '/'} ${e.message ?? 'invalid'}`);
@@ -798,33 +802,34 @@ function printEventLine(line: string, noColor: boolean): FleetEvent | undefined 
 
 // ---------- daemon-backed commands ----------
 
+type OnLine = (line: string) => void;
+
 async function daemonCall(
   method: string,
   reqPath: string,
   body?: unknown,
-  onLine?: (line: string) => void,
+  onLine?: OnLine,
 ): Promise<DaemonResponse> {
   try {
     return await request(method, reqPath, body, { onLine });
   } catch (err) {
     // A TCP address means a port-forward is carrying this call, and a dead
     // session is the likeliest cause (#57) — say where to look, not just what broke.
-    const hint =
-      daemonTarget().kind === 'tcp'
-        ? '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state'
-        : '';
+    const tcpHint = '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state';
+    const hint = daemonTarget().kind === 'tcp' ? tcpHint : '';
     fail(`cannot reach daemon at ${describeTarget()}: ${errorMessage(err)}${hint}`);
   }
 }
 
 /** What a rejected daemon call says, as lines. Shared so every surface says it identically. */
 function daemonFailureMessage(res: DaemonResponse, what: string): string {
-  // Daemon API contract: schema failures return {errors: [...ajv error objects]};
-  // non-schema failures (409 not-blocked, 422 bad option) return {error: string}.
-  const body = res.json as { errors?: AjvError[]; error?: string } | undefined;
+  // Daemon API contract: schema failures return an errors array; non-schema
+  // failures (409 not-blocked, 422 bad option) return an error string.
+  const body = res.json as DaemonApiError | undefined;
   if (body && Array.isArray(body.errors)) return formatFindings(what, body.errors).join('\n');
-  if (body && typeof body.error === 'string') return `${what} failed: ${body.error}`;
-  return `${what} failed: daemon returned ${res.status}${res.body ? ` ${res.body.trim()}` : ''}`;
+  if (body && typeof body.error === 'string') return what + ' failed: ' + body.error;
+  const tail = res.body ? ' ' + res.body.trim() : '';
+  return what + ' failed: daemon returned ' + res.status + tail;
 }
 
 function daemonFailure(res: DaemonResponse, what: string): number {
@@ -927,14 +932,20 @@ async function readAnswerLine(prompt: string): Promise<{ option?: string; text?:
  * decisions are answered from stdin between poll cycles. Watching is a view,
  * never a lifeline: disconnecting changes nothing for the job.
  */
+/** Build the events query string for a follow or resume-from-seq request. */
+function followQuery(after: number | undefined): string {
+  return after === undefined ? '?follow=1' : '?after=' + after + '&follow=1';
+}
+
 async function followJob(jobId: string, answerMode: boolean): Promise<number> {
   let after: number | undefined;
   let terminal = false;
   let pendingDecision: FleetEvent | undefined;
-  const noColor = logsNoColor(process.env as Record<string, string | undefined>, process.stdout.isTTY ?? false);
+  const isTTY = process.stdout.isTTY === true;
+  const noColor = logsNoColor(process.env as Record<string, string | undefined>, isTTY);
 
   while (!terminal) {
-    const query = after === undefined ? '?follow=1' : `?after=${after}&follow=1`;
+    const query = followQuery(after);
     const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/events${query}`, undefined, (line) => {
       const event = printEventLine(line, noColor);
       if (!event) return;
@@ -993,6 +1004,47 @@ async function cmdCancel(args: string[]): Promise<number> {
 
 // ---------- artifacts ----------
 
+async function cmdArtifactsList(jobId: string): Promise<number> {
+  const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts');
+  if (res.status !== 200) return daemonFailure(res, 'artifacts');
+  const body = res.json as { artifacts?: { path: string; bytes: number }[] };
+  if (!body.artifacts || body.artifacts.length === 0) {
+    console.log('no artifacts');
+    return EXIT_OK;
+  }
+  for (const artifact of body.artifacts) {
+    console.log(artifact.path + '  ' + artifact.bytes + ' bytes');
+  }
+  return EXIT_OK;
+}
+
+async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
+  const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
+  const artifactPath = getPos[0];
+  // Encode each path segment separately so slashes are preserved.
+  const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
+  const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodedPath);
+  if (res.status !== 200) return daemonFailure(res, 'artifacts get');
+  // Daemon returns JSON {path, content (base64), bytes, sha256}.
+  const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
+  if (!body.content) fail('artifacts get: daemon returned no content');
+  const buffer = Buffer.from(body.content, 'base64');
+  // Verify end-to-end integrity; the daemon stamps sha256 at store time.
+  if (body.sha256) {
+    const actual = createHash('sha256').update(buffer).digest('hex');
+    if (actual !== body.sha256) fail('artifacts get: sha256 mismatch for ' + artifactPath + ' — content corrupted in transit');
+  }
+  if (typeof values.out === 'string') {
+    const filename = path.basename(artifactPath);
+    const outPath = path.join(values.out, filename);
+    fs.writeFileSync(outPath, buffer);
+    console.log('saved to ' + outPath);
+  } else {
+    process.stdout.write(buffer);
+  }
+  return EXIT_OK;
+}
+
 async function cmdArtifacts(args: string[]): Promise<number> {
   if (args.length === 0 || (args.length === 1 && (args[0] === '--help' || args[0] === '-h'))) {
     console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
@@ -1003,49 +1055,9 @@ async function cmdArtifacts(args: string[]): Promise<number> {
     console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
     return EXIT_USAGE;
   }
-
-  if (!subcommand || subcommand === 'list') {
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts`);
-    if (res.status !== 200) return daemonFailure(res, 'artifacts');
-    const body = res.json as { artifacts?: { path: string; bytes: number }[] };
-    if (!body.artifacts || body.artifacts.length === 0) {
-      console.log('no artifacts');
-      return EXIT_OK;
-    }
-    for (const artifact of body.artifacts) {
-      console.log(`${artifact.path}  ${artifact.bytes} bytes`);
-    }
-    return EXIT_OK;
-  }
-
-  if (subcommand === 'get') {
-    const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
-    const artifactPath = getPos[0];
-    // Encode each path segment separately so slashes are preserved.
-    const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
-    const res = await daemonCall('GET', `/jobs/${encodeURIComponent(jobId)}/artifacts/${encodedPath}`);
-    if (res.status !== 200) return daemonFailure(res, 'artifacts get');
-    // Daemon returns JSON {path, content (base64), bytes, sha256}.
-    const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
-    if (!body.content) fail('artifacts get: daemon returned no content');
-    const buffer = Buffer.from(body.content, 'base64');
-    // Verify end-to-end integrity; the daemon stamps sha256 at store time.
-    if (body.sha256) {
-      const actual = createHash('sha256').update(buffer).digest('hex');
-      if (actual !== body.sha256) fail(`artifacts get: sha256 mismatch for ${artifactPath} — content corrupted in transit`);
-    }
-    if (typeof values.out === 'string') {
-      const filename = path.basename(artifactPath);
-      const outPath = path.join(values.out, filename);
-      fs.writeFileSync(outPath, buffer);
-      console.log(`saved to ${outPath}`);
-    } else {
-      process.stdout.write(buffer);
-    }
-    return EXIT_OK;
-  }
-
-  console.error(`fleet artifacts: unknown subcommand: ${subcommand}`);
+  if (!subcommand || subcommand === 'list') return cmdArtifactsList(jobId);
+  if (subcommand === 'get') return cmdArtifactsGet(jobId, rest);
+  console.error('fleet artifacts: unknown subcommand: ' + subcommand);
   return EXIT_USAGE;
 }
 
@@ -1110,7 +1122,7 @@ const INTERPRETERS = new Set(['node', 'bash', 'sh', 'python', 'python3', 'ruby',
  * Returns undefined when no file can be identified (e.g. "sh -c '...'").
  */
 function gateScriptFile(pickup: string): string | undefined {
-  const tokens = pickup.trim().split(/\s+/);
+  const tokens = pickup.trim().split(WORDS_RE);
   let skipNext = false;
   for (const token of tokens) {
     if (skipNext) { skipNext = false; continue; }
@@ -1205,7 +1217,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
     if (scriptFile !== undefined && !fs.existsSync(scriptFile)) {
       findings.push(`gate script missing: ${scriptFile}`);
     } else {
-      const tokens = pickup.trim().split(/\s+/);
+      const tokens = pickup.trim().split(WORDS_RE);
       const gateRes = spawnSync(tokens[0], tokens.slice(1), { encoding: 'utf8' });
       const code = gateRes.error !== undefined ? -1 : (gateRes.status ?? -1);
       // Exit 2 = "cannot evaluate" (no target) — expected without a dispatch target; not a defect.
@@ -1259,6 +1271,27 @@ async function cmdDoctor(args: string[]): Promise<number> {
 // ---------- resume-push ----------
 
 /**
+ * Resolve a retained record after verifying the record and workspace still
+ * exist. Prints the appropriate error and returns undefined on any problem so
+ * cmdResumePush can exit without duplicating the checks.
+ */
+function loadRetainedWorkspace(home: string, jobId: string): RetainedRecord | undefined {
+  const record = readRetainedRecord(home, jobId);
+  if (record === undefined) {
+    console.error('no retained workspace for job ' + jobId + ' (looked in ' + retainedDir(home) + ')');
+    console.error('container jobs keep their workspace inside the stopped task, not on this host');
+    return undefined;
+  }
+  if (!fs.existsSync(record.workspace)) {
+    clearRetainedRecord(home, jobId);
+    console.error('retained workspace is gone: ' + record.workspace);
+    console.error('record dropped; nothing is recoverable from this host');
+    return undefined;
+  }
+  return record;
+}
+
+/**
  * Retry the work push from a workspace the runner kept because its push failed
  * (#38). Reuses the runner's pushWork so the retry commits, pushes, and judges
  * delivery exactly as the original attempt did — no second push path.
@@ -1271,18 +1304,8 @@ function cmdResumePush(args: string[]): number {
   const { positionals } = parseCommand(args, {}, 1, 1);
   const jobId = positionals[0];
   const home = fleetHome();
-  const record = readRetainedRecord(home, jobId);
-  if (record === undefined) {
-    console.error(`no retained workspace for job ${jobId} (looked in ${retainedDir(home)})`);
-    console.error('container jobs keep their workspace inside the stopped task, not on this host');
-    return EXIT_FAILURE;
-  }
-  if (!fs.existsSync(record.workspace)) {
-    clearRetainedRecord(home, jobId);
-    console.error(`retained workspace is gone: ${record.workspace}`);
-    console.error('record dropped; nothing is recoverable from this host');
-    return EXIT_FAILURE;
-  }
+  const record = loadRetainedWorkspace(home, jobId);
+  if (!record) return EXIT_FAILURE;
   const { target, branch } = record;
   if (!target || !branch) {
     // The request file existed but did not parse: the workspace was kept on

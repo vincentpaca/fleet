@@ -98,6 +98,20 @@ export function verifyRung(
   };
 }
 
+/** Dispatch a verified rung check to its dedicated verifier. */
+function dispatchRungCheck(prUrl: string, targetRung: string, reached: string | null, ghRunner: GhRunner): RungVerification {
+  switch (targetRung) {
+    case "pushed": return verifyPushed(prUrl, reached, ghRunner);
+    case "pr-open": return verifyPrOpen(prUrl, reached, ghRunner);
+    case "ci-green": return verifyCiGreen(prUrl, reached, ghRunner);
+    case "reviews-clear": return verifyReviewsClear(prUrl, reached, ghRunner);
+    case "mergeable": return verifyMergeable(prUrl, reached, ghRunner);
+    case "merge-ready": return verifyMergeReady(prUrl, reached, ghRunner);
+    case "merged": return verifyMerged(prUrl, reached, ghRunner);
+    default: return { verified: false, reached, notes: ["unverified: no gh check for " + targetRung] };
+  }
+}
+
 /**
  * Verify a gh-dependent rung by calling the gh CLI.
  * The PR URL from settle.report.pr is the primary evidence anchor.
@@ -115,41 +129,20 @@ function verifyWithGh(
     return {
       verified: false,
       reached,
-      notes: [`reached rung ${reached ?? "(none)"} is below target ${targetRung}`],
+      notes: ["reached rung " + (reached ?? "(none)") + " is below target " + targetRung],
     };
   }
 
   const prUrl = settle.report?.pr;
   if (!prUrl || typeof prUrl !== "string") {
-    return {
-      verified: false,
-      reached,
-      notes: ["unverified: no PR URL in settle report"],
-    };
+    return { verified: false, reached, notes: ["unverified: no PR URL in settle report"] };
   }
 
   try {
-    switch (targetRung) {
-      case "pushed":
-        return verifyPushed(prUrl, reached, ghRunner);
-      case "pr-open":
-        return verifyPrOpen(prUrl, reached, ghRunner);
-      case "ci-green":
-        return verifyCiGreen(prUrl, reached, ghRunner);
-      case "reviews-clear":
-        return verifyReviewsClear(prUrl, reached, ghRunner);
-      case "mergeable":
-        return verifyMergeable(prUrl, reached, ghRunner);
-      case "merge-ready":
-        return verifyMergeReady(prUrl, reached, ghRunner);
-      case "merged":
-        return verifyMerged(prUrl, reached, ghRunner);
-      default:
-        return { verified: false, reached, notes: [`unverified: no gh check for ${targetRung}`] };
-    }
+    return dispatchRungCheck(prUrl, targetRung, reached, ghRunner);
   } catch (err) {
     const msg = String(err instanceof Error ? err.message : err).split("\n")[0];
-    return { verified: false, reached, notes: [`gh error: ${msg}`] };
+    return { verified: false, reached, notes: ["gh error: " + msg] };
   }
 }
 

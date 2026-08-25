@@ -729,9 +729,25 @@ resource "aws_ecs_task_definition" "runner" {
 # reads at apply time is the copy that rots. test/cloud-agnostic.test.ts fails a
 # unit that writes the map more than once.
 locals {
+  # Valid Fargate memory values (MiB) per task CPU value. Consumed by the
+  # daemon task definition's precondition (below) that holds the pairing.
+  fargate_memory_mib = {
+    256  = [512, 1024, 2048]
+    512  = range(1024, 4096 + 1, 1024)
+    1024 = range(2048, 8192 + 1, 1024)
+    2048 = range(4096, 16384 + 1, 1024)
+    4096 = range(8192, 30720 + 1, 1024)
+  }
+
   fleet_config = {
     provider = "ecs"
     cluster  = aws_ecs_cluster.this.name
+    # The region every aws CLI call against this deployment must name (#138):
+    # the operator picked it at setup, and relying on the caller's ambient
+    # AWS_REGION instead turns a wrong default into "the daemon service is not
+    # up". The daemon's own boot-time SSM read is the one caller that still
+    # runs ambient — inside the task, ECS sets AWS_REGION to this value.
+    region = data.aws_region.current.region
     # capacity_provider replaces launch_type: run-task uses --capacity-provider-strategy
     # so ECS managed scaling fires and the ASG scales out for each job.
     capacity_provider = aws_ecs_capacity_provider.ec2.name
@@ -793,6 +809,18 @@ resource "aws_ecs_task_definition" "daemon" {
   memory             = tostring(var.daemon_memory)
   task_role_arn      = aws_iam_role.daemon.arn
   execution_role_arn = aws_iam_role.task_execution.arn
+
+  lifecycle {
+    # The Fargate cpu↔memory pairing: a precondition, not a variable
+    # validation, because it reads both variables and cross-variable
+    # validation needs terraform 1.9 while this module still supports 1.5.
+    # Each variable's own validation holds its independent bounds; this holds
+    # the pairing Fargate would otherwise reject at apply.
+    precondition {
+      condition     = contains(local.fargate_memory_mib[var.daemon_cpu], var.daemon_memory)
+      error_message = "daemon_memory=${var.daemon_memory} is not a valid Fargate memory for daemon_cpu=${var.daemon_cpu}. Valid: 256→512/1024/2048; 512→1024-4096; 1024→2048-8192; 2048→4096-16384; 4096→8192-30720 (1024-MiB steps above cpu 256)."
+    }
+  }
 
   volume {
     name = "fleet-home"

@@ -215,6 +215,60 @@ function renderTailPane(m: CockpitModel, w: number, noColor: boolean, budget: nu
  * always exactly as tall as the terminal: writing more lines than there are rows
  * scrolls the screen, which is the one thing a full-screen view must never do.
  */
+/** Render the drill-down (job) view: one job's tail, context strip, decision card. */
+function renderJobView(
+  m: CockpitModel, w: number, h: number, counts: ReturnType<typeof jobCounts>,
+  foot: string[], opts: FrameOpts, noColor: boolean,
+): string {
+  const job = selectedJob(m);
+  const strip = h >= 6
+    ? renderContextStrip(
+        counts.blocked, counts.running, counts.done, w, opts,
+        job ? renderJobLine(job, { ...opts, noColor }) : 'no job selected',
+      ).split('\n')
+    : [];
+  // A blocked job's open decision is pinned above the input line, not left
+  // to scroll: the question was unfindable under a long transcript, and the
+  // one thing a blocked drill-down must say is what it needs from the human.
+  // Skipped only when the terminal is too short to fit it at all.
+  const pinned = job?.state === 'blocked' && job.decision
+    ? decisionCardLines(job.decision, w, noColor)
+    : [];
+  const card = h - strip.length - foot.length - pinned.length >= 0 ? pinned : [];
+  const body = renderTailPane(m, w, noColor, h - strip.length - card.length - foot.length);
+  return [...strip, ...body, ...card, ...foot].join('\n');
+}
+
+/**
+ * Render the board view: banner + context strip + table header + job roster.
+ * No tail here — logs stream only in the drill-down the operator opens on purpose.
+ */
+function renderBoardView(
+  m: CockpitModel, w: number, h: number, counts: ReturnType<typeof jobCounts>,
+  foot: string[], opts: FrameOpts, noColor: boolean,
+): string {
+  const col = makeCol(noColor);
+  const banner = h >= BANNER_MIN_ROWS ? renderBanner(w, noColor, opts.colorLevel ?? '256').split('\n') : [];
+  const strip = h >= 6 ? renderContextStrip(counts.blocked, counts.running, counts.done, w, opts).split('\n') : [];
+  const tableHeader = h >= 9 ? renderTableHeader(w, noColor).split('\n') : [];
+  const head = [...banner, ...strip, ...tableHeader];
+  const avail = h - head.length - foot.length;
+  const rows = renderRosterRows(m.jobs, m.selection, w, opts);
+  const roster = m.jobs.length === 0
+    ? exactly([col('  no jobs — dispatch one from the line below: delegate <target>', 90)], avail)
+    : exactly(windowRosterRows(rows, m.selection, avail), avail);
+  return [...head, ...roster, ...foot].join('\n');
+}
+
+/**
+ * Pure: the same model renders the same frame, so every layout rule here — the
+ * pane split, what the banner costs, what a short terminal drops first — is
+ * asserted in tests rather than eyeballed.
+ *
+ * Chrome is dropped from the outside in as the terminal shrinks, and the frame is
+ * always exactly as tall as the terminal: writing more lines than there are rows
+ * scrolls the screen, which is the one thing a full-screen view must never do.
+ */
 export function renderCockpit(
   m: CockpitModel,
   width: number,
@@ -224,49 +278,12 @@ export function renderCockpit(
   const w = Math.max(MIN_COLUMNS, width);
   const h = Math.max(1, height);
   const noColor = opts.noColor ?? false;
-  const col = makeCol(noColor);
   const counts = jobCounts(m.jobs);
   const input = renderInputLine(m, w, noColor);
   if (h === 1) return input;
   const foot = [renderFooter(m, w, noColor), input];
-
-  // Drill-down: one job, its tail, and the same command line.
-  if (m.view === 'job') {
-    const job = selectedJob(m);
-    const strip = h >= 6
-      ? renderContextStrip(
-          counts.blocked, counts.running, counts.done, w, opts,
-          job ? renderJobLine(job, { ...opts, noColor }) : 'no job selected',
-        ).split('\n')
-      : [];
-    // A blocked job's open decision is pinned above the input line, not left
-    // to scroll: the question was unfindable under a long transcript, and the
-    // one thing a blocked drill-down must say is what it needs from the human.
-    // Skipped only when the terminal is too short to fit it at all.
-    const pinned = job?.state === 'blocked' && job.decision
-      ? decisionCardLines(job.decision, w, noColor)
-      : [];
-    const card = h - strip.length - foot.length - pinned.length >= 0 ? pinned : [];
-    const body = renderTailPane(m, w, noColor, h - strip.length - card.length - foot.length);
-    return [...strip, ...body, ...card, ...foot].join('\n');
-  }
-
-  // Board view, outermost chrome first: each piece appears only once there is
-  // room for it and for a pane to sit under it. No tail here, ever — logs
-  // stream only in the drill-down the operator opens on purpose; the board is
-  // the thing being operated, and it owns the whole body.
-  const banner = h >= BANNER_MIN_ROWS ? renderBanner(w, noColor, opts.colorLevel ?? '256').split('\n') : [];
-  const strip = h >= 6 ? renderContextStrip(counts.blocked, counts.running, counts.done, w, opts).split('\n') : [];
-  const tableHeader = h >= 9 ? renderTableHeader(w, noColor).split('\n') : [];
-  const head = [...banner, ...strip, ...tableHeader];
-
-  const avail = h - head.length - foot.length;
-  const rows = renderRosterRows(m.jobs, m.selection, w, opts);
-  const roster = m.jobs.length === 0
-    ? exactly([col('  no jobs — dispatch one from the line below: delegate <target>', 90)], avail)
-    : exactly(windowRosterRows(rows, m.selection, avail), avail);
-
-  return [...head, ...roster, ...foot].join('\n');
+  if (m.view === 'job') return renderJobView(m, w, h, counts, foot, opts, noColor);
+  return renderBoardView(m, w, h, counts, foot, opts, noColor);
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────────────
@@ -289,6 +306,58 @@ export type CockpitAction =
   | { kind: 'confirm'; yes: boolean }
   | { kind: 'quit' }
   | { kind: 'ignore' };
+
+/** Keys that always produce the same action regardless of model state. */
+const STATIC_KEY_ACTIONS: ReadonlyMap<string, CockpitAction> = new Map([
+  ['\x03', { kind: 'quit' as const }],         // ^C, always
+  ['\t', { kind: 'complete' as const }],
+  ['\x7f', { kind: 'erase' as const }],        // DEL
+  ['\b', { kind: 'erase' as const }],           // Backspace
+  ['\x15', { kind: 'clear' as const }],         // ^U
+  ['\x10', { kind: 'history', delta: -1 } as const],  // ^P
+  ['\x0e', { kind: 'history', delta: 1 } as const],   // ^N
+  ['\x1b[5~', { kind: 'scroll', delta: SCROLL_LINES } as const],   // PgUp: back in time
+  ['\x1b[6~', { kind: 'scroll', delta: -SCROLL_LINES } as const],  // PgDn: towards live
+]);
+
+/** Resolve confirm-mode keys (y/Y accept, anything else declines). */
+function parseConfirmKey(key: string): CockpitAction {
+  return key === 'y' || key === 'Y' ? { kind: 'confirm', yes: true } : { kind: 'confirm', yes: false };
+}
+
+/**
+ * Resolve context-sensitive navigation keys: Enter, arrows, lone ESC. Returns
+ * the action, or undefined when the key is not in this set.
+ */
+function parseContextKey(key: string, inputEmpty: boolean): CockpitAction | undefined {
+  if (key === '\r' || key === '\n') return inputEmpty ? { kind: 'open' } : { kind: 'submit' };
+  if (key === '\x1b[A') return inputEmpty ? { kind: 'select', delta: -1 } : { kind: 'history', delta: -1 };
+  if (key === '\x1b[B') return inputEmpty ? { kind: 'select', delta: 1 } : { kind: 'history', delta: 1 };
+  if (key === '\x1b') return inputEmpty ? { kind: 'back' } : { kind: 'clear' };
+  return undefined;
+}
+
+/** True for a printable character or pasted chunk (no escape bytes). */
+function isPrintableKey(key: string): boolean {
+  return key.length > 0 && !key.includes('\x1b') && [...key].every((c) => c >= ' ' && c !== '\x7f');
+}
+
+/** Navigation letters (j/k) and printable text, respecting option claims. */
+function parseNavOrPrintableKey(
+  key: string,
+  state: { inputEmpty: boolean; optionIds?: string[] },
+): CockpitAction {
+  // Navigation letters, unless the open decision claims them (see cockpitKeyAction rule 2).
+  const claimed = (state.optionIds ?? []).some((id) => id.toLowerCase().startsWith(key));
+  if (state.inputEmpty && !claimed) {
+    if (key === 'k') return { kind: 'select', delta: -1 };
+    if (key === 'j') return { kind: 'select', delta: 1 };
+  }
+  // Printable text, including a pasted chunk. Unknown escape sequences must
+  // never leak into the line as stray letters.
+  if (isPrintableKey(key)) return { kind: 'insert', text: key };
+  return { kind: 'ignore' };
+}
 
 /**
  * Map a raw keystroke to an action. Two things share this keyboard — a job list
@@ -315,34 +384,13 @@ export function cockpitKeyAction(
   key: string,
   state: { inputEmpty: boolean; confirming?: boolean; optionIds?: string[] },
 ): CockpitAction {
-  if (key === '\x03') return { kind: 'quit' }; // ^C, always
-  if (state.confirming) {
-    if (key === 'y' || key === 'Y') return { kind: 'confirm', yes: true };
-    return { kind: 'confirm', yes: false }; // anything else declines
-  }
+  const staticAction = STATIC_KEY_ACTIONS.get(key);
+  if (staticAction) return staticAction;
+  if (state.confirming) return parseConfirmKey(key);
   if (key === '\x04' && state.inputEmpty) return { kind: 'quit' }; // ^D on an empty line
-  if (key === '\r' || key === '\n') return state.inputEmpty ? { kind: 'open' } : { kind: 'submit' };
-  if (key === '\t') return { kind: 'complete' };
-  if (key === '\x7f' || key === '\b') return { kind: 'erase' };
-  if (key === '\x15') return { kind: 'clear' }; // ^U
-  if (key === '\x10') return { kind: 'history', delta: -1 }; // ^P
-  if (key === '\x0e') return { kind: 'history', delta: 1 }; // ^N
-  if (key === '\x1b[5~') return { kind: 'scroll', delta: SCROLL_LINES }; // PgUp: back in time
-  if (key === '\x1b[6~') return { kind: 'scroll', delta: -SCROLL_LINES }; // PgDn: towards live
-  if (key === '\x1b[A') return state.inputEmpty ? { kind: 'select', delta: -1 } : { kind: 'history', delta: -1 };
-  if (key === '\x1b[B') return state.inputEmpty ? { kind: 'select', delta: 1 } : { kind: 'history', delta: 1 };
-  // A lone ESC; arrow keys arrive as '\x1b[A' and are handled above.
-  if (key === '\x1b') return state.inputEmpty ? { kind: 'back' } : { kind: 'clear' };
-  // Navigation letters, unless the open decision claims them (see rule 2).
-  const claimed = (state.optionIds ?? []).some((id) => id.toLowerCase().startsWith(key));
-  if (state.inputEmpty && !claimed && key === 'k') return { kind: 'select', delta: -1 };
-  if (state.inputEmpty && !claimed && key === 'j') return { kind: 'select', delta: 1 };
-  // Printable text, including a pasted chunk. Escape sequences we do not know
-  // must never leak into the line as stray letters.
-  if (key.length > 0 && !key.includes('\x1b') && [...key].every((c) => c >= ' ' && c !== '\x7f')) {
-    return { kind: 'insert', text: key };
-  }
-  return { kind: 'ignore' };
+  const ctxAction = parseContextKey(key, state.inputEmpty);
+  if (ctxAction) return ctxAction;
+  return parseNavOrPrintableKey(key, state);
 }
 
 // ── The command line ──────────────────────────────────────────────────────────
@@ -360,6 +408,54 @@ export type CockpitCommand =
   | { kind: 'quit' }
   | { kind: 'nothing' }
   | { kind: 'error'; message: string };
+
+/** Context passed to {@link parseCockpitInput}: the option ids the selected job is waiting on. */
+type ParseCockpitCtx = { optionIds?: string[] };
+
+/** Verb sets to avoid `||` chains that inflate cyclomatic complexity. */
+const VERB_HELP = new Set(['help', '?']);
+const VERB_QUIT = new Set(['quit', 'exit']);
+const VERB_FOCUS = new Set(['logs', 'attach']);
+/** Hoisted so that the inline /\s+/ regex does not trigger a Lizard tokeniser misparse. */
+const WORDS_RE = /\s+/;
+
+/** Parse the args to `delegate`, extracting an optional `--mode` flag. */
+function parseDelegateCommand(rest: string[]): CockpitCommand {
+  const args: string[] = [];
+  let mode: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === '--mode') {
+      mode = rest[i + 1];
+      i += 1;
+      if (mode === undefined) return { kind: 'error', message: 'delegate: --mode needs a mode name' };
+      continue;
+    }
+    args.push(rest[i]!);
+  }
+  const target = args.join(' ');
+  if (target === '') return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--mode m]' };
+  return mode === undefined ? { kind: 'delegate', target } : { kind: 'delegate', target, mode };
+}
+
+/** Parse the args to `answer`. */
+function parseAnswerCommand(rest: string[]): CockpitCommand {
+  const answer = parseAnswerLine(rest.join(' '));
+  if (!answer) return { kind: 'error', message: 'answer: needs an option id, or "text: <free text>"' };
+  return { kind: 'answer', ...answer };
+}
+
+/** Parse a single-token word as an option id, near-miss verb, or bare delegate. */
+function parseCockpitContextual(word: string, trimmed: string, rest: string[], optionIds: string[]): CockpitCommand {
+  if (rest.length === 0 && optionIds.includes(word)) return { kind: 'answer', option: word };
+  const near = nearVerb(word.toLowerCase());
+  if (near !== undefined) {
+    return {
+      kind: 'error',
+      message: `unknown command "${word}" — did you mean ${near}? (to dispatch it as written: delegate ${trimmed})`,
+    };
+  }
+  return { kind: 'delegate', target: trimmed };
+}
 
 /**
  * Interpret a submitted line. A palette, not a chat: every line resolves to one
@@ -380,53 +476,34 @@ export type CockpitCommand =
  * of four or more characters within two of a verb it prefixes or extends, and
  * `delegate <anything>` always dispatches the line as written.
  */
-export function parseCockpitInput(line: string, ctx: { optionIds?: string[] } = {}): CockpitCommand {
+/** Parse the args to `cancel`, returning an optional jobId. */
+function parseCancelCommand(rest: string[]): CockpitCommand {
+  const jobId = rest[0];
+  return jobId !== undefined ? { kind: 'cancel', jobId } : { kind: 'cancel' };
+}
+
+/** Parse the args to `logs`/`attach`, returning an optional jobId. */
+function parseFocusCommand(rest: string[]): CockpitCommand {
+  const jobId = rest[0];
+  return jobId !== undefined ? { kind: 'focus', jobId } : { kind: 'focus' };
+}
+
+export function parseCockpitInput(line: string, ctx?: ParseCockpitCtx): CockpitCommand {
   const trimmed = line.trim();
   if (trimmed === '') return { kind: 'nothing' };
-  const [word, ...rest] = trimmed.split(/\s+/);
+  const parts = trimmed.split(WORDS_RE);
+  const word = parts[0]!;  // safe: trimmed is non-empty
+  const rest = parts.slice(1);
   const verb = word.toLowerCase();
+  const optionIds = (ctx && ctx.optionIds) || [];
 
-  if (verb === 'help' || verb === '?') return { kind: 'help' };
-  if (verb === 'quit' || verb === 'exit') return { kind: 'quit' };
-
-  if (verb === 'delegate') {
-    const args: string[] = [];
-    let mode: string | undefined;
-    for (let i = 0; i < rest.length; i++) {
-      if (rest[i] === '--mode') {
-        mode = rest[i + 1];
-        i += 1;
-        if (mode === undefined) return { kind: 'error', message: 'delegate: --mode needs a mode name' };
-        continue;
-      }
-      args.push(rest[i]);
-    }
-    const target = args.join(' ');
-    if (target === '') return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--mode m]' };
-    return mode === undefined ? { kind: 'delegate', target } : { kind: 'delegate', target, mode };
-  }
-
-  if (verb === 'answer') {
-    const answer = parseAnswerLine(rest.join(' '));
-    if (!answer) return { kind: 'error', message: 'answer: needs an option id, or "text: <free text>"' };
-    return { kind: 'answer', ...answer };
-  }
-
-  if (verb === 'cancel') return rest[0] === undefined ? { kind: 'cancel' } : { kind: 'cancel', jobId: rest[0] };
-  if (verb === 'logs' || verb === 'attach') {
-    return rest[0] === undefined ? { kind: 'focus' } : { kind: 'focus', jobId: rest[0] };
-  }
-
-  const optionIds = ctx.optionIds ?? [];
-  if (rest.length === 0 && optionIds.includes(word)) return { kind: 'answer', option: word };
-  const near = nearVerb(verb);
-  if (near !== undefined) {
-    return {
-      kind: 'error',
-      message: `unknown command "${word}" — did you mean ${near}? (to dispatch it as written: delegate ${trimmed})`,
-    };
-  }
-  return { kind: 'delegate', target: trimmed };
+  if (VERB_HELP.has(verb)) return { kind: 'help' };
+  if (VERB_QUIT.has(verb)) return { kind: 'quit' };
+  if (verb === 'delegate') return parseDelegateCommand(rest);
+  if (verb === 'answer') return parseAnswerCommand(rest);
+  if (verb === 'cancel') return parseCancelCommand(rest);
+  if (VERB_FOCUS.has(verb)) return parseFocusCommand(rest);
+  return parseCockpitContextual(word, trimmed, rest, optionIds);
 }
 
 /**
@@ -731,6 +808,32 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
   // holding the local port with nobody left to stop it, which is the precise
   // opposite of "a cockpit-owned tunnel dies with it". So `running` is re-checked
   // after every await, and the whole thing is awaited on the way out.
+  // Extract the tunnel-opening attempt so checkTunnel's branch count stays low.
+  const openTunnel = async (port: number): Promise<void> => {
+    try {
+      // Forward the port the rest of the CLI resolves, not the capture's own
+      // idea of it: a cockpit tunnelling somewhere it does not read from is worse
+      // than no tunnel at all.
+      const tunnel = await resolveTunnel(deps.cwd, port);
+      // Nothing may be spawned once the view is closing: the teardown that would
+      // have stopped it has already run.
+      if (!running || held !== undefined) return;
+      const session = holdTunnel(tunnel, deps.home, (line) => note(`tunnel: ${line}`));
+      held = session;
+      model.tunnel = { kind: 'owned', port: session.port };
+      note(`tunnel: opening ${endpoint} from ${tunnel.source}`);
+      void session.ended.then((failure) => {
+        if (held !== session) return; // replaced, or stopped on the way out
+        held = undefined;
+        model.tunnel = { kind: 'failed', why: failure ? failure.message : 'the tunnel closed' };
+        dirty = true;
+      });
+    } catch (err) {
+      model.tunnel = { kind: 'failed', why: errorText(err) };
+      note(`tunnel: ${model.tunnel.why}`);
+    }
+  };
+
   const checkTunnel = async (): Promise<void> => {
     tunnelCheckedAt = Date.now();
     const target = daemonTarget(env, { cwd: deps.cwd });
@@ -763,28 +866,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
       return;
     }
     if (!running) return;
-    try {
-      // Forward the port the rest of the CLI resolves, not the capture's own
-      // idea of it: a cockpit tunnelling somewhere it does not read from is worse
-      // than no tunnel at all.
-      const tunnel = await resolveTunnel(deps.cwd, target.port);
-      // Nothing may be spawned once the view is closing: the teardown that would
-      // have stopped it has already run.
-      if (!running || held !== undefined) return;
-      const session = holdTunnel(tunnel, deps.home, (line) => note(`tunnel: ${line}`));
-      held = session;
-      model.tunnel = { kind: 'owned', port: session.port };
-      note(`tunnel: opening ${endpoint} from ${tunnel.source}`);
-      void session.ended.then((failure) => {
-        if (held !== session) return; // replaced, or stopped on the way out
-        held = undefined;
-        model.tunnel = { kind: 'failed', why: failure ? failure.message : 'the tunnel closed' };
-        dirty = true;
-      });
-    } catch (err) {
-      model.tunnel = { kind: 'failed', why: errorText(err) };
-      note(`tunnel: ${model.tunnel.why}`);
-    }
+    await openTunnel(target.port);
   };
 
   /** The tunnel work in flight, so closing the view can wait for it. */

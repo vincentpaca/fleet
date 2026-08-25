@@ -61,7 +61,12 @@ export function refreshDeployment(
   if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
   // --with-decryption: the parameter is a SecureString (infra/aws/main.tf), and
   // without it the call returns ciphertext that fails to parse.
-  return run(['ssm', 'get-parameter', '--name', ssmPath, '--with-decryption', '--output', 'json']).then((stdout) => ({
+  // --region when the capture names one (#138): the parameter lives in the
+  // deployment's region, and the ambient region — the only other candidate —
+  // being wrong is a likely reason the operator is refreshing at all.
+  const args = ['ssm', 'get-parameter', '--name', ssmPath, '--with-decryption', '--output', 'json'];
+  if (typeof config.region === 'string' && config.region !== '') args.push('--region', config.region);
+  return run(args).then((stdout) => ({
     source: `SSM parameter ${ssmPath}`,
     config: parseFleetConfigSsmResponse(stdout),
   }));

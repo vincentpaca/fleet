@@ -116,33 +116,30 @@ export function configDaemonUrl(config: Record<string, unknown>): URL | undefine
  *   2. .fleet/infra/<provider>/fleet-config.json — daemon_url field
  *   3. Unix socket at $FLEET_HOME/daemon.sock
  */
+/** Convert a URL object to a TCP target, stripping trailing slashes from the base path. */
+function urlToTcpTarget(u: URL): Target {
+  return {
+    kind: 'tcp',
+    host: u.hostname,
+    port: u.port ? Number(u.port) : 80,
+    basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
+  };
+}
+
 export function daemonTarget(
   env: Record<string, string | undefined> = process.env,
   opts: { cwd?: string } = {},
 ): Target {
   // 1. Explicit env override.
   const url = env.FLEET_DAEMON_URL;
-  if (url) {
-    const u = new URL(url);
-    return {
-      kind: 'tcp',
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 80,
-      basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
-    };
-  }
+  if (url) return urlToTcpTarget(new URL(url));
 
   // 2. Per-deployment fleet-config.json (written by `fleet setup infra` (#13) or by hand).
   //    Scan .fleet/infra/<provider>/fleet-config.json for a daemon_url field; first wins.
   for (const { config } of fleetConfigFiles(opts.cwd ?? process.cwd())) {
     const u = configDaemonUrl(config);
     if (!u) continue;
-    return {
-      kind: 'tcp',
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 80,
-      basePath: u.pathname === '/' ? '' : u.pathname.replace(/\/+$/, ''),
-    };
+    return urlToTcpTarget(u);
   }
 
   // 3. Unix socket at $FLEET_HOME.

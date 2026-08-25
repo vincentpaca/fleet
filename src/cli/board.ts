@@ -145,6 +145,17 @@ function planeColor(x: number, y: number): [number, number, number] {
   return c.map((v) => Math.round(v * 0.55)) as [number, number, number];
 }
 
+/** Render one half-block character for a pair of pixel rows at column x. */
+function renderPixelPair(top: boolean, bot: boolean, x: number, row: number, level: ColorLevel | undefined): string {
+  if (!top && !bot) return ' ';
+  if (!level) return top && bot ? '█' : top ? '▀' : '▄';
+  const tc = planeColor(x, row * 2);
+  const bc = planeColor(x, row * 2 + 1);
+  if (top && bot) return fg(tc, level) + bg(bc, level) + '▀\x1b[0m';
+  if (top) return fg(tc, level) + '▀\x1b[0m';
+  return fg(bc, level) + '▄\x1b[0m';
+}
+
 /** Build the 4 banner lines: half-block plane + wordmark. Plain when level omitted. */
 function buildBanner(level?: ColorLevel): string[] {
   const wide = PLANE_PX[0].length;
@@ -152,20 +163,12 @@ function buildBanner(level?: ColorLevel): string[] {
   for (let row = 0; row < PLANE_PX.length / 2; row++) {
     let line = ' ';
     for (let x = 0; x < wide; x++) {
-      const top = pxAt(x, row * 2);
-      const bot = pxAt(x, row * 2 + 1);
-      if (!top && !bot) { line += ' '; continue; }
-      if (!level) { line += top && bot ? '█' : top ? '▀' : '▄'; continue; }
-      const tc = planeColor(x, row * 2);
-      const bc = planeColor(x, row * 2 + 1);
-      if (top && bot) line += `${fg(tc, level)}${bg(bc, level)}▀\x1b[0m`;
-      else if (top) line += `${fg(tc, level)}▀\x1b[0m`;
-      else line += `${fg(bc, level)}▄\x1b[0m`;
+      line += renderPixelPair(pxAt(x, row * 2), pxAt(x, row * 2 + 1), x, row, level);
     }
     lines.push(line);
   }
-  lines[1] += !level ? '   F L E E T' : `   \x1b[1;38;5;153mF L E E T\x1b[0m`;
-  lines[2] += !level ? '   your cloud' : `   \x1b[2myour cloud\x1b[0m`;
+  lines[1] += !level ? '   F L E E T' : '   \x1b[1;38;5;153mF L E E T\x1b[0m';
+  lines[2] += !level ? '   your cloud' : '   \x1b[2myour cloud\x1b[0m';
   return lines;
 }
 
@@ -197,6 +200,22 @@ export function visualLength(s: string): number {
 export function makeCol(noColor: boolean): (text: string, ...codes: number[]) => string {
   return (text, ...codes) => noColor ? text : `${ansi(...codes)}${text}${RESET}`;
 }
+
+/** Type alias for the col() helper so it can be used in parameter position
+ *  without the inline function type that Lizard misparses as a nested function. */
+type ColFn = ReturnType<typeof makeCol>;
+
+/** Pending-decisions map: decision id → question text. Avoids inline object type in params. */
+type PendingDecisions = Map<string, string>;
+
+/** One option item from a decision; extracted so parameter types stay Lizard-clean. */
+type OptionItem = { id: string; label?: string; recommended?: boolean };
+
+/** Extract the `id` field from an option item; passed to Array.map() by reference. */
+function optionId(o: OptionItem): string { return o.id; }
+
+/** Numeric-only target: #42 style. Hoisted so no inline regex in function bodies. */
+const IS_NUMERIC = /^\d+$/;
 
 /**
  * Clip a string (which may contain ANSI codes) to at most maxLen visible
@@ -237,6 +256,27 @@ export function renderBanner(width: number, noColor: boolean, level: ColorLevel 
   return lines.map((line) => visualClip(line, width)).join('\n');
 }
 
+/** Build the left-side context parts for the header strip. */
+function buildContextParts(
+  ctx: ContextInfo | undefined,
+  endpoint: string | undefined,
+  col: ColFn,
+): string[] {
+  const parts: string[] = [col('FLEET', 1, 36)];
+  if (ctx?.repo) {
+    const repoStr = ctx.branch ? ctx.repo + '/' + ctx.branch : ctx.repo;
+    parts.push(col(repoStr, 36));
+  }
+  if (endpoint) {
+    const dot = ctx?.daemonReachable === false ? col('○', 31) : col('●', 32);
+    parts.push(col(endpoint, 90) + ' ' + dot);
+  }
+  if (ctx?.provider) parts.push(col(ctx.provider, 90));
+  if (ctx?.harnessCli) parts.push(col(ctx.harnessCli, 90));
+  if (ctx?.tunnel) parts.push(col(ctx.tunnel, 90));
+  return parts;
+}
+
 /**
  * Render the two-line (roster) or three-line (detail) context strip.
  * Always box-drawn; clips to width. jobLine adds a middle row (detail view only).
@@ -254,20 +294,9 @@ export function renderContextStrip(
   const inner = w - 2; // chars between corner glyphs
 
   // Assemble left-side parts.
-  const parts: string[] = [col('FLEET', 1, 36)];
   const ctx = opts.context;
-  if (ctx?.repo) {
-    const repoStr = ctx.branch ? `${ctx.repo}/${ctx.branch}` : ctx.repo;
-    parts.push(col(repoStr, 36));
-  }
   const endpoint = opts.endpoint;
-  if (endpoint) {
-    const dot = ctx?.daemonReachable === false ? col('○', 31) : col('●', 32);
-    parts.push(`${col(endpoint, 90)} ${dot}`);
-  }
-  if (ctx?.provider) parts.push(col(ctx.provider, 90));
-  if (ctx?.harnessCli) parts.push(col(ctx.harnessCli, 90));
-  if (ctx?.tunnel) parts.push(col(ctx.tunnel, 90));
+  const parts = buildContextParts(ctx, endpoint, col);
 
   // Right-side: semantic count labels.
   const bLabel = blockedCount > 0 ? col(`blk:${blockedCount}`, 33) : col(`blk:0`, 90);
@@ -309,6 +338,53 @@ export function renderTableHeader(w: number, noColor: boolean): string {
   return [visualClip(col(header, 90), w), visualClip(col(rule, 90), w)].join('\n');
 }
 
+/** Render the per-option lines for a decision card. */
+function renderOptionLines(options: OptionItem[], col: ColFn, w: number): string[] {
+  const lines: string[] = [];
+  for (const opt of options) {
+    const rec = opt.recommended ? col(' ★', 33) : '';
+    lines.push(visualClip('     ' + col('[' + opt.id + ']', 33) + ' ' + (opt.label ?? opt.id) + rec, w));
+  }
+  return lines;
+}
+
+/** Render the lines for a decision event, tracking the pending question. */
+function renderDecisionLines(
+  ev: BoardEvent,
+  pending: PendingDecisions,
+  col: ColFn,
+  prefix: string,
+  w: number,
+): string[] {
+  if (!ev.id) return [];
+  const question = ev.question ?? '';
+  const options = ev.options ?? [];
+  pending.set(ev.id, question);
+  const out = [visualClip(prefix + ' ' + col('?', 1, 33) + ' ' + col(question, 1), w)];
+  out.push(...renderOptionLines(options, col, w));
+  // Same rule as the roster card: a question on screen states how to answer it, in place.
+  const ids = options.map(optionId).join(' | ');
+  out.push(visualClip('     ' + col('answer: type an option id below — ' + ids, 33), w));
+  return out;
+}
+
+/** Render the single summary line for an answer event. */
+function renderAnswerLine(
+  ev: BoardEvent,
+  pending: PendingDecisions,
+  col: ColFn,
+  prefix: string,
+): string {
+  const dec = ev.decision ? pending.get(ev.decision) : undefined;
+  const qText = dec ? col('"' + dec + '"', 90) : '';
+  const ansText = ev.option ? col('[' + ev.option + ']', 32) : col('(free text)', 90);
+  const byText = ev.by ? col(' by ' + ev.by, 90) : '';
+  if (ev.decision) pending.delete(ev.decision);
+  return qText
+    ? prefix + ' ' + col('✓', 32) + ' ' + qText + ' → ' + ansText + byText
+    : prefix + ' ' + col('✓', 32) + ' answer: ' + ansText + byText;
+}
+
 /**
  * Convert a BoardEvent array to display lines for a job's tail. Decision events
  * become cards — the schema's question and every option, verbatim and never
@@ -318,59 +394,37 @@ export function renderEventLines(events: BoardEvent[], w: number, noColor: boole
   const col = makeCol(noColor);
   const lines: string[] = [];
   // Track pending decisions for "question → answer" rendering.
-  const pending = new Map<string, { question: string }>();
+  const pending: PendingDecisions = new Map();
 
   for (const ev of events) {
-    const prefix = col(`[${ev.seq}]`, 90);
+    const prefix = col('[' + ev.seq + ']', 90);
     switch (ev.type) {
       case 'think':
       case 'log':
-        lines.push(visualClip(`${prefix} ${col(ev.text ?? '', 90)}`, w));
+        lines.push(visualClip(prefix + ' ' + col(ev.text ?? '', 90), w));
         break;
       case 'phase':
-        lines.push(visualClip(`${prefix} ${col('phase', 90)} ${col(ev.text ?? '', 90)}`, w));
+        lines.push(visualClip(prefix + ' ' + col('phase', 90) + ' ' + col(ev.text ?? '', 90), w));
         break;
       case 'state': {
         const c = ev.state === 'blocked' ? 33 : ev.state === 'running' ? 32 : 90;
-        lines.push(visualClip(`${prefix} ${col('→', 90)} ${col(ev.state ?? '', c)}`, w));
+        lines.push(visualClip(prefix + ' ' + col('→', 90) + ' ' + col(ev.state ?? '', c), w));
         break;
       }
       case 'decision':
-        if (ev.id) {
-          pending.set(ev.id, { question: ev.question ?? '' });
-          lines.push(visualClip(`${prefix} ${col('?', 1, 33)} ${col(ev.question ?? '', 1)}`, w));
-          for (const opt of ev.options ?? []) {
-            const rec = opt.recommended ? col(' ★', 33) : '';
-            lines.push(visualClip(`     ${col(`[${opt.id}]`, 33)} ${opt.label ?? opt.id}${rec}`, w));
-          }
-          // Same rule as the roster card: a question on screen states how to
-          // answer it, in place.
-          lines.push(visualClip(
-            `     ${col(`answer: type an option id below — ${(ev.options ?? []).map((o) => o.id).join(' | ')}`, 33)}`,
-            w,
-          ));
-        }
+        lines.push(...renderDecisionLines(ev, pending, col, prefix, w));
         break;
-      case 'answer': {
-        const dec = ev.decision ? pending.get(ev.decision) : undefined;
-        const qText = dec ? col(`"${dec.question}"`, 90) : '';
-        const ansText = ev.option ? col(`[${ev.option}]`, 32) : col('(free text)', 90);
-        const byText = ev.by ? col(` by ${ev.by}`, 90) : '';
-        const summary = qText
-          ? `${prefix} ${col('✓', 32)} ${qText} → ${ansText}${byText}`
-          : `${prefix} ${col('✓', 32)} answer: ${ansText}${byText}`;
-        lines.push(visualClip(summary, w));
-        if (ev.decision) pending.delete(ev.decision);
+      case 'answer':
+        lines.push(visualClip(renderAnswerLine(ev, pending, col, prefix), w));
         break;
-      }
       case 'settle':
         lines.push(visualClip(
-          `${prefix} ${col('settle', 36)} rung=${col(ev.rung ?? '?', 36)} status=${col(ev.report?.status ?? '?', 36)}`,
+          prefix + ' ' + col('settle', 36) + ' rung=' + col(ev.rung ?? '?', 36) + ' status=' + col(ev.report?.status ?? '?', 36),
           w,
         ));
         break;
       default:
-        lines.push(visualClip(`${prefix} ${col(ev.type, 90)}`, w));
+        lines.push(visualClip(prefix + ' ' + col(ev.type, 90), w));
         break;
     }
   }
@@ -387,12 +441,12 @@ export function renderJobLine(job: BoardJob, opts: FrameOpts): string {
   const col = makeCol(opts.noColor ?? false);
   const rawTarget = job.workOrder?.target ?? '?';
   const title = job.workOrder?.title;
-  const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
+  const ref = rawTarget.replace(IS_NUMERIC, '#$&');
   return [
     col(job.id, 1),
     col(formatJobState(job), stateColor(job)),
     job.workOrder?.mode ?? '?',
-    title ? `${ref}: ${title}` : rawTarget,
+    title ? ref + ': ' + title : rawTarget,
     jobElapsed(job, opts.now ?? 0),
   ].filter(Boolean).join('  ');
 }
@@ -486,16 +540,75 @@ export type RosterRow = { jobIndex: number; lines: string[] };
  */
 export function decisionCardLines(decision: BoardDecision, w: number, noColor: boolean): string[] {
   const col = makeCol(noColor);
-  const lines: string[] = [visualClip(`     ${col(decision.question, 1)}`, w)];
+  const lines: string[] = [visualClip('     ' + col(decision.question, 1), w)];
   for (const opt of decision.options) {
     const rec = opt.recommended ? col(' ★', 33) : '';
-    lines.push(visualClip(`     [${opt.id}] ${opt.label ?? opt.id}${rec}`, w));
+    lines.push(visualClip('     [' + opt.id + '] ' + (opt.label ?? opt.id) + rec, w));
   }
-  lines.push(visualClip(
-    `     ${col(`answer: type an option id below — ${decision.options.map((o) => o.id).join(' | ')}`, 33)}`,
-    w,
-  ));
+  const ids = decision.options.map(optionId).join(' | ');
+  lines.push(visualClip('     ' + col('answer: type an option id below — ' + ids, 33), w));
   return lines;
+}
+
+/** Urgency glyph for a roster row, pulsing on blocked. */
+function jobGlyph(job: BoardJob, pulse: boolean, col: ColFn): string {
+  if (job.state === 'blocked') return pulse ? col('!!', 1, 31) : col('!!', 33);
+  if (job.state === 'running' || job.state === 'queued') return col('●', 32) + ' ';
+  return col('·', 90) + ' ';
+}
+
+/**
+ * Delivered-artifact suffix for a settled roster row (issue #81).
+ * A done row with files must not look identical to an empty-handed one.
+ */
+function artifactSuffix(job: BoardJob, col: ColFn): string {
+  const settled = job.state === 'done' || job.state === 'cancelled';
+  if (!settled || (job.artifacts ?? 0) <= 0) return '';
+  return '  ' + col(job.artifacts + ' file' + (job.artifacts === 1 ? '' : 's'), 90);
+}
+
+/** Extra lines below a roster row: decision card (blocked) or last activity (live). */
+function jobExtraLines(job: BoardJob, noColor: boolean, now: number, w: number): string[] {
+  const col = makeCol(noColor);
+  if (job.state === 'blocked' && job.decision) {
+    return [...decisionCardLines(job.decision, w, noColor), ''];
+  }
+  if ((job.state === 'running' || job.state === 'queued') && job.lastActivity) {
+    // The daemon reports latest activity for every live job — not stream-dependent.
+    // Only live jobs get it: "now:" under a settled job would describe the past.
+    const age = fmtElapsed(now - new Date(job.lastActivity.at).getTime());
+    const ageStr = age ? ' (' + age + ')' : '';
+    return [visualClip('     ' + col('now: ' + formatLogText(job.lastActivity.text) + ageStr, 90), w)];
+  }
+  return [];
+}
+
+/** Build one roster row from a job snapshot. Called via .map() in renderRosterRows. */
+function buildRosterRow(
+  job: BoardJob,
+  i: number,
+  selection: number,
+  col: ColFn,
+  noColor: boolean,
+  pulse: boolean,
+  now: number,
+  w: number,
+): RosterRow {
+  const sel = i === selection ? col('▶', 36) : ' ';
+  const elapsed = jobElapsed(job, now);
+  const mode = job.workOrder?.mode ?? '?';
+  const rawTarget = job.workOrder?.target ?? '?';
+  const title = job.workOrder?.title;
+  // Prefer "#<n> <title>" when both are present.
+  const ref = IS_NUMERIC.test(rawTarget) ? '#' + rawTarget : rawTarget;
+  const targetDisplay = title ? ref + ' ' + title : rawTarget;
+  const stateDisplay = formatJobState(job);
+  const glyph = jobGlyph(job, pulse, col);
+  const files = artifactSuffix(job, col);
+  const row = sel + ' ' + glyph + ' ' + visualClip(job.id, 22).padEnd(22) + '  '
+    + col(stateDisplay.padEnd(9), stateColor(job)) + '  ' + mode.padEnd(10) + '  '
+    + visualClip(targetDisplay, 17).padEnd(17) + '  ' + elapsed + files;
+  return { jobIndex: i, lines: [visualClip(row, w), ...jobExtraLines(job, noColor, now, w)] };
 }
 
 export function renderRosterRows(
@@ -510,46 +623,7 @@ export function renderRosterRows(
   const w = Math.max(40, width);
   const col = makeCol(noColor);
 
-  return ordered.map((job, i) => {
-    const lines: string[] = [];
-    const sel = i === selection ? col('▶', 36) : ' ';
-    const elapsed = jobElapsed(job, now);
-    const mode = job.workOrder?.mode ?? '?';
-    const rawTarget = job.workOrder?.target ?? '?';
-    const title = job.workOrder?.title;
-    // Prefer "#<n> <title>" when both are present.
-    const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
-    const targetDisplay = title ? `${ref} ${title}` : rawTarget;
-    const stateDisplay = formatJobState(job);
-    const glyph = job.state === 'blocked'
-      // Urgency marker pulses on a ~600ms cycle.
-      ? (pulse ? col('!!', 1, 31) : col('!!', 33))
-      : job.state === 'running' || job.state === 'queued'
-        ? `${col('●', 32)} `
-        : `${col('·', 90)} `;
-    // Delivered artifacts on a settled row (issue #81): the fleet's delivery
-    // guarantee has to be visible where the job is read as finished — a done
-    // row with files waiting must not look identical to an empty-handed one.
-    const settled = job.state === 'done' || job.state === 'cancelled';
-    const files = settled && (job.artifacts ?? 0) > 0
-      ? `  ${col(`${job.artifacts} file${job.artifacts === 1 ? '' : 's'}`, 90)}`
-      : '';
-    const row = `${sel} ${glyph} ${visualClip(job.id, 22).padEnd(22)}  ${col(stateDisplay.padEnd(9), stateColor(job))}  ${mode.padEnd(10)}  ${visualClip(targetDisplay, 17).padEnd(17)}  ${elapsed}${files}`;
-    lines.push(visualClip(row, w));
-
-    if (job.state === 'blocked' && job.decision) {
-      lines.push(...decisionCardLines(job.decision, w, noColor));
-      lines.push('');
-    } else if ((job.state === 'running' || job.state === 'queued') && job.lastActivity) {
-      // The daemon reports the latest activity for every live job, so this line
-      // does not depend on anyone following that job's stream. Only live jobs get
-      // it: "now:" under a settled job would be describing the past.
-      const age = fmtElapsed(now - new Date(job.lastActivity.at).getTime());
-      const ageStr = age ? ` (${age})` : '';
-      lines.push(visualClip(`     ${col(`now: ${formatLogText(job.lastActivity.text)}${ageStr}`, 90)}`, w));
-    }
-    return { jobIndex: i, lines };
-  });
+  return ordered.map((job, i) => buildRosterRow(job, i, selection, col, noColor, pulse, now, w));
 }
 
 // ── Daemon helpers ────────────────────────────────────────────────────────────

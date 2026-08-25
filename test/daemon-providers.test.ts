@@ -20,6 +20,8 @@ import {
   parseDaemonRuntimeId,
   ssmSessionTarget,
   buildPortForwardArgs,
+  buildListDaemonTasksArgs,
+  buildDescribeDaemonTaskArgs,
   ecsTunnelOpener,
 } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
@@ -1151,6 +1153,103 @@ test("ecsTunnelOpener resolves the current task on every call", async () => {
   assert.equal(calls.length, 4, "each open re-lists and re-describes");
   // describe-tasks must ask about the task list-tasks just returned.
   assert.equal(calls[3][calls[3].indexOf("--tasks") + 1], taskArns[1]);
+});
+
+// ---------- region plumbing (#138) --------------------------------------------
+// Every aws call against a deployment names the deployment's own region, taken
+// from fleet_config. The alternative — the caller's ambient AWS_REGION — does
+// not error when wrong: list-tasks in another region returns an empty list,
+// which the tunnel path reports as the misleading "the daemon service is not
+// up". The fake aws runner records the argv the real CLI would receive.
+
+test("fleet_config region reaches every tunnel-path aws call and the session argv (#138)", async () => {
+  const access = ecsDaemonAccessFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    daemon_service: "fleet-daemon",
+    daemon_container_name: "fleet-daemon",
+    daemon_port: 9000,
+    region: "ap-southeast-1",
+  });
+  assert.equal(access.region, "ap-southeast-1");
+
+  const calls: string[][] = [];
+  const opener = ecsTunnelOpener(access, async (args) => {
+    calls.push(args);
+    if (args[1] === "list-tasks") {
+      return JSON.stringify({ taskArns: ["arn:aws:ecs:ap-southeast-1:111122223333:task/fleet/t1"] });
+    }
+    return JSON.stringify({
+      tasks: [{ lastStatus: "RUNNING", containers: [{ name: "fleet-daemon", runtimeId: "rt-1" }] }],
+    });
+  });
+  const endpoint = await opener(19000);
+
+  // Both resolution reads (list-tasks, describe-tasks) and the start-session
+  // argv that holds the tunnel open: `fleet connect` with only fleet_config
+  // set — no ambient region vars — must land every call in the deployment.
+  assert.equal(calls.length, 2);
+  for (const args of calls) {
+    const at = args.indexOf("--region");
+    assert.ok(at >= 0, `aws call missing --region: aws ${args.join(" ")}`);
+    assert.equal(args[at + 1], "ap-southeast-1");
+  }
+  const sessionAt = endpoint.argv.indexOf("--region");
+  assert.ok(sessionAt >= 0, `start-session missing --region: ${endpoint.argv.join(" ")}`);
+  assert.equal(endpoint.argv[sessionAt + 1], "ap-southeast-1");
+});
+
+test("a capture without region builds the exact pre-#138 argv (backward compatible)", () => {
+  // Legacy fleet-config.json files predate the region field. They must keep
+  // working on the operator's ambient region, not gain a `--region undefined`.
+  assert.ok(!("region" in ecsDaemonAccessFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    daemon_service: "fleet-daemon",
+    daemon_container_name: "fleet-daemon",
+    daemon_port: 9000,
+  })));
+  assert.ok(!buildListDaemonTasksArgs(DAEMON_ACCESS).includes("--region"));
+  assert.ok(!buildDescribeDaemonTaskArgs(DAEMON_ACCESS, "arn").includes("--region"));
+  assert.ok(!buildPortForwardArgs("ecs:fleet_t_rt", 9000, 19000).includes("--region"));
+});
+
+test("EcsProvider run-task and stop-task carry the fleet_config region (#138)", () => {
+  const config = ecsConfigFromFleetConfig({
+    provider: "ecs",
+    cluster: "fleet-cluster",
+    runner_task_definition: "fleet-runner",
+    runner_container_name: "fleet-runner",
+    region: "ap-southeast-1",
+  });
+  assert.equal(config.region, "ap-southeast-1");
+  const provider = new EcsProvider(config);
+
+  // Region rides argv, not the input file (#126 x #138): it is a routing
+  // flag, not a secret, and stays uniform with every other aws builder.
+  const runArgs = provider.buildRunTaskArgs("/private/fleet-ecs-run/payload");
+  assert.equal(runArgs[runArgs.indexOf("--region") + 1], "ap-southeast-1");
+  const stopArgs = provider.buildStopTaskArgs("arn:aws:ecs:ap-southeast-1:111122223333:task/fleet/t1");
+  assert.equal(stopArgs[stopArgs.indexOf("--region") + 1], "ap-southeast-1");
+
+  // No region in the config → no --region flag, same argv as before #138.
+  const legacy = new EcsProvider(ECS_CONFIG);
+  assert.ok(!legacy.buildRunTaskArgs("/private/fleet-ecs-run/payload").includes("--region"));
+  assert.ok(!legacy.buildStopTaskArgs("handle").includes("--region"));
+});
+
+test("ecsConfigFromEnv carries FLEET_ECS_REGION when set (#138)", () => {
+  const base = {
+    FLEET_ECS_CLUSTER: "fleet-cluster",
+    FLEET_ECS_TASK_DEF: "fleet-runner:3",
+    FLEET_ECS_CONTAINER: "runner",
+  };
+  assert.equal(ecsConfigFromEnv(base).region, undefined);
+  assert.equal(ecsConfigFromEnv({ ...base, FLEET_ECS_REGION: "ap-southeast-1" }).region, "ap-southeast-1");
 });
 
 // ---------- CLI budgets + terminate idempotency (#122) ------------------------

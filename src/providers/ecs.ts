@@ -24,6 +24,13 @@ export type EcsConfig = {
   taskDefinition: string;
   /** Container name in the task definition receiving the env overrides. */
   containerName: string;
+  /**
+   * AWS region of the deployment (#138). When present, every `aws` argv this
+   * provider builds carries `--region` so a wrong ambient AWS_REGION cannot
+   * point a call at the wrong account corner. Optional: legacy fleet_config
+   * captures predate it, and env-var configs may rely on ambient config.
+   */
+  region?: string;
   subnets: string[];
   securityGroups: string[];
   /**
@@ -52,6 +59,13 @@ export type EcsConfig = {
 export type FleetConfig = {
   provider: string;
   cluster: string;
+  /**
+   * AWS region the unit deployed into. Optional for backward compatibility
+   * with captures that predate #138; when present it is appended as --region
+   * to every aws invocation so the operator's ambient region cannot misroute
+   * a call (the failure reads as "the daemon service is not up").
+   */
+  region?: string;
   /**
    * ECS capacity provider name — preferred over launch_type when present.
    * Run-task uses --capacity-provider-strategy so managed ASG scaling fires.
@@ -87,6 +101,7 @@ export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
     cluster: required("cluster", config.cluster),
     taskDefinition: required("runner_task_definition", config.runner_task_definition),
     containerName: required("runner_container_name", config.runner_container_name),
+    region: config.region,
     subnets: config.subnets ?? [],
     securityGroups: config.security_groups ?? [],
     capacityProvider: config.capacity_provider,
@@ -94,6 +109,17 @@ export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
     assignPublicIp: "DISABLED",
     capacityTiers: config.capacity_tiers ?? [],
   };
+}
+
+/**
+ * Append `--region <region>` when the deployment names one (#138). Every argv
+ * builder in this file routes through it: the alternative is the CLI's ambient
+ * region, and a wrong ambient region does not error — it asks a different
+ * region the same question and gets an empty answer, which the tunnel path
+ * reports as "the daemon service is not up".
+ */
+function withRegion(args: string[], region: string | undefined): string[] {
+  return region ? [...args, "--region", region] : args;
 }
 
 /**
@@ -135,6 +161,11 @@ export function parseFleetConfigSsmResponse(ssmJson: string): FleetConfig {
  * Shell out to `aws ssm get-parameter` and return an EcsConfig.
  * Used at daemon startup when FLEET_ECS_CONFIG_SSM_PATH is set and no
  * FLEET_ECS_CLUSTER override is present.
+ *
+ * Deliberately no --region (#138): this is the bootstrap read — the region
+ * lives inside the parameter this call fetches. The daemon runs inside the
+ * deployment's own ECS task, where AWS_REGION is set by the substrate to the
+ * right value; everything after this call names the region explicitly.
  */
 export async function ecsConfigFromSsm(path: string): Promise<EcsConfig> {
   const { stdout } = await run("aws", [
@@ -155,7 +186,8 @@ export async function ecsConfigFromSsm(path: string): Promise<EcsConfig> {
 
 /**
  * Read FLEET_ECS_* config. Required: FLEET_ECS_CLUSTER, FLEET_ECS_TASK_DEF,
- * FLEET_ECS_CONTAINER. Optional: FLEET_ECS_SUBNETS / FLEET_ECS_SECURITY_GROUPS
+ * FLEET_ECS_CONTAINER. Optional: FLEET_ECS_REGION (falls back to the ambient
+ * AWS config when unset), FLEET_ECS_SUBNETS / FLEET_ECS_SECURITY_GROUPS
  * (comma-separated), FLEET_ECS_LAUNCH_TYPE (default EC2),
  * FLEET_ECS_ASSIGN_PUBLIC_IP (default DISABLED).
  * Capacity tiers cannot be set via env vars — use fleet_config (SSM) for production.
@@ -172,6 +204,7 @@ export function ecsConfigFromEnv(env: Record<string, string | undefined> = proce
     cluster: required("FLEET_ECS_CLUSTER"),
     taskDefinition: required("FLEET_ECS_TASK_DEF"),
     containerName: required("FLEET_ECS_CONTAINER"),
+    region: env.FLEET_ECS_REGION,
     subnets: list(env.FLEET_ECS_SUBNETS),
     securityGroups: list(env.FLEET_ECS_SECURITY_GROUPS),
     launchType: env.FLEET_ECS_LAUNCH_TYPE ?? "EC2",
@@ -194,6 +227,13 @@ export type EcsDaemonAccess = {
   containerName: string;
   /** Port the daemon binds inside the container. */
   port: number;
+  /**
+   * AWS region of the deployment (#138). Optional — captures predating it
+   * fall back to the caller's ambient region, which is exactly the failure
+   * mode this field removes: `fleet connect` under a wrong AWS_REGION lists
+   * tasks in the wrong region and reports "the daemon service is not up".
+   */
+  region?: string;
 };
 
 /** Build an EcsDaemonAccess from a parsed fleet_config, naming any missing field. */
@@ -211,28 +251,37 @@ export function ecsDaemonAccessFromFleetConfig(config: FleetConfig): EcsDaemonAc
     service: required("daemon_service", config.daemon_service),
     containerName: required("daemon_container_name", config.daemon_container_name),
     port,
+    // Spread, not `region: config.region`: a capture predating #138 yields an
+    // access object without the key, identical to what it produced before.
+    ...(config.region ? { region: config.region } : {}),
   };
 }
 
 /** argv after `aws` for listing the daemon service's running tasks. */
 export function buildListDaemonTasksArgs(access: EcsDaemonAccess): string[] {
-  return [
-    "ecs",
-    "list-tasks",
-    "--cluster",
-    access.cluster,
-    "--service-name",
-    access.service,
-    "--desired-status",
-    "RUNNING",
-    "--output",
-    "json",
-  ];
+  return withRegion(
+    [
+      "ecs",
+      "list-tasks",
+      "--cluster",
+      access.cluster,
+      "--service-name",
+      access.service,
+      "--desired-status",
+      "RUNNING",
+      "--output",
+      "json",
+    ],
+    access.region,
+  );
 }
 
 /** argv after `aws` for describing one task. */
 export function buildDescribeDaemonTaskArgs(access: EcsDaemonAccess, taskArn: string): string[] {
-  return ["ecs", "describe-tasks", "--cluster", access.cluster, "--tasks", taskArn, "--output", "json"];
+  return withRegion(
+    ["ecs", "describe-tasks", "--cluster", access.cluster, "--tasks", taskArn, "--output", "json"],
+    access.region,
+  );
 }
 
 /** First task ARN from an `ecs list-tasks --output json` response. Throws when the service has none. */
@@ -282,21 +331,29 @@ export function ssmSessionTarget(cluster: string, taskArn: string, runtimeId: st
 }
 
 /** argv after `aws` for the port-forward session that holds the tunnel open. */
-export function buildPortForwardArgs(target: string, remotePort: number, localPort: number): string[] {
-  return [
-    "ssm",
-    "start-session",
-    "--target",
-    target,
-    "--document-name",
-    "AWS-StartPortForwardingSessionToRemoteHost",
-    "--parameters",
-    JSON.stringify({
-      host: ["localhost"],
-      portNumber: [String(remotePort)],
-      localPortNumber: [String(localPort)],
-    }),
-  ];
+export function buildPortForwardArgs(
+  target: string,
+  remotePort: number,
+  localPort: number,
+  region?: string,
+): string[] {
+  return withRegion(
+    [
+      "ssm",
+      "start-session",
+      "--target",
+      target,
+      "--document-name",
+      "AWS-StartPortForwardingSessionToRemoteHost",
+      "--parameters",
+      JSON.stringify({
+        host: ["localhost"],
+        portNumber: [String(remotePort)],
+        localPortNumber: [String(localPort)],
+      }),
+    ],
+    region,
+  );
 }
 
 /**
@@ -338,7 +395,7 @@ export function ecsTunnelOpener(access: EcsDaemonAccess, aws: CloudCliRunner = a
       access.containerName,
     );
     const target = ssmSessionTarget(access.cluster, taskArn, runtimeId);
-    return { argv: ["aws", ...buildPortForwardArgs(target, access.port, localPort)], id: target };
+    return { argv: ["aws", ...buildPortForwardArgs(target, access.port, localPort, access.region)], id: target };
   };
 }
 
@@ -419,11 +476,16 @@ export class EcsProvider implements Provider {
   }
 
   /**
-   * argv after `aws` for run-task: nothing but the path to the input file.
-   * All parameters — and every secret — live in the file (#126).
+   * argv after `aws` for run-task: the path to the input file, plus --region
+   * (#138) — a routing flag, not a secret, kept on argv so region handling
+   * stays uniform with every other builder in this file. All parameters — and
+   * every secret — live in the file (#126).
    */
   buildRunTaskArgs(inputPath: string): string[] {
-    return ["ecs", "run-task", "--cli-input-json", `file://${inputPath}`, "--output", "json"];
+    return withRegion(
+      ["ecs", "run-task", "--cli-input-json", `file://${inputPath}`, "--output", "json"],
+      this.config.region,
+    );
   }
 
   /**
@@ -475,18 +537,21 @@ export class EcsProvider implements Provider {
 
   /** argv after `aws` for stopping one task — pure function, unit-tested without AWS. */
   buildStopTaskArgs(handle: string): string[] {
-    return [
-      "ecs",
-      "stop-task",
-      "--cluster",
-      this.config.cluster,
-      "--task",
-      handle,
-      "--reason",
-      "fleet-cancel",
-      "--output",
-      "json",
-    ];
+    return withRegion(
+      [
+        "ecs",
+        "stop-task",
+        "--cluster",
+        this.config.cluster,
+        "--task",
+        handle,
+        "--reason",
+        "fleet-cancel",
+        "--output",
+        "json",
+      ],
+      this.config.region,
+    );
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {

@@ -348,6 +348,15 @@ async function keepAlive(
   return undefined;
 }
 
+/** Log the /health result at the start of a forwarding session. */
+function logHealthStatus(deps: SuperviseDeps, health: string, localPort: number): void {
+  if (health === 'ok') {
+    deps.log('daemon /health ok on http://127.0.0.1:' + localPort);
+  } else if (health === 'silent' && !deps.stopped()) {
+    deps.log('warning: /health did not answer within ' + seconds(HEALTH_TIMEOUT_MS) + ' — holding the session open anyway');
+  }
+}
+
 /**
  * Hold the tunnel open until the operator stops it.
  *
@@ -393,11 +402,7 @@ export async function superviseTunnel(localPort: number, deps: SuperviseDeps): P
     const handle = deps.spawnForward(endpoint.argv);
     const exited = watchExit(handle);
     const health = await waitForHealth(deps, exited);
-    if (health === 'ok') {
-      deps.log(`daemon /health ok on http://127.0.0.1:${localPort}`);
-    } else if (health === 'silent' && !deps.stopped()) {
-      deps.log(`warning: /health did not answer within ${seconds(HEALTH_TIMEOUT_MS)} — holding the session open anyway`);
-    }
+    logHealthStatus(deps, health, localPort);
 
     const closed = await keepAlive(deps, handle, exited, health === 'ok');
     const exit = closed ?? (await handle.exited);
@@ -412,7 +417,7 @@ export async function superviseTunnel(localPort: number, deps: SuperviseDeps): P
     // open and stops a few minutes in is a crash loop, and crediting it for the
     // minutes it lasted would reopen against it every four minutes forever.
     failures = closed === undefined && lasted >= HEALTHY_SESSION_MS ? 0 : failures + 1;
-    deps.log(`session ended after ${seconds(lasted)} (${exit.how}) — reopening in ${seconds(wait())}`);
+    deps.log('session ended after ' + seconds(lasted) + ' (' + exit.how + ') — reopening in ' + seconds(wait()));
     await deps.sleep(wait());
   }
 }
