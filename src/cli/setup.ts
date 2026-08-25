@@ -800,6 +800,7 @@ type RepoManifest = {
   env?: { vars: string[] };
   harness: { cli: string; commands: Array<{ path: string; critic: string }> };
   gates: { pickup: string; default_finish: string };
+  limits: { idle: string; block_hot: string; decision_timeout: string };
 };
 
 /**
@@ -894,6 +895,9 @@ export function repoManifest(answers: Answers): RepoManifest {
     // Phase 1 ships one runner adapter, so the CLI is shown rather than asked.
     harness: { cli: 'claude-code', commands: [{ path: answers.command_path, critic: answers.critic }] },
     gates: { pickup: answers.pickup, default_finish: 'merge-ready' },
+    // Not interviewed: these are the documented defaults (src/shared/time.ts),
+    // written out so the manifest shows the cost model instead of hiding it.
+    limits: { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
   };
   if (sync.length > 0) manifest.workspace.sync = sync;
   if (vars.length > 0) manifest.env = { vars };

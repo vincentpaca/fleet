@@ -3,9 +3,10 @@
  * upload each to the daemon's artifact endpoint, and return produced[] entries
  * for the settle event.
  *
- * Size caps:
+ * Caps:
  *   PER_FILE_CAP: 10 MB per artifact file
  *   TOTAL_CAP:   100 MB total across all artifacts in one job
+ *   MAX_FILES:   file-count bound on the walk itself (#139)
  *
  * Over-cap files produce a loud note; the settle still completes and other
  * artifacts are delivered. The job never fails solely due to an over-cap file.
@@ -14,9 +15,9 @@
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP } from '../shared/home.ts';
+import { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP, ARTIFACT_MAX_FILES } from '../shared/home.ts';
 
-export { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP };
+export { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP, ARTIFACT_MAX_FILES };
 
 export type ProducedEntry = {
   id: string;
@@ -32,13 +33,47 @@ export type ArtifactResult = {
   notes: string[];
 };
 
-/** Recursive directory walk; yields absolute file paths. */
-function* walkDir(dir: string): Generator<string> {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkDir(full);
-    else if (entry.isFile()) yield full;
-  }
+/**
+ * Directory nesting the walk will follow (#139). Nobody stages artifacts 32
+ * directories deep on purpose; a deeper tree is a bomb (or a symlinked loop
+ * materialised as directories) and following it risks the settle itself.
+ */
+const MAX_WALK_DEPTH = 32;
+
+/**
+ * Bounded directory walk (#139): stops at ARTIFACT_MAX_FILES files and skips
+ * anything deeper than MAX_WALK_DEPTH, each with a loud note in the same
+ * over-cap style as the byte caps. Bounded during the walk, not after it —
+ * enumerating a file-count bomb to completion is the delay the cap exists to
+ * prevent, and the settle races the daemon's backstop margin.
+ */
+function listArtifactFiles(dir: string): { files: string[]; notes: string[] } {
+  const files: string[] = [];
+  const notes: string[] = [];
+  let capped = false;
+  let tooDeep = false;
+  const walk = (current: string, depth: number): void => {
+    if (depth > MAX_WALK_DEPTH) {
+      tooDeep = true;
+      return;
+    }
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (capped) return;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.isFile()) {
+        if (files.length >= ARTIFACT_MAX_FILES) {
+          capped = true;
+          return;
+        }
+        files.push(full);
+      }
+    }
+  };
+  walk(dir, 0);
+  if (capped) notes.push('artifact walk capped at ' + ARTIFACT_MAX_FILES + ' files; remaining files skipped');
+  if (tooDeep) notes.push('artifact walk skipped directories nested deeper than ' + MAX_WALK_DEPTH + ' levels');
+  return { files, notes };
 }
 
 /**
@@ -119,10 +154,9 @@ export async function collectArtifacts(opts: {
 }): Promise<ArtifactResult> {
   const artifactsDir = join(opts.workspace, '.fleet', 'out', 'artifacts');
   if (!existsSync(artifactsDir)) return { produced: [], notes: [] };
-  const allFiles = [...walkDir(artifactsDir)];
-  if (allFiles.length === 0) return { produced: [], notes: [] };
+  const { files: allFiles, notes } = listArtifactFiles(artifactsDir);
+  if (allFiles.length === 0) return { produced: [], notes };
 
-  const notes: string[] = [];
   const produced: ProducedEntry[] = [];
   let totalBytes = 0;
   const url = opts.daemonUrl.replace(/\/$/, '') + '/internal/jobs/' + encodeURIComponent(opts.jobId) + '/artifacts';

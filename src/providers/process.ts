@@ -39,8 +39,12 @@ export function prepareWorkspace(spec: LaunchSpec, root: string): string {
   writeFileSync(join(fleetDir, "order.json"), JSON.stringify(spec.workOrder, null, 2));
   for (const [relPath, base64] of Object.entries(spec.sync)) {
     const target = resolve(workspace, relPath);
-    if (target !== workspace && !target.startsWith(workspace + sep)) {
-      throw new Error(`sync path escapes workspace: ${relPath}`);
+    // Strict containment (#139): the old guard admitted the workspace root
+    // itself, so a sync key of "." crashed writeFileSync with EISDIR instead
+    // of failing with a readable error. Same predicate as the runner's
+    // materializeWorkspace — keep them identical.
+    if (!target.startsWith(workspace + sep)) {
+      throw new Error(`sync path "${relPath}" resolves to the workspace root or escapes it`);
     }
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, Buffer.from(base64, "base64"));

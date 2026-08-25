@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
   validateManifest,
   validateWorkOrder,
+  manifestSchema,
   jobStates,
 } from '../src/validate.mjs';
 
@@ -81,6 +82,30 @@ test('work order continues (#80): additive, followthrough-only, both fields requ
   assert.equal(validateWorkOrder({ ...ft, continues: { pr: '77', branch: 'x' } }).ok, false, 'pr must be a number, not a string');
   assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77, branch: '' } }).ok, false, 'branch must be non-empty');
   assert.equal(validateWorkOrder({ ...ft, continues: { ...c, extra: true } }).ok, false, 'unknown continues fields are rejected');
+});
+
+test('wall_clock forbids zero in both schemas (#134): an instant death sentence is a typo', () => {
+  const m = read('examples/full.manifest.json');
+  m.limits.wall_clock = '0m';
+  assert.equal(validateManifest(m).ok, false, 'manifest wall_clock "0m" must fail');
+  m.limits.wall_clock = '0s';
+  assert.equal(validateManifest(m).ok, false, 'manifest wall_clock "0s" must fail');
+  m.limits.wall_clock = '90m';
+  assert.equal(validateManifest(m).ok, true, 'a real budget still validates');
+
+  const base = { mode: 'implement', target: 'APP-123', finish: 'implemented' };
+  assert.equal(validateWorkOrder({ ...base, limits: { wall_clock: '0m' } }).ok, false, 'order wall_clock "0m" must fail');
+  assert.equal(validateWorkOrder({ ...base, limits: { wall_clock: '1m' } }).ok, true, 'a real override still validates');
+});
+
+test('limit defaults have exactly one source of truth (#134): no "default" annotations in the schema', () => {
+  // Ajv is built without useDefaults, so a "default" annotation here is inert —
+  // a second, false source of truth beside src/shared/time.ts. The descriptions
+  // name the defaults and where they live; the annotation must stay deleted.
+  const props = manifestSchema.properties.limits.properties;
+  for (const key of ['wall_clock', 'idle', 'block_hot', 'decision_timeout']) {
+    assert.equal('default' in props[key], false, `manifest limits.${key} must carry no inert "default" annotation`);
+  }
 });
 
 test('job state machine transitions are closed over declared states', () => {

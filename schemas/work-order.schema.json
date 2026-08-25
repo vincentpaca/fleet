@@ -58,9 +58,9 @@
     "limits": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Per-dispatch overrides of manifest limits.",
+      "description": "Per-dispatch overrides of manifest limits. Merged over the manifest's limits at one chokepoint (src/shared/time.ts mergedLimits) read by both the daemon and the runner.",
       "properties": {
-        "wall_clock": { "type": "string", "pattern": "^[0-9]+(m|h)$" },
+        "wall_clock": { "type": "string", "pattern": "^[1-9][0-9]*(m|h)$" },
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$" },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$" }
       }

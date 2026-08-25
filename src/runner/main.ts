@@ -33,9 +33,19 @@ import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDr
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { runSetupScript } from './setup.ts';
-import { parseDurationMs, idleLimitMs, heartbeatMs, toMinutes } from '../shared/time.ts';
+import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
+
+/**
+ * Hard cap on one harness stdout line (#139). Readline buffers the whole line
+ * before 'line' fires, but everything downstream — the capture file, the
+ * translator's JSON.parse, the event it may become — must not carry an
+ * unbounded payload. Generous: real stream-json lines with embedded file
+ * contents run to the hundreds of KB, never MBs.
+ */
+const MAX_LINE_CHARS = 1_048_576;
+const LINE_TRUNCATION_MARKER = '…[truncated by fleet runner]';
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -110,9 +120,13 @@ async function main(): Promise<void> {
   // named PR branch instead of creating a fresh one. Schema-validated at
   // dispatch; the shape check here only guards direct runner invocations.
   let continues: { pr: number; branch: string } | undefined;
+  // Per-dispatch limit overrides (#134): the work order's limits win over the
+  // manifest's. Merged below through the same chokepoint the daemon uses.
+  let orderLimits: unknown;
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
+    orderLimits = order.limits;
     if (typeof order.title === 'string' && order.title) orderTitle = order.title;
     authorityPublish = order?.authority?.publish === true;
     if (typeof order?.continues?.pr === 'number' && typeof order?.continues?.branch === 'string' && order.continues.branch !== '') {
@@ -288,14 +302,16 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
 
   // Parse limits; build timers so the decision watcher can pause the wall-clock
-  // while blocked and park the job when block_hot expires.
-  const limits = (manifest.limits ?? {}) as Record<string, unknown>;
+  // while blocked and park the job when block_hot expires. Work-order limits
+  // override manifest limits (#134) — same merge the daemon applies at intake.
+  const limits = mergedLimits(manifest.limits, orderLimits);
   const wallClockStr = typeof limits.wall_clock === 'string' ? limits.wall_clock : undefined;
   const wallClockLimitMs = wallClockStr !== undefined ? parseDurationMs(wallClockStr) : undefined;
   const wallClock = wallClockLimitMs !== undefined ? new WallClockTimer(wallClockLimitMs, startedAt) : undefined;
 
-  const blockHotStr = typeof limits.block_hot === 'string' ? limits.block_hot : undefined;
-  const blockHotMs = blockHotStr !== undefined ? parseDurationMs(blockHotStr) : undefined;
+  // Always a number (#134): a job whose question is never answered must park
+  // at the documented default rather than keeping the container hot forever.
+  const blockHotMs = blockHotLimitMs(limits);
 
   // Stall detection (#39): unlike wall_clock this is always armed — a running
   // job that emits nothing is never in an intended state. The threshold defaults
@@ -385,10 +401,27 @@ async function main(): Promise<void> {
   const heartbeatWindow =
     parseInt(process.env.FLEET_HEARTBEAT_MS ?? '', 10) || heartbeatMs(idleMs);
   let lastEmitAt = startedAt;
-  lines.on('line', (line) => {
+  // Line-length cap (#139): truncate, mark, and continue — never crash on an
+  // unbounded line. Only the first truncation is announced; a harness that
+  // streams many oversized lines must not turn the cap into its own flood.
+  let truncatedLines = 0;
+  const capLine = (raw: string): string => {
+    if (raw.length <= MAX_LINE_CHARS) return raw;
+    truncatedLines += 1;
+    if (truncatedLines === 1) {
+      forget(sink.emit({
+        type: 'log',
+        who: 'runner',
+        text: `harness emitted a ${raw.length}-char line; truncated to ${MAX_LINE_CHARS} (later truncations are silent)`,
+      }));
+    }
+    return raw.slice(0, MAX_LINE_CHARS) + LINE_TRUNCATION_MARKER;
+  };
+  lines.on('line', (rawLine) => {
     // Any output line is proof of life, translatable or not: the stall clock
     // measures silence on the harness's own stream, not event throughput.
     idle.touch();
+    const line = capLine(rawLine);
     if (capture) {
       captureStream ??= createWriteStream(capture, { flags: 'a' });
       captureStream.write(line + '\n');
@@ -645,8 +678,8 @@ async function main(): Promise<void> {
     }
   };
 
-  // Park signal: resolves with the decision id when block_hot fires.
-  // Silently never resolves if blockHotMs is not set.
+  // Park signal: resolves with the decision id when block_hot fires. Always
+  // armed — blockHotLimitMs defaults when the merged limits carry no value.
   const parkPromise = watcher.parked.then(
     (decisionId) => ({ kind: 'parked' as const, decisionId }),
   );
@@ -749,6 +782,26 @@ async function main(): Promise<void> {
   await sink.flush();
   await endCapture();
   await watcher.stop();
+
+  // Settle heartbeat (#139): the liveness line above lives in the stdout
+  // handler and dies with the harness — exactly when the settle work (WIP/work
+  // push, PR create, artifact upload) starts racing the daemon's backstops.
+  // The idle sweep measures event-stream silence and, firing, terminates the
+  // container without pushing anything; one bounded line per window keeps it
+  // fed for as long as the settle honestly takes. The wall-clock backstop is
+  // deliberately NOT extended: after a wall-clock expiry the whole settle —
+  // SIGTERM grace (30s default) + pushes + PR + artifacts — must fit inside
+  // its fixed margin (DEFAULT_BACKSTOP_MARGIN_MS, 90s). That is the budget.
+  const settleStartedAt = Date.now();
+  const settleHeartbeatWindow =
+    parseInt(process.env.FLEET_SETTLE_HEARTBEAT_MS ?? '', 10) || SETTLE_HEARTBEAT_MS;
+  const settleHeartbeat = setInterval(() => {
+    forget(sink.emit({
+      type: 'log',
+      who: 'runner',
+      text: `settling — ${toMinutes(Date.now() - settleStartedAt)}m in (pushing work, collecting artifacts)`,
+    }));
+  }, settleHeartbeatWindow);
 
   // Deliver the work (#2): commit and push whatever the harness produced —
   // partial work included; evidence over tidiness.
@@ -902,6 +955,7 @@ async function main(): Promise<void> {
     const notDone = Array.isArray(report.not_done) ? report.not_done as unknown[] : [];
     body.report = { ...report, not_done: [...notDone, timeout.nextAction] };
   }
+  clearInterval(settleHeartbeat);
   await sink.emit(body);
 
   if (ok) {

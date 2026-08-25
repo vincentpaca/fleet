@@ -26,7 +26,7 @@
  * (the dispatched manifest wins over the cloned one, but is never pushed).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 // The gh-executor seam (inject in tests; defaults to the real gh CLI) is
 // shared with the daemon's rung verification — one definition (#128).
@@ -74,10 +74,16 @@ const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
  */
 export function gitCredentialEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   if (!env.GH_TOKEN && !env.GITHUB_TOKEN) return {};
+  // Merge with inherited GIT_CONFIG_* (#139): the job env may already carry
+  // config entries (an operator's own injection, a CI harness). Returning a
+  // hardcoded GIT_CONFIG_COUNT of 1 silently clobbered them — append the
+  // helper at the next index instead.
+  const inherited = parseInt(env.GIT_CONFIG_COUNT ?? '', 10);
+  const next = Number.isInteger(inherited) && inherited > 0 ? inherited : 0;
   return {
-    GIT_CONFIG_COUNT: '1',
-    GIT_CONFIG_KEY_0: 'credential.https://github.com.helper',
-    GIT_CONFIG_VALUE_0: '!gh auth git-credential',
+    GIT_CONFIG_COUNT: String(next + 1),
+    [`GIT_CONFIG_KEY_${next}`]: 'credential.https://github.com.helper',
+    [`GIT_CONFIG_VALUE_${next}`]: '!gh auth git-credential',
   };
 }
 
@@ -200,6 +206,29 @@ function restoreDispatchFiles(workspace: string, preserved: Map<string, Buffer>)
 }
 
 /**
+ * Merge exclude entries into .git/info/exclude, deduped (#139): every launch
+ * gets a fresh workspace today, but nothing structural guarantees that — a
+ * reused workspace must never accrete duplicate entries. Read-merge-write,
+ * not check-then-append: a read that treats a missing file as empty and one
+ * whole-file write leave no exists/read/append window (js/file-system-race).
+ */
+function mergeExcludes(workspace: string, excludes: string[]): void {
+  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
+  const excludeFile = join(workspace, '.git', 'info', 'exclude');
+  let current = '';
+  try {
+    current = readFileSync(excludeFile, 'utf8');
+  } catch {
+    // No exclude file yet: merge into empty content.
+  }
+  const present = new Set(current.split('\n'));
+  const fresh = excludes.filter((line) => !present.has(line));
+  if (fresh.length === 0) return;
+  const head = current === '' || current.endsWith('\n') ? current : current + '\n';
+  writeFileSync(excludeFile, head + fresh.join('\n') + '\n');
+}
+
+/**
  * Turn the staged workspace into a checkout of the repo on the job branch,
  * and push the branch immediately. Returns the branch name and base branch.
  */
@@ -221,9 +250,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
 
   // Restore the dispatch payload over whatever the clone brought in, and make
   // sure none of it can ever be committed or pushed.
-  const excludes = restoreDispatchFiles(workspace, preserved);
-  mkdirSync(join(workspace, '.git', 'info'), { recursive: true });
-  appendFileSync(join(workspace, '.git', 'info', 'exclude'), excludes.join('\n') + '\n');
+  mergeExcludes(workspace, restoreDispatchFiles(workspace, preserved));
 
   if (!existing) {
     // Initial setup: push the branch immediately so evidence is preserved even

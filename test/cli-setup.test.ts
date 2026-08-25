@@ -615,6 +615,11 @@ test('setup repo: an all-Enter interview extracts a valid manifest from the chec
   assert.equal(manifest.harness.commands[0].critic, 'code-reviewer');
   assert.deepEqual(manifest.env.vars, ['API_TOKEN', 'DB_URL'], 'env var names come from .env.example');
   assert.equal(manifest.workspace.sync, undefined, 'an empty answer omits the section, never an empty array');
+  assert.deepEqual(
+    manifest.limits,
+    { idle: '20m', block_hot: '30m', decision_timeout: '24h' },
+    '#134: the interview writes the documented limit defaults explicitly',
+  );
 
   assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8'), /npm ci/);
   assert.equal((await runCli(['lint'], { cwd })).code, 0, 'the interview cannot produce a manifest lint rejects');

@@ -32,7 +32,11 @@ export type MockDaemon = {
   close(): Promise<void>;
 };
 
-export async function startMockDaemon(opts: { token: string }): Promise<MockDaemon> {
+export async function startMockDaemon(opts: {
+  token: string;
+  /** Hold each artifact upload this long before answering — simulates a slow settle (#139). */
+  artifactDelayMs?: number;
+}): Promise<MockDaemon> {
   const events: PostedEvent[] = [];
   const artifacts: PostedArtifact[] = [];
   const rejected: { event: unknown; errors: unknown }[] = [];
@@ -82,6 +86,9 @@ export async function startMockDaemon(opts: { token: string }): Promise<MockDaem
     if (req.method === 'POST' && /^\/internal\/jobs\/[^/]+\/artifacts$/.test(url.pathname)) {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
+      if (opts.artifactDelayMs !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, opts.artifactDelayMs));
+      }
       artifacts.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as PostedArtifact);
       res.writeHead(200).end(JSON.stringify({ stored: true }));
       return;

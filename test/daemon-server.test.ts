@@ -6,6 +6,7 @@ import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { request } from "../src/shared/http.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, tempHome, op, runnerPost, until } from "./daemon-helpers.ts";
+import { DEFAULT_DECISION_TIMEOUT_MS } from "../src/shared/time.ts";
 import type { ResourceRequest } from "../src/providers/provider.ts";
 
 const LONG_POLL_MS = 300;
@@ -976,6 +977,67 @@ test("decision_timeout sweep marks parked job stale; job remains answerable", as
   const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
   assert.equal(answered.status, 200, answered.body);
   assert.equal(provider.launches.length, 2, "stale job must re-launch on answer");
+});
+
+test("stale sweep fires for a manifest with no limits block: the 24h default is armed (#134)", async (t) => {
+  // Before #134 initDecisionTimeout only ran when the manifest named the key,
+  // so the documented happy-path manifest (fleet init wrote no limits block)
+  // produced parked jobs that never surfaced as stale. MANIFEST here carries
+  // no limits key at all — the default must arm the sweep anyway.
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    wallClockSweepIntervalMs: 100,
+  });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+  assert.equal(
+    daemon.registry.decisionTimeLimitMs(id),
+    DEFAULT_DECISION_TIMEOUT_MS,
+    "the documented 24h default must be armed at creation",
+  );
+  const token = provider.launches[0].runnerToken;
+
+  await runnerPost(sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(sock, id, token, event(id, 1, DECISION));
+  await runnerPost(sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+
+  // Compressed clock: pretend the decision has been waiting for 24h + 1m.
+  daemon.registry.setDecisionBlockedAt(id, Date.now() - (DEFAULT_DECISION_TIMEOUT_MS + 60_000));
+
+  await until(async () => {
+    const j = jobOf((await op(sock, "GET", `/jobs/${id}`)).json);
+    return j.state === "blocked" && j.marker === "stale";
+  }, 2_000);
+});
+
+test("work-order limits override manifest limits at job creation (#134)", async (t) => {
+  // workOrder.limits ("per-dispatch overrides", work-order.schema.json) had
+  // zero consumers: an operator's override silently did nothing. The daemon
+  // must arm its backstops from the merged view — order keys win, manifest
+  // keys the order does not name survive.
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const manifest = { ...MANIFEST, limits: { wall_clock: "4h", decision_timeout: "24h" } };
+  const workOrder = { ...WORK_ORDER, limits: { wall_clock: "1m" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder, manifest });
+  assert.equal(res.status, 201, res.body);
+  const id = jobOf(res.json).id;
+
+  assert.equal(ctx.daemon.registry.wallClockLimitMs(id), 60_000, "the order's 1m must beat the manifest's 4h");
+  assert.equal(
+    ctx.daemon.registry.decisionTimeLimitMs(id),
+    24 * 3_600_000,
+    "manifest keys the order does not override keep their value",
+  );
 });
 
 test("re-launch failure after answer cancels the job — not stuck in blocked", async (t) => {

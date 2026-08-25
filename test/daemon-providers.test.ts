@@ -278,7 +278,23 @@ test("prepareWorkspace materialises manifest, order, and sync files; refuses pat
 
   assert.throws(
     () => prepareWorkspace({ ...SPEC, sync: { "../evil.txt": Buffer.from("x").toString("base64") } }, root),
-    /escapes workspace/,
+    /escapes it/,
+  );
+});
+
+test("prepareWorkspace rejects a sync key naming the workspace root with a readable error (#139)", () => {
+  // "." resolves to the workspace itself: the old guard admitted it and
+  // writeFileSync(workspace) crashed EISDIR — an opaque failure instead of a
+  // readable rejection before anything is materialised.
+  const root = mkdtempSync(join(tmpdir(), "fleet-ws-"));
+  assert.throws(
+    () => prepareWorkspace({ ...SPEC, sync: { ".": Buffer.from("x").toString("base64") } }, root),
+    (err: unknown) => {
+      const message = String(err instanceof Error ? err.message : err);
+      assert.match(message, /workspace root/, `expected a readable root rejection, got: ${message}`);
+      assert.doesNotMatch(message, /EISDIR/, "must reject by policy, not crash on the write");
+      return true;
+    },
   );
 });
 
@@ -334,6 +350,45 @@ test("materializeWorkspace drops path-traversal sync entries and logs a warning"
     assert.ok(
       stderrLines.some((line) => line.includes("../evil.txt")),
       `expected a warning mentioning the dropped path; got: ${JSON.stringify(stderrLines)}`,
+    );
+  } finally {
+    console.error = origError;
+    for (const key of ["FLEET_MANIFEST_JSON", "FLEET_SYNC_JSON"]) {
+      if (key in origEnv) {
+        process.env[key] = origEnv[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+  }
+});
+
+test("materializeWorkspace drops a sync key naming the workspace root instead of crashing EISDIR (#139)", () => {
+  // The old guard (`target !== workspace && ...`) admitted the root itself, so
+  // a sync key of "." reached writeFileSync(workspace) and threw EISDIR before
+  // any EventSink existed — the job died with no readable trace. It must be
+  // dropped with a warning like any other out-of-workspace entry, and the
+  // remaining sync entries must still land.
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-root-"));
+  const origEnv = { ...process.env };
+  const stderrLines: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => stderrLines.push(args.join(" "));
+  try {
+    process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
+    process.env.FLEET_SYNC_JSON = Buffer.from(
+      JSON.stringify({
+        ".": Buffer.from("boom").toString("base64"),
+        ".env.development": Buffer.from("A=1\n").toString("base64"),
+      }),
+    ).toString("base64");
+
+    materializeWorkspace(workspace); // must not throw
+
+    assert.equal(readFileSync(join(workspace, ".env.development"), "utf8"), "A=1\n", "good entries still land");
+    assert.ok(
+      stderrLines.some((line) => line.includes('"."') && line.includes("workspace root")),
+      `expected a readable warning naming the dropped "." entry; got: ${JSON.stringify(stderrLines)}`,
     );
   } finally {
     console.error = origError;
