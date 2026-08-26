@@ -146,14 +146,62 @@ export function checkResourceFit(resources: ResourceRequest, tiers: CapacityTier
 }
 
 /**
+ * The plain string value in an `aws ssm get-parameter --output json` response.
+ * Pure function — testable without shelling out.
+ */
+export function parseSsmParameterValue(ssmJson: string): string {
+  const response = JSON.parse(ssmJson) as { Parameter?: { Value?: string } };
+  const value = response?.Parameter?.Value;
+  if (!value) throw new Error("SSM get-parameter response missing Parameter.Value");
+  return value;
+}
+
+/**
  * Parse the raw JSON string returned by `aws ssm get-parameter --output json`.
  * Pure function — testable without shelling out.
  */
 export function parseFleetConfigSsmResponse(ssmJson: string): FleetConfig {
-  const response = JSON.parse(ssmJson) as { Parameter?: { Value?: string } };
-  const value = response?.Parameter?.Value;
-  if (!value) throw new Error("SSM get-parameter response missing Parameter.Value");
-  return JSON.parse(value) as FleetConfig;
+  return JSON.parse(parseSsmParameterValue(ssmJson)) as FleetConfig;
+}
+
+/**
+ * Where a deployment's operator token lives, derived from where its config
+ * lives (#188): the sibling `operator-token` under the same SSM prefix —
+ * `/fleet/fleet-config` → `/fleet/operator-token`. Derived, never hardcoded,
+ * so a unit deployed under another name (`/staging/fleet-config`) publishes
+ * and fetches under its own prefix. One function for both ends of the
+ * contract: the daemon publishes to it at boot, the CLI fetches from it.
+ */
+export function operatorTokenSsmPath(configSsmPath: string): string {
+  return `${configSsmPath.slice(0, configSsmPath.lastIndexOf("/") + 1)}operator-token`;
+}
+
+/**
+ * Publish the operator token beside the config parameter (#188): a fresh
+ * deployment mints its token on EFS, and without this the operator's only way
+ * to it is `aws ecs execute-command` by hand. SecureString under the
+ * account's `aws/ssm` key — the daemon only knows the parameter *path*, not
+ * the unit's CMK, and the managed key needs no kms grant on either side.
+ * Anyone with SSM read on the path already holds execute-command-grade access
+ * to the account, so this widens nothing. The token rides a 0600 file into
+ * `--cli-input-json`, never argv (#126). No --region for the same reason as
+ * ecsConfigFromSsm above: inside the task, AWS_REGION is the right value.
+ * Returns the parameter name so the boot log can say where it went.
+ */
+export async function publishOperatorTokenToSsm(configSsmPath: string, token: string): Promise<string> {
+  const name = operatorTokenSsmPath(configSsmPath);
+  const input = writeSecretTempFile(
+    "fleet-ssm-token-",
+    JSON.stringify({ Name: name, Value: token, Type: "SecureString", Overwrite: true }),
+  );
+  try {
+    await run("aws", ["ssm", "put-parameter", "--cli-input-json", `file://${input.path}`, "--output", "json"], {
+      timeout: AWS_CLI_TIMEOUT_MS,
+    });
+  } finally {
+    input.cleanup();
+  }
+  return name;
 }
 
 /**

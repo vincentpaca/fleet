@@ -86,7 +86,7 @@ export function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-export type MockRequest = { method: string; url: string; body: string };
+export type MockRequest = { method: string; url: string; body: string; headers: http.IncomingHttpHeaders };
 
 export type MockDaemon = {
   url: string;
@@ -108,7 +108,7 @@ export function startMockDaemon(
       body += chunk;
     });
     req.on('end', () => {
-      const record: MockRequest = { method: req.method ?? '', url: req.url ?? '', body };
+      const record: MockRequest = { method: req.method ?? '', url: req.url ?? '', body, headers: req.headers };
       requests.push(record);
       const pathname = record.url.split('?')[0];
       const handler = routes[`${record.method} ${pathname}`];

@@ -12,7 +12,9 @@ import {
   awsCli,
   ecsDaemonAccessFromFleetConfig,
   ecsTunnelOpener,
+  operatorTokenSsmPath,
   parseFleetConfigSsmResponse,
+  parseSsmParameterValue,
   type FleetConfig,
 } from '../providers/ecs.ts';
 
@@ -70,4 +72,28 @@ export function refreshDeployment(
     source: `SSM parameter ${ssmPath}`,
     config: parseFleetConfigSsmResponse(stdout),
   }));
+}
+
+/**
+ * Fetch the operator token the deployment's daemon published at boot (#188),
+ * for a CLI whose local copy is absent or refused. Same dispatch shape as
+ * refreshDeployment above: the captured config names its own config parameter,
+ * the token is the sibling `operator-token` under that prefix, and the read
+ * runs with the operator's existing AWS credentials. Returns undefined when
+ * this provider offers no such source or the config does not name one — the
+ * caller then falls back to the 401 the daemon already gave it.
+ */
+export function fetchDeploymentOperatorToken(
+  config: Record<string, unknown>,
+  run: CloudRunner = awsCli,
+): Promise<string> | undefined {
+  if (config.provider !== 'ecs') return undefined;
+  const ssmPath = config.ssm_config_path;
+  if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
+  // --with-decryption and --region for the same reasons refreshDeployment
+  // passes them: SecureString, and the parameter lives in the deployment's
+  // region, not the caller's ambient one (#138).
+  const args = ['ssm', 'get-parameter', '--name', operatorTokenSsmPath(ssmPath), '--with-decryption', '--output', 'json'];
+  if (typeof config.region === 'string' && config.region !== '') args.push('--region', config.region);
+  return run(args).then((stdout) => parseSsmParameterValue(stdout).trim());
 }
