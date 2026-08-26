@@ -57,6 +57,55 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
+  # The mocked-apply run below (#189) needs computed attributes shaped like the
+  # real thing: a generated mock is a random string, and the provider validates
+  # ARN-taking arguments (kms_key_id, task/execution role ARNs) at apply even
+  # against a mock. Plan runs are untouched — computed values stay unknown at
+  # plan regardless of these defaults.
+  mock_resource "aws_kms_key" {
+    defaults = {
+      arn = "arn:aws:kms:us-east-1:111122223333:key/00000000-0000-0000-0000-000000000000"
+    }
+  }
+
+  mock_resource "aws_iam_role" {
+    defaults = {
+      arn = "arn:aws:iam::111122223333:role/mock-role"
+    }
+  }
+
+  mock_resource "aws_ecr_repository" {
+    defaults = {
+      arn            = "arn:aws:ecr:us-east-1:111122223333:repository/mock-repo"
+      repository_url = "111122223333.dkr.ecr.us-east-1.amazonaws.com/mock-repo"
+    }
+  }
+
+  mock_resource "aws_cloudwatch_log_group" {
+    defaults = {
+      arn = "arn:aws:logs:us-east-1:111122223333:log-group:/mock"
+    }
+  }
+
+  mock_resource "aws_autoscaling_group" {
+    defaults = {
+      arn = "arn:aws:autoscaling:us-east-1:111122223333:autoScalingGroup:00000000-0000-0000-0000-000000000000:autoScalingGroupName/mock-asg"
+    }
+  }
+
+  mock_resource "aws_ecs_cluster" {
+    defaults = {
+      arn = "arn:aws:ecs:us-east-1:111122223333:cluster/mock-cluster"
+    }
+  }
+
+  mock_resource "aws_ecs_task_definition" {
+    defaults = {
+      arn                  = "arn:aws:ecs:us-east-1:111122223333:task-definition/mock:1"
+      arn_without_revision = "arn:aws:ecs:us-east-1:111122223333:task-definition/mock"
+    }
+  }
 }
 
 # The default shape: the unit creates its VPC with public subnets and no NAT
@@ -357,6 +406,106 @@ run "runner_default_exceeding_tier_fails_at_plan" {
   }
 
   expect_failures = [aws_ecs_task_definition.runner]
+}
+
+# --- in-account image build (#189) -------------------------------------------------
+
+# `fleet setup infra` owns image production: a pinned source ref provisions the
+# CodeBuild project that builds :runner and :daemon from the public repo at
+# exactly that ref, and fleet_config names the project so the wizard can start
+# the build it provisioned.
+run "a_pinned_source_ref_provisions_the_image_build" {
+  command = plan
+
+  variables {
+    source_ref = "v9"
+  }
+
+  assert {
+    condition = (
+      aws_codebuild_project.images[0].source[0].location == "https://github.com/vincentpaca/fleet.git" &&
+      aws_codebuild_project.images[0].source_version == "v9"
+    )
+    error_message = "the image build must clone the public repository at exactly the ref the module was applied from — any other source lets images and infra skew"
+  }
+
+  # The two tags the task definitions pin, built and pushed by the buildspec.
+  # Both docker builds and both pushes: a buildspec that quietly drops one
+  # image leaves a deployment whose daemon (or runner) can never start.
+  assert {
+    condition = alltrue([
+      for needle in [
+        ":runner\" -f images/runner/Dockerfile",
+        ":daemon\" -f images/daemon/Dockerfile",
+        "docker push \"$REPOSITORY_URL:runner\"",
+        "docker push \"$REPOSITORY_URL:daemon\"",
+      ] : strcontains(aws_codebuild_project.images[0].source[0].buildspec, needle)
+    ])
+    error_message = "the buildspec must build BOTH images from images/ and push the :runner and :daemon tags the task definitions pin"
+  }
+
+  # `docker build` needs the Docker daemon CodeBuild starts only in privileged
+  # builds; without it the first build fails after the apply already succeeded.
+  assert {
+    condition     = aws_codebuild_project.images[0].environment[0].privileged_mode == true
+    error_message = "the image build environment must be privileged, or docker build has no daemon to talk to"
+  }
+
+  assert {
+    condition     = output.fleet_config.image_build_project == "fleet-images"
+    error_message = "fleet_config must name the build project, or the wizard cannot start the build the apply provisioned (and --rebuild-images has nothing to re-run)"
+  }
+}
+
+# No ref means no honest source to build from: the unit provisions nothing and
+# fleet_config says so, rather than defaulting to a floating branch that would
+# skew images from infra the day after the apply.
+run "an_unpinned_module_source_provisions_no_image_build" {
+  command = plan
+
+  assert {
+    condition = (
+      length(aws_codebuild_project.images) == 0 &&
+      length(aws_iam_role.image_build) == 0 &&
+      output.fleet_config.image_build_project == null
+    )
+    error_message = "without source_ref the unit must provision no build project (and fleet_config must carry null), so the CLI refuses honestly instead of building from an unpinned default"
+  }
+}
+
+# The push grant, scoped tight. A mocked apply rather than a plan: the policy
+# JSON embeds the repository's computed ARN, so its rendered value only exists
+# once the mock provider has "created" the repository.
+run "image_build_role_pushes_to_the_runner_repository_only" {
+  command = apply
+
+  variables {
+    source_ref = "v9"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.image_build[0].policy).Statement :
+      contains(s.Action, "ecr:PutImage") && s.Resource == aws_ecr_repository.runner.arn
+    ])
+    error_message = "the image-build role's ECR push actions must be scoped to this deployment's runner repository — a wildcard push grant can overwrite every image in the account"
+  }
+
+  assert {
+    condition = !anytrue([
+      for s in jsondecode(aws_iam_role_policy.image_build[0].policy).Statement :
+      contains(s.Action, "ecr:PutImage") && s.Resource == "*"
+    ])
+    error_message = "no statement may grant ecr:PutImage on * (ecr:GetAuthorizationToken is the only action AWS forces to *)"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(aws_iam_role_policy.image_build[0].policy).Statement :
+      contains(s.Action, "logs:PutLogEvents") && s.Resource == "${aws_cloudwatch_log_group.image_build[0].arn}:*"
+    ])
+    error_message = "the image-build role's log grant must be scoped to its own log group"
+  }
 }
 
 # --- worker break-glass (#198) ---------------------------------------------------

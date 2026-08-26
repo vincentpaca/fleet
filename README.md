@@ -16,7 +16,7 @@ npm install -g github:vincentpaca/fleet   # always current
 npm install -g ownfleet                   # the npm registry name; may lag main
 ```
 
-That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs two more tools — Terraform >= 1.7 and Docker — and runs from a Fleet checkout (`fleet setup infra` and `images/build.sh` in the quick start below), because the Terraform unit and image sources ship by git, not in the npm package.
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs one more tool — Terraform >= 1.7 — and runs from a Fleet checkout (`fleet setup infra` in the quick start below), because the Terraform unit ships by git, not in the npm package. The container images are built inside your own cloud account by the wizard, so Docker on your machine is only needed for the developer path (`images/build.sh`).
 
 ## What Fleet owns
 
@@ -49,7 +49,7 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work. `fleet setup repo` writes it by interview, with the defaults read out of your checkout.
-2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. Costs are bounded on both ends: idle workers cost nothing (the fleet floors at zero and runs Spot by default), and every job carries hard wall-clock and idle budgets, so a runaway dispatch dies at its cap instead of billing overnight. `fleet setup infra --destroy` takes it back down.
+2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. Costs are bounded on both ends: idle workers cost nothing (the fleet floors at zero and runs Spot by default), and every job carries hard wall-clock and idle budgets, so a runaway dispatch dies at its cap instead of billing overnight. After the apply, the same command builds Fleet's runner and daemon images inside your account — from the exact git ref the Terraform is pinned to — and pushes them to the deployment's registry; `--rebuild-images` re-runs just that on upgrade, and `fleet setup infra --destroy` takes it all back down.
 3. `fleet delegate 42` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back. A dispatch is a target and a prompt — nothing to configure: name an issue or a PR and the job delivers a draft PR, or write the ask in prose and it delivers a report and its files instead.
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
 5. The job ends as a draft pull request (or, for a prose dispatch, a report with artifacts you pull down with `fleet artifacts <job> get <file>`). A human merges it. Fleet never merges and never deploys.
@@ -59,15 +59,14 @@ From a machine that has never seen Fleet, that is the whole path:
 ```sh
 npm install -g github:vincentpaca/fleet
 fleet setup repo        # interview → .fleet/manifest.json (fleet init for the placeholder scaffold)
-fleet setup infra       # interview → plan → apply → .fleet/infra/aws/fleet-config.json
-<fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
+fleet setup infra       # interview → plan → apply → images built in your account → fleet-config.json
 fleet connect           # hold the SSM tunnel to the daemon
 fleet setup harness     # install the delegate skill into your coding harness
 fleet delegate 42                      # an issue: ends in a draft PR
 fleet delegate "why do queued jobs sit behind the capacity cap"   # prose: ends in a report
 ```
 
-`setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
+`setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. The runner and daemon images are built by the same command, inside your account (a one-shot CodeBuild project the unit provisions), from that same pinned ref — images and infrastructure can never skew, and there is no clone and no local Docker anywhere on this path. `fleet setup infra --rebuild-images` re-runs just the build when you upgrade. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
 
 ## Using Fleet from your coding harness
 

@@ -63,6 +63,39 @@ if (args[0] === '--hold') {
   const readRound = () => (existsSync(roundFile) ? Number(readFileSync(roundFile, 'utf8')) : 1);
   const [service, action] = args;
 
+  if (service === 'codebuild') {
+    // The wizard's in-account image build (#189): start-build, then poll with
+    // batch-get-builds until terminal. Calls land in codebuild.log so tests
+    // can assert the project, region and cadence; state files steer failures:
+    //   fail-start-build — start-build exits non-zero (no permission, no project)
+    //   fail-image-build — the build ends FAILED instead of SUCCEEDED
+    appendFileSync(join(dir, 'codebuild.log'), `${args.join(' ')}\n`);
+    if (action === 'start-build') {
+      if (existsSync(join(dir, 'fail-start-build'))) {
+        process.stderr.write('fake-aws: AccessDeniedException on StartBuild\n');
+        process.exit(254);
+      }
+      const project = args[args.indexOf('--project-name') + 1];
+      process.stdout.write(`${project}:fake-build-1\n`); // --query build.id --output text
+      process.exit(0);
+    }
+    if (action === 'batch-get-builds') {
+      const pollFile = join(dir, 'build-polls');
+      const polls = (existsSync(pollFile) ? Number(readFileSync(pollFile, 'utf8')) : 0) + 1;
+      writeFileSync(pollFile, String(polls));
+      // Two in-progress phases, then terminal: enough shape for the wizard's
+      // phase-change reporting to be observable without a real build.
+      const answer =
+        polls === 1 ? { phase: 'PROVISIONING', status: 'IN_PROGRESS' }
+        : polls === 2 ? { phase: 'BUILD', status: 'IN_PROGRESS' }
+        : { phase: 'COMPLETED', status: existsSync(join(dir, 'fail-image-build')) ? 'FAILED' : 'SUCCEEDED' };
+      process.stdout.write(`${JSON.stringify(answer)}\n`);
+      process.exit(0);
+    }
+    process.stderr.write(`fake-aws: unexpected codebuild call: ${args.join(' ')}\n`);
+    process.exit(2);
+  }
+
   if (service === 'ecs' && action === 'list-tasks') {
     const round = readRound();
     process.stdout.write(

@@ -137,6 +137,23 @@ variable "offered_memory_mib" {
 
 # --- Images -----------------------------------------------------------------
 
+variable "source_repository" {
+  description = "Public git repository the in-account image build clones to produce the :runner and :daemon images (#189). Defaults to Fleet's canonical repo; `fleet setup infra` overrides it with the repository its module source names, so a fork builds its own code."
+  type        = string
+  default     = "https://github.com/vincentpaca/fleet.git"
+
+  validation {
+    condition     = can(regex("^https://", var.source_repository))
+    error_message = "source_repository must be an https git URL — CodeBuild clones a public repository anonymously, which only the https form supports."
+  }
+}
+
+variable "source_ref" {
+  description = "Git ref (tag or commit) of source_repository the image build checks out — the same pinned ref this module was applied from, so images and infra can never skew. `fleet setup infra` supplies it from the generated root module's own module source. Empty (the default) provisions no build project at all: a module applied from a local path has no honest ref to pin, and building from a floating default would skew silently. The developer path (images/build.sh) still works either way."
+  type        = string
+  default     = ""
+}
+
 variable "project_repos" {
   description = "Names of additional ECR repositories to create, one per project image (e.g. [\"acme-app\"])."
   type        = list(string)

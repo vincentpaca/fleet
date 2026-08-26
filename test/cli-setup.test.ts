@@ -16,6 +16,7 @@ import {
   interview,
   renderMainTf,
   resolveModuleSource,
+  pinnedSource,
   repoManifest,
   runSetupRepo,
   terraformTooOld,
@@ -32,6 +33,7 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
   env: Record<string, string | undefined>;
   state: string;
   calls: () => string[];
+  buildCalls: () => string[];
 } {
   const cwd = makeTempDir('fleet-setup-');
   const state = makeTempDir('fleet-fake-tf-state-');
@@ -42,6 +44,10 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
     env: {
       PATH: `${bin}${path.delimiter}${process.env.PATH}`,
       FAKE_TF_DIR: state,
+      FAKE_AWS_DIR: state,
+      // The image-build wait polls the fake cloud CLI; real-cadence polling
+      // would spend five wall seconds per fake phase.
+      FLEET_IMAGE_POLL_MS: '5',
       // The region prompt defaults to the shell's — scrubbed so these tests
       // assert the wizard's behaviour, not the machine they run on.
       AWS_REGION: undefined,
@@ -52,6 +58,10 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
     },
     calls: () => {
       const log = path.join(state, 'calls.log');
+      return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+    },
+    buildCalls: () => {
+      const log = path.join(state, 'codebuild.log');
       return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
     },
   };
@@ -81,6 +91,10 @@ test('setup infra on a terminal: prompts only, then applies on an explicit yes',
   assert.match(mainTf, /region\s*=\s*"us-east-1"/, 'Enter accepted the region default');
   assert.match(mainTf, /source\s*=\s*"git::https:\/\/git\.invalid\/fleet\.git\/\/infra\/aws\?ref=v9"/);
   assert.doesNotMatch(mainTf, /vpc_id/, 'no existing VPC answered means the module creates one');
+  // Source-ref threading (#189): the in-account image build clones exactly the
+  // ref the module source pins — a root module missing these builds nothing.
+  assert.match(mainTf, /source_repository\s*=\s*"https:\/\/git\.invalid\/fleet\.git"/);
+  assert.match(mainTf, /source_ref\s*=\s*"v9"/);
 
   assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan', 'apply', 'output']);
   // Every terraform step runs in the deployment directory, never the project root.
@@ -91,6 +105,20 @@ test('setup infra on a terminal: prompts only, then applies on an explicit yes',
   const config = JSON.parse(fs.readFileSync(path.join(infraDir(s.cwd), 'fleet-config.json'), 'utf8'));
   assert.equal(config.cluster, 'demo');
   assert.equal(config.daemon_url, 'http://127.0.0.1:19000', 'the last manual bring-up step is written in');
+
+  // The wizard owns image production (#189): after the apply it starts the
+  // deployment's own build and waits it out — the happy path has no clone and
+  // no local docker anywhere in it.
+  assert.equal(
+    s.buildCalls().filter((line) => line.startsWith('codebuild start-build')).length,
+    1,
+    'exactly one build started after the apply',
+  );
+  assert.match(s.buildCalls()[0], /start-build --project-name demo-images --region us-east-1/);
+  assert.match(res.stdout, /build demo-images:fake-build-1/, 'the build id is reported');
+  assert.match(res.stdout, /images: PROVISIONING/, 'progress is phases, not silence');
+  assert.match(res.stdout, /images built and pushed/);
+  assert.doesNotMatch(res.stdout, /build\.sh/, 'the happy path no longer points at the developer script');
 
   // The generated terraform and its state are per-deployment, never committed.
   const gitignore = fs.readFileSync(path.join(s.cwd, '.fleet', '.gitignore'), 'utf8');
@@ -422,6 +450,87 @@ test('setup infra: --backend writes the block and --backend-config reaches init'
   assert.ok(init.includes('-backend-config=key=fleet/demo.tfstate'), init);
 });
 
+// ---------- the in-account image build (#189) ----------
+
+test('setup infra: a failed image build fails the command and names its log', async () => {
+  const s = scratch();
+  fs.writeFileSync(path.join(s.state, 'fail-image-build'), '');
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /image build failed \(FAILED\)/, 'the terminal status is the headline');
+  assert.match(res.stderr, /batch-get-builds --ids demo-images:fake-build-1/, 'names the exact command that reads the log');
+  // The apply itself succeeded and the capture must survive: the deployment is
+  // real, only its images are missing, and a rerun of --rebuild-images fixes it.
+  assert.ok(fs.existsSync(path.join(infraDir(s.cwd), 'fleet-config.json')), 'the capture is kept');
+});
+
+test('setup infra: a build that cannot even start surfaces the cloud CLI error', async () => {
+  const s = scratch();
+  fs.writeFileSync(path.join(s.state, 'fail-start-build'), '');
+  const res = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /starting the image build failed/);
+  assert.match(res.stderr, /AccessDeniedException/, "the cloud CLI's own reason is not swallowed");
+});
+
+test('setup infra --rebuild-images: re-runs the build alone, without terraform', async () => {
+  const s = scratch();
+  assert.equal((await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  fs.writeFileSync(path.join(s.state, 'calls.log'), '');
+  fs.writeFileSync(path.join(s.state, 'codebuild.log'), '');
+
+  const res = await runCli(['setup', 'infra', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'preflight only — no plan, no apply, nothing regenerated');
+  assert.equal(s.buildCalls().filter((line) => line.startsWith('codebuild start-build')).length, 1, 'one fresh build');
+  assert.match(res.stdout, /images built and pushed/);
+  // A rebuild's images do not roll the daemon by themselves; guidance is
+  // printed, never run — and never as a pasteable deploy command, because no
+  // shipped code path may carry one (docs/decisions.md#d5, pinned by
+  // test/images-build.test.ts). Deploying is the operator's act.
+  assert.match(res.stdout, /service demo-daemon on cluster demo \(region us-east-1\)/);
+  assert.match(res.stdout, /infra\/aws\/README\.md/);
+});
+
+test('setup infra --rebuild-images: nothing captured here means nothing to rebuild', async () => {
+  const s = scratch();
+  const res = await runCli(['setup', 'infra', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /no deployment to rebuild images for/);
+  assert.match(res.stderr, /fleet setup infra/, 'names the command that creates one');
+  assert.deepEqual(s.buildCalls(), [], 'no build was started');
+});
+
+test('setup infra --rebuild-images: a prompt flag is refused, not ignored', async () => {
+  const s = scratch();
+  assert.equal((await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  const res = await runCli(['setup', 'infra', '--rebuild-images', '--name', 'staging'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /--name/);
+});
+
+test('setup infra: a deployment applied from an unpinned source falls back honestly', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: '/opt/fleet-checkout/infra/aws' });
+  // What the real unit outputs when source_ref is empty: no build project.
+  fs.writeFileSync(
+    path.join(s.state, 'fleet-config'),
+    JSON.stringify({ provider: 'ecs', cluster: 'demo', region: 'us-east-1', daemon_port: 9000 }),
+  );
+  const applied = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(applied.code, 0, applied.stderr);
+  const mainTf = fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8');
+  assert.doesNotMatch(mainTf, /source_ref/, 'a local path pins no ref, so none is invented');
+  assert.deepEqual(s.buildCalls(), [], 'no build exists to start');
+  assert.match(applied.stdout, /no in-account image build/, 'said plainly, not skipped silently');
+  assert.match(applied.stdout, /build\.sh/, 'the developer path is named as the fallback');
+
+  // The upgrade path refuses for the same reason, loudly: --rebuild-images on
+  // a deployment with no build project must not invent a ref to build from.
+  const rebuild = await runCli(['setup', 'infra', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(rebuild.code, 1, rebuild.stdout);
+  assert.match(rebuild.stderr, /unpinned module source/);
+});
+
 // ---------- prompt/flag merging ----------
 
 /** An asker with a script of answers, recording what it was asked. */
@@ -514,6 +623,24 @@ test('module source: derived from this checkout, pinned — tag when there is on
     /\?ref=f{40}$/,
     'no tag at HEAD pins the commit — never a floating branch',
   );
+});
+
+test('pinned source: a git source with a ref yields the repository and ref, nothing else does', () => {
+  // The pair feeds the unit's source_repository/source_ref (#189): the
+  // in-account image build must clone exactly what the module pins. Tag or
+  // commit, .git or not — but a local path or a floating (ref-less) git source
+  // pins nothing, and inventing a ref there is the bug this function refuses.
+  assert.deepEqual(pinnedSource('git::https://github.com/example-org/fleet.git//infra/aws?ref=v1.2.3'), {
+    repository: 'https://github.com/example-org/fleet.git',
+    ref: 'v1.2.3',
+  });
+  assert.deepEqual(pinnedSource(`git::https://git.invalid/fleet//infra/aws?ref=${'f'.repeat(40)}`), {
+    repository: 'https://git.invalid/fleet.git',
+    ref: 'f'.repeat(40),
+  });
+  assert.equal(pinnedSource('/opt/fleet-checkout/infra/aws'), undefined, 'a local path pins nothing');
+  assert.equal(pinnedSource('git::https://git.invalid/fleet.git//infra/aws'), undefined, 'no ?ref= is a floating source');
+  assert.equal(pinnedSource('git::ssh://git@git.invalid/fleet.git//infra/aws?ref=v9'), undefined, 'a build host clones anonymously — ssh is not a source it can fetch');
 });
 
 test('module source: no unit beside the install and no override is an actionable refusal', () => {

@@ -53,6 +53,11 @@ if (command === 'version') {
     : JSON.stringify({
         provider: 'ecs',
         cluster: 'demo',
+        // region + image_build_project: what the wizard's post-apply image
+        // build (#189) reads. Present by default because the setup tests pin
+        // a *pinned* module source, which is the shape that provisions one.
+        region: 'us-east-1',
+        image_build_project: 'demo-images',
         daemon_service: 'demo-daemon',
         daemon_container_name: 'demo-daemon',
         daemon_port: 9000,
