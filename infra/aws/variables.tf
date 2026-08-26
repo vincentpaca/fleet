@@ -60,13 +60,28 @@ variable "instance_type" {
 }
 
 variable "max_instances" {
-  description = "Maximum size of the ECS container-instance auto scaling group (minimum is always 0 so the cluster scales to zero when idle)."
+  description = "Maximum size of the ECS container-instance auto scaling group (the minimum is min_instances, default 0, so the cluster scales to zero when idle)."
   type        = number
   default     = 4
 
   validation {
     condition     = var.max_instances >= 1
     error_message = "max_instances must be at least 1: an ASG capped at 0 can never scale out, so every job queues forever."
+  }
+}
+
+variable "min_instances" {
+  description = "Warm capacity floor: container instances the auto scaling group keeps running even when no job is. Default 0 is the scale-to-zero design commitment — idle costs nothing. Raise it to skip the ~3-4 minute cold start (instance boot + image pull) on the first job of a burst: a warm instance already holds the runner image, so warm-start is task start in seconds. Each always-on t3.medium is roughly $30/mo — more than the rest of a Fleet deployment combined."
+  type        = number
+  default     = 0
+
+  # min_instances <= max_instances needs both variables, so it lives as a
+  # precondition on aws_autoscaling_group.instances (main.tf): the module still
+  # supports terraform 1.5, and cross-variable validation needs 1.9. This block
+  # holds the bound no pairing escapes.
+  validation {
+    condition     = var.min_instances >= 0
+    error_message = "min_instances cannot be negative: it is the ASG's minimum size."
   }
 }
 
