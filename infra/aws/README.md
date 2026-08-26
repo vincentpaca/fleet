@@ -339,5 +339,12 @@ smoke, API-shaped goes in the suite.
   `ssm:GetParameter` for the fleet-config read at boot; the execution role uses the
   AWS-managed `AmazonECSTaskExecutionRolePolicy`; the instance role combines
   `AmazonEC2ContainerServiceforEC2Role` with `AmazonSSMManagedInstanceCore`.
+- Next to that read grant, the daemon role holds `ssm:PutParameter` on exactly
+  `/<name>/operator-token`: at boot the daemon publishes its operator token there as a
+  SecureString (AWS-managed `aws/ssm` key), and the CLI fetches it with the operator's
+  own AWS credentials instead of the operator extracting it with `ecs execute-command`
+  by hand (#188). The parameter is written at runtime, not by Terraform. Anyone with
+  SSM read on the prefix already holds execute-command-grade access to the account,
+  so the trust boundary does not move.
 - Region is never hardcoded in the module; the example defaults to `us-east-1` via a
   variable.

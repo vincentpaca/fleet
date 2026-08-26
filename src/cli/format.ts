@@ -113,6 +113,22 @@ export function formatJobState(job: { state: string; marker?: string; reason?: s
   return typeof job.attempt === 'number' && job.attempt > 1 ? `${base} [attempt ${job.attempt}]` : base;
 }
 
+/**
+ * Delivered-artifact tally for a job line (#195): ` · 3 artifacts` after the
+ * state, from the daemon's index-derived count on the job payload — never the
+ * settle event's produced[] claim. Settled jobs only (a live job's count is
+ * still moving), and empty when nothing was delivered, so an empty-handed job
+ * shows nothing new. A cancelled job with partial uploads shows its real
+ * count — partial delivery is exactly when the operator needs to know files
+ * exist. Shared by `fleet status` and the board roster.
+ */
+export function artifactTally(job: { state: string; artifacts?: { count?: number } }): string {
+  const settled = job.state === 'done' || job.state === 'cancelled';
+  const count = job.artifacts?.count ?? 0;
+  if (!settled || count <= 0) return '';
+  return ` · ${count} artifact${count === 1 ? '' : 's'}`;
+}
+
 // ── The rendering core ────────────────────────────────────────────────────────
 
 /**
@@ -234,15 +250,33 @@ function paneAnswerLine(ev: FleetEvent, col: ColFn, pending: Map<string, string>
     : prefix + ' ' + col('✓', 32) + ' answer: ' + ansText + byText;
 }
 
+/**
+ * The artifact-lane paths a settle delivered: produced[] entries carrying a
+ * path (URL-lane entries carry none and have nothing to fetch).
+ */
+function settledArtifactPaths(ev: FleetEvent): string[] {
+  return (ev.outcome?.produced ?? [])
+    .map((item) => item.path)
+    .filter((p): p is string => typeof p === 'string' && p !== '');
+}
+
 function renderSettle(ev: FleetEvent, t: RenderTarget): string[] {
   const status = ev.report?.status ?? '?';
+  // Per-file fetch commands (#195): a delivered artifact with no visible way
+  // to fetch it reads as a dead end — same rule as decision cards, which
+  // spell out the answer incantation in place.
+  const paths = settledArtifactPaths(ev);
   if (t.kind === 'plain') {
-    const body = `${plainHead(ev)} rung=${ev.rung ?? '?'} status=${status}${ev.report?.next_action ? ` next: ${ev.report.next_action}` : ''}`;
+    const head = `${plainHead(ev)} rung=${ev.rung ?? '?'} status=${status}${ev.report?.next_action ? ` next: ${ev.report.next_action}` : ''}`;
+    const fetches = paths.map((p) => `  fetch: fleet artifacts <jobId> get ${p}`);
     // Green for success (READY), red for failure (PARTIAL/FAILED/etc.).
-    return [t.col(body, status === 'READY' ? 32 : 31)];
+    return [t.col([head, ...fetches].join('\n'), status === 'READY' ? 32 : 31)];
   }
   const col = t.col;
-  return [`${panePrefix(ev, col)} ${col('settle', 36)} rung=${col(ev.rung ?? '?', 36)} status=${col(status, 36)}`];
+  return [
+    `${panePrefix(ev, col)} ${col('settle', 36)} rung=${col(ev.rung ?? '?', 36)} status=${col(status, 36)}`,
+    ...paths.map((p) => '     ' + col(`fetch: fleet artifacts <jobId> get ${p}`, 36)),
+  ];
 }
 
 /** An unknown event type still renders as a line rather than disappearing. */

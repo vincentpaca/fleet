@@ -17,9 +17,11 @@ import { fileURLToPath } from 'node:url';
 import { startMockDaemon } from './runner-mock-daemon.ts';
 import {
   blockHotLimitMs,
+  checkpointLimitMs,
   decisionTimeoutMs,
   mergedLimits,
   DEFAULT_BLOCK_HOT_MS,
+  DEFAULT_CHECKPOINT_MS,
   DEFAULT_DECISION_TIMEOUT_MS,
 } from '../src/shared/time.ts';
 
@@ -49,6 +51,16 @@ test('decision_timeout defaults to the documented 24h when absent', () => {
 test('an unparseable limit value falls back to the default, never to "off"', () => {
   assert.equal(blockHotLimitMs({ block_hot: 'soon' }), DEFAULT_BLOCK_HOT_MS);
   assert.equal(decisionTimeoutMs({ decision_timeout: 12 }), DEFAULT_DECISION_TIMEOUT_MS);
+  assert.equal(checkpointLimitMs({ checkpoint: 'often' }), DEFAULT_CHECKPOINT_MS);
+});
+
+test('checkpoint defaults to the documented 10m when absent (#190)', () => {
+  // Like idle, always armed: a container provider's workspace dies with the
+  // task, so "no checkpoints" is not a configuration — only a wider cadence is.
+  assert.equal(checkpointLimitMs({}), DEFAULT_CHECKPOINT_MS);
+  assert.equal(checkpointLimitMs(undefined), DEFAULT_CHECKPOINT_MS);
+  assert.equal(DEFAULT_CHECKPOINT_MS, 10 * 60_000, 'the default is the documented 10m');
+  assert.equal(checkpointLimitMs({ checkpoint: '2m' }), 2 * 60_000);
 });
 
 // --- The merge: work-order limits override manifest limits, key by key ---

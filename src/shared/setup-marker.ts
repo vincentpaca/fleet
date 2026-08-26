@@ -8,11 +8,14 @@
 // pickup gate (src/runner/setup.ts). One constant shared by the baker and the
 // checker, or the two sides drift and the script runs twice (or never).
 //
-// The marker lives under $HOME, not /etc: the runner base drops to USER node
-// (images/runner/Dockerfile), so the job image's build layers cannot write
-// root-owned paths. A flat dotfile rather than anything under ~/.fleet — on
-// the process provider $HOME is the operator's real home, and ~/.fleet is
-// FLEET_HOME's default, which tests and docs promise never to touch.
+// The marker lives under $HOME, not /etc: one constant has to name the same
+// file at bake time and at check time on every substrate. In the runner image
+// both sides are root's home — build layers run as root and the runner checks
+// the marker *before* the privilege drop (#196), while $HOME still names the
+// boot user's home. On the process provider $HOME is the operator's real home,
+// where /etc was never writable. A flat dotfile rather than anything under
+// ~/.fleet — that is FLEET_HOME's default, which tests and docs promise never
+// to touch.
 
 import { homedir } from "node:os";
 import { join } from "node:path";

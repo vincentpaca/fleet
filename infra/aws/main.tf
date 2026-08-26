@@ -26,6 +26,11 @@ locals {
   daemon_container_name = "${var.name}-daemon"
   daemon_service_name   = "${var.name}-daemon"
   fleet_config_ssm_path = "/${var.name}/fleet-config"
+  # The daemon publishes its operator token here at boot (#188) — a runtime
+  # write, so no aws_ssm_parameter resource exists for it. The CLI derives the
+  # same sibling path from fleet_config's ssm_config_path; only the IAM grant
+  # below needs it spelled out at plan time.
+  operator_token_ssm_path = "/${var.name}/operator-token"
 
   # Fargate daemon: assign a public IP when subnets are public (no NAT gateway)
   # so the task can pull its image from ECR and write logs to CloudWatch.
@@ -510,10 +515,23 @@ resource "aws_iam_role_policy" "daemon_ssm_config" {
       {
         # The parameter is a SecureString, so reading it is two authorizations:
         # ssm:GetParameter above and kms:Decrypt here. Scoped to decrypt only —
-        # the daemon never writes the parameter.
+        # the daemon never writes the fleet-config parameter.
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
         Resource = aws_kms_key.fleet.arn
+      },
+      {
+        # The daemon publishes its operator token at boot (#188) as a
+        # SecureString beside the config it just read, so the CLI can fetch it
+        # instead of the operator extracting it with ecs execute-command by
+        # hand. Write-only, and exactly this one path: anyone with SSM read on
+        # the prefix already holds execute-command-grade access, so the grant
+        # widens nothing. The token parameter uses the AWS-managed aws/ssm key
+        # (the daemon knows the path, not this unit's CMK), which needs no kms
+        # grant on either side. Pinned by test/infra-aws.test.ts.
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${local.operator_token_ssm_path}"
       },
     ]
   })

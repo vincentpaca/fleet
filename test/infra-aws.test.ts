@@ -318,3 +318,35 @@ test('the daemon dispatch policy grants the reconcile sweep its two read actions
     assert.match(statement, /ecs:cluster/, `the ${action} grant must stay cluster-scoped (#187)`);
   }
 });
+
+// #188: the daemon publishes its operator token at boot as an SSM parameter,
+// so the CLI can fetch it instead of the operator running ecs execute-command
+// by hand. The grant's resource ARN embeds computed region/account values no
+// plan resolves, so — like the #187 grants above — it is pinned at the source
+// level: present, write-only, and scoped to exactly the operator-token path.
+test('the daemon SSM policy grants the boot-time token publish, scoped to one path', () => {
+  const text = readFileSync(join(INFRA, 'aws', 'main.tf'), 'utf8');
+  const start = text.indexOf('resource "aws_iam_role_policy" "daemon_ssm_config"');
+  assert.notEqual(start, -1, 'daemon_ssm_config policy resource must exist');
+  const body = text.slice(start, text.indexOf('\nresource ', start + 1));
+  const at = body.indexOf('"ssm:PutParameter"');
+  assert.notEqual(
+    at,
+    -1,
+    'daemon_ssm_config must grant ssm:PutParameter or the boot-time token publish is denied live (#188)',
+  );
+  // Scoped to the one operator-token path — a PutParameter that widens past it
+  // lets the daemon overwrite fleet-config, which it must never write.
+  const next = body.indexOf('Effect', at);
+  const statement = body.slice(at, next === -1 ? body.length : next);
+  assert.match(
+    statement,
+    /operator_token_ssm_path/,
+    'the ssm:PutParameter grant must stay scoped to the operator-token parameter (#188)',
+  );
+  assert.match(
+    text,
+    /operator_token_ssm_path\s*=\s*"\/\$\{var\.name\}\/operator-token"/,
+    'the operator-token path must be the sibling of fleet-config under the same prefix (#188)',
+  );
+});

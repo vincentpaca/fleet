@@ -132,6 +132,9 @@ test("backstop cancel does not block on gh; its verdict lands later too", async 
     ghRunner: slowGh,
     wallClockBackstopMarginMs: 300,
     wallClockSweepIntervalMs: 50,
+    // The wedged runner never goes terminal on its own; skip most of the
+    // post-terminate settle wait (#197) so the synthetic path fires promptly.
+    backstopSettleWaitMs: 250,
   });
   t.after(() => ctx.daemon.stop());
 

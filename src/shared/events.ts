@@ -42,6 +42,12 @@ export type FleetEvent = {
   rung?: string;
   minutes?: number;
   report?: { status?: string; next_action?: string };
+  /**
+   * Settle outcome (schema-required on settle events). Consumers read only the
+   * artifact-lane paths off produced[] — the entries carry more (id, type,
+   * title, sha256, url) that no renderer needs.
+   */
+  outcome?: { produced?: { path?: string }[] };
 };
 
 /** A decision awaiting an answer: its id, the verbatim question, the options. */

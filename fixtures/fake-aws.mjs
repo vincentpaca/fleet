@@ -15,6 +15,9 @@
 //   sessions.log — one line per start-session, "<target> <launcherPid> <holderPid>"
 //                  ("-" for a holder when the session died before forking one).
 //   die-first    — present: the first start-session exits 1 instead of holding.
+//   params.json  — the SSM parameter store (#188): `{ [name]: { Value, Type } }`.
+//                  `ssm get-parameter` reads it, `ssm put-parameter` writes it —
+//                  seed it in a test to model parameters an apply created.
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
@@ -23,6 +26,12 @@ import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
 const args = process.argv.slice(2);
+
+/** The SSM parameter store (#188): params.json in FAKE_AWS_DIR, empty when unseeded. */
+function readParams(dir) {
+  const file = join(dir, 'params.json');
+  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+}
 
 // --- the "plugin": bind the local port and proxy it to the far end ------------
 if (args[0] === '--hold') {
@@ -114,6 +123,36 @@ if (args[0] === '--hold') {
         ],
       }),
     );
+    process.exit(0);
+  } else if (service === 'ssm' && action === 'get-parameter') {
+    // #188: the CLI fetches the operator token; the daemon reads fleet-config.
+    const params = readParams(dir);
+    const name = args[args.indexOf('--name') + 1];
+    const entry = params[name];
+    if (entry === undefined) {
+      process.stderr.write(`An error occurred (ParameterNotFound) when calling the GetParameter operation: parameter ${name} not found\n`);
+      process.exit(254);
+    }
+    process.stdout.write(JSON.stringify({ Parameter: { Name: name, Type: entry.Type ?? 'String', Value: entry.Value } }));
+    process.exit(0);
+  } else if (service === 'ssm' && action === 'put-parameter') {
+    // The daemon publishes its operator token at boot (#188). Secrets ride
+    // --cli-input-json (#126); accept --name/--value too for completeness.
+    // deny-put present: the write is refused — an IAM denial, for the tests
+    // that need the publish to fail while everything else works.
+    if (existsSync(join(dir, 'deny-put'))) {
+      process.stderr.write('An error occurred (AccessDeniedException) when calling the PutParameter operation: not authorized\n');
+      process.exit(254);
+    }
+    const params = readParams(dir);
+    const jsonAt = args.indexOf('--cli-input-json');
+    const input = jsonAt !== -1
+      ? JSON.parse(readFileSync(args[jsonAt + 1].replace(/^file:\/\//, ''), 'utf8'))
+      : { Name: args[args.indexOf('--name') + 1], Value: args[args.indexOf('--value') + 1], Type: args[args.indexOf('--type') + 1] };
+    params[input.Name] = { Value: input.Value, Type: input.Type };
+    writeFileSync(join(dir, 'params.json'), JSON.stringify(params, null, 2));
+    appendFileSync(join(dir, 'puts.log'), `${input.Name} ${input.Type} ${input.Overwrite === true ? 'overwrite' : '-'}\n`);
+    process.stdout.write(JSON.stringify({ Version: 1, Tier: 'Standard' }));
     process.exit(0);
   } else if (service === 'ssm' && action === 'start-session') {
     const target = args[args.indexOf('--target') + 1];

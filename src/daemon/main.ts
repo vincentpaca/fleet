@@ -6,14 +6,15 @@
 // FLEET_PROVIDER (process | docker | ecs; default process), FLEET_NOTIFY_WEBHOOK
 // (optional, comma-separated URLs; {text} payload per decision).
 // Logs four terse `fleet daemon: ` lines at boot (home, provider, config source,
-// listen address; a fifth when it discovers its IP from ECS metadata) and nothing
+// listen address; a fifth when it discovers its IP from ECS metadata, and one
+// more when it publishes the operator token to SSM — #188) and nothing
 // per-request — see test/daemon-boot-log.test.ts.
 import { mkdirSync } from "node:fs";
 import { fleetHome } from "../shared/home.ts";
 import { loadOrCreateOperatorToken, FleetDaemon } from "./server.ts";
 import { ProcessProvider } from "../providers/process.ts";
 import { DockerProvider } from "../providers/docker.ts";
-import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm } from "../providers/ecs.ts";
+import { EcsProvider, ecsConfigFromEnv, ecsConfigFromSsm, publishOperatorTokenToSsm } from "../providers/ecs.ts";
 import type { Provider } from "../providers/provider.ts";
 
 /**
@@ -113,19 +114,37 @@ if (!tcpHost) tcpHost = "127.0.0.1";
 // socket and over an SSM tunnel alike. Every real daemon enforces it —
 // there is no credential-free deployment of the /jobs/* surface.
 const provider = await buildProvider(choice, home);
+const operatorToken = loadOrCreateOperatorToken(home);
 const daemon = new FleetDaemon({
   home,
   provider,
   port,
   bindHost,
   tcpHost,
-  operatorToken: loadOrCreateOperatorToken(home),
+  operatorToken,
 });
 
 const { socketPath: sock, port: boundPort } = await daemon.start();
 // Same `fleet daemon: ` prefix as the lines above: one filter on a log stream
 // must not drop the line that says the daemon is up.
 console.log(`fleet daemon: listening on ${sock}${boundPort !== null ? ` and ${bindHost}:${boundPort} (advertising ${tcpHost})` : ""}`);
+
+// Token distribution (#188): a fresh cloud deployment mints its token on a
+// volume the operator cannot read without `ecs execute-command` by hand, so
+// publish it as the SecureString SSM parameter next to the config this boot
+// just read — the CLI fetches it from there with the operator's own AWS
+// credentials. After the listen line: a hung SSM write must not block the
+// bind, and best-effort: a daemon that serves but could not publish is
+// strictly better than one that is down. The log line carries the parameter
+// NAME only — boot evidence must be safe to ship to a log group.
+if (choice.name === "ecs" && choice.ssmPath !== undefined) {
+  try {
+    const name = await publishOperatorTokenToSsm(choice.ssmPath, operatorToken);
+    console.log(`fleet daemon: published operator token to ssm:${name}`);
+  } catch (error) {
+    console.error(`fleet: operator token publish failed: ${String(error)} — the CLI cannot fetch it; read $FLEET_HOME/operator-token via ecs execute-command instead`);
+  }
+}
 
 // Only after start() holds the home lock: settle what a previous daemon's
 // death orphaned (#123). Quiet unless it acts, and never on stdout — the boot

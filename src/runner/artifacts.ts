@@ -108,11 +108,19 @@ function readArtifactFile(
 }
 
 /**
+ * Per-request bound on an artifact upload when the caller sets none. The
+ * settle races the daemon's backstop margin, and `fetch` against a black-holed
+ * daemon otherwise waits undici's ~300s default — the same wedge #152 cut out
+ * of the git pushes. Cancel-path callers pass a much tighter slice.
+ */
+const DEFAULT_UPLOAD_TIMEOUT_MS = 15_000;
+
+/**
  * Upload one artifact payload to the daemon, retrying once on transient
  * failure. Returns null on success, or the last error message on failure.
  * sha256 is pre-computed by the caller so it is not hashed twice.
  */
-async function uploadArtifact(url: string, token: string, relPath: string, content: Buffer, sha256: string): Promise<string | null> {
+async function uploadArtifact(url: string, token: string, relPath: string, content: Buffer, sha256: string, timeoutMs: number): Promise<string | null> {
   // Build the payload once; sha256 and bytes come from the buffer so they
   // describe these exact bytes (not what fstat reported before reading).
   const body = JSON.stringify({
@@ -128,6 +136,7 @@ async function uploadArtifact(url: string, token: string, relPath: string, conte
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-fleet-runner-token': token },
         body,
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (response.ok) return null;
       const detail = await response.text().catch(() => '');
@@ -149,6 +158,12 @@ export async function collectArtifacts(opts: {
   jobId: string;
   daemonUrl: string;
   token: string;
+  /**
+   * Per-request upload bound; defaults generous. The cancel teardown passes a
+   * slice of its hard deadline instead — an upload that cannot finish there
+   * was never going to, and failing it buys the settle its window (#152).
+   */
+  uploadTimeoutMs?: number;
 }): Promise<ArtifactResult> {
   const artifactsDir = join(opts.workspace, '.fleet', 'out', 'artifacts');
   if (!existsSync(artifactsDir)) return { produced: [], notes: [] };
@@ -169,7 +184,10 @@ export async function collectArtifacts(opts: {
     // it hands back more bytes than fstat measured.
     const sha256 = createHash('sha256').update(content).digest('hex');
     const bytes = content.length;
-    const errorMsg = await uploadArtifact(url, opts.token, relPath, content, sha256);
+    const errorMsg = await uploadArtifact(
+      url, opts.token, relPath, content, sha256,
+      opts.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS,
+    );
     if (errorMsg) {
       notes.push('artifact upload failed (' + relPath + '): ' + errorMsg);
       continue;
