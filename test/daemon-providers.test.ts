@@ -25,14 +25,13 @@ import {
   ecsTunnelOpener,
   parseFleetTasks,
 } from "../src/providers/ecs.ts";
-import { requestJson } from "../src/shared/http.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
 import { writeSecretTempFile } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
-import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until } from "./daemon-helpers.ts";
+import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until, requestJson } from "./daemon-helpers.ts";
 
 const SPEC: LaunchSpec = {
   jobId: "job-abc123",

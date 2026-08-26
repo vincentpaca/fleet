@@ -101,7 +101,7 @@ export function skillPath(
  * `PATHEXT` expansion. On Windows a `claude.cmd` is missed and detection falls
  * back to the config directory below — a weaker answer, not a wrong one.
  */
-export function onPath(binary: string, env: Record<string, string | undefined>): boolean {
+export function onPath(binary: string, env: Record<string, string | undefined>): boolean { // contract pin: test-only export, asserted by the suite
   for (const dir of (env.PATH ?? '').split(path.delimiter)) {
     if (dir === '') continue;
     try {

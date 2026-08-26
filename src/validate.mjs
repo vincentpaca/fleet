@@ -6,11 +6,11 @@ import addFormats from 'ajv-formats';
 const schemaPath = (name) => fileURLToPath(new URL(`../schemas/${name}`, import.meta.url));
 const load = (name) => JSON.parse(readFileSync(schemaPath(name), 'utf8'));
 
-export const manifestSchema = load('manifest.schema.json');
-export const workOrderSchema = load('work-order.schema.json');
-export const eventsSchema = load('events.schema.json');
+export const manifestSchema = load('manifest.schema.json'); // contract pin: test-only export, asserted by the suite
+const workOrderSchema = load('work-order.schema.json');
+const eventsSchema = load('events.schema.json');
 export const jobStates = load('job-states.json');
-export const decisionFileSchema = load('decision-file.schema.json');
+const decisionFileSchema = load('decision-file.schema.json');
 
 const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true, allowUnionTypes: true });
 addFormats(ajv);

@@ -32,7 +32,7 @@ import { dirname, join } from 'node:path';
 // shared with the daemon's rung verification — one definition (#128).
 import type { GhRunner } from '../shared/git.ts';
 
-export type GitSetupOptions = {
+type GitSetupOptions = {
   url: string;
   jobId: string;
   target: string;
@@ -131,7 +131,7 @@ function defaultGhRun(workspace: string): GhRunner {
 }
 
 /** fleet/<target>-<jobId>, target sanitized to git-ref-safe characters. */
-export function jobBranch(target: string, jobId: string): string {
+export function jobBranch(target: string, jobId: string): string { // contract pin: test-only export, asserted by the suite
   const safe = target.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '') || 'work';
   return `fleet/${safe}-${jobId}`;
 }

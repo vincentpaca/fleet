@@ -117,7 +117,7 @@ export function formatJobState(job: { state: string; marker?: string; reason?: s
  * caller owns the map's lifetime — one per tail, threaded through every event
  * in order. Width is the caller's concern too: pane lines come back unclipped.
  */
-export type RenderTarget =
+type RenderTarget =
   | { kind: 'plain'; col: ColFn }
   | { kind: 'pane'; col: ColFn; pending: Map<string, string> };
 

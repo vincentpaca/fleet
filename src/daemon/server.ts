@@ -32,7 +32,7 @@ import type { Provider } from "../providers/provider.ts";
 const RETAINED_WORKSPACE_NOTE_PREFIX = "workspace retained at";
 
 /** Blocked-first ordering: anything waiting on the operator sorts first. */
-export const RANK: Record<JobState, number> = {
+const RANK: Record<JobState, number> = {
   blocked: 0,
   running: 1,
   queued: 2,
@@ -47,7 +47,7 @@ export const RANK: Record<JobState, number> = {
  * history, so the default carries every live job plus the most recently
  * updated settled ones; `?all=1` keeps the full history reachable.
  */
-export const LIST_TERMINAL_LIMIT = 50;
+export const LIST_TERMINAL_LIMIT = 50; // contract pin: test-only export, asserted by the suite
 
 /** Every live job, plus the LIST_TERMINAL_LIMIT most recently updated settled ones. */
 function boundJobList(jobs: JobRecord[], all: boolean): JobRecord[] {
@@ -74,7 +74,7 @@ type ArtifactEntry = { bytes: number; sha256: string | null };
 /** Per-job artifact bookkeeping: `total` is kept equal to the sum of `files` sizes. */
 type ArtifactMeta = { files: Map<string, ArtifactEntry>; total: number };
 
-export type DaemonOptions = {
+export type DaemonOptions = { // contract pin: test-only export, asserted by the suite
   home: string;
   provider: Provider;
   /**
@@ -147,7 +147,7 @@ type IntakeResult = IntakeError | { deduped: true } | null;
  * as a function body, hiding the function from the complexity gate (the same
  * trap registry.ts documents on LaunchHalf).
  */
-export type OrphanTask = { job: string; handle: string; stopped: boolean };
+type OrphanTask = { job: string; handle: string; stopped: boolean };
 
 /** Wire shape for operator responses: the runner token never leaves the daemon. */
 function publicJob(record: JobRecord): Omit<JobRecord, "runnerToken"> {
@@ -174,7 +174,7 @@ function stringRecord(value: unknown, what: string): Record<string, string> {
  * explicit bound a hung call would keep its verification chain link pending
  * forever and every later job's check queued behind it.
  */
-export const GH_VERIFY_TIMEOUT_MS = 30_000;
+const GH_VERIFY_TIMEOUT_MS = 30_000;
 
 /**
  * gh CLI runner for deferred rung verification. Async on purpose (#117): the
@@ -204,7 +204,7 @@ function defaultGhRunner(): GhRunnerAsync {
  * bytes for this whole window, and an idle timeout at or below it would
  * destroy the request mid-poll instead of letting the daemon answer.
  */
-export const DEFAULT_LONG_POLL_MS = 25_000;
+export const DEFAULT_LONG_POLL_MS = 25_000; // contract pin: test-only export, asserted by the suite
 
 /** Target rung from a work order already validated at job creation. */
 function targetRung(workOrder: unknown): string {

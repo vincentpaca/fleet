@@ -357,7 +357,6 @@ test('#109: daemon unreachable mid-stream → runner survives, settles, drop cou
   const report = {
     status: 'READY',
     next_action: 'open the pull request',
-    implemented: ['generic feature'],
     verification: ['fixture replay completed'],
   };
 

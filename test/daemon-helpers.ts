@@ -3,9 +3,30 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { requestJson, request } from "../src/shared/http.ts";
-import type { HttpResponse } from "../src/shared/http.ts";
+import { request } from "../src/shared/http.ts";
+import type { HttpResponse, RequestOptions } from "../src/shared/http.ts";
 import type { LaunchSpec, Provider } from "../src/providers/provider.ts";
+
+/**
+ * `request` + JSON body/headers both ways. `json` is null when the body is not
+ * JSON. Test-side helper (issue #129): the product never speaks JSON-over-HTTP
+ * generically — it lives here with its only consumers.
+ */
+export async function requestJson(
+  opts: Omit<RequestOptions, "body"> & { body?: unknown },
+): Promise<HttpResponse & { json: unknown }> {
+  const body = opts.body === undefined ? undefined : JSON.stringify(opts.body);
+  const headers = { ...opts.headers };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const res = await request({ ...opts, headers, body });
+  let json: unknown = null;
+  try {
+    json = JSON.parse(res.body);
+  } catch {
+    // non-JSON body (e.g. ndjson dump); caller reads res.body directly
+  }
+  return { ...res, json };
+}
 
 /** Minimal valid manifest (generic content only). */
 export const MANIFEST = {

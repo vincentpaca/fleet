@@ -33,7 +33,7 @@ export type EventBody = Record<string, unknown>;
  * view (`FleetEvent`, src/shared/events.ts): the two are different contracts,
  * and one name across both is how a reader conflates them (#128).
  */
-export type RunnerEvent = {
+type RunnerEvent = {
   job: string;
   seq: number;
   at: string;

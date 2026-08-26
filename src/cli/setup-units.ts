@@ -35,7 +35,7 @@ export type PromptSpec = {
 };
 
 /** A `required_providers` entry for the generated root module. */
-export type RequiredProvider = { name: string; source: string; version: string };
+type RequiredProvider = { name: string; source: string; version: string };
 
 export type SetupUnit = {
   /** Directory name under `infra/` in this repo and under `.fleet/infra/` in the project. */
@@ -65,12 +65,12 @@ export type SetupUnit = {
 // ---------- shared validators ----------
 
 /** Quote a string as an HCL literal. */
-export function hclString(value: string): string {
+function hclString(value: string): string {
   return JSON.stringify(value);
 }
 
 /** Render a comma-separated answer as an HCL list of strings. */
-export function hclStringList(value: string): string {
+function hclStringList(value: string): string {
   return `[${splitList(value).map(hclString).join(', ')}]`;
 }
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
-import { historyToEvents, eventsToHistory } from '../src/history-events.mjs';
+import { historyToEvents, eventsToHistory } from './history-events.mjs';
 import { validateEvent } from '../src/validate.mjs';
 
 /**

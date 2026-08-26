@@ -43,7 +43,7 @@ test('settle accepts a status-first report and rejects malformed ones', () => {
     report: {
       status: 'READY',
       target_rung: 'merge-ready',
-      base_sha: 'abc123', head_sha: 'def456', pr: 'org/repo#12',
+      pr: 'org/repo#12',
       verification: ['focused tests', 'hosted CI green at head'],
       next_action: 'merge the PR',
     },

@@ -17,9 +17,7 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync }
 import { join, relative } from 'node:path';
 import { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP, ARTIFACT_MAX_FILES } from '../shared/home.ts';
 
-export { ARTIFACT_PER_FILE_CAP, ARTIFACT_TOTAL_CAP, ARTIFACT_MAX_FILES };
-
-export type ProducedEntry = {
+type ProducedEntry = {
   id: string;
   type: 'file';
   title: string;
@@ -28,7 +26,7 @@ export type ProducedEntry = {
   bytes: number;
 };
 
-export type ArtifactResult = {
+type ArtifactResult = {
   produced: ProducedEntry[];
   notes: string[];
 };

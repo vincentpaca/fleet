@@ -137,12 +137,8 @@
       "properties": {
         "status": { "enum": ["READY", "BLOCKED", "STALE", "NOT-DEPLOYED", "CODE-READY-RUNTIME-UNVERIFIED", "PARTIAL"] },
         "target_rung": { "$ref": "work-order.schema.json#/$defs/rung" },
-        "base_sha": { "type": "string" },
-        "head_sha": { "type": "string" },
         "pr": { "type": "string" },
-        "implemented": { "type": "array", "items": { "type": "string" } },
         "verification": { "type": "array", "items": { "type": "string" } },
-        "self_review": { "type": "array", "items": { "type": "string" } },
         "not_done": { "type": "array", "items": { "type": "string" } },
         "next_action": { "type": "string", "minLength": 1 }
       }
