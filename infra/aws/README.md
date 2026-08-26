@@ -1,6 +1,6 @@
 # Fleet Terraform module
 
-Provisions everything Fleet needs to run coding-agent jobs in containers on your own AWS
+Provisions everything Fleet needs to run your own harness jobs in containers on your own AWS
 account: an ECS cluster backed by an EC2 auto scaling group that scales to zero, the
 Fleet daemon as an always-on Fargate service with durable `FLEET_HOME` state on EFS,
 ECR repositories for the runner and project images, and CloudWatch log groups.

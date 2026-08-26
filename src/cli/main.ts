@@ -53,7 +53,7 @@ const EXIT_OK = 0;
 const EXIT_FAILURE = 1;
 const EXIT_USAGE = 2;
 
-const HELP = `fleet — run coding-agent jobs in containers in your own cloud
+const HELP = `fleet — run your own harness jobs in containers in your own cloud
 
 Usage: fleet [command] [options]
 
