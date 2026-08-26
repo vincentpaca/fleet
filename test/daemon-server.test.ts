@@ -511,6 +511,9 @@ test("wall-clock backstop terminates and cancels wedged job via daemon sweep", a
     wallClockBackstopMarginMs: 300,
     // Sweep every 50ms so the test finishes quickly.
     wallClockSweepIntervalMs: 50,
+    // The runner here is wedged and will never settle for itself; don't sit
+    // out the full post-terminate wait (#197) before synthesising.
+    backstopSettleWaitMs: 250,
   });
   const { socketPath } = await daemon.start();
   t.after(() => daemon.stop());
@@ -570,6 +573,8 @@ test("stall backstop cancels a running job whose events dried up (reason stall)"
     // Fire 300ms past the 1s idle threshold; sweep fast so the test is quick.
     idleBackstopMarginMs: 300,
     wallClockSweepIntervalMs: 50,
+    // A dead runner settles nothing; skip most of the post-terminate wait (#197).
+    backstopSettleWaitMs: 250,
   });
   const { socketPath } = await daemon.start();
   t.after(() => daemon.stop());
@@ -604,6 +609,79 @@ test("stall backstop cancels a running job whose events dried up (reason stall)"
   const cancelEvent = events.find((e) => e.type === "state" && e.state === "cancelled");
   assert.ok(cancelEvent);
   assert.equal(cancelEvent.reason, "stall");
+});
+
+test("the backstop defers to a runner that settles for itself after terminate (#197)", async (t) => {
+  // terminate() is a signal, not a death: on ECS and the process provider it
+  // returns while the runner's cancel teardown — WIP push, artifact
+  // collection, settle — is still running. Synthesising immediately marked
+  // the job terminal and 422-rejected every teardown event: the journal of
+  // job-mt9y7vel shows the daemon's produced:[] settle while the runner's own
+  // account never landed. On pre-#197 code this test fails exactly there.
+  const home = tempHome();
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({
+    home,
+    provider,
+    longPollMs: LONG_POLL_MS,
+    idleBackstopMarginMs: 300,
+    wallClockSweepIntervalMs: 50,
+    // Room for the "runner" below to deliver its teardown after terminate.
+    backstopSettleWaitMs: 5_000,
+  });
+  const { socketPath } = await daemon.start();
+  t.after(() => daemon.stop());
+  const ctx: Ctx = { daemon, sock: socketPath, provider, home };
+
+  const manifest = { ...MANIFEST, limits: { idle: "1s" } };
+  const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest });
+  assert.equal(res.status, 201, res.body);
+  const job = (res.json as { job: { id: string; handle?: string } }).job;
+  const launch = provider.launches.find((l) => l.jobId === job.id);
+  assert.ok(launch);
+  const token = launch.runnerToken;
+
+  await runnerPost(ctx.sock, job.id, token, event(job.id, 0, { type: "state", state: "running" }));
+
+  // Silence until the backstop terminates; the stub records the terminate.
+  await until(async () => provider.terminated.includes(job.handle ?? `stub:${job.id}`), 10_000);
+
+  // The "runner's" cancel teardown, arriving AFTER terminate: a wip-push log,
+  // a settle with real produced[], the cancelled state. All must be accepted.
+  const teardownSettle = {
+    type: "settle",
+    minutes: 3,
+    outcome: {
+      produced: [{ id: "answer.md", type: "file", title: "answer.md", path: "answer.md" }],
+      findings: 0,
+      decisions: 0,
+    },
+    report: { status: "PARTIAL", next_action: "job cancelled: runner received SIGTERM" },
+  };
+  const logPost = await runnerPost(ctx.sock, job.id, token, event(job.id, 1, { type: "log", text: "wip pushed to fleet/x (cancelled)", who: "runner" }));
+  assert.equal(logPost.status, 200, `teardown log rejected: ${logPost.body}`);
+  const settlePost = await runnerPost(ctx.sock, job.id, token, event(job.id, 2, teardownSettle));
+  assert.equal(settlePost.status, 200, `teardown settle rejected: ${settlePost.body}`);
+  const statePost = await runnerPost(ctx.sock, job.id, token, event(job.id, 3, { type: "state", state: "cancelled", reason: "signal" }));
+  assert.equal(statePost.status, 200, `teardown state rejected: ${statePost.body}`);
+
+  // The record carries the runner's account, and the daemon synthesised no
+  // second settle over it.
+  await until(async () => {
+    const j = jobOf((await op(ctx.sock, "GET", `/jobs/${job.id}`)).json);
+    return j.state === "cancelled";
+  }, 10_000);
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${job.id}/events`)).body) as Record<string, unknown>[];
+  const settles = events.filter((e) => e.type === "settle");
+  assert.equal(settles.length, 1, "exactly one settle: the runner's, never a synthetic twin");
+  const outcome = settles[0].outcome as { produced: unknown[] };
+  assert.equal(outcome.produced.length, 1, "the runner's produced[] survives");
+  // And the journal still says why the daemon acted: the backstop names its
+  // cause before terminating, since the runner only knows it got a signal.
+  assert.ok(
+    events.some((e) => e.type === "log" && /stall backstop: terminating/.test(String(e.text))),
+    "the backstop must record why it terminated",
+  );
 });
 
 test("stall backstop leaves a blocked job alone however long it waits", async (t) => {

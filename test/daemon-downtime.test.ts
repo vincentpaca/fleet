@@ -27,7 +27,7 @@ async function startDaemon(home: string, sweeping = false): Promise<Ctx> {
     // Sweeping daemons fire fast and with a tiny margin, so a bug that bills
     // the outage cancels within the test's first few hundred milliseconds.
     ...(sweeping
-      ? { wallClockSweepIntervalMs: 50, wallClockBackstopMarginMs: 300, idleBackstopMarginMs: 300 }
+      ? { wallClockSweepIntervalMs: 50, wallClockBackstopMarginMs: 300, idleBackstopMarginMs: 300, backstopSettleWaitMs: 250 }
       : {}),
   });
   const { socketPath } = await daemon.start();
