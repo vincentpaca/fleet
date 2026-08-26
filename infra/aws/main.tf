@@ -373,6 +373,22 @@ resource "aws_iam_role_policy" "daemon_dispatch" {
         Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.this.arn } }
       },
       {
+        # The reconcile sweep (#147/#171) lists the cluster's running tasks and
+        # describes them to find orphans by startedBy. Read-only, cluster-scoped
+        # (#187): without these two the sweep's first AWS call is denied and
+        # POST /reconcile answers 500 on a live deployment.
+        Effect    = "Allow"
+        Action    = ["ecs:ListTasks"]
+        Resource  = "*"
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.this.arn } }
+      },
+      {
+        Effect    = "Allow"
+        Action    = ["ecs:DescribeTasks"]
+        Resource  = "*"
+        Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.this.arn } }
+      },
+      {
         Effect    = "Allow"
         Action    = ["ecs:StopTask"]
         Resource  = "*"
