@@ -16,7 +16,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startMockDaemon } from './runner-mock-daemon.ts';
-import { runSetupScript } from '../src/runner/setup.ts';
+import { runSetupScript, dropPrivileges } from '../src/runner/setup.ts';
 import { SETUP_BAKED_BASENAME, setupBakedMarkerPath } from '../src/shared/setup-marker.ts';
 
 const runnerMain = fileURLToPath(new URL('../src/runner/main.ts', import.meta.url));
@@ -138,6 +138,31 @@ describe('runSetupScript', () => {
       });
       assert.equal(outcome.kind, 'failed');
       assert.match((outcome as { detail: string }).detail, /timed out/);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------- unit: dropPrivileges (#196) ----------
+//
+// The real drop (root → uid 1000) only happens inside the runner container and
+// is asserted on live jobs in test/cli-image.test.ts (FLEET_TEST_DOCKER=1).
+// What can and must hold on any host: a non-root process is a clean no-op.
+// The plausible bug: an unconditional setuid throws EPERM off-root, which
+// would cancel every process-provider job on the drop that #196 added.
+
+describe('dropPrivileges', () => {
+  test('not root → skipped, and nothing is mutated', { skip: process.getuid?.() === 0 ? 'test host is root' : false }, () => {
+    const workspace = tempWorkspace();
+    const homeBefore = process.env.HOME;
+    const userBefore = process.env.USER;
+    try {
+      const outcome = dropPrivileges(workspace);
+      assert.equal(outcome.kind, 'skipped', JSON.stringify(outcome));
+      assert.equal(process.env.HOME, homeBefore, 'a skipped drop must not rehome the process');
+      assert.equal(process.env.USER, userBefore);
+      assert.notEqual(process.getuid?.(), 0);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

@@ -16,7 +16,7 @@
         "devcontainer": { "type": "string", "description": "Path to devcontainer.json (image/build/postCreateCommand subset, built via @devcontainers/cli)." },
         "image": { "type": "string", "description": "Base image (fallback form)." },
         "dockerfile": { "type": "string", "description": "Dockerfile path (fallback form, mutually exclusive with image)." },
-        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run." }
+        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run. Runs as root — it is operator-authored (laptop trust class) and may install system packages; the runner drops to the unprivileged job user before the pickup gate and the harness, so the agent never runs as root." }
       },
       "oneOf": [
         { "required": ["devcontainer"], "not": { "anyOf": [{ "required": ["image"] }, { "required": ["dockerfile"] }] } },
