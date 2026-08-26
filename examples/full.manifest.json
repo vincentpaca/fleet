@@ -35,6 +35,7 @@
     "idle": "20m",
     "block_hot": "30m",
     "decision_timeout": "24h",
+    "checkpoint": "10m",
     "egress": ["github.com", "api.anthropic.com", "your-tracker.example.com"]
   }
 }

@@ -358,6 +358,16 @@ export function pushWip(workspace: string, reason: string, timeoutMs?: number): 
   return commitAndPush(workspace, `wip(park): ${reason}`, undefined, timeoutMs);
 }
 
+/**
+ * The periodic WIP checkpoint during a run (#190): same commit-and-push
+ * machinery as the park/cancel pushes, bounded the same way. A clean,
+ * fully-pushed workspace is a no-op ('clean'); each later checkpoint and the
+ * final teardown push then move only the delta since the last one.
+ */
+export function pushCheckpoint(workspace: string, note: string, timeoutMs?: number): 'pushed' | 'clean' {
+  return commitAndPush(workspace, `wip(checkpoint): ${note}`, undefined, timeoutMs);
+}
+
 /** HEAD SHA after all commits; used for settle reporting. */
 export function getHeadSha(workspace: string): string {
   return git(workspace, ['rev-parse', 'HEAD']).trim();

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { runCli, makeTempDir, startMockDaemon, sendJson, sendNdjson, EVENT_BATTERY, type MockRequest } from './cli-helpers.ts';
@@ -72,6 +73,7 @@ test('formatEvent: exact output for every event type, color and noColor (#128 ch
     '\x1b[32m[12] settle rung=pr-open status=READY next: review it\x1b[0m',
     '\x1b[31m[13] settle rung=? status=PARTIAL\x1b[0m',
     '[14] pair {"minutes":3}',
+    '\x1b[32m[15] settle rung=inspected status=READY next: fetch the artifacts\n  fetch: fleet artifacts <jobId> get dist/report.pdf\n  fetch: fleet artifacts <jobId> get charts/fig1.png\x1b[0m',
   ];
   const expectedNoColor = [
     '[1] state → running',
@@ -88,6 +90,7 @@ test('formatEvent: exact output for every event type, color and noColor (#128 ch
     '[12] settle rung=pr-open status=READY next: review it',
     '[13] settle rung=? status=PARTIAL',
     '[14] pair {"minutes":3}',
+    '[15] settle rung=inspected status=READY next: fetch the artifacts\n  fetch: fleet artifacts <jobId> get dist/report.pdf\n  fetch: fleet artifacts <jobId> get charts/fig1.png',
   ];
   assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, false)), expectedColor);
   assert.deepEqual(EVENT_BATTERY.map((e) => formatEvent(e, true)), expectedNoColor);
@@ -505,6 +508,125 @@ test('artifacts get --out that cannot be written is a one-line failure, exit 1, 
   assert.equal(res.code, 1);
   assert.match(res.stderr, /artifacts get: cannot write /);
   assert.doesNotMatch(res.stderr, /node:internal|at .*\.ts:\d/, 'no stack trace');
+});
+
+// ── artifacts get --all: every indexed file, sha-verified, overwrite-guarded (#195) ─
+
+/** One artifact's wire response; flip `corrupt` to serve bytes that betray the declared sha. */
+function artifactBody(content: string, corrupt = false): { content: string; bytes: number; sha256: string } {
+  const buf = Buffer.from(content);
+  return {
+    content: buf.toString('base64'),
+    bytes: buf.length,
+    sha256: createHash('sha256').update(corrupt ? 'other bytes entirely' : content).digest('hex'),
+  };
+}
+
+/** Mock daemon indexing three artifacts (one nested); `corruptPath` serves a bad sha. */
+function multiArtifactDaemon(corruptPath?: string): ReturnType<typeof startMockDaemon> {
+  const files: Record<string, string> = { 'a.txt': 'alpha', 'charts/fig1.png': 'fakepng', 'b.md': '# beta\n' };
+  const routes: Record<string, (req: MockRequest, res: ServerResponse) => void> = {
+    'GET /jobs/job-1/artifacts': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, {
+        artifacts: Object.entries(files).map(([p, c]) => ({ path: p, bytes: Buffer.byteLength(c) })),
+      }),
+  };
+  for (const [p, c] of Object.entries(files)) {
+    routes[`GET /jobs/job-1/artifacts/${p}`] = (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 200, { path: p, ...artifactBody(c, p === corruptPath) });
+  }
+  return startMockDaemon(routes);
+}
+
+test('artifacts get --all round-trips every indexed file, preserving nested paths', async (t) => {
+  const daemon = await multiArtifactDaemon();
+  t.after(daemon.close);
+
+  const outDir = makeTempDir('fleet-art-all-');
+  const res = await runCli(['artifacts', 'job-1', 'get', '--all', '--out', outDir], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const { readFileSync } = await import('node:fs');
+  assert.equal(readFileSync(path.join(outDir, 'a.txt'), 'utf8'), 'alpha');
+  assert.equal(readFileSync(path.join(outDir, 'charts', 'fig1.png'), 'utf8'), 'fakepng', 'nested path preserved, not flattened');
+  assert.equal(readFileSync(path.join(outDir, 'b.md'), 'utf8'), '# beta\n');
+});
+
+test('artifacts get --all: a corrupted file fails loudly and the rest still land', async (t) => {
+  const daemon = await multiArtifactDaemon('charts/fig1.png');
+  t.after(daemon.close);
+
+  const outDir = makeTempDir('fleet-art-all-');
+  const res = await runCli(['artifacts', 'job-1', 'get', '--all', '--out', outDir], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 1, 'a failed file must fail the command');
+  assert.match(res.stderr, /sha256 mismatch for charts\/fig1\.png/);
+  assert.match(res.stderr, /1 of 3 artifacts failed/);
+  const { readFileSync, existsSync } = await import('node:fs');
+  assert.equal(readFileSync(path.join(outDir, 'a.txt'), 'utf8'), 'alpha', 'files before the corruption land');
+  assert.equal(readFileSync(path.join(outDir, 'b.md'), 'utf8'), '# beta\n', 'files after the corruption land too');
+  assert.ok(!existsSync(path.join(outDir, 'charts', 'fig1.png')), 'the corrupted file is never written');
+});
+
+test('artifacts get --all refuses to overwrite without --force, then overwrites with it', async (t) => {
+  const daemon = await multiArtifactDaemon();
+  t.after(daemon.close);
+
+  const outDir = makeTempDir('fleet-art-all-');
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  writeFileSync(path.join(outDir, 'a.txt'), 'precious local edits');
+
+  const refused = await runCli(['artifacts', 'job-1', 'get', '--all', '--out', outDir], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /refusing to overwrite .*a\.txt.*--force/);
+  assert.equal(readFileSync(path.join(outDir, 'a.txt'), 'utf8'), 'precious local edits', 'nothing overwritten');
+
+  const forced = await runCli(['artifacts', 'job-1', 'get', '--all', '--out', outDir, '--force'], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(forced.code, 0, forced.stderr);
+  assert.equal(readFileSync(path.join(outDir, 'a.txt'), 'utf8'), 'alpha');
+});
+
+test('artifacts get --all with a path argument is a usage error', async (t) => {
+  const daemon = await multiArtifactDaemon();
+  t.after(daemon.close);
+  const res = await runCli(['artifacts', 'job-1', 'get', '--all', 'a.txt'], {
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 2);
+  assert.match(res.stderr, /--all takes no <path>/);
+});
+
+// ── status: the artifact tally is visible where the job reads as finished (#195) ─
+
+test('status renders done · N artifacts from the payload tally; zero shows nothing new', async (t) => {
+  const jobs = [
+    { id: 'job-art', state: 'done', workOrder: { finish: 'inspected', target: 'notes' }, artifacts: { count: 3, totalBytes: 4096 } },
+    { id: 'job-none', state: 'done', workOrder: { finish: 'inspected', target: 'notes' } },
+    { id: 'job-partial', state: 'cancelled', reason: 'stall', workOrder: { finish: 'inspected', target: 'notes' }, artifacts: { count: 1, totalBytes: 5 } },
+  ];
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs }),
+    'GET /jobs/job-art': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { job: jobs[0] }),
+  });
+  t.after(daemon.close);
+  const env = { FLEET_DAEMON_URL: daemon.url };
+
+  const list = await runCli(['status'], { env });
+  assert.equal(list.code, 0, list.stderr);
+  assert.match(list.stdout, /job-art\s+done · 3 artifacts\s+finish=/);
+  assert.match(list.stdout, /job-none\s+done\s+finish=/, 'an empty-handed job shows nothing new');
+  // A cancelled job with partial uploads shows its real count.
+  assert.match(list.stdout, /job-partial\s+cancelled\(stall\) · 1 artifact\s+finish=/);
+
+  const single = await runCli(['status', 'job-art'], { env });
+  assert.equal(single.code, 0, single.stderr);
+  assert.match(single.stdout, /job-art\s+done · 3 artifacts\s+finish=/);
 });
 
 test('status prints friendly empty-state with delegate hint when no jobs', async (t) => {

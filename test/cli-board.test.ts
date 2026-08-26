@@ -174,12 +174,11 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
       },
     },
     { id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: 'app' } },
-    { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'notes' }, artifacts: 3 },
+    { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'notes' }, artifacts: { count: 3, totalBytes: 4096 } },
   ];
-  // At 80 columns the widened FINISH column (#36: 13, so every targetable rung
-  // fits and TARGET stays on one column) pushes the artifact marker past the
-  // edge — the same clipping any job with an elapsed time already hit here. The
-  // marker's own coverage is the next test, which renders at 100.
+  // The artifact tally rides the state cell (#195): `done · 3 artifacts`
+  // reads as one fact, and the row past it shifts rather than the tally
+  // falling off the 80-column edge as #81's trailing marker did.
   assert.equal(roster(jobs, 0, 80), [
     '▶ !! job-blk                 blocked    inspected      docs               ',
     '     Deploy now?',
@@ -188,26 +187,27 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
     '     answer: type an option id below — go | wait',
     '',
     '  ●  job-run                 running    merge-ready    app                ',
-    '  ·  job-done                done       inspected      notes                3 f…',
+    '  ·  job-done                done · 3 artifacts  inspected      notes          …',
   ].join('\n'));
 });
 
-test('a done row shows its delivered-artifact count; empty or live rows do not (#81)', () => {
+test('a done row shows its delivered-artifact tally; empty or live rows do not (#81/#195)', () => {
   // The delivery guarantee has to be visible where the job reads as finished:
   // a done job with files waiting must not look identical to an empty-handed one.
-  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'docs' }, artifacts: 3 };
-  assert.match(roster([done]), /job-done.*3 files/);
-  // Singular for one file — "1 files" reads as a bug.
-  assert.match(roster([{ ...done, artifacts: 1 }]), /job-done.*1 file(?!s)/);
-  // Zero or unknown: no marker at all, not "0 files".
-  assert.doesNotMatch(roster([{ ...done, artifacts: 0 }]), /file/);
-  assert.doesNotMatch(roster([{ ...done, artifacts: undefined }]), /file/);
-  // A live job never carries the marker: its settle has not happened, so any
-  // count on it would be stale data wearing a delivery badge.
-  assert.doesNotMatch(roster([{ ...done, state: 'running' }]), /file/);
+  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'docs' }, artifacts: { count: 3, totalBytes: 4096 } };
+  assert.match(roster([done]), /job-done\s+done · 3 artifacts/);
+  // Singular for one file — "1 artifacts" reads as a bug.
+  assert.match(roster([{ ...done, artifacts: { count: 1, totalBytes: 5 } }]), /job-done\s+done · 1 artifact(?!s)/);
+  // Zero or unknown: no marker at all, not "0 artifacts".
+  assert.doesNotMatch(roster([{ ...done, artifacts: { count: 0, totalBytes: 0 } }]), /artifact/);
+  assert.doesNotMatch(roster([{ ...done, artifacts: undefined }]), /artifact/);
+  // A live job never carries the marker: its uploads are still moving, so any
+  // count on it would be stale by the next poll.
+  assert.doesNotMatch(roster([{ ...done, state: 'running' }]), /artifact/);
   // A cancelled job that still delivered artifacts shows them — partial
-  // delivery is exactly when the operator needs to know files exist.
-  assert.match(roster([{ ...done, state: 'cancelled', reason: 'stall' }]), /job-done.*3 files/);
+  // delivery is exactly when the operator needs to know files exist (#195:
+  // the count is index-derived, so it is the real partial count).
+  assert.match(roster([{ ...done, state: 'cancelled', reason: 'stall' }]), /job-done\s+cancelled\(stall\) · 3 artifacts/);
 });
 
 test('the blocked marker pulses, and only the blocked one', () => {
@@ -306,6 +306,9 @@ test('renderEventLines: exact output for every event type, color and noColor (#1
     '\x1b[90m[12]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36mpr-open\x1b[0m status=\x1b[36mREADY\x1b[0m',
     '\x1b[90m[13]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36m?\x1b[0m status=\x1b[36mPARTIAL\x1b[0m',
     '\x1b[90m[14]\x1b[0m \x1b[90mpair\x1b[0m',
+    '\x1b[90m[15]\x1b[0m \x1b[36msettle\x1b[0m rung=\x1b[36minspected\x1b[0m status=\x1b[36mREADY\x1b[0m',
+    '     \x1b[36mfetch: fleet artifacts <jobId> get dist/report.pdf\x1b[0m',
+    '     \x1b[36mfetch: fleet artifacts <jobId> get charts/fig1.png\x1b[0m',
   ];
   const expectedNoColor = [
     '[1] → running',
@@ -326,6 +329,9 @@ test('renderEventLines: exact output for every event type, color and noColor (#1
     '[12] settle rung=pr-open status=READY',
     '[13] settle rung=? status=PARTIAL',
     '[14] pair',
+    '[15] settle rung=inspected status=READY',
+    '     fetch: fleet artifacts <jobId> get dist/report.pdf',
+    '     fetch: fleet artifacts <jobId> get charts/fig1.png',
   ];
   const battery = EVENT_BATTERY as FleetEvent[];
   assert.deepEqual(renderEventLines(battery, 100, false), expectedColor);
@@ -505,19 +511,21 @@ test('fetchBoardJobs: a cached decision is not re-read, and a re-block is not se
   assert.equal(cache.size, 1, 'the cache is pruned to what is on the board');
 });
 
-test('fetchBoardJobs carries the artifact count from the stored settle (#81)', async (t) => {
-  // The daemon listing already stores the settle; the count must come from it
-  // without any per-job event read — and an empty produced[] must map to no
-  // count at all, not zero.
+test('fetchBoardJobs carries the artifact tally from the daemon payload, not the settle claim (#195)', async (t) => {
+  // The daemon derives the tally from the per-job artifact index — what is
+  // actually fetchable — and puts it on the listing, so no per-job read here.
+  // A settle whose produced[] over-claims must not leak in as a count: the
+  // stored settle rides the listing too, and reading it is the #195 bug.
   const daemon = await startMockDaemon({
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
         jobs: [
           {
             id: 'job-art', state: 'done',
-            settle: { outcome: { produced: [{ id: 'a.md', type: 'file', title: 'a.md' }, { id: 'b.csv', type: 'file', title: 'b.csv' }], findings: 0, decisions: 0 } },
+            artifacts: { count: 2, totalBytes: 300 },
+            settle: { outcome: { produced: [{ id: 'a.md', type: 'file', title: 'a.md' }, { id: 'b.csv', type: 'file', title: 'b.csv' }, { id: 'ghost', type: 'file', title: 'never uploaded' }], findings: 0, decisions: 0 } },
           },
-          { id: 'job-empty', state: 'done', settle: { outcome: { produced: [], findings: 0, decisions: 0 } } },
+          { id: 'job-claims-only', state: 'done', settle: { outcome: { produced: [{ id: 'x', type: 'file', title: 'x' }], findings: 0, decisions: 0 } } },
           { id: 'job-nosettle', state: 'running' },
         ],
       }),
@@ -527,8 +535,8 @@ test('fetchBoardJobs carries the artifact count from the stored settle (#81)', a
   const result = await fetchBoardJobs({ FLEET_DAEMON_URL: daemon.url });
   assert.ok(result.ok, `fetchBoardJobs failed: ${result.error}`);
   const byId = new Map(result.jobs!.map((j) => [j.id, j]));
-  assert.equal(byId.get('job-art')?.artifacts, 2);
-  assert.equal(byId.get('job-empty')?.artifacts, undefined, 'empty produced[] maps to no count');
+  assert.deepEqual(byId.get('job-art')?.artifacts, { count: 2, totalBytes: 300 }, 'the index tally, not produced[] length');
+  assert.equal(byId.get('job-claims-only')?.artifacts, undefined, 'a produced[] claim with no payload tally maps to no count');
   assert.equal(byId.get('job-nosettle')?.artifacts, undefined);
 });
 

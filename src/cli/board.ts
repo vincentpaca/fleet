@@ -8,7 +8,7 @@
 //
 // Zero dependencies: hand-rolled ANSI; erasable TS only.
 import { request } from './client.ts';
-import { formatJobState, formatLogText, renderEvent } from './format.ts';
+import { artifactTally, formatJobState, formatLogText, renderEvent } from './format.ts';
 import { makeCol, visualClip, visualLength, type ColFn } from './ansi.ts';
 import { optionId, type FleetEvent, type PendingDecision } from '../shared/events.ts';
 import { displayTarget } from '../shared/issue-ref.ts';
@@ -29,8 +29,8 @@ export type BoardJob = {
   updatedAt?: string;
   lastActivity?: { text: string; at: string }; // most recent think/log from the daemon (all jobs)
   decision?: PendingDecision; // pending decision enriched from event stream
-  /** Delivered artifacts (settle outcome produced[] length). Settled jobs only. */
-  artifacts?: number;
+  /** Delivered-artifact tally from the daemon job payload (#195): index-derived, never the settle claim. */
+  artifacts?: { count?: number; totalBytes?: number };
 };
 
 /** Context info shown in the header strip. Gathered at startup; optional fields. */
@@ -430,16 +430,6 @@ function jobGlyph(job: BoardJob, pulse: boolean, col: ColFn): string {
   return col('·', 90) + ' ';
 }
 
-/**
- * Delivered-artifact suffix for a settled roster row (issue #81).
- * A done row with files must not look identical to an empty-handed one.
- */
-function artifactSuffix(job: BoardJob, col: ColFn): string {
-  const settled = job.state === 'done' || job.state === 'cancelled';
-  if (!settled || (job.artifacts ?? 0) <= 0) return '';
-  return '  ' + col(job.artifacts + ' file' + (job.artifacts === 1 ? '' : 's'), 90);
-}
-
 /** Extra lines below a roster row: decision card (blocked) or last activity (live). */
 function jobExtraLines(job: BoardJob, noColor: boolean, now: number, w: number): string[] {
   const col = makeCol(noColor);
@@ -477,12 +467,14 @@ function buildRosterRow(
   // Prefer "#<n> <title>" when both are present.
   const ref = displayTarget(rawTarget);
   const targetDisplay = title ? ref + ' ' + title : rawTarget;
-  const stateDisplay = formatJobState(job);
+  // Delivered-artifact tally rides the state cell — `done · 3 artifacts` —
+  // so a settled row with files waiting must not look identical to an
+  // empty-handed one (#81, count now index-derived via the job payload, #195).
+  const stateDisplay = formatJobState(job) + artifactTally(job);
   const glyph = jobGlyph(job, pulse, col);
-  const files = artifactSuffix(job, col);
   const row = sel + ' ' + glyph + ' ' + visualClip(job.id, 22).padEnd(22) + '  '
     + col(stateDisplay.padEnd(9), stateColor(job)) + '  ' + finish.padEnd(FINISH_W) + '  '
-    + visualClip(targetDisplay, 17).padEnd(17) + '  ' + elapsed + files;
+    + visualClip(targetDisplay, 17).padEnd(17) + '  ' + elapsed;
   return { jobIndex: i, lines: [visualClip(row, w), ...jobExtraLines(job, noColor, now, w)] };
 }
 
@@ -513,8 +505,8 @@ type RawJob = {
   createdAt?: string;
   updatedAt?: string;
   lastActivity?: { text: string; at: string };
-  /** Stored settle (daemon keeps it on the record); produced[] is the artifact list. */
-  settle?: { outcome?: { produced?: unknown[] } };
+  /** Artifact tally the daemon derives from the per-job index (#195) — ground truth of what is fetchable. */
+  artifacts?: { count?: number; totalBytes?: number };
 };
 
 /** Reduce one raw event line into the latest unanswered decision. */
@@ -593,6 +585,28 @@ export function invalidateDecision(cache: Map<string, PendingDecision>, jobId: s
 }
 
 /**
+ * One listed job as the board holds it. The artifact tally rides the listing
+ * (#195, replacing #81's produced[] length): the daemon derives it from the
+ * per-job index — what is actually fetchable — so a settle that over-claims,
+ * or a job cancelled mid-upload, still shows the real count. No extra read
+ * per job.
+ */
+function toBoardJob(r: RawJob): BoardJob {
+  return {
+    id: r.id,
+    state: r.state,
+    marker: r.marker,
+    reason: r.reason,
+    attempt: r.attempt,
+    workOrder: r.workOrder,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+    lastActivity: r.lastActivity,
+    artifacts: r.artifacts,
+  };
+}
+
+/**
  * Fetch current jobs from the daemon, enriching blocked jobs with their pending
  * decision — which the job listing does not carry, so it comes from the event
  * log, the same contract every other consumer reads (no daemon change earns a
@@ -613,40 +627,39 @@ export async function fetchBoardJobs(
       return { ok: false, error: `daemon returned ${res.status}` };
     }
     const listed = res.json as { jobs: RawJob[] };
-    const jobs: BoardJob[] = listed.jobs.map((r) => ({
-      id: r.id,
-      state: r.state,
-      marker: r.marker,
-      reason: r.reason,
-      attempt: r.attempt,
-      workOrder: r.workOrder,
-      createdAt: r.createdAt,
-      updatedAt: r.updatedAt,
-      lastActivity: r.lastActivity,
-      // Artifact count from the stored settle (issue #81): the listing already
-      // carries it, so no extra read per job.
-      ...(Array.isArray(r.settle?.outcome?.produced) && r.settle.outcome.produced.length > 0
-        ? { artifacts: r.settle.outcome.produced.length }
-        : {}),
-    }));
-    for (const job of jobs) {
-      if (job.state !== 'blocked') continue;
-      const key = decisionKey(job);
-      const cached = cache?.get(key);
-      if (cached !== undefined) {
-        job.decision = cached;
-        continue;
-      }
-      job.decision = await fetchDecision(job.id, env);
-      if (job.decision !== undefined) cache?.set(key, job.decision);
-    }
-    if (cache) {
-      const live = new Set(jobs.filter((j) => j.state === 'blocked').map(decisionKey));
-      for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
-    }
+    const jobs: BoardJob[] = listed.jobs.map(toBoardJob);
+    await enrichBlockedDecisions(jobs, env, cache);
     return { ok: true, jobs };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Attach each blocked job's pending decision, reading a question's event log
+ * once per cache lifetime; the cache is then pruned to the current listing so
+ * it cannot outgrow the fleet. Split from fetchBoardJobs for the complexity
+ * gate — same behavior, one caller.
+ */
+async function enrichBlockedDecisions(
+  jobs: BoardJob[],
+  env: Record<string, string | undefined>,
+  cache?: Map<string, PendingDecision>,
+): Promise<void> {
+  for (const job of jobs) {
+    if (job.state !== 'blocked') continue;
+    const key = decisionKey(job);
+    const cached = cache?.get(key);
+    if (cached !== undefined) {
+      job.decision = cached;
+      continue;
+    }
+    job.decision = await fetchDecision(job.id, env);
+    if (job.decision !== undefined) cache?.set(key, job.decision);
+  }
+  if (cache) {
+    const live = new Set(jobs.filter((j) => j.state === 'blocked').map(decisionKey));
+    for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
   }
 }
 

@@ -23,7 +23,7 @@ import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
-import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
+import { artifactTally, formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
 import { COMPAT_MODE, SHAPE_DEFAULTS, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
 import { displayTarget, isIssueTarget, normalizeTarget } from '../shared/issue-ref.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
@@ -129,6 +129,11 @@ Commands:
   cancel <jobId>                           Cancel a job
   artifacts <jobId> [list]                 List artifacts delivered by a job
   artifacts <jobId> get <path> [--out dir] Download an artifact (writes to dir/<filename>, or stdout)
+  artifacts <jobId> get --all [--out dir] [--force]
+                                           Download every artifact, sha-verified, preserving relative
+                                           paths under dir (default: the current directory). Refuses
+                                           to overwrite existing files without --force; a corrupted
+                                           file fails loudly and the rest still land.
   connect [--port N] [--detach]            Open and hold the tunnel to a cloud daemon: resolve the
                                            deployment, forward its daemon port to localhost, verify
                                            /health, and reopen on session death (re-resolving the
@@ -968,10 +973,14 @@ type Job = {
   /** `mode` is deprecated (#36) and no longer rendered; old jobs still carry it. */
   workOrder?: { finish?: string; target?: string; title?: string };
   updatedAt?: string;
+  /** Delivered-artifact tally from the daemon job payload (#195): index-derived, never the settle claim. */
+  artifacts?: { count?: number; totalBytes?: number };
 };
 
 function formatJob(job: Job): string {
-  const state = formatJobState(job);
+  // `done · 3 artifacts` — deliverables must be visible where the job reads
+  // as finished (#195); empty-handed jobs show nothing new.
+  const state = formatJobState(job) + artifactTally(job);
   // The finish rung, which every work order carries (schema-required) — so old
   // jobs render theirs too, and '?' means a job record with no order at all.
   const finish = job.workOrder?.finish ?? '?';
@@ -1176,21 +1185,46 @@ async function cmdArtifactsList(jobId: string): Promise<number> {
   return EXIT_OK;
 }
 
-async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
-  const { values, positionals: getPos } = parseCommand(rest, { out: { type: 'string' } }, 1, 1);
-  const artifactPath = getPos[0];
+/**
+ * Fetch one artifact and verify its integrity end to end (the daemon stamps
+ * sha256 at store time). Returns the bytes, or the failure as a message —
+ * never throws — so `get --all` can fail one file loudly and fetch the rest.
+ */
+async function fetchVerifiedArtifact(jobId: string, artifactPath: string): Promise<{ buffer: Buffer } | { error: string }> {
   // Encode each path segment separately so slashes are preserved.
   const encodedPath = artifactPath.split('/').map(encodeURIComponent).join('/');
   const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts/' + encodedPath);
-  if (res.status !== 200) return daemonFailure(res, 'artifacts get');
+  if (res.status !== 200) return { error: daemonFailureMessage(res, 'artifacts get') };
   // Daemon returns JSON {path, content (base64), bytes, sha256}.
   const body = res.json as { path?: string; content?: string; bytes?: number; sha256?: string };
-  if (!body.content) fail('artifacts get: daemon returned no content');
+  if (!body.content) return { error: 'artifacts get: daemon returned no content for ' + artifactPath };
   const buffer = Buffer.from(body.content, 'base64');
-  // Verify end-to-end integrity; the daemon stamps sha256 at store time.
   if (body.sha256) {
     const actual = createHash('sha256').update(buffer).digest('hex');
-    if (actual !== body.sha256) fail('artifacts get: sha256 mismatch for ' + artifactPath + ' — content corrupted in transit');
+    if (actual !== body.sha256) {
+      return { error: 'artifacts get: sha256 mismatch for ' + artifactPath + ' — content corrupted in transit' };
+    }
+  }
+  return { buffer };
+}
+
+async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
+  const { values, positionals: getPos } = parseCommand(
+    rest,
+    { out: { type: 'string' }, all: { type: 'boolean' }, force: { type: 'boolean' } },
+    0,
+    1,
+  );
+  if (values.all === true) {
+    if (getPos.length > 0) throw new UsageError('get --all takes no <path>');
+    return cmdArtifactsGetAll(jobId, typeof values.out === 'string' ? values.out : '.', values.force === true);
+  }
+  if (getPos.length === 0) throw new UsageError('get requires <path>, or --all for every artifact');
+  const artifactPath = getPos[0];
+  const fetched = await fetchVerifiedArtifact(jobId, artifactPath);
+  if ('error' in fetched) {
+    console.error(fetched.error);
+    return EXIT_FAILURE;
   }
   if (typeof values.out === 'string') {
     const filename = path.basename(artifactPath);
@@ -1199,25 +1233,88 @@ async function cmdArtifactsGet(jobId: string, rest: string[]): Promise<number> {
     // one-line failure — not an unhandled ENOENT stack (#125).
     try {
       fs.mkdirSync(values.out, { recursive: true });
-      fs.writeFileSync(outPath, buffer);
+      fs.writeFileSync(outPath, fetched.buffer);
     } catch (err) {
       fail('artifacts get: cannot write ' + outPath + ': ' + errorMessage(err));
     }
     console.log('saved to ' + outPath);
   } else {
-    process.stdout.write(buffer);
+    process.stdout.write(fetched.buffer);
   }
   return EXIT_OK;
 }
 
+/**
+ * Fetch one indexed artifact to its place under outDir, preserving the
+ * relative path (unlike single get's basename, so nested trees cannot
+ * collide). Returns the failure as a message rather than throwing.
+ */
+async function fetchArtifactTo(jobId: string, relPath: string, outDir: string): Promise<string | undefined> {
+  // The daemon's path guard rejects escapes at intake, but these paths arrive
+  // over the wire — never write outside outDir on this side either.
+  if (relPath.startsWith('/') || relPath.split('/').some((part) => part === '' || part === '.' || part === '..')) {
+    return 'artifacts get: refusing unsafe artifact path: ' + relPath;
+  }
+  const fetched = await fetchVerifiedArtifact(jobId, relPath);
+  if ('error' in fetched) return fetched.error;
+  const outPath = path.join(outDir, relPath);
+  try {
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, fetched.buffer);
+  } catch (err) {
+    return 'artifacts get: cannot write ' + outPath + ': ' + errorMessage(err);
+  }
+  console.log('saved to ' + outPath);
+  return undefined;
+}
+
+/**
+ * `fleet artifacts <job> get --all [--out dir] [--force]` (#195): fetch every
+ * indexed artifact, each sha-verified. Overwrites are refused up front without
+ * --force; a corrupted file fails that file loudly and the rest still land.
+ */
+async function cmdArtifactsGetAll(jobId: string, outDir: string, force: boolean): Promise<number> {
+  const res = await daemonCall('GET', '/jobs/' + encodeURIComponent(jobId) + '/artifacts');
+  if (res.status !== 200) return daemonFailure(res, 'artifacts');
+  const body = res.json as { artifacts?: { path: string; bytes: number }[] };
+  const artifacts = body.artifacts ?? [];
+  if (artifacts.length === 0) {
+    console.log('no artifacts');
+    return EXIT_OK;
+  }
+  if (!force) {
+    const clashes = artifacts.map((a) => path.join(outDir, a.path)).filter((p) => fs.existsSync(p));
+    if (clashes.length > 0) {
+      console.error('artifacts get --all: refusing to overwrite ' + clashes.join(', ') + ' — pass --force');
+      return EXIT_FAILURE;
+    }
+  }
+  let failed = 0;
+  for (const artifact of artifacts) {
+    const error = await fetchArtifactTo(jobId, artifact.path, outDir);
+    if (error !== undefined) {
+      console.error(error);
+      failed++;
+    }
+  }
+  if (failed > 0) {
+    console.error('artifacts get --all: ' + failed + ' of ' + artifacts.length + ' artifacts failed');
+    return EXIT_FAILURE;
+  }
+  return EXIT_OK;
+}
+
+const ARTIFACTS_USAGE =
+  'usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>] | get --all [--out <outdir>] [--force]]';
+
 async function cmdArtifacts(args: string[]): Promise<number> {
   if (args.length === 0 || (args.length === 1 && (args[0] === '--help' || args[0] === '-h'))) {
-    console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
+    console.error(ARTIFACTS_USAGE);
     return EXIT_USAGE;
   }
   const [jobId, subcommand, ...rest] = args;
   if (!jobId) {
-    console.error('usage: fleet artifacts <jobId> [list | get <path> [--out <outdir>]]');
+    console.error(ARTIFACTS_USAGE);
     return EXIT_USAGE;
   }
   if (!subcommand || subcommand === 'list') return cmdArtifactsList(jobId);

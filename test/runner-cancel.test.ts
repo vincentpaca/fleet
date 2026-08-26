@@ -246,6 +246,93 @@ test('cancel: SIGTERM during an active run kills the SIGTERM-trapping tree, push
   }
 });
 
+// --- 1b: a committed-but-unpushed commit and on-disk artifacts survive (#197) --
+//
+// job-mt9y7vel: the harness had COMMITTED its work (clean tree, unpushed
+// commit) and written two artifact files before the daemon's stall backstop
+// cancelled it — and the teardown delivered neither. The WIP push must move
+// commits, not just uncommitted changes, and the cancel settle must collect
+// what already exists in .fleet/out/artifacts. On pre-#197 code the artifact
+// half fails: the cancel settle composed produced:[] without collecting.
+
+test('cancel: an unpushed commit lands on the branch and on-disk artifacts ride the cancel settle', async () => {
+  const token = 'cancel-token-9';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const workspace = writeWorkspace({ idle: '60s' });
+  const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-cancel-committed',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_GIT_URL: remote,
+    FLEET_GIT_NAME: 'Operator One',
+    FLEET_GIT_EMAIL: 'op@example.com',
+    FLEET_HARNESS_CMD: `node ${committingHarness}`,
+  });
+  try {
+    // The fixture marks when the commit and the artifacts are all on disk.
+    await waitFor(
+      () => heartbeat(workspace, 'harness') !== '' ||
+        readFileSyncSafe(join(workspace, '.fleet', 'out', 'work-staged')) !== '',
+      'the harness to stage its commit and artifacts',
+    );
+
+    assert.ok(child.pid !== undefined);
+    process.kill(child.pid, 'SIGTERM');
+
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(40_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 1', 'the cancel path must terminate the runner within a deadline');
+
+    // The commit the harness made — never pushed by it — is on the remote.
+    assert.ok(
+      logTexts(daemon.events).some((text) => text.startsWith('wip pushed to')),
+      `expected a wip push log; got ${JSON.stringify(logTexts(daemon.events))}`,
+    );
+    const branch = 'fleet/111-job-cancel-committed';
+    const files = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], {
+      cwd: remote,
+      encoding: 'utf8',
+    });
+    assert.match(files, /committed-work\.txt/, 'the committed-but-unpushed work must land on the remote');
+
+    // The artifacts already on disk were uploaded, and produced[] names them.
+    const uploaded = daemon.artifacts.map((a) => a.path).sort();
+    assert.deepEqual(uploaded, ['answer.md', 'readme-audit.md'],
+      'the cancel settle must upload what already exists in .fleet/out/artifacts');
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle, 'a settle event must be emitted on cancel');
+    const produced = (settle.outcome as { produced: { path: string }[] }).produced;
+    assert.deepEqual(
+      produced.map((p) => p.path).sort(),
+      ['answer.md', 'readme-audit.md'],
+      'produced[] must list the collected artifacts, not read []',
+    );
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+/** Read a marker file, '' when absent — same tolerance as heartbeat(). */
+function readFileSyncSafe(path: string): string {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 // --- 2: a failed harness start produces a settle/log, not a crash -----------
 //
 // The 'error' event (EMFILE/EAGAIN at exec time) resolves the exit promise

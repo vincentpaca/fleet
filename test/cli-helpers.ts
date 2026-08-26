@@ -36,6 +36,21 @@ export const EVENT_BATTERY = [
   { seq: 12, type: 'settle', rung: 'pr-open', report: { status: 'READY', next_action: 'review it' } },
   { seq: 13, type: 'settle', report: { status: 'PARTIAL' } },
   { seq: 14, type: 'pair', minutes: 3 },
+  // A settle that delivered artifacts (#195): path-carrying produced[] entries
+  // render a fetch command each; the URL-lane entry has no path and none.
+  {
+    seq: 15, type: 'settle', rung: 'inspected',
+    report: { status: 'READY', next_action: 'fetch the artifacts' },
+    outcome: {
+      produced: [
+        { id: 'a1', type: 'file', title: 'report', path: 'dist/report.pdf' },
+        { id: 'a2', type: 'file', title: 'figure', path: 'charts/fig1.png' },
+        { id: 'a3', type: 'page', title: 'notes', url: 'https://wiki.invalid/notes' },
+      ],
+      findings: 0,
+      decisions: 0,
+    },
+  },
 ];
 
 export type CliResult = { code: number; stdout: string; stderr: string };

@@ -35,6 +35,14 @@ export const DEFAULT_BLOCK_HOT_MS = 30 * 60_000; // contract pin: test-only expo
  */
 export const DEFAULT_DECISION_TIMEOUT_MS = 24 * 3_600_000; // contract pin: test-only export, asserted by the suite
 
+/**
+ * Cadence of WIP checkpoint pushes when `limits.checkpoint` is absent (#190).
+ * Like idle, always armed: on a container provider the workspace dies with the
+ * task, so between checkpoints the teardown push is the work's only exit —
+ * and #152 deliberately bounds that push to seconds.
+ */
+export const DEFAULT_CHECKPOINT_MS = 10 * 60_000; // contract pin: test-only export, asserted by the suite
+
 /** One limit key as ms, or the fallback when absent/unparseable. */
 function limitMs(limits: unknown, key: string, fallback: number): number {
   if (limits === null || typeof limits !== 'object') return fallback;
@@ -67,6 +75,14 @@ export function blockHotLimitMs(limits: unknown): number {
  */
 export function decisionTimeoutMs(limits: unknown): number {
   return limitMs(limits, 'decision_timeout', DEFAULT_DECISION_TIMEOUT_MS);
+}
+
+/**
+ * checkpoint cadence in ms from a `limits` object; defaults so every git-backed
+ * job checkpoints (#190). The runner (the only enforcer) reads it through here.
+ */
+export function checkpointLimitMs(limits: unknown): number {
+  return limitMs(limits, 'checkpoint', DEFAULT_CHECKPOINT_MS);
 }
 
 /**
