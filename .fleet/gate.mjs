@@ -1,45 +1,36 @@
 #!/usr/bin/env node
 // Pickup gate for this repo: is this dispatch actually ready to pick up?
 // Runs before any model spend. Exit 0 = ready, 1 = not ready, 2 = cannot
-// evaluate (missing target, a target that is not an issue number in a strict
-// mode, no gh, no network) — the runner treats any nonzero exit as an abort,
-// with this script's output as the evidence.
+// evaluate (missing target, no gh, no network) — the runner treats any nonzero
+// exit as an abort, with this script's output as the evidence.
 //
-// A gate should gate model spend proportionally to the authority the mode
-// grants. implement/followthrough may write code and open PRs, so they pay the
-// full GitHub-issue readiness check (D11): a vague implement dispatch dies here
-// rather than burning a container (docs/architecture.md, "vagueness changes the
-// mode, not the mechanism"). assess/investigate/review/compare carry no repo
-// authority and deliver a report artifact (#18), so a prose target is a
-// legitimate dispatch, not a defect — they pass with a note. An unrecognized
-// mode is treated as strict; the gate never relaxes on a guess. A missing
-// target fails in every mode: nothing can be gated blind.
-// Exception (#80): a followthrough order carrying `continues` adopts an
-// existing PR's branch, so it verifies that PR (exists, open, head matches)
-// instead of issue readiness — the deliverable is the PR, and its issue is
-// often already closed.
+// Strictness keys on the shape of the dispatch, not on a requested mode (#36,
+// docs/decisions.md#d17). Three shapes, read off the order's own fields:
+//
+//   `continues` present  → adoption. Verify the adopted PR (exists, open, head
+//                          matches the named branch) plus the claim guard. The
+//                          deliverable is that PR, and the issue behind a
+//                          delivered PR is routinely closed (#80).
+//   numeric target       → issue. Pay the full GitHub-issue readiness check
+//                          (D11): open, "ready" label, an "## Acceptance"
+//                          section, no rival fleet/<n>-* branch on origin. A
+//                          vague issue dispatch dies here rather than burning a
+//                          container.
+//   anything else        → prose. Pass with a note: there is no issue that
+//                          could be "ready", and the deliverable is the report
+//                          artifact (#18).
+//
+// A missing target fails in every shape: nothing can be gated blind. Note the
+// consequence recorded in D17 — strictness follows shape, not authority, so a
+// numeric target always pays the readiness check even when the dispatch is a
+// read-only assessment. Assessing an unready issue is phrased as prose.
 //
 // Target resolution order: first argument, $FLEET_TARGET, .fleet/order.json
-// target. Mode resolution order: $FLEET_MODE, .fleet/order.json mode, else
-// implement. Env outranks the staged order for both, deliberately and by the
-// same rule: nothing in Fleet sets either var, they exist so an operator can
-// run this gate by hand against a checkout whose order.json belongs to some
-// earlier dispatch. Two resolution orders for two neighbouring inputs would be
-// the worse trade.
-// Strict-mode checks: issue exists and is open; has the "ready" label; body
-// carries an "## Acceptance" section; no branch fleet/<n>-* already on origin.
+// target. Env outranks the staged order deliberately: nothing in Fleet sets
+// that var, it exists so an operator can run this gate by hand against a
+// checkout whose order.json belongs to some earlier dispatch.
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-
-/**
- * Modes whose authority is read-only: the deliverable is the report artifact,
- * so there is no issue that could be "ready". Exported because it restates a
- * fact owned by `presets/modes.json` (the presets granting neither edit nor
- * publish) — `test/gate.test.ts` derives the same set from that file, so a
- * preset that later gains edit authority fails here instead of silently
- * keeping its exemption.
- */
-export const REPORT_ONLY_MODES = new Set(['assess', 'investigate', 'review', 'compare']);
 
 /** Strip a leading "#" from a target like "#42" → "42". */
 const STRIP_HASH = /^#/;
@@ -52,8 +43,8 @@ function labelName(l) { return l.name; }
 /** Normalise a caught error to a message string. */
 function errMsg(err) { return err instanceof Error ? err.message : String(err); }
 
-/** Verify the PR facts for a followthrough continuation. */
-function evaluateFollowthrough({ issue, jobId, continues, prState, prHead, branches }) {
+/** Verify the PR facts for an adoption dispatch. */
+function evaluateAdoption({ issue, jobId, continues, prState, prHead, branches }) {
   const findings = [];
   if (prState === undefined || prState.toUpperCase() !== 'OPEN') {
     findings.push(`PR #${continues.pr} is ${prState ?? 'unknown'}, not open`);
@@ -66,39 +57,56 @@ function evaluateFollowthrough({ issue, jobId, continues, prState, prHead, branc
 }
 
 /**
- * Pure readiness decision — fixture-testable, no network.
- * Report-only modes short-circuit: they need a target and nothing else, so the
- * issue facts may be absent. Absent facts in a strict mode fail closed (not
- * ready) rather than throwing — a spend gate that crashes reports nothing
- * useful. The job's OWN branch never counts as a claim: the
- * runner pushes fleet/<issue>-<jobId> at creation BEFORE the gate runs, and a
- * parked job re-enters onto its existing branch — neither may trip the
- * collision guard.
+ * The dispatch's shape, from its own fields — the one place this gate decides
+ * how strict to be (#36). Exported so the CLI-side classification has something
+ * to be pinned against: the two implementations are deliberately independent
+ * (the gate is repo-owned and must stand alone) and `test/gate.test.ts` asserts
+ * they agree. `#42` and `42` are the same issue dispatch.
+ * @param {{ continues?: unknown, target?: unknown }} order
+ * @returns {'adoption' | 'issue' | 'prose'}
+ */
+export function dispatchShape(order) {
+  if (order.continues) return 'adoption';
+  const target = typeof order.target === 'string' ? order.target.replace(STRIP_HASH, '') : '';
+  return IS_ISSUE_NUM.test(target) ? 'issue' : 'prose';
+}
+
+/**
+ * Pure readiness decision — fixture-testable, no network. `issue` is the
+ * target with any leading `#` already stripped.
  *
- * Followthrough continuation (#80): a followthrough order carrying `continues`
- * checks the PR it adopts — exists, open, head matches the adopted branch —
- * INSTEAD of issue readiness: the issue behind a delivered PR is often closed
- * and never re-labelled, and the deliverable is the PR itself. The adopted
- * branch is excluded from the claim guard exactly like a job's own branch;
- * every other claimant still blocks, and an implement dispatch (no continues)
- * still trips on the adopted branch — adoption is deliberate.
- * @param {{ mode?: string, state?: string, labels?: string[], body?: string, branches?: string[], issue: string, jobId?: string, continues?: { pr: number, branch: string }, prState?: string, prHead?: string }} facts
+ * Prose dispatches short-circuit: they need a target and nothing else, so the
+ * issue facts may be absent. Absent facts on an issue dispatch fail closed (not
+ * ready) rather than throwing — a spend gate that crashes reports nothing
+ * useful. The job's OWN branch never counts as a claim: the runner pushes
+ * fleet/<issue>-<jobId> at creation BEFORE the gate runs, and a parked job
+ * re-enters onto its existing branch — neither may trip the collision guard.
+ *
+ * Adoption (#80, re-keyed by #36): an order carrying `continues` checks the PR
+ * it adopts — exists, open, head matches the adopted branch — INSTEAD of issue
+ * readiness: the issue behind a delivered PR is often closed and never
+ * re-labelled, and the deliverable is the PR itself. The adopted branch is
+ * excluded from the claim guard exactly like a job's own branch; every other
+ * claimant still blocks, and a dispatch without `continues` still trips on the
+ * adopted branch — adoption is declared, never inferred.
+ * @param {{ state?: string, labels?: string[], body?: string, branches?: string[], issue: string, jobId?: string, continues?: { pr: number, branch: string }, prState?: string, prHead?: string }} facts
  * @returns {{ ready: boolean, findings: string[], note?: string }}
  */
 export function evaluate(facts) {
-  const { mode, state, labels = [], body = '', branches = [], issue, jobId, continues, prState, prHead } = facts;
-  if (REPORT_ONLY_MODES.has(mode)) {
+  const { state, labels = [], body = '', branches = [], issue, jobId, continues, prState, prHead } = facts;
+  const shape = dispatchShape({ continues, target: issue });
+  if (shape === 'adoption') {
+    // Absent PR facts fail closed, same rule as absent issue facts below.
+    return evaluateAdoption({ issue, jobId, continues, prState, prHead, branches });
+  }
+  if (shape === 'prose') {
     return {
       ready: true,
       findings: [],
-      note: `${mode} mode is report-only — issue readiness not required for target "${issue}"`,
+      note: `prose dispatch — no issue readiness to check for target "${issue}"`,
     };
   }
   const findings = [];
-  if (mode === 'followthrough' && continues) {
-    // Absent PR facts fail closed, same rule as absent issue facts below.
-    return evaluateFollowthrough({ issue, jobId, continues, prState, prHead, branches });
-  }
   if (state !== undefined && state.toUpperCase() !== 'OPEN') {
     findings.push(`issue ${issue} is ${state}, not open`);
   }
@@ -135,7 +143,9 @@ function claimFindings({ issue, jobId, branches, adopted }) {
 
 /**
  * The staged work order, read once. Absent or unparseable yields {} — which
- * leaves the mode at its strict default, never at a relaxed guess.
+ * leaves the shape to be read off the resolved target alone, never guessed
+ * into adoption: no order means no `continues`, so no PR is ever taken on
+ * trust.
  */
 function readOrder() {
   if (!existsSync('.fleet/order.json')) return {};
@@ -154,13 +164,7 @@ function resolveTarget(order) {
   return undefined;
 }
 
-function resolveMode(order) {
-  if (process.env.FLEET_MODE) return process.env.FLEET_MODE;
-  if (typeof order.mode === 'string') return order.mode;
-  return 'implement';
-}
-
-/** The staged order's continuation, when well-formed; anything else is undefined (strict path). */
+/** The staged order's continuation, when well-formed; anything else is undefined (not an adoption). */
 function resolveContinues(order) {
   const c = order.continues;
   if (c && typeof c.pr === 'number' && typeof c.branch === 'string' && c.branch !== '') {
@@ -181,15 +185,15 @@ function claimBranches(issue) {
     .map((ref) => ref.replace('refs/heads/', ''));
 }
 
-/** Fetch and assemble issue facts for the strict-mode check. Throws on gh failure. */
-function buildIssueFacts(issue, mode) {
+/** Fetch and assemble issue facts for the readiness check. Throws on gh failure. */
+function buildIssueFacts(issue) {
   const view = JSON.parse(
     execFileSync('gh', ['issue', 'view', issue, '--json', 'state,labels,body'], { encoding: 'utf8' }),
   );
   // Query the remote directly rather than trusting local refs — the gate
   // owns its own freshness (evaluate against live state, never a stale copy).
   return {
-    issue, mode, jobId: process.env.FLEET_JOB_ID,
+    issue, jobId: process.env.FLEET_JOB_ID,
     state: view.state,
     labels: view.labels.map(labelName),
     body: view.body ?? '',
@@ -197,77 +201,72 @@ function buildIssueFacts(issue, mode) {
   };
 }
 
+/** Print findings and exit with the verdict's code. */
+function reportVerdict({ ready, findings }, readyLine) {
+  if (ready) {
+    console.log(`gate: ${readyLine}`);
+    process.exit(0);
+  }
+  for (const finding of findings) console.error(`gate: ${finding}`);
+  process.exit(1);
+}
+
 /**
- * Followthrough continuation (#80): check the adopted PR instead of issue readiness.
+ * Adoption (#80): check the adopted PR instead of issue readiness.
  * Always calls process.exit(); extracting this keeps main() under the CCN threshold.
  */
-function handleContinues(mode, target, continues) {
-  const issue = target.replace(STRIP_HASH, '');
+function handleAdoption(issue, continues) {
   try {
     const pr = JSON.parse(
       execFileSync('gh', ['pr', 'view', String(continues.pr), '--json', 'state,headRefName'], { encoding: 'utf8' }),
     );
     const facts = {
-      mode, issue, jobId: process.env.FLEET_JOB_ID, continues,
+      issue, jobId: process.env.FLEET_JOB_ID, continues,
       prState: pr.state, prHead: pr.headRefName,
       branches: IS_ISSUE_NUM.test(issue) ? claimBranches(issue) : [],
     };
-    const { ready, findings } = evaluate(facts);
-    if (ready) {
-      console.log(`gate: PR #${continues.pr} is open on ${continues.branch} — continuation ready`);
-      process.exit(0);
-    }
-    for (const finding of findings) console.error(`gate: ${finding}`);
-    process.exit(1);
+    reportVerdict(evaluate(facts), `PR #${continues.pr} is open on ${continues.branch} — continuation ready`);
   } catch (err) {
     console.error(`gate: cannot evaluate PR #${continues.pr}: ${errMsg(err)}`);
     process.exit(2);
   }
 }
 
-function main() {
-  const order = readOrder();
-  const target = resolveTarget(order);
-  const mode = resolveMode(order);
-  if (!target) {
-    console.error('gate: no target (argv, $FLEET_TARGET, or .fleet/order.json)');
-    process.exit(2);
-  }
-  // Report-only modes stop here: no issue to look up, so no gh/git round trip.
-  if (REPORT_ONLY_MODES.has(mode)) {
-    console.log(`gate: ${evaluate({ mode, issue: target }).note}`);
-    process.exit(0);
-  }
-  // Followthrough continuation (#80): the dispatch adopts an existing PR's
-  // branch, so the gate checks that PR instead of issue readiness. The claim
-  // guard still runs when the target is an issue number — a rival job branch
-  // other than the adopted one still blocks.
-  const continues = mode === 'followthrough' ? resolveContinues(order) : undefined;
-  if (continues) {
-    handleContinues(mode, target, continues);
-    return; // handleContinues always exits; return satisfies control-flow analysis
-  }
-  const issue = target.replace(STRIP_HASH, '');
-  if (!IS_ISSUE_NUM.test(issue)) {
-    console.error(`gate: ${mode} mode requires a ready GitHub issue; target "${target}" is not an issue number`);
-    process.exit(2);
-  }
-
+/** Issue dispatch: the full readiness check, over live gh/git facts. */
+function handleIssue(issue) {
   let facts;
   try {
-    facts = buildIssueFacts(issue, mode);
+    facts = buildIssueFacts(issue);
   } catch (err) {
     console.error(`gate: cannot evaluate issue ${issue}: ${errMsg(err)}`);
     process.exit(2);
   }
+  reportVerdict(evaluate(facts), `issue ${issue} is ready`);
+}
 
-  const { ready, findings } = evaluate(facts);
-  if (ready) {
-    console.log(`gate: issue ${issue} is ready`);
+function main() {
+  const order = readOrder();
+  const target = resolveTarget(order);
+  if (!target) {
+    console.error('gate: no target (argv, $FLEET_TARGET, or .fleet/order.json)');
+    process.exit(2);
+  }
+  const continues = resolveContinues(order);
+  const shape = dispatchShape({ continues, target });
+  // Adoption: the dispatch declared a PR to continue, so the gate checks that
+  // PR instead of issue readiness. The claim guard still runs when the target
+  // is an issue number — a rival job branch other than the adopted one blocks.
+  if (shape === 'adoption') {
+    handleAdoption(target.replace(STRIP_HASH, ''), continues);
+    return; // handleAdoption always exits; return satisfies control-flow analysis
+  }
+  // Prose stops here: no issue to look up, so no gh/git round trip. The target
+  // is echoed as typed — a `#` the operator wrote is part of what they asked.
+  if (shape === 'prose') {
+    console.log(`gate: ${evaluate({ issue: target }).note}`);
     process.exit(0);
   }
-  for (const finding of findings) console.error(`gate: ${finding}`);
-  process.exit(1);
+  handleIssue(target.replace(STRIP_HASH, ''));
 }
 
 // Run only as a script; importing for tests must not execute the gate.

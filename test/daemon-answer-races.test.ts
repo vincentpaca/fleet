@@ -213,3 +213,53 @@ test("a late park after a hot answer with a live runner is not misread: normal p
   assert.equal(job.state, "blocked");
   assert.equal(job.marker, "parked");
 });
+
+test("a pre-migration order re-enters from parked verbatim (#36 window)", async (t) => {
+  // The migration-window guarantee: an order written before #36 — a `mode`, a
+  // `report`, every dead authority subfield, and a followthrough carrying
+  // `continues` against an issue-number target — is accepted at intake and
+  // re-staged unchanged on re-entry. The daemon never re-validates a stored
+  // order, so the field that would break this is one the daemon READS. It read
+  // exactly one (`mode`, for the queued event's label); this pins that nothing
+  // reads it again, and that the runner still receives what it was dispatched.
+  const preMigration = {
+    mode: "followthrough",
+    target: "80",
+    title: "Post-settle feedback re-entry",
+    finish: "merge-ready",
+    report: "status-first",
+    authority: {
+      edit: true, publish: true, jira: ["read", "comment", "transition"],
+      merge: false, deploy: false, runtime_read: false,
+    },
+    continues: { pr: 77, branch: "fleet/80-job-old" },
+  };
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const created = await op(ctx.sock, "POST", "/jobs", { workOrder: preMigration, manifest: MANIFEST });
+  assert.equal(created.status, 201, created.body);
+  const { id } = jobOf(created.json);
+  const first = ctx.provider.launches.find((l) => l.jobId === id);
+  assert.ok(first, "provider.launch not called");
+  assert.deepEqual(first.workOrder, preMigration, "staged verbatim at dispatch");
+
+  // The queued event's label is the target alone now — no mode prefix — and
+  // `target` still travels beside it as the machine-readable field.
+  const queued = (await events(ctx, id)).find((e) => e.type === "state" && e.state === "queued");
+  const meta = queued?.meta as { label?: string; target?: string } | undefined;
+  assert.equal(meta?.label, "80");
+  assert.equal(meta?.target, "80");
+
+  // Park it and answer: the re-entry launch carries the same order, unrewritten.
+  const token = first.runnerToken;
+  await runnerPost(ctx.sock, id, token, event(id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, id, token, event(id, 1, { type: "decision", ...DECISION }));
+  await runnerPost(ctx.sock, id, token, event(id, 2, { type: "state", state: "blocked", marker: "parked" }));
+  const answered = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });
+  assert.equal(answered.status, 200, answered.body);
+
+  const reentry = ctx.provider.launches.find((l) => l.reentryAnswer !== undefined);
+  assert.ok(reentry, "no re-entry launch");
+  assert.deepEqual(reentry.workOrder, preMigration, "re-staged verbatim — the gate keys on fields it still carries");
+});

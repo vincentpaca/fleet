@@ -1,5 +1,5 @@
 {
-  "description": "Per-mode work-order defaults. `fleet delegate <target>` = implement preset; overrides are explicit flags. Each preset merged with a target yields a valid work order.",
+  "description": "DEPRECATED (#36). Since modes left the surface this file is the `--mode` mapping table and nothing else: the names the deprecated flag still accepts, and — via each entry's authority.publish — whether the name asks for a read-only `inspected` job (publish false) or just for delivery with no opinion on the rung (publish true). Order construction reads the shape table in src/cli/dispatch.ts, not this file. Both go in the follow-up release; until then each entry still merges with a target into a valid work order, which is what test/presets.test.mjs pins.",
   "modes": {
     "assess": {
       "mode": "assess",

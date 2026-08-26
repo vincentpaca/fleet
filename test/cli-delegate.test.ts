@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ServerResponse } from 'node:http';
-import { validateWorkOrder } from '../src/validate.mjs';
+import { targetableRungs, validateWorkOrder } from '../src/validate.mjs';
 import { runCli, makeTempDir, startMockDaemon, sendJson, type MockRequest } from './cli-helpers.ts';
 import { toHttpsGitUrl } from '../src/shared/giturl.ts';
 
@@ -35,7 +35,25 @@ function jobsRoute() {
     },
   };
 }
-test('delegate builds a valid implement work order from presets and posts it', async (t) => {
+/** Dispatch and return the posted work order, asserting the CLI succeeded. */
+async function postedOrder(
+  args: string[],
+  cwd: string,
+  daemon: { url: string; requests: MockRequest[] },
+  env: Record<string, string | undefined> = {},
+): Promise<Record<string, unknown>> {
+  const res = await runCli(['delegate', ...args], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', ...env },
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const order = JSON.parse(daemon.requests[daemon.requests.length - 1].body).workOrder;
+  const { ok, errors } = validateWorkOrder(order);
+  assert.equal(ok, true, JSON.stringify(errors));
+  return order;
+}
+
+test('delegate builds a valid work order from the target shape and posts it', async (t) => {
   const cwd = scaffold();
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
@@ -52,11 +70,12 @@ test('delegate builds a valid implement work order from presets and posts it', a
 
   const { ok, errors } = validateWorkOrder(body.workOrder);
   assert.equal(ok, true, JSON.stringify(errors));
-  assert.equal(body.workOrder.mode, 'implement');
   assert.equal(body.workOrder.target, 'APP-123');
-  assert.equal(body.workOrder.finish, 'merge-ready');
-  assert.equal(body.workOrder.report, 'status-first');
-  assert.equal(body.workOrder.authority.edit, true);
+  // APP-123 is not an issue number, so this is a prose dispatch: read-only,
+  // inspected, no PR. It is also the case the manifest's default_finish loses,
+  // because a prose dispatch's rung is not a repo-configurable default.
+  assert.equal(body.workOrder.finish, 'inspected');
+  assert.equal(body.workOrder.authority.publish, false);
   assert.equal(body.workOrder.authority.merge, false, 'merge never grantable');
   assert.equal(body.workOrder.authority.deploy, false, 'deploy never grantable');
 
@@ -69,22 +88,190 @@ test('delegate builds a valid implement work order from presets and posts it', a
   );
 });
 
-test('delegate --mode and --finish override the preset', async (t) => {
-  const cwd = scaffold();
+// --- Shape-keyed defaults (#36) ---
+
+test('delegate: an issue dispatch publishes and aims at merge-ready; prose does neither', async (t) => {
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const issue = await postedOrder(['42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(issue.finish, 'merge-ready');
+  // The authority block is `publish` plus D5's two const-false limits, and
+  // nothing else: the deprecated subfields have no reader and are not written
+  // even in the migration window (test/gate-window-compat.test.ts proves the
+  // pre-window schema accepts an order without them).
+  assert.deepEqual(issue.authority, { publish: true, merge: false, deploy: false });
+
+  const prose = await postedOrder(['why do queued jobs sit behind the capacity cap'], cwd, daemon);
+  assert.equal(prose.finish, 'inspected');
+  assert.equal((prose.authority as { publish: boolean }).publish, false, 'prose opens no PR by default');
+});
+
+test('delegate: #42 and 42 are the same issue dispatch — normalized at parse', async (t) => {
+  // The bug this catches: the CLI and the pickup gate disagreeing about `#42`
+  // (the gate stripped the hash, the CLI did not), which since #36 would mean a
+  // dispatch whose authority and whose strictness disagree about what it is.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const order = await postedOrder(['#42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(order.target, '42', 'the hash is stripped — branch naming and the claim guard read this');
+  assert.equal(order.finish, 'merge-ready', 'and it gets the issue row, not the prose row');
+  assert.equal(order.title, 'Fix the flaky heartbeat', 'the title lookup sees an issue number too');
+});
+
+test('delegate --publish gives a prose dispatch push+PR authority', async (t) => {
+  // No default_finish in this manifest, so the shape default is what shows.
+  const cwd = scaffold({ ...MIN_MANIFEST, gates: { pickup: 'true' } });
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'APP-123', '--mode', 'assess', '--finish', 'inspected'], {
-    cwd,
-    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value' },
-  });
+  const order = await postedOrder(['--publish', 'draft the retry-policy note and open a PR'], cwd, daemon);
+  assert.equal((order.authority as { publish: boolean }).publish, true);
+  // --publish grants authority; on its own it does not move the finish line.
+  assert.equal(order.finish, 'inspected');
+});
+
+test('delegate: manifest.gates.default_finish beats the shape default and loses to --finish', async (t) => {
+  // The revived knob: presets/*.finish shadowed it into dead code before #36.
+  const cwd = scaffold({ ...MIN_MANIFEST, gates: { pickup: 'true', default_finish: 'ci-green' } });
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+
+  assert.equal((await postedOrder(['42'], cwd, daemon, env)).finish, 'ci-green', 'manifest beats the shape default');
+  assert.equal(
+    (await postedOrder(['42', '--finish', 'pushed'], cwd, daemon, env)).finish,
+    'pushed',
+    '--finish beats the manifest',
+  );
+  // A mapped --mode is still a per-dispatch request, so it outranks repo config.
+  assert.equal((await postedOrder(['42', '--mode', 'assess'], cwd, daemon, env)).finish, 'inspected');
+});
+
+test('delegate: a repo default_finish applies only where the dispatch could reach it (D17)', async (t) => {
+  // The test is the RUNG, not the shape and not the publish bit: `pr-open` and
+  // above need push authority, everything below is reachable without it,
+  // because the runner pushes the job branch whenever the workspace has a git
+  // URL and gates only PR creation on the bit. Two bugs this catches: a prose
+  // dispatch inheriting a delivery rung it cannot reach (so every run reports
+  // short of its own target), and the over-correction that throws away a
+  // perfectly reachable repo default just because the dispatch is prose.
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const withDefault = (rung: string): string =>
+    scaffold({ ...MIN_MANIFEST, gates: { pickup: 'true', default_finish: rung } });
+
+  const unreachable = withDefault('ci-green');
+  const prose = await postedOrder(['some open question'], unreachable, daemon);
+  assert.equal(prose.finish, 'inspected', 'the shape default stands when the repo default needs publishing');
+  assert.equal((prose.authority as { publish: boolean }).publish, false);
+  // Say --publish and the repo's delivery rung applies again — one rule, not a
+  // prose-shaped exception.
+  assert.equal((await postedOrder(['--publish', 'some open question'], unreachable, daemon)).finish, 'ci-green');
+  // An explicit --finish is never second-guessed, publish or not: naming a rung
+  // is a decision, not a default.
+  assert.equal((await postedOrder(['--finish', 'ci-green', 'some open question'], unreachable, daemon)).finish, 'ci-green');
+
+  // Every rung the ladder offers, split at the real boundary rather than at a
+  // hand-copied list: the schema owns the ladder, `pr-open` is where push
+  // authority starts, and a rung added anywhere in that range must land on the
+  // right side of this without anyone remembering to update a set. Iterating
+  // the schema's own enum is what makes that true — a hardcoded list here would
+  // drift in lockstep with a hardcoded list in the implementation.
+  const floor = targetableRungs.indexOf('pr-open');
+  assert.ok(floor > 0, 'the ladder must still have a pr-open rung with rungs below it');
+  for (const [i, rung] of targetableRungs.entries()) {
+    const cwd = withDefault(rung);
+    const expected = i < floor ? rung : 'inspected';
+    assert.equal(
+      (await postedOrder(['some open question'], cwd, daemon)).finish,
+      expected,
+      i < floor ? `${rung} is reachable without publish` : `${rung} needs publish, so the shape default must stand`,
+    );
+  }
+});
+
+test('delegate: the window release writes a compat mode computed from shape', async (t) => {
+  // Operator repos carry their own gate copies, and every pre-#36 copy reads a
+  // missing mode as implement (strict). Drop this field and every prose
+  // dispatch dies against every un-updated repo gate.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  assert.equal((await postedOrder(['some open question'], cwd, daemon)).mode, 'investigate');
+  assert.equal((await postedOrder(['42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` })).mode, 'implement');
+  // A mapped --mode must NOT soften it: this is what keeps `--mode assess 42`
+  // gating strict on an old gate as well as a new one (D17's inversion).
+  const mapped = await postedOrder(['--mode', 'assess', '42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(mapped.mode, 'implement', 'the compat mode is keyed on shape, never on the flag');
+});
+
+// --- The deprecated --mode flag, for the life of the window ---
+
+test('delegate --mode: read-only names ask for read-only and inspected, and it warns', async (t) => {
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const env = { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` };
+
+  const res = await runCli(['delegate', '42', '--mode', 'assess'], { cwd, env });
   assert.equal(res.code, 0, res.stderr);
-  const body = JSON.parse(daemon.requests[0].body);
-  assert.equal(body.workOrder.mode, 'assess');
-  assert.equal(body.workOrder.finish, 'inspected');
-  assert.equal(body.workOrder.authority.edit, false, 'assess is read-only');
-  const { ok, errors } = validateWorkOrder(body.workOrder);
-  assert.equal(ok, true, JSON.stringify(errors));
+  assert.match(res.stderr, /--mode is deprecated \(#36\)/, 'the flag announces its own removal');
+  const order = JSON.parse(daemon.requests[0].body).workOrder;
+  assert.equal(order.authority.publish, false, 'assess is a read-only request');
+  assert.equal(order.finish, 'inspected');
+});
+
+test('delegate --mode implement/followthrough grant publish and no more, on any shape', async (t) => {
+  // The window's back-compat promise: an invocation that published before #36
+  // still publishes. The bug this catches is the tempting reading — "map every
+  // name onto the dispatch's own row" — under which `--mode implement` on a
+  // prose target silently withdraws the authority it was typed to grant.
+  const cwd = scaffold({ ...MIN_MANIFEST, gates: { pickup: 'true', default_finish: 'ci-green' } });
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+
+  const prose = await postedOrder(['--mode', 'implement', 'refactor the retry backoff'], cwd, daemon);
+  assert.equal((prose.authority as { publish: boolean }).publish, true, 'implement still means publish');
+
+  // ... and no more: the flag has no opinion on the rung, so the repo's
+  // default_finish decides and `--mode implement 42` is a bare `42`. Asserted
+  // against ci-green, which is neither the shape default nor the old preset's
+  // merge-ready — so this cannot pass by coincidence.
+  assert.equal(prose.finish, 'ci-green');
+  const issue = await postedOrder(['42', '--mode', 'implement'], cwd, daemon, env);
+  assert.equal(issue.finish, 'ci-green');
+  assert.deepEqual(
+    await postedOrder(['42'], cwd, daemon, env),
+    issue,
+    '--mode implement must produce the same order as no flag at all',
+  );
+});
+
+test('delegate: the specific flags beat the mapped --mode bundle', async (t) => {
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+
+  const order = await postedOrder(['42', '--mode', 'assess', '--finish', 'merge-ready'], cwd, daemon, env);
+  assert.equal(order.finish, 'merge-ready', '--finish beats the mapped bundle');
+  assert.equal((order.authority as { publish: boolean }).publish, false, 'and only --finish moved');
+
+  const published = await postedOrder(['42', '--mode', 'assess', '--publish'], cwd, daemon, env);
+  assert.equal((published.authority as { publish: boolean }).publish, true, '--publish beats the mapped bundle');
 });
 
 test('delegate fails loudly on a missing env var, before any POST', async (t) => {

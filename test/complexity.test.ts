@@ -67,7 +67,9 @@ const FUNCTION_BASELINE = [
   'src/cli/main.ts::cmdDoctor',
   // cmdLint: two try/catch loops + git check = CCN 15; genuine.
   'src/cli/main.ts::cmdLint',
-  // dispatchDelegate: full dispatch state machine = CCN 51, NLOC 108; genuine.
+  // dispatchDelegate: full dispatch state machine. CCN 51, NLOC 108 as measured
+  // before #36 added the shape/authority resolution, which grew both; genuine,
+  // and the numbers are a floor rather than the current reading.
   'src/cli/main.ts::dispatchDelegate',
   // main: top-level argument dispatch over all subcommands = CCN 23; genuine.
   'src/cli/main.ts::main',

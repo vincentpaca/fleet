@@ -1,8 +1,9 @@
 // The pickup gate's readiness decision, fixture-tested (issue #1 acceptance).
 // The pure `evaluate` core takes facts; the script wrapper owns gh/git I/O.
-// Mode-awareness (#56) is tested on both halves: evaluate() per mode, and the
-// script end to end in a temp workspace — the strict/report-only fork lives in
-// main(), so a unit test of evaluate() alone would not prove the dispatch path.
+// Shape-keying (#36, superseding #56's mode-keying) is tested on both halves:
+// evaluate() per shape, and the script end to end in a temp workspace — the
+// prose/issue/adoption fork lives in main(), so a unit test of evaluate() alone
+// would not prove the dispatch path.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -11,7 +12,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 // Executable-but-importable: the gate's main() only runs when invoked as argv[1].
-import { evaluate, REPORT_ONLY_MODES } from '../.fleet/gate.mjs';
+import { dispatchShape, evaluate } from '../.fleet/gate.mjs';
+// The CLI's own copy of the shape rule, pinned against the gate's below.
+import { dispatchShape as cliDispatchShape } from '../src/cli/dispatch.ts';
 import { validateManifest } from '../src/validate.mjs';
 
 const gateScript = fileURLToPath(new URL('../.fleet/gate.mjs', import.meta.url));
@@ -19,7 +22,7 @@ const gateScript = fileURLToPath(new URL('../.fleet/gate.mjs', import.meta.url))
 /**
  * Run the real gate script against a throwaway workspace carrying `order`.
  * Ambient FLEET_* vars are stripped: this test process may itself be a fleet
- * job, and an inherited target/mode would decide the assertion instead of the
+ * job, and an inherited target would decide the assertion instead of the
  * fixture.
  */
 function runGate(
@@ -115,77 +118,96 @@ test('multiple defects produce one finding each', () => {
   assert.equal(findings.length, 4);
 });
 
-// --- Mode-awareness (#56): the gate spends strictness where authority is. ---
+// --- Shape-keying (#36): the gate spends strictness on what the dispatch is. ---
 
-test('implement mode keeps the full issue-readiness check', () => {
-  const { ready: ok, findings } = evaluate({ ...ready, mode: 'implement', labels: [], body: 'prose' });
+test('dispatchShape: continues wins, then a numeric target, else prose', () => {
+  // continues first, and not merely as a tie-break: a PR dispatch's target is
+  // rewritten to its linked issue, so an adoption's target usually IS numeric.
+  assert.equal(dispatchShape({ continues: { pr: 41, branch: 'b' }, target: '42' }), 'adoption');
+  assert.equal(dispatchShape({ continues: { pr: 41, branch: 'b' }, target: 'pr/41' }), 'adoption');
+  assert.equal(dispatchShape({ target: '42' }), 'issue');
+  assert.equal(dispatchShape({ target: '#42' }), 'issue', 'a leading # is the same issue dispatch');
+  assert.equal(dispatchShape({ target: 'why do queued jobs sit' }), 'prose');
+  assert.equal(dispatchShape({ target: 'pr/41' }), 'prose', 'a PR reference without continues is not an adoption');
+  assert.equal(dispatchShape({ target: '42x' }), 'prose');
+  assert.equal(dispatchShape({}), 'prose', 'no target at all is not an issue dispatch');
+});
+
+test('the CLI and the gate classify a target identically', () => {
+  // Two independent copies of the rule by design — a repo's gate must stand
+  // alone and cannot import the CLI. This is the checkpoint that they agree: a
+  // drift here would mean a dispatch whose defaults and whose strictness
+  // disagree about what it is (the pre-#36 `#42` split, exactly — the gate
+  // stripped the hash, the CLI did not, so `#42` was an issue to one side and
+  // prose to the other).
+  const targets = ['42', '#42', '0042', 'pr/41', '42x', 'why does the daemon wedge', 'APP-123', '#not a number', ''];
+  for (const target of targets) {
+    assert.equal(dispatchShape({ target }), cliDispatchShape(target, undefined), `disagreed on "${target}"`);
+  }
+  // Including the malformed `continues` values a staged order file can carry.
+  // The two copies test it differently (`if (order.continues)` vs a parameter),
+  // so these are exactly where a pin that only tried `undefined` and one good
+  // object would miss a divergence.
+  for (const continues of [{ pr: 1, branch: 'b' }, {}, null, false, 0, '']) {
+    for (const target of targets) {
+      assert.equal(
+        dispatchShape({ target, continues }),
+        cliDispatchShape(target, continues),
+        `disagreed on target "${target}" with continues ${JSON.stringify(continues)}`,
+      );
+    }
+  }
+});
+
+test('an issue dispatch keeps the full issue-readiness check', () => {
+  const { ready: ok, findings } = evaluate({ ...ready, labels: [], body: 'prose' });
   assert.equal(ok, false);
   assert.match(findings.join('\n'), /"ready" label/);
   assert.match(findings.join('\n'), /## Acceptance/);
 });
 
-test('followthrough mode is strict too — it also carries edit authority', () => {
-  assert.equal(evaluate({ ...ready, mode: 'followthrough', labels: [] }).ready, false);
+test('a prose dispatch passes with a note naming the target', () => {
+  const verdict = evaluate({ issue: 'deep research on retry storms' });
+  assert.deepStrictEqual(verdict.findings, []);
+  assert.equal(verdict.ready, true);
+  assert.match(verdict.note ?? '', /^prose dispatch/);
+  assert.match(verdict.note ?? '', /deep research on retry storms/);
 });
 
-test('report-only modes pass with a note naming the mode and target', () => {
-  for (const mode of ['assess', 'investigate', 'review', 'compare']) {
-    const verdict = evaluate({ mode, issue: 'deep research on retry storms' });
-    assert.deepStrictEqual(verdict.findings, [], `${mode} produced findings`);
-    assert.equal(verdict.ready, true, `${mode} did not pass`);
-    assert.match(verdict.note ?? '', new RegExp(`^${mode} mode is report-only`));
-    assert.match(verdict.note ?? '', /deep research on retry storms/);
-  }
-});
-
-test('report-only modes ignore issue facts entirely, not merely tolerate them', () => {
-  // Every strict check fails here; investigate must still pass, because none of
-  // these facts bear on a report-artifact deliverable.
+test('a numeric target is strict however read-only the intent — the recorded inversion (D17)', () => {
+  // Pre-#36 this passed with a note under --mode assess. Strictness keys on
+  // shape now: assessing an unready issue is phrased as prose, and the bug this
+  // catches is a legacy mode field talking the gate out of the check.
   const hostile = {
-    mode: 'investigate',
-    issue: '7',
-    state: 'CLOSED',
-    labels: [],
-    body: '',
+    issue: '7', state: 'CLOSED', labels: [], body: '',
     branches: ['fleet/7-someone-else'],
   };
-  assert.equal(evaluate({ ...hostile, mode: 'implement' }).findings.length, 4, 'fixture must fail every strict check');
-  const verdict = evaluate(hostile);
+  assert.equal(evaluate(hostile).findings.length, 4, 'every readiness check must still fire');
+  assert.equal(evaluate({ ...hostile, mode: 'assess' }).ready, false, 'a stale mode field must not relax the gate');
+  assert.equal(evaluate({ ...hostile, mode: 'investigate' }).ready, false);
+});
+
+test('a prose dispatch ignores issue facts entirely, not merely tolerates them', () => {
+  // Every readiness check would fail here; a prose target must still pass,
+  // because none of these facts bear on a report-artifact deliverable.
+  const verdict = evaluate({
+    issue: 'why do queued jobs sit behind the capacity cap',
+    state: 'CLOSED', labels: [], body: '', branches: ['fleet/7-someone-else'],
+  });
   assert.equal(verdict.ready, true);
   assert.deepStrictEqual(verdict.findings, []);
 });
 
-test('absent or unrecognized mode falls back to strict — never relax on a guess', () => {
-  const broken = { ...ready, labels: [] };
-  assert.equal(evaluate(broken).ready, false, 'no mode should mean strict');
-  assert.equal(evaluate({ ...broken, mode: 'INVESTIGATE' }).ready, false, 'case variant is not a known mode');
-  assert.equal(evaluate({ ...broken, mode: 'explore' }).ready, false, 'unknown mode should mean strict');
-});
-
-test('strict mode with absent facts fails closed instead of throwing', () => {
+test('an issue dispatch with absent facts fails closed instead of throwing', () => {
   // A spend gate that crashes reports nothing an operator can act on.
-  const { ready: ok, findings } = evaluate({ mode: 'implement', issue: '7' });
+  const { ready: ok, findings } = evaluate({ issue: '7' });
   assert.equal(ok, false);
   assert.equal(findings.length, 2, findings.join('; '));
 });
 
-test('the exempt modes are exactly the presets granting neither edit nor publish', () => {
-  // The gate's exemption list restates a fact owned by presets/modes.json. This
-  // is the checkpoint: a preset that gains edit authority while staying exempt
-  // would otherwise skip the readiness check silently.
-  const presets = JSON.parse(
-    readFileSync(new URL('../presets/modes.json', import.meta.url), 'utf8'),
-  ) as { modes: Record<string, { authority: { edit: boolean; publish: boolean } }> };
-  const readOnly = Object.entries(presets.modes)
-    .filter(([, preset]) => !preset.authority.edit && !preset.authority.publish)
-    .map(([name]) => name);
-  assert.deepStrictEqual([...REPORT_ONLY_MODES].sort(), readOnly.sort());
-});
-
-// --- Followthrough continuation (#80): the gate checks the PR, not the issue. ---
+// --- Adoption (#80): the gate checks the PR, not the issue. ---
 
 const adoption = {
-  mode: 'followthrough',
   issue: '7',
   jobId: 'job-new',
   continues: { pr: 41, branch: 'fleet/7-job-old' },
@@ -194,7 +216,7 @@ const adoption = {
   branches: ['fleet/7-job-old'],
 };
 
-test('followthrough+continues checks the PR instead of issue readiness', () => {
+test('an adoption checks the PR instead of issue readiness', () => {
   // Every issue-readiness fact is hostile (closed, unlabelled, no acceptance);
   // the continuation must pass anyway — the deliverable is the PR, and the
   // issue behind a delivered PR is routinely closed.
@@ -203,7 +225,7 @@ test('followthrough+continues checks the PR instead of issue readiness', () => {
   assert.equal(verdict.ready, true);
 });
 
-test('followthrough+continues fails closed on a non-open or unknown PR', () => {
+test('an adoption fails closed on a non-open or unknown PR', () => {
   const merged = evaluate({ ...adoption, prState: 'MERGED' });
   assert.equal(merged.ready, false);
   assert.match(merged.findings.join('\n'), /PR #41 is MERGED, not open/);
@@ -213,7 +235,7 @@ test('followthrough+continues fails closed on a non-open or unknown PR', () => {
   assert.match(unknown.findings.join('\n'), /unknown/);
 });
 
-test('followthrough+continues fails when the PR head is not the adopted branch', () => {
+test('an adoption fails when the PR head is not the adopted branch', () => {
   // The bug this catches: the operator continues PR A while the order names
   // branch B — the job would push A's fixes onto the wrong branch.
   const { ready: ok, findings } = evaluate({ ...adoption, prHead: 'fleet/7-job-other' });
@@ -229,18 +251,18 @@ test('the adopted branch is excluded from the claim guard; a rival branch still 
   assert.ok(!rival.findings.join('\n').includes('fleet/7-job-old,'), 'the adopted branch must not be named a claimant');
 });
 
-test('a rival implement dispatch on the same issue is still blocked by the adopted branch', () => {
-  // Adoption is deliberate: only a followthrough order carrying continues may
-  // walk past the claim. An implement dispatch never adopts.
-  const { ready: ok, findings } = evaluate({ ...ready, mode: 'implement', branches: ['fleet/7-job-old'] });
+test('a rival dispatch on the same issue is still blocked by the adopted branch', () => {
+  // Adoption is declared, never inferred: only an order carrying continues may
+  // walk past the claim. A plain issue dispatch never adopts — and a legacy
+  // mode field saying "followthrough" does not make it one.
+  const { ready: ok, findings } = evaluate({ ...ready, branches: ['fleet/7-job-old'] });
   assert.equal(ok, false);
   assert.match(findings.join('\n'), /fleet\/7-job-old/);
-});
-
-test('followthrough WITHOUT continues keeps the full issue-readiness check', () => {
-  // continues is the key, not the mode: a plain followthrough on an issue is
-  // still gated like implement (#56 policy unchanged).
-  assert.equal(evaluate({ ...ready, mode: 'followthrough', labels: [] }).ready, false);
+  assert.equal(
+    evaluate({ ...ready, mode: 'followthrough', branches: ['fleet/7-job-old'] }).ready,
+    false,
+    'a stale mode field must not grant adoption',
+  );
 });
 
 /** A bin dir whose `gh` prints the given JSON; prepended to PATH for script runs. */
@@ -254,10 +276,10 @@ function fakeGhBin(stdout: string, exitCode = 0): string {
   return bin;
 }
 
-test('script: followthrough+continues gates on the PR via gh, no issue lookup', () => {
+test('script: an adoption gates on the PR via gh, no issue lookup', () => {
   const bin = fakeGhBin('{"state":"OPEN","headRefName":"fleet/7-job-old"}');
   const order = {
-    mode: 'followthrough',
+    // No mode field at all: `continues` is the adoption declaration since #36.
     target: 'pr/41', // non-numeric target: a PR-only continuation must not demand an issue number
     continues: { pr: 41, branch: 'fleet/7-job-old' },
   };
@@ -266,52 +288,61 @@ test('script: followthrough+continues gates on the PR via gh, no issue lookup', 
   assert.match(out, /PR #41 is open on fleet\/7-job-old/);
 });
 
-test('script: followthrough+continues exits 1 when the PR has closed since dispatch', () => {
+test('script: an adoption exits 1 when the PR has closed since dispatch', () => {
   const bin = fakeGhBin('{"state":"CLOSED","headRefName":"fleet/7-job-old"}');
-  const order = { mode: 'followthrough', target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
+  const order = { target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
   const { status, out } = runGate(order, { env: { PATH: `${bin}:${process.env.PATH}` } });
   assert.equal(status, 1, out);
   assert.match(out, /PR #41 is CLOSED, not open/);
 });
 
-test('script: followthrough+continues exits 2 when gh cannot answer', () => {
+test('script: an adoption exits 2 when gh cannot answer', () => {
   const bin = fakeGhBin('', 1);
-  const order = { mode: 'followthrough', target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
+  const order = { target: 'pr/41', continues: { pr: 41, branch: 'fleet/7-job-old' } };
   const { status, out } = runGate(order, { env: { PATH: `${bin}:${process.env.PATH}` } });
   assert.equal(status, 2, out);
   assert.match(out, /cannot evaluate PR #41/);
 });
 
-test('script: investigate mode passes on a prose target with no gh or network', () => {
-  const { status, out } = runGate({ mode: 'investigate', target: 'deep research on stall backstops' });
+test('script: a bare prose dispatch passes with no gh or network', () => {
+  // No mode, no flags — the shape #36 exists to make dispatchable.
+  const { status, out } = runGate({ target: 'deep research on stall backstops', finish: 'inspected' });
   assert.equal(status, 0, out);
-  assert.match(out, /report-only/);
+  assert.match(out, /prose dispatch/);
   assert.match(out, /deep research on stall backstops/);
 });
 
-test('script: implement mode dies on a prose target with the issue-readiness message', () => {
+test('script: a legacy implement-mode prose order passes too — shape decides, not mode', () => {
+  // The pre-migration order this repo's own gate used to kill. A parked job
+  // re-entering with an old order must not die on a field nothing reads.
   const { status, out } = runGate({ mode: 'implement', target: 'deep research on stall backstops' });
-  assert.equal(status, 2, out);
-  assert.match(out, /implement mode requires a ready GitHub issue/);
+  assert.equal(status, 0, out);
+  assert.match(out, /prose dispatch/);
 });
 
-test('script: a missing target still exits 2 in a report-only mode', () => {
-  const { status, out } = runGate({ mode: 'investigate' });
+test('script: a missing target still exits 2, whatever the shape would have been', () => {
+  const { status, out } = runGate({ finish: 'inspected' });
   assert.equal(status, 2, out);
   assert.match(out, /no target/);
 });
 
-test('script: $FLEET_MODE overrides the staged order for a hand-run gate', () => {
-  const order = { mode: 'implement', target: 'why does the daemon wedge' };
-  const { status, out } = runGate(order, { env: { FLEET_MODE: 'assess' } });
+test('script: $FLEET_TARGET overrides the staged order for a hand-run gate', () => {
+  // Nothing in Fleet sets it; it exists so an operator can run the gate by hand
+  // against a checkout whose order.json belongs to an earlier dispatch.
+  const order = { mode: 'implement', target: '42', finish: 'merge-ready' };
+  const { status, out } = runGate(order, { env: { FLEET_TARGET: 'why does the daemon wedge' } });
   assert.equal(status, 0, out);
-  assert.match(out, /assess mode is report-only/);
+  assert.match(out, /prose dispatch — no issue readiness to check for target "why does the daemon wedge"/);
 });
 
-test('script: no order file at all is treated as implement — strict by default', () => {
+test('script: no order file at all reads the shape off the argv target', () => {
   const { status, out } = runGate(undefined, { args: ['open-ended question'] });
-  assert.equal(status, 2, out);
-  assert.match(out, /implement mode requires a ready GitHub issue/);
+  assert.equal(status, 0, out);
+  assert.match(out, /prose dispatch/);
+  // ... and an issue-shaped argv target still pays the check, so a missing
+  // order file is not a way to walk past readiness.
+  const numeric = runGate(undefined, { args: ['999999999'] });
+  assert.notEqual(numeric.status, 0, numeric.out);
 });
 
 test("this repo's own manifest validates", () => {

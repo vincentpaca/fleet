@@ -15,7 +15,7 @@ type HarnessPlan = {
 // A fixed permissive tool grant: the sandbox is the blast-radius boundary;
 // reach beyond it is governed by egress + a credential broker once they
 // exist, at which point this list is generated from the manifest's services.
-// WebSearch/WebFetch: assess-mode research jobs are useless without them
+// WebSearch/WebFetch: research-shaped jobs are useless without them
 // (#35's first run analyzed the wrong protocol from stale training data).
 const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite', 'WebSearch', 'WebFetch'];
 
@@ -89,11 +89,11 @@ function checkVersionNotes(actualVersion: string | undefined, required: string |
   if (satisfied === undefined) notes.push(`cannot evaluate cli_version requirement "${required}" against ${actualVersion}`);
 }
 
-/** Build the followthrough continuation clause, or empty string. */
+/** Build the adopted-PR continuation clause, or empty string. */
 function continuationClause(continues: { pr: number; branch: string } | undefined): string {
   if (!continues) return '';
   return (
-    ` -- followthrough on PR #${continues.pr} (branch ${continues.branch}):` +
+    ` -- continuing PR #${continues.pr} (branch ${continues.branch}):` +
     ` read that PR's review comments and failing checks with gh (gh pr view ${continues.pr} --comments; gh pr checks ${continues.pr})` +
     ` and address them. Push fixes to the same branch so the PR updates in place; never open a new PR.`
   );
@@ -121,7 +121,7 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   if (!name) return undefined;
 
   // The output contract (#81) rides on every prompt, continuation included: a
-  // followthrough that produces a report instead of commits still owes its
+  // continuation that produces a report instead of commits still owes its
   // deliverables to the artifact lane.
   const prompt = JSON.stringify(`/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`);
   const tools = CLAUDE_ALLOWED_TOOLS.map((tool) => JSON.stringify(tool)).join(' ');

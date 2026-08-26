@@ -399,12 +399,12 @@ export function cockpitKeyAction( // contract pin: test-only export, asserted by
 
 // ── The command line ──────────────────────────────────────────────────────────
 
-/** The verbs the input line understands. The same ones the CLI has (#36). */
+/** The verbs the input line understands. The same ones the CLI has (#61). */
 const COCKPIT_VERBS = ['delegate', 'answer', 'logs', 'attach', 'cancel', 'help', 'quit'];
 
 /** A submitted line, resolved to an intent. Nothing here talks to the daemon. */
 type CockpitCommand =
-  | { kind: 'delegate'; target: string; mode?: string }
+  | { kind: 'delegate'; target: string; mode?: string; publish?: boolean; finish?: string }
   | { kind: 'answer'; option?: string; text?: string }
   | { kind: 'cancel'; jobId?: string }
   | { kind: 'focus'; jobId?: string }
@@ -423,22 +423,63 @@ const VERB_FOCUS = new Set(['logs', 'attach']);
 /** Hoisted so that the inline /\s+/ regex does not trigger a Lizard tokeniser misparse. */
 const WORDS_RE = /\s+/;
 
-/** Parse the args to `delegate`, extracting an optional `--mode` flag. */
-function parseDelegateCommand(rest: string[]): CockpitCommand {
+/** Every flag `delegate` understands here; must match `fleet delegate`'s own. */
+const DELEGATE_FLAGS = ['--publish', '--finish', '--mode'];
+
+/** Of those, the ones that take a following value. `--mode` is deprecated (#36). */
+const DELEGATE_VALUE_FLAGS = new Set(['--mode', '--finish']);
+
+/**
+ * Split a delegate line into the words that make up its target and the flags it
+ * carried, or one refusal.
+ *
+ * An unrecognised `--word` is target text, not an error. That is the same trade
+ * {@link nearVerb} documents and makes for the same reason: this line has no
+ * quoting layer, a prose target may legitimately contain a flag name ("why does
+ * --watch hang after a settle"), and Fleet's own domain is CLI flags — so
+ * refusing every unknown `--word` would break the surface built for typing
+ * symptom statements, and would diverge from `fleet delegate "why does --watch
+ * hang"`, which the shell hands through as one positional. The cost is that
+ * `--publsh` is a typo the operator has to see in the target on the board
+ * rather than in a refusal; guessing at near-misses would refuse `--node` on a
+ * Node repo, which is the worse failure.
+ */
+function splitDelegateFlags(
+  rest: string[],
+): { args: string[]; flags: Record<string, string | true> } | { error: string } {
   const args: string[] = [];
-  let mode: string | undefined;
+  const flags: Record<string, string | true> = {};
   for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === '--mode') {
-      mode = rest[i + 1];
-      i += 1;
-      if (mode === undefined) return { kind: 'error', message: 'delegate: --mode needs a mode name' };
-      continue;
-    }
-    args.push(rest[i]!);
+    const arg = rest[i]!;
+    if (!DELEGATE_FLAGS.includes(arg)) { args.push(arg); continue; }
+    if (!DELEGATE_VALUE_FLAGS.has(arg)) { flags[arg] = true; continue; }
+    const value = rest[i + 1];
+    i += 1;
+    if (value === undefined) return { error: `delegate: ${arg} needs a value` };
+    flags[arg] = value;
   }
-  const target = args.join(' ');
-  if (target === '') return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--mode m]' };
-  return mode === undefined ? { kind: 'delegate', target } : { kind: 'delegate', target, mode };
+  return { args, flags };
+}
+
+/**
+ * Parse the args to `delegate`: everything that is not a flag is the target,
+ * which may be prose. Every flag `fleet delegate` honours has to be honoured
+ * here, because the two surfaces share one dispatch path (#61).
+ */
+function parseDelegateCommand(rest: string[]): CockpitCommand {
+  const split = splitDelegateFlags(rest);
+  if ('error' in split) return { kind: 'error', message: split.error };
+  const target = split.args.join(' ');
+  if (target === '') {
+    return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--publish] [--finish rung]' };
+  }
+  const { flags } = split;
+  return {
+    kind: 'delegate', target,
+    ...(typeof flags['--mode'] === 'string' ? { mode: flags['--mode'] } : {}),
+    ...(typeof flags['--finish'] === 'string' ? { finish: flags['--finish'] } : {}),
+    ...(flags['--publish'] === true ? { publish: true } : {}),
+  };
 }
 
 /** Parse the args to `answer`. */
@@ -649,7 +690,10 @@ type CockpitDeps = {
    */
   delegate: (req: {
     target: string;
+    /** Deprecated (#36); passed through for the life of the flag. */
     mode?: string;
+    publish?: boolean;
+    finish?: string;
     log: (line: string) => void;
     warn: (line: string) => void;
     /** Aborted when the cockpit closes: a dispatch mid-build must die with the view (#121). */
@@ -669,19 +713,24 @@ function errorText(err: unknown): string {
  * the operator through the same status line every other notice uses, and
  * `abort()` (wired to the view closing) kills the build's docker child.
  */
+/** The delegate intent, minus its discriminant — what the runner hands on. */
+type DelegateCommand = { target: string; mode?: string; publish?: boolean; finish?: string };
+
 function delegateRunner(io: {
   delegate: CockpitDeps['delegate'];
   say: (line: string, hold?: number) => void;
   refuse: (line: string) => void;
   poll: () => Promise<void>;
-}): { start: (command: { target: string; mode?: string }) => void; abort: () => void } {
+}): { start: (command: DelegateCommand) => void; abort: () => void } {
   let inFlight: string | undefined;
   let controller: AbortController | undefined;
-  const dispatch = async (command: { target: string; mode?: string }, signal: AbortSignal): Promise<void> => {
+  const dispatch = async (command: DelegateCommand, signal: AbortSignal): Promise<void> => {
     try {
       const created = await io.delegate({
         target: command.target,
         mode: command.mode,
+        publish: command.publish,
+        finish: command.finish,
         // Progress holds the footer the way a refusal does: a build is minutes
         // long, and a notice that expired mid-build reads as a dispatch that
         // silently went away.
@@ -977,7 +1026,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
       case 'nothing':
         return;
       case 'help':
-        say('delegate <target> [--mode m] · answer <id> [note] · logs <job> · cancel <job> · quit');
+        say('delegate <target> [--publish] [--finish rung] · answer <id> [note] · logs <job> · cancel <job> · quit');
         return;
       case 'quit':
         running = false;

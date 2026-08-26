@@ -49,7 +49,8 @@ test('delegate writes a pointer entry to .fleet/dispatched.jsonl', async (t) => 
   const entry = JSON.parse(lines[0]) as Record<string, string>;
   assert.equal(entry.jobId, 'job-res-1');
   assert.equal(entry.target, '42');
-  assert.equal(entry.mode, 'implement');
+  assert.equal(entry.finish, 'merge-ready', 'the finish rung replaced mode in the pointer (#36)');
+  assert.equal(entry.mode, undefined, 'and mode is no longer written');
   assert.ok(typeof entry.daemonUrl === 'string' && entry.daemonUrl !== '', 'daemonUrl is a non-empty string');
   assert.ok(typeof entry.at === 'string' && entry.at !== '', 'at is a non-empty string');
   // Pointer only: no status fields.
@@ -104,6 +105,11 @@ test('daemon resolved via fleet-config.json when FLEET_DAEMON_URL is absent', as
 
 // ── fleet resume output ordering ─────────────────────────────────────────────
 
+/**
+ * Seed the ledger in its PRE-#36 shape, carrying `mode` and no `finish`. Left
+ * that way deliberately: `fleet resume` reads a ledger it did not write, and
+ * every existing checkout's `dispatched.jsonl` looks like this.
+ */
 function seedLedger(cwd: string, entries: Array<{ jobId: string; target: string; mode?: string; daemonUrl: string }>): void {
   const ledgerPath = path.join(cwd, '.fleet', 'dispatched.jsonl');
   const lines = entries.map((e) =>

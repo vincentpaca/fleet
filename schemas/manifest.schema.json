@@ -103,8 +103,7 @@
         "pickup": { "type": "string", "description": "REQUIRED command; must exit 0 or the job aborts before model spend. The gate script owns its own force-fetch; the runner treats every nonzero exit identically." },
         "default_finish": {
           "$ref": "work-order.schema.json#/$defs/targetableRung",
-          "default": "merge-ready",
-          "description": "Repo-default target rung when the work order does not name one."
+          "description": "Repo-default target rung, consumed by the CLI at order construction (#36): it beats the dispatch shape's own default and loses to an explicit --finish. It applies only where the dispatch could reach it — a rung needing push authority (pr-open and above) is skipped on a dispatch that publishes nothing, and the shape default stands. Absent, the shape default is used: merge-ready for an issue or an adopted PR, inspected for prose. No inert \"default\" annotation here on purpose — the resolution lives in src/cli/dispatch.ts and having two sources of truth for it is the defect docs/decisions.md#d17 records."
         }
       }
     },

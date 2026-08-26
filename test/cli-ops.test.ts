@@ -10,7 +10,7 @@ import { translateLine } from '../src/runner/translate.ts';
 const RUNNING_JOB = {
   id: 'job-1',
   state: 'running',
-  workOrder: { mode: 'implement', target: 'APP-123', finish: 'merge-ready' },
+  workOrder: { target: 'APP-123', finish: 'merge-ready' },
   updatedAt: '2026-01-01T00:00:00Z',
 };
 
@@ -211,8 +211,8 @@ test('status shows cancelled(stall) distinctly from cancelled(wall-clock)', asyn
     'GET /jobs': (_req: MockRequest, res: ServerResponse) => {
       sendJson(res, 200, {
         jobs: [
-          { id: 'job-s', state: 'cancelled', reason: 'stall', workOrder: { mode: 'implement', target: '39' } },
-          { id: 'job-w', state: 'cancelled', reason: 'wall-clock', workOrder: { mode: 'implement', target: '7' } },
+          { id: 'job-s', state: 'cancelled', reason: 'stall', workOrder: { finish: 'merge-ready', target: '39' } },
+          { id: 'job-w', state: 'cancelled', reason: 'wall-clock', workOrder: { finish: 'merge-ready', target: '7' } },
         ],
       });
     },
@@ -222,8 +222,8 @@ test('status shows cancelled(stall) distinctly from cancelled(wall-clock)', asyn
   const list = await runCli(['status'], { env: { FLEET_DAEMON_URL: daemon.url } });
   assert.equal(list.code, 0, list.stderr);
   const lines = list.stdout.trim().split('\n');
-  assert.match(lines[0], /job-s\s+cancelled\(stall\)\s+mode=implement/);
-  assert.match(lines[1], /job-w\s+cancelled\(wall-clock\)\s+mode=implement/);
+  assert.match(lines[0], /job-s\s+cancelled\(stall\)\s+finish=merge-ready/);
+  assert.match(lines[1], /job-w\s+cancelled\(wall-clock\)\s+finish=merge-ready/);
 });
 
 test('status lists jobs and shows a single job', async (t) => {
@@ -231,7 +231,9 @@ test('status lists jobs and shows a single job', async (t) => {
     'GET /jobs': (_req: MockRequest, res: ServerResponse) => {
       sendJson(res, 200, {
         jobs: [
-          { id: 'job-2', state: 'blocked', marker: 'parked', workOrder: { mode: 'assess', target: 'APP-456' } },
+          // Pre-#36 order shape: still carries `mode`. `fleet status` must
+          // render its finish rung, not blank the column for every old job.
+          { id: 'job-2', state: 'blocked', marker: 'parked', workOrder: { mode: 'assess', finish: 'inspected', target: 'APP-456' } },
           RUNNING_JOB,
         ],
       });
@@ -245,8 +247,8 @@ test('status lists jobs and shows a single job', async (t) => {
   assert.equal(list.code, 0, list.stderr);
   const lines = list.stdout.trim().split('\n');
   assert.equal(lines.length, 2);
-  assert.match(lines[0], /job-2\s+blocked\(parked\)\s+mode=assess\s+target=APP-456/, 'blocked-first order preserved');
-  assert.match(lines[1], /job-1\s+running\s+mode=implement\s+target=APP-123/);
+  assert.match(lines[0], /job-2\s+blocked\(parked\)\s+finish=inspected\s+target=APP-456/, 'blocked-first order preserved');
+  assert.match(lines[1], /job-1\s+running\s+finish=merge-ready\s+target=APP-123/);
 
   const one = await runCli(['status', 'job-1'], { env });
   assert.equal(one.code, 0, one.stderr);
@@ -264,7 +266,7 @@ test('status: shows #<n> <title> when work order has a title', async (t) => {
           {
             id: 'job-3',
             state: 'running',
-            workOrder: { mode: 'implement', target: '37', title: 'Add legibility features' },
+            workOrder: { finish: 'merge-ready', target: '37', title: 'Add legibility features' },
           },
         ],
       }),
@@ -273,7 +275,7 @@ test('status: shows #<n> <title> when work order has a title', async (t) => {
         job: {
           id: 'job-3',
           state: 'running',
-          workOrder: { mode: 'implement', target: '37', title: 'Add legibility features' },
+          workOrder: { finish: 'merge-ready', target: '37', title: 'Add legibility features' },
         },
       }),
   });

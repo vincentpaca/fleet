@@ -31,6 +31,7 @@ import { dirname, join } from 'node:path';
 // The gh-executor seam (inject in tests; defaults to the real gh CLI) is
 // shared with the daemon's rung verification — one definition (#128).
 import type { GhRunner } from '../shared/git.ts';
+import { displayTarget, isIssueTarget } from '../shared/issue-ref.ts';
 
 type GitSetupOptions = {
   url: string;
@@ -49,11 +50,11 @@ type GitSetupOptions = {
    */
   reentry?: boolean;
   /**
-   * Branch adoption (issue #80): a followthrough dispatch continuing an
-   * existing PR names that PR's head branch here. Same mechanics as re-entry —
-   * fetch, check out, set upstream, no creation push — but on the adopted
-   * branch instead of this job's own fleet/<target>-<jobId> name, so work
-   * pushes update the existing PR in place.
+   * Branch adoption (issue #80): a dispatch continuing an existing PR names
+   * that PR's head branch here. Same mechanics as re-entry — fetch, check out,
+   * set upstream, no creation push — but on the adopted branch instead of this
+   * job's own fleet/<target>-<jobId> name, so work pushes update the existing
+   * PR in place.
    */
   adoptBranch?: string;
   /**
@@ -383,7 +384,7 @@ export function remoteHasHead(workspace: string, branch: string): boolean {
  * Did the remote branch gain commits beyond a known SHA? The delivery test for
  * an adopted branch (#80): pushWork's 'delivered' only says the branch is ahead
  * of base, which an adopted PR branch always is — the original job's commits
- * are on it. Judging a followthrough by that would claim a rung for doing
+ * are on it. Judging a continuation by that would claim a rung for doing
  * nothing. `sinceSha` is the adopted branch tip captured at setup.
  */
 export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: string, timeoutMs?: number): boolean {
@@ -399,7 +400,7 @@ export function remoteMovedBeyond(workspace: string, branch: string, sinceSha: s
 
 /**
  * The open PR whose head is `branch`, or undefined when none exists (issue
- * #80): a followthrough that adopted a branch reports the existing PR at
+ * #80): a dispatch that adopted a branch reports the existing PR at
  * settle instead of creating one. Same GhRunner seam as createDraftPr.
  */
 export function findOpenPr(workspace: string, branch: string, ghRun?: GhRunner): { url: string; number: number } | undefined {
@@ -430,14 +431,14 @@ export function composeDraftPrText(opts: {
     next_action?: string;
   };
 }): { title: string; body: string } {
-  const ref = /^\d+$/.test(opts.target) ? `#${opts.target}` : opts.target;
+  const ref = displayTarget(opts.target);
   const title = opts.issueTitle ? `${ref}: ${opts.issueTitle}` : `${ref}: fleet job ${opts.jobId}`;
   const list = (v: string[] | string | undefined): string[] =>
     v === undefined ? [] : Array.isArray(v) ? v : [v];
   const r = opts.report;
   const lines: string[] = [
     '## Problem',
-    `${opts.issueTitle ?? 'See the referenced work item.'}${/^\d+$/.test(opts.target) ? ` Closes ${ref}.` : ''}`,
+    `${opts.issueTitle ?? 'See the referenced work item.'}${isIssueTarget(opts.target) ? ` Closes ${ref}.` : ''}`,
     '',
     '## Status',
     r?.status ? `${r.status}` : 'No report was produced — inspect the job transcript before reviewing.',

@@ -50,7 +50,7 @@ import {
 const BLOCKED: BoardJob = {
   id: 'job-blk',
   state: 'blocked',
-  workOrder: { mode: 'implement', target: '61', title: 'Cockpit' },
+  workOrder: { finish: 'merge-ready', target: '61', title: 'Cockpit' },
   createdAt: '2026-01-01T00:00:00Z',
   updatedAt: '2026-01-01T00:05:00Z',
   decision: {
@@ -66,7 +66,7 @@ const BLOCKED: BoardJob = {
 const RUNNING: BoardJob = {
   id: 'job-run',
   state: 'running',
-  workOrder: { mode: 'assess', target: 'docs' },
+  workOrder: { finish: 'inspected', target: 'docs' },
   createdAt: '2026-01-01T00:00:00Z',
   lastActivity: { text: 'reading the schema', at: '2026-01-01T00:04:00Z' },
 };
@@ -388,11 +388,30 @@ test('splitKeys turns one read into the keys it actually contains', () => {
 
 // ---------- the command line ----------
 
-test('delegate: target, mode, and a missing target', () => {
+test('delegate: target, flags, and a missing target', () => {
   assert.deepEqual(parseCockpitInput('delegate 61'), { kind: 'delegate', target: '61' });
-  assert.deepEqual(parseCockpitInput('delegate 61 --mode assess'), { kind: 'delegate', target: '61', mode: 'assess' });
   assert.deepEqual(parseCockpitInput('  delegate   61  '), { kind: 'delegate', target: '61' });
   assert.equal(parseCockpitInput('delegate').kind, 'error');
+  // --publish (#36): the cockpit must honour the same flags dispatchDelegate
+  // does, or a prose dispatch typed here can never open a PR.
+  assert.deepEqual(parseCockpitInput('delegate --publish draft the note'), {
+    kind: 'delegate', target: 'draft the note', publish: true,
+  });
+  assert.deepEqual(parseCockpitInput('delegate look into the stall backstop'), {
+    kind: 'delegate', target: 'look into the stall backstop',
+  }, 'no --publish means the key is absent, not false');
+  assert.deepEqual(parseCockpitInput('delegate 61 --finish pushed'), {
+    kind: 'delegate', target: '61', finish: 'pushed',
+  });
+  assert.equal(parseCockpitInput('delegate 61 --finish').kind, 'error');
+  // An unrecognised --word is target text, not an error — this line has no
+  // quoting layer, and Fleet's own domain is CLI flags, so a symptom statement
+  // naming one has to stay dispatchable. Same trade nearVerb makes.
+  assert.deepEqual(parseCockpitInput('delegate why does --watch hang after a settle'), {
+    kind: 'delegate', target: 'why does --watch hang after a settle',
+  });
+  // --mode survives the migration window, deprecated, with its own refusals.
+  assert.deepEqual(parseCockpitInput('delegate 61 --mode assess'), { kind: 'delegate', target: '61', mode: 'assess' });
   assert.equal(parseCockpitInput('delegate 61 --mode').kind, 'error');
 });
 
@@ -609,8 +628,8 @@ test('the cockpit renders the board and quits clean, leaving the terminal as it 
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
         jobs: [
-          { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' } },
-          { id: 'job-blk', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'assess', target: 'docs' } },
+          { id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: 'app' } },
+          { id: 'job-blk', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { finish: 'inspected', target: 'docs' } },
         ],
       }),
     'GET /jobs/job-blk/events': (_req: MockRequest, res: ServerResponse) =>
@@ -662,7 +681,10 @@ test('a delegate typed at the input line dispatches, and nothing else does', asy
   assert.equal(posted.length, 1, 'exactly one dispatch');
   const body = JSON.parse(posted[0].body);
   assert.equal(body.workOrder.target, 'APP-123');
-  assert.equal(body.workOrder.mode, 'implement', 'the default mode, from the same presets delegate uses');
+  // APP-123 is prose, so the shape defaults apply — read-only, inspected, no
+  // PR — exactly as `fleet delegate APP-123` would build it (#36).
+  assert.equal(body.workOrder.finish, 'inspected', 'the shape default, from the same path delegate uses');
+  assert.equal(body.workOrder.authority.publish, false);
   assert.equal(body.workOrder.authority.merge, false, 'merge is never grantable, whoever typed it');
   assert.ok(body.manifest, 'the manifest travels with the dispatch, exactly as fleet delegate sends it');
 
@@ -673,6 +695,35 @@ test('a delegate typed at the input line dispatches, and nothing else does', asy
     'the dispatch ledger to name the job',
   );
   assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'dispatched.jsonl'), 'utf8'), /job-new/);
+  assert.equal(await cockpit.quit(), 0);
+});
+
+test("a flag typed at the input line reaches the order, not just the parser", async (t) => {
+  // The seam a pure parseCockpitInput test cannot see: cmdCockpit's `delegate`
+  // dep is the only hop between the input line and dispatchDelegate, and it is
+  // the one hop the cockpit's other e2e tests stub out. A field parsed, carried
+  // through four types and dropped here looks exactly like a working flag.
+  const daemon = await startMockDaemon({
+    'GET /jobs': (_req: MockRequest, res: ServerResponse) => sendJson(res, 200, { jobs: [] }),
+    'POST /jobs': (_req: MockRequest, res: ServerResponse) =>
+      sendJson(res, 201, { job: { id: 'job-flagged', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+
+  const cockpit = startCockpit({ cwd: scaffold(), env: { FLEET_DAEMON_URL: daemon.url } });
+  t.after(() => cockpit.child.kill('SIGKILL'));
+  await shows(cockpit, 'no jobs', 'the empty board');
+
+  for (const key of 'delegate --publish --finish pushed look into the stall backstop') cockpit.type(key);
+  cockpit.type('\r');
+  await shows(cockpit, 'job-flagged queued', 'the dispatched job');
+
+  const posted = daemon.requests.filter((r) => r.method === 'POST' && r.url === '/jobs');
+  assert.equal(posted.length, 1);
+  const order = JSON.parse(posted[0].body).workOrder;
+  assert.equal(order.target, 'look into the stall backstop', 'the flags are not part of the target');
+  assert.equal(order.finish, 'pushed', '--finish reached the order');
+  assert.equal(order.authority.publish, true, '--publish reached the order');
   assert.equal(await cockpit.quit(), 0);
 });
 
@@ -713,7 +764,7 @@ test("a blocked job's decision is answered from the cockpit, and never by the co
           id: 'job-blk',
           state: answered === undefined ? 'blocked' : 'running',
           updatedAt: '2026-01-01T00:00:00Z',
-          workOrder: { mode: 'implement', target: '61' },
+          workOrder: { finish: 'merge-ready', target: '61' },
         }],
       }),
     'GET /jobs/job-blk/events': (_req: MockRequest, res: ServerResponse) =>
@@ -762,8 +813,8 @@ test("answering one decision does not refetch the other blocked jobs' logs (#125
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
         jobs: [
-          { id: 'job-a', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '1' } },
-          { id: 'job-b', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'implement', target: '2' } },
+          { id: 'job-a', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { finish: 'merge-ready', target: '1' } },
+          { id: 'job-b', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { finish: 'merge-ready', target: '2' } },
         ],
       }),
     'GET /jobs/job-a/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, decisionOf('job-a', 'go')),
@@ -801,7 +852,7 @@ test('cancelling from the cockpit asks first, and only y goes through', async (t
   const cancels: string[] = [];
   const daemon = await startMockDaemon({
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
-      sendJson(res, 200, { jobs: [{ id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' } }] }),
+      sendJson(res, 200, { jobs: [{ id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: 'app' } }] }),
     'GET /jobs/job-run/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, []),
     'POST /jobs/job-run/cancel': (req: MockRequest, res: ServerResponse) => {
       cancels.push(req.url);
@@ -839,8 +890,8 @@ test('the drill-down tails the selected job only; the board never tails anything
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
         jobs: [
-          { id: 'job-alpha', state: 'running', workOrder: { mode: 'implement', target: 'alpha' } },
-          { id: 'job-beta', state: 'running', workOrder: { mode: 'assess', target: 'beta' } },
+          { id: 'job-alpha', state: 'running', workOrder: { finish: 'merge-ready', target: 'alpha' } },
+          { id: 'job-beta', state: 'running', workOrder: { finish: 'inspected', target: 'beta' } },
         ],
       }),
     'GET /jobs/job-alpha/events': (_req: MockRequest, res: ServerResponse) =>
@@ -861,7 +912,7 @@ test('the drill-down tails the selected job only; the board never tails anything
 
   // Enter opens the selected job: its events, nobody else's, roster gone.
   cockpit.type('\r');
-  await nowShows(cockpit, 'job-alpha  running  implement  alpha', 'the drill-down header');
+  await nowShows(cockpit, 'job-alpha  running  merge-ready  alpha', 'the drill-down header');
   await nowShows(cockpit, '[0] alpha is reading the schema', "alpha's own events");
   assert.ok(!cockpit.frame().includes('JOB '), 'the roster is gone in the drill-down');
   assert.ok(!cockpit.frame().includes('beta is running'), "beta's events are not in alpha's tail");

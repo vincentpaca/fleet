@@ -1,5 +1,5 @@
 {
-  "description": "Reference work orders — one per mode, generic, collectively exercising every contract field. These are documentation and test fixtures; real dispatches come from mode presets + flags.",
+  "description": "Reference work orders — generic, collectively exercising every contract field, and deliberately including the pre-#36 fields (mode, report, the dead authority subfields) a migration-window daemon must still accept. These are documentation and test fixtures; real dispatches are built from the dispatch's shape plus flags. The follow-up release shrinks this to three shape-keyed examples.",
   "orders": {
     "assess": {
       "mode": "assess",

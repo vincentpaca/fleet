@@ -313,3 +313,98 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
     await daemon.close();
   }
 });
+
+// --- The publish bit is the whole difference between the two shapes (#36) ---
+
+/** Stage an order for the same prose target, differing only in authority.publish. */
+function stageProseOrder(workspace: string, publish: boolean): void {
+  writeFileSync(
+    join(workspace, '.fleet', 'order.json'),
+    JSON.stringify({
+      // No mode field: a prose target is the shape, and `publish` is the only
+      // authority bit anything reads.
+      target: 'why do queued jobs sit behind the capacity cap',
+      finish: publish ? 'pr-open' : 'inspected',
+      authority: { publish, merge: false, deploy: false },
+    }),
+  );
+}
+
+/** A bare remote with a `main` to branch from. */
+function makeFreshRemote(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-happy-fresh-'));
+  const remote = join(dir, 'remote.git');
+  const seed = join(dir, 'seed');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote]);
+  mkdirSync(seed, { recursive: true });
+  writeFileSync(join(seed, 'README.md'), 'seed\n');
+  const g = (args: string[]) =>
+    execFileSync('git', ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com', ...args], { cwd: seed, encoding: 'utf8' });
+  execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+  g(['add', '-A']);
+  g(['commit', '-q', '-m', 'seed']);
+  g(['push', '-q', remote, 'main']);
+  return remote;
+}
+
+/** Run one prose dispatch to settle and report what the runner did about a PR. */
+async function proseRun(publish: boolean, jobId: string, token: string): Promise<{
+  rung: unknown; ghCalls: string[]; logs: string[];
+}> {
+  const daemon = await startMockDaemon({ token });
+  const remote = makeFreshRemote();
+  const workspace = writeWorkspace(`node -e "process.exit(0)"`);
+  stageProseOrder(workspace, publish);
+  const gh = fakeGhBin('https://github.com/acme/example-app/pull/99');
+  try {
+    const exitCode = await runRunner({
+      FLEET_JOB_ID: jobId,
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_GIT_URL: remote,
+      FLEET_GIT_NAME: 'Operator One',
+      FLEET_GIT_EMAIL: 'op@example.com',
+      PATH: `${gh.bin}:${process.env.PATH ?? ''}`,
+      FLEET_HARNESS_CMD: `node -e "require('node:fs').writeFileSync('notes.md','findings\\n')"`,
+    });
+    assert.equal(exitCode, 0);
+    assert.deepEqual(daemon.rejected, []);
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle, 'settle event posted');
+    return {
+      rung: settle.rung,
+      ghCalls: gh.calls(),
+      logs: daemon.events.filter((e) => e.type === 'log').map((e) => String(e.text)),
+    };
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+}
+
+test('a prose dispatch opens no PR; the same dispatch with publish granted opens a draft PR', async () => {
+  // The #36 acceptance bullet, and the branch that barely ran before it: every
+  // preset except the four read-only ones granted publish, so `publish: false`
+  // with a real git remote was close to untested. Now it is the DEFAULT for any
+  // non-numeric target, so the no-PR path carries the product's promise that an
+  // open-ended prompt cannot quietly become a pull request.
+  const withoutPublish = await proseRun(false, 'job-prose-nopub', 'test-token-prose-1');
+  assert.ok(
+    !withoutPublish.ghCalls.some((c) => c.startsWith('pr create')),
+    `no PR may be created without publish authority, saw: ${withoutPublish.ghCalls.join(' | ')}`,
+  );
+  assert.ok(!withoutPublish.logs.some((t) => t.includes('draft PR opened')), 'and it must not claim one');
+  // The branch is still pushed — evidence has to survive the container — so the
+  // rung reached is `pushed`, not `inspected`. That is exactly why a repo's
+  // default_finish is skipped only for rungs above this one (D17).
+  assert.equal(withoutPublish.rung, 'pushed');
+
+  const withPublish = await proseRun(true, 'job-prose-pub', 'test-token-prose-2');
+  assert.ok(
+    withPublish.ghCalls.some((c) => c.startsWith('pr create')),
+    `--publish must reach pr create, saw: ${withPublish.ghCalls.join(' | ')}`,
+  );
+  assert.equal(withPublish.rung, 'pr-open');
+  assert.ok(withPublish.logs.some((t) => t.includes('draft PR opened')), 'and the PR is reported');
+});

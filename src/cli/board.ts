@@ -11,6 +11,7 @@ import { request } from './client.ts';
 import { formatJobState, formatLogText, renderEvent } from './format.ts';
 import { makeCol, visualClip, visualLength, type ColFn } from './ansi.ts';
 import { optionId, type FleetEvent, type PendingDecision } from '../shared/events.ts';
+import { displayTarget } from '../shared/issue-ref.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -22,7 +23,8 @@ export type BoardJob = {
   reason?: string;
   /** Launch attempt (#30); rendered as [attempt N] when > 1. Absent = 1. */
   attempt?: number;
-  workOrder?: { mode?: string; target?: string; title?: string };
+  /** `mode` is deprecated (#36) and no longer rendered; old jobs still carry it. */
+  workOrder?: { finish?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
   lastActivity?: { text: string; at: string }; // most recent think/log from the daemon (all jobs)
@@ -167,8 +169,6 @@ export const RESTORE_SEQ = '\x1b[?25h\x1b[?1049l';
 // ANSI helpers (makeCol / ColFn / visualLength / visualClip) live in ./ansi.ts
 // (#128); the cockpit imports them from there directly.
 
-/** Numeric-only target: #42 style. Hoisted so no inline regex in function bodies. */
-const IS_NUMERIC = /^\d+$/;
 
 // ── Pure frame renderers (new) ────────────────────────────────────────────────
 
@@ -252,10 +252,18 @@ export function renderContextStrip(
   return lines.join('\n');
 }
 
+/**
+ * Width of the FINISH column. 13 fits every targetable rung — `reviews-clear`
+ * and `focused-green` are the longest — so a roster of mixed rungs keeps TARGET
+ * on one column. The MODE column this replaced was 10 and `followthrough`
+ * pushed past it (#36).
+ */
+const FINISH_W = 13;
+
 /** Render the dim table-header row + separator rule for the roster. */
 export function renderTableHeader(w: number, noColor: boolean): string {
   const col = makeCol(noColor);
-  const header = `     ${'JOB'.padEnd(22)}  ${'STATE'.padEnd(9)}  ${'MODE'.padEnd(10)}  ${'TARGET'.padEnd(17)}  ELAPSED`;
+  const header = `     ${'JOB'.padEnd(22)}  ${'STATE'.padEnd(9)}  ${'FINISH'.padEnd(FINISH_W)}  ${'TARGET'.padEnd(17)}  ELAPSED`;
   const rule = `  ${'─'.repeat(Math.max(0, w - 2))}`;
   return [visualClip(col(header, 90), w), visualClip(col(rule, 90), w)].join('\n');
 }
@@ -297,8 +305,8 @@ export function clampTailScroll(events: FleetEvent[], proposed: number): number 
 }
 
 /**
- * The one-line identity of a job, for the drill-down header: id, state, mode,
- * target and elapsed. The title is shown in full (the caller clips to width),
+ * The one-line identity of a job, for the drill-down header: id, state, finish
+ * rung, target and elapsed. The title is shown in full (the caller clips to width),
  * and the separator is a colon here — "#42: Fix login" — against the roster's
  * space, because this is a contextual header and the roster is tabular data.
  */
@@ -306,11 +314,11 @@ export function renderJobLine(job: BoardJob, opts: FrameOpts): string {
   const col = makeCol(opts.noColor ?? false);
   const rawTarget = job.workOrder?.target ?? '?';
   const title = job.workOrder?.title;
-  const ref = rawTarget.replace(IS_NUMERIC, '#$&');
+  const ref = displayTarget(rawTarget);
   return [
     col(job.id, 1),
     col(formatJobState(job), stateColor(job)),
-    job.workOrder?.mode ?? '?',
+    job.workOrder?.finish ?? '?',
     title ? ref + ': ' + title : rawTarget,
     jobElapsed(job, opts.now ?? 0),
   ].filter(Boolean).join('  ');
@@ -461,17 +469,19 @@ function buildRosterRow(
 ): RosterRow {
   const sel = i === selection ? col('▶', 36) : ' ';
   const elapsed = jobElapsed(job, now);
-  const mode = job.workOrder?.mode ?? '?';
+  // Every work order carries a finish rung — it is schema-required — so old
+  // jobs render theirs too, and '?' means a job record with no order at all.
+  const finish = job.workOrder?.finish ?? '?';
   const rawTarget = job.workOrder?.target ?? '?';
   const title = job.workOrder?.title;
   // Prefer "#<n> <title>" when both are present.
-  const ref = IS_NUMERIC.test(rawTarget) ? '#' + rawTarget : rawTarget;
+  const ref = displayTarget(rawTarget);
   const targetDisplay = title ? ref + ' ' + title : rawTarget;
   const stateDisplay = formatJobState(job);
   const glyph = jobGlyph(job, pulse, col);
   const files = artifactSuffix(job, col);
   const row = sel + ' ' + glyph + ' ' + visualClip(job.id, 22).padEnd(22) + '  '
-    + col(stateDisplay.padEnd(9), stateColor(job)) + '  ' + mode.padEnd(10) + '  '
+    + col(stateDisplay.padEnd(9), stateColor(job)) + '  ' + finish.padEnd(FINISH_W) + '  '
     + visualClip(targetDisplay, 17).padEnd(17) + '  ' + elapsed + files;
   return { jobIndex: i, lines: [visualClip(row, w), ...jobExtraLines(job, noColor, now, w)] };
 }
@@ -499,7 +509,7 @@ type RawJob = {
   marker?: string;
   reason?: string;
   attempt?: number;
-  workOrder?: { mode?: string; target?: string; title?: string };
+  workOrder?: { finish?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
   lastActivity?: { text: string; at: string };

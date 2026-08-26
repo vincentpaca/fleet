@@ -10,6 +10,14 @@ export const manifestSchema = load('manifest.schema.json'); // contract pin: tes
 const workOrderSchema = load('work-order.schema.json');
 const eventsSchema = load('events.schema.json');
 export const jobStates = load('job-states.json');
+
+/**
+ * The rungs a v1 work order may target, in ladder order — read from the schema
+ * that owns them rather than restated, the same way the state machine loads
+ * `job-states.json` instead of hardcoding transitions. `src/cli/dispatch.ts`
+ * splits this at `pr-open` to know which rungs need push authority.
+ */
+export const targetableRungs = workOrderSchema.$defs.targetableRung.enum;
 const decisionFileSchema = load('decision-file.schema.json');
 
 const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true, allowUnionTypes: true });

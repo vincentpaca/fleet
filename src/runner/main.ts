@@ -120,9 +120,10 @@ async function main(): Promise<void> {
   let target = 'work';
   let orderTitle: string | undefined;
   let authorityPublish = false;
-  // Continuation (#80): a followthrough order carrying `continues` adopts the
-  // named PR branch instead of creating a fresh one. Schema-validated at
-  // dispatch; the shape check here only guards direct runner invocations.
+  // Continuation (#80): an order carrying `continues` adopts the named PR
+  // branch instead of creating a fresh one — its presence IS the adoption
+  // declaration (#36). Schema-validated at dispatch; the shape check here only
+  // guards direct runner invocations.
   let continues: { pr: number; branch: string } | undefined;
   // Per-dispatch limit overrides (#134): the work order's limits win over the
   // manifest's. Merged below through the same chokepoint the daemon uses.
@@ -171,7 +172,7 @@ async function main(): Promise<void> {
         reentry: !!reentryAnswer,
         // Adoption (#80): check out the continued PR's head branch. Same
         // no-push mechanics as re-entry, and re-entry of a parked
-        // followthrough lands on this branch too.
+        // adoption lands on this branch too.
         ...(continues !== undefined ? { adoptBranch: continues.branch } : {}),
         // Auto-retry (#30): rename the previous attempt's branch first.
         ...(retryAttempt !== undefined ? { retryAttempt } : {}),
