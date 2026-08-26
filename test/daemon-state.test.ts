@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { canTransition, isTerminal, isMarkerAllowed, INITIAL_STATE, STATES } from "../src/daemon/state.ts";
-import { verifyRung, verifyRungGh, RUNG_LADDER } from "../src/daemon/verify.ts";
+import { verifyRung, verifyRungGh, RUNG_LADDER, INVALID_PR_NOTE } from "../src/daemon/verify.ts";
 
 test("state machine mirrors schemas/job-states.json", () => {
   assert.equal(INITIAL_STATE, "queued");
@@ -213,4 +213,44 @@ test("verifyRungGh: gh errors are caught and reported as unverified", async () =
   const result = await verifyRungGh(prSettle("pr-open", PR), "pr-open", mockGh);
   assert.equal(result.verified, false);
   assert.match(result.notes.join(" "), /rate limit/);
+});
+
+// --- report.pr is job-authored: it must never reach gh argv unvalidated (#175) ---
+
+test("verifyRungGh: flag-shaped or malformed report.pr never reaches gh argv", async () => {
+  const invocations: string[][] = [];
+  const recordingGh = async (args: string[]) => {
+    invocations.push(args);
+    return JSON.stringify({ state: "OPEN" });
+  };
+  const hostile = [
+    "--web",
+    "-R evil/repo",
+    "7; rm -rf /",
+    "owner/repo#7",
+    "https://github.com/owner/repo/pull/7 --web",
+    "http://github.com/owner/repo/pull/7",
+  ];
+  for (const pr of hostile) {
+    const result = await verifyRungGh(prSettle("pr-open", pr), "pr-open", recordingGh);
+    assert.equal(result.verified, false, `must not verify with pr=${JSON.stringify(pr)}`);
+    assert.deepEqual(result.notes, [INVALID_PR_NOTE]);
+  }
+  // Empty string is caught earlier as a missing URL — same guarantee, its own note.
+  const empty = await verifyRungGh(prSettle("pr-open", ""), "pr-open", recordingGh);
+  assert.equal(empty.verified, false);
+  assert.match(empty.notes.join(" "), /no PR URL/);
+  assert.deepEqual(invocations, [], "gh must never be invoked with a rejected report.pr");
+});
+
+test("verifyRungGh: a legitimate PR URL verifies with -- before the positional", async () => {
+  let seen: string[] | undefined;
+  const mockGh = async (args: string[]) => {
+    seen = args;
+    return JSON.stringify({ state: "OPEN" });
+  };
+  const result = await verifyRungGh(prSettle("pr-open", PR), "pr-open", mockGh);
+  assert.equal(result.verified, true);
+  assert.match(result.notes.join(" "), /pr-open: PR is OPEN/);
+  assert.deepEqual(seen, ["pr", "view", "--json", "state", "--", PR]);
 });
