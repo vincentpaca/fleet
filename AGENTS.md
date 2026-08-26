@@ -1,6 +1,6 @@
 # Working on this repo
 
-Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/architecture.md` explains the system; `docs/decisions.md` records settled calls — don't relitigate them in code, reopen them with a human.
+Fleet runs the owner's own harness jobs in containers in their own cloud. `docs/architecture.md` explains the system; `docs/decisions.md` records settled calls — don't relitigate them in code, reopen them with a human.
 
 ## Build and test
 
