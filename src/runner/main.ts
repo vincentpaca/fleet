@@ -85,6 +85,10 @@ async function main(): Promise<void> {
   // and collide with the old d1 answer still in the daemon's event log.
   const decisionSeed = parseInt(process.env.FLEET_REENTRY_DECISION_SEED ?? '', 10);
   const reentryDecisionSeed = Number.isInteger(decisionSeed) && decisionSeed > 0 ? decisionSeed : undefined;
+  // Auto-retry (#30): attempt number of this launch (2 = the one automatic
+  // retry). Set by the daemon; the workspace setup renames the previous
+  // attempt's branch before creating this attempt's own.
+  const retryAttempt = retryAttemptEnv();
   // Event delivery backpressure (#109): when the sink's bounded buffer is
   // near-full, pause the harness stdout reader instead of queueing without
   // bound; resume below the low watermark. The hook is wired to the
@@ -169,10 +173,19 @@ async function main(): Promise<void> {
         // no-push mechanics as re-entry, and re-entry of a parked
         // followthrough lands on this branch too.
         ...(continues !== undefined ? { adoptBranch: continues.branch } : {}),
+        // Auto-retry (#30): rename the previous attempt's branch first.
+        ...(retryAttempt !== undefined ? { retryAttempt } : {}),
       });
       branch = setup.branch;
       base = setup.base;
       if (continues !== undefined) adoptedTip = getHeadSha(workspace);
+      if (setup.released !== undefined) {
+        await sink.emit({
+          type: 'log',
+          text: `claim released: previous attempt's branch renamed to ${setup.released}`,
+          who: 'runner',
+        });
+      }
       await sink.emit({
         type: 'log',
         text: continues !== undefined
@@ -966,6 +979,12 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'cancelled', reason });
     process.exit(1);
   }
+}
+
+/** FLEET_RETRY_ATTEMPT as a number, when it names a real retry (#30). */
+function retryAttemptEnv(): number | undefined {
+  const parsed = parseInt(process.env.FLEET_RETRY_ATTEMPT ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 1 ? parsed : undefined;
 }
 
 /** Contract shape for aborts before/without a harness result. */

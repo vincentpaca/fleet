@@ -20,6 +20,8 @@ export type BoardJob = {
   marker?: string;
   /** Cancellation reason (stall, wall-clock, ...) — rendered as cancelled(<reason>). */
   reason?: string;
+  /** Launch attempt (#30); rendered as [attempt N] when > 1. Absent = 1. */
+  attempt?: number;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -496,6 +498,7 @@ type RawJob = {
   state: string;
   marker?: string;
   reason?: string;
+  attempt?: number;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -605,6 +608,7 @@ export async function fetchBoardJobs(
       state: r.state,
       marker: r.marker,
       reason: r.reason,
+      attempt: r.attempt,
       workOrder: r.workOrder,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,

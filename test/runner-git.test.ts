@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, renameRemoteBranch, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -448,4 +448,63 @@ test('a push that hangs is SIGKILLed at its bound and throws a timeout that name
   );
   assert.ok(Date.now() - started < 10_000, 'the hang must be cut at the bound, not ride it out');
   await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+// ── Harness-exit auto-retry: claim release by rename (#30) ─────────────────────
+
+test('renameRemoteBranch moves the claim aside and keeps every commit reachable (#30)', () => {
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const { branch } = setupWorkspace(workspace, opts(remote));
+  writeFileSync(join(workspace, 'partial.txt'), 'half-finished\n');
+  pushWork(workspace, 'APP-7', 'job-1', false);
+
+  assert.equal(renameRemoteBranch(workspace, branch, `${branch}-attempt1`), 'renamed');
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(!refs.includes(`refs/heads/${branch}\n`), 'the old claim name is gone');
+  assert.ok(refs.includes(`refs/heads/${branch}-attempt1`), 'the evidence branch exists');
+  const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', `${branch}-attempt1`], { cwd: remote, encoding: 'utf8' });
+  assert.match(tree, /partial\.txt/, 'the partial work survives the rename');
+});
+
+test('renameRemoteBranch on a branch the remote never had reports absent, touches nothing', () => {
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  setupWorkspace(workspace, opts(remote));
+  assert.equal(renameRemoteBranch(workspace, 'fleet/APP-7-job-ghost', 'fleet/APP-7-job-ghost-attempt1'), 'absent');
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(!refs.includes('ghost'), 'no ref invented');
+});
+
+test('a retry attempt renames the previous claim, then creates its fresh branch from base (#30)', () => {
+  const remote = makeRemote();
+  const first = makeWorkspace();
+  const { branch } = setupWorkspace(first, opts(remote));
+  writeFileSync(join(first, 'partial.txt'), 'attempt 1 got this far\n');
+  pushWork(first, 'APP-7', 'job-1', false);
+
+  // Attempt 2: same job id, fresh workspace — exactly what the daemon relaunches.
+  const second = makeWorkspace();
+  const setup = setupWorkspace(second, { ...opts(remote), retryAttempt: 2 });
+  assert.equal(setup.branch, branch, 'the retry claims the same branch name');
+  assert.equal(setup.released, `${branch}-attempt1`, 'the previous claim is reported released');
+
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${branch}-attempt1`), 'attempt 1 evidence retained');
+  assert.ok(refs.includes(`refs/heads/${branch}\n`), 'the fresh claim branch is pushed');
+  // The fresh branch starts from base — attempt 1's partial work is NOT on it.
+  const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
+  assert.ok(!tree.includes('partial.txt'), 'the retry starts clean, not on top of the failed attempt');
+  const evidence = execFileSync('git', ['ls-tree', '-r', '--name-only', `${branch}-attempt1`], { cwd: remote, encoding: 'utf8' });
+  assert.match(evidence, /partial\.txt/, 'the failed attempt stays inspectable');
+});
+
+test('a retry whose previous attempt never pushed proceeds without a rename', () => {
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  // No prior branch on the remote (attempt 1 died before its creation push).
+  const setup = setupWorkspace(workspace, { ...opts(remote), retryAttempt: 2 });
+  assert.equal(setup.released, undefined);
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${setup.branch}`), 'the branch is still created and pushed');
 });

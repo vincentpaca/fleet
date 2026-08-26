@@ -39,6 +39,13 @@ export type LaunchSpec = {
    * and decision ids stay unique across park/resume generations.
    */
   reentryDecisionSeed?: number;
+  /**
+   * Harness-exit auto-retry (#30): which attempt this launch is (2 = the one
+   * automatic retry). The runner renames the previous attempt's job branch to
+   * <branch>-attempt<n-1> before creating its own — claim released, pushed
+   * evidence retained. Absent on first launches and re-entries.
+   */
+  retryAttempt?: number;
 };
 
 export interface Provider {
@@ -189,6 +196,10 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     // Re-entry decision seed: keep ids unique across generations (issue #110).
     ...(spec.reentryDecisionSeed !== undefined
       ? { FLEET_REENTRY_DECISION_SEED: String(spec.reentryDecisionSeed) }
+      : {}),
+    // Auto-retry (#30): the runner renames the prior attempt's branch first.
+    ...(spec.retryAttempt !== undefined
+      ? { FLEET_RETRY_ATTEMPT: String(spec.retryAttempt) }
       : {}),
   };
 }

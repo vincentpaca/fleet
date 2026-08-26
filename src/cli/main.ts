@@ -2,7 +2,7 @@
 // fleet — operator CLI. Exit codes: 0 ok, 1 failure, 2 usage.
 import { parseArgs, promisify } from 'node:util';
 import { createHash } from 'node:crypto';
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +17,7 @@ import {
   retainedDir,
   type RetainedRecord,
 } from '../shared/retained.ts';
-import { getHeadSha, pushWork, remoteHasHead } from '../runner/git.ts';
+import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, DaemonTargetError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
@@ -107,6 +107,11 @@ Commands:
   resume-push <jobId>                      Retry the work push from a workspace retained because the
                                            job's push failed. Removes the workspace once the remote
                                            has the work; leaves it in place if the push fails again.
+  reclaim <target>                         Release a dead job's branch claim so the target can be
+                                           re-dispatched: renames fleet/<target>-<job> on origin to
+                                           ...-attempt<n> (evidence retained, never deleted). Refuses
+                                           while the claiming job is still live; run from a checkout
+                                           whose origin is the target repo.
   status [jobId]                           List jobs (blocked first) or show one job
   logs <jobId> [--after seq] [--tools] [--full]
                                            Dump job events (default: narrative spine — state, phase,
@@ -885,6 +890,8 @@ type Job = {
   state: string;
   marker?: string;
   reason?: string;
+  /** Launch attempt (#30); rendered as [attempt N] when > 1. Absent = 1. */
+  attempt?: number;
   workOrder?: { mode?: string; target?: string; title?: string };
   updatedAt?: string;
 };
@@ -1469,6 +1476,100 @@ function cmdResumePush(args: string[]): number {
   return EXIT_OK;
 }
 
+// ---------- reclaim (#30) ----------
+
+/** Suffix marking a claim branch already released by a retry or a reclaim. */
+const RELEASED_CLAIM = /-attempt\d+$/;
+
+/** fleet/<target>-* heads on origin, listed from the current checkout. */
+function claimHeads(prefix: string): string[] {
+  const out = execFileSync('git', ['ls-remote', '--heads', 'origin', `${prefix}*`], { encoding: 'utf8' });
+  return out
+    .split('\n')
+    .map((line) => line.split('\t')[1] ?? '')
+    .filter(Boolean)
+    .map((ref) => ref.replace('refs/heads/', ''));
+}
+
+/**
+ * The claiming job's live state, or undefined when that is not a fact we hold
+ * (404, or no reachable daemon). Reclaim is the operator's escape hatch for
+ * exactly the messes where the record may be gone — an unreachable daemon
+ * downgrades the safety check to a warning, it does not brick the command.
+ */
+async function reclaimJobState(jobId: string): Promise<string | undefined> {
+  try {
+    const res = await request('GET', `/jobs/${encodeURIComponent(jobId)}`);
+    if (res.status !== 200) return undefined;
+    return (res.json as { job: Job }).job.state;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Release one claim branch: refuse if its job is live, else rename it aside. */
+async function reclaimOne(branch: string, prefix: string, all: string[]): Promise<boolean> {
+  const jobId = branch.slice(prefix.length);
+  const state = await reclaimJobState(jobId);
+  if (state !== undefined && !TERMINAL_STATES.includes(state)) {
+    console.error(`${branch}: job ${jobId} is ${state} — cancel it before reclaiming its branch`);
+    return false;
+  }
+  if (state === undefined) {
+    console.error(`${branch}: daemon has no record of ${jobId} (or is unreachable) — releasing on your authority`);
+  }
+  // First free -attempt<n> for this branch: a twice-reclaimed target keeps
+  // every generation of evidence instead of overwriting attempt 1's.
+  let n = 1;
+  while (all.includes(`${branch}-attempt${n}`)) n += 1;
+  const to = `${branch}-attempt${n}`;
+  try {
+    renameRemoteBranch(process.cwd(), branch, to);
+  } catch (err) {
+    console.error(`${branch}: rename failed: ${errorMessage(err).split('\n')[0]}`);
+    return false;
+  }
+  console.log(`released ${branch} -> ${to} (evidence retained; the claim no longer blocks re-dispatch)`);
+  return true;
+}
+
+/**
+ * `fleet reclaim <target>` (#30): release a dead job's branch claim so the
+ * target can be re-dispatched — the manual sibling of the harness-exit
+ * auto-retry's rename, for the cases policy does not cover. Rename, never
+ * delete: fleet/<target>-<job> becomes fleet/<target>-<job>-attempt<n> and the
+ * pickup gate treats -attempt<n> branches as released. Refuses any branch
+ * whose job the daemon still holds live.
+ */
+async function cmdReclaim(args: string[]): Promise<number> {
+  const { positionals } = parseCommand(args, {}, 1, 1);
+  // A leading "#" is stripped without a regex literal: a '#' inside a regex
+  // reads as a preprocessor line to Lizard's TS-as-C parse and swallows every
+  // function after this one (see registry.ts on LaunchHalf for the sibling trap).
+  const target = positionals[0].startsWith('#') ? positionals[0].slice(1) : positionals[0];
+  // The claim namespace, exactly as the runner names branches: jobBranch with
+  // an empty job id yields the shared `fleet/<safe-target>-` prefix.
+  const prefix = jobBranch(target, '');
+  let branches: string[];
+  try {
+    branches = claimHeads(prefix);
+  } catch (err) {
+    console.error(`cannot list origin branches: ${errorMessage(err).split('\n')[0]}`);
+    console.error('run fleet reclaim from a checkout whose origin is the target repo');
+    return EXIT_FAILURE;
+  }
+  const claims = branches.filter((b) => b.startsWith(prefix) && !RELEASED_CLAIM.test(b));
+  if (claims.length === 0) {
+    console.log(`no claim branches for ${target} on origin — nothing to release`);
+    return EXIT_OK;
+  }
+  let ok = true;
+  for (const branch of claims) {
+    ok = (await reclaimOne(branch, prefix, branches)) && ok;
+  }
+  return ok ? EXIT_OK : EXIT_FAILURE;
+}
+
 // ---------- resume ----------
 
 type LedgerEntry = {
@@ -1748,6 +1849,8 @@ async function main(argv: string[]): Promise<number> {
         return await cmdResume(rest);
       case 'resume-push':
         return cmdResumePush(rest);
+      case 'reclaim':
+        return await cmdReclaim(rest);
       case 'status':
         return await cmdStatus(rest);
       case 'logs':

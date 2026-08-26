@@ -185,6 +185,13 @@ export type JobRecord = {
    * cancellation this was without replaying the event log.
    */
   reason?: string;
+  /**
+   * Which launch attempt this record is on (#30). Absent = 1 (every record
+   * written before auto-retry existed). Set from the daemon-authored queued
+   * retry event's `attempt` field — an absolute value, so boot reconciliation
+   * replaying the journal derives the same count intake did.
+   */
+  attempt?: number;
   workOrder: unknown;
   createdAt: string;
   updatedAt: string;

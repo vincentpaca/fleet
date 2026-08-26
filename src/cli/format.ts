@@ -102,11 +102,15 @@ export function isNarrativeEvent(event: FleetEvent, tools: boolean): boolean {
  * State with its qualifier for job listings: the marker on blocked
  * (parked/stale), the cancellation reason on cancelled — `cancelled(stall)`
  * reads differently from `cancelled(wall-clock)`, and that difference is the
- * whole diagnosis. Shared by `fleet status` and the board.
+ * whole diagnosis. A retried job carries its attempt count (#30):
+ * `cancelled(harness-exit) [attempt 2]` failed twice and needs an operator,
+ * which must never look like a job that failed once. Shared by `fleet status`
+ * and the board.
  */
-export function formatJobState(job: { state: string; marker?: string; reason?: string }): string {
+export function formatJobState(job: { state: string; marker?: string; reason?: string; attempt?: number }): string {
   const qualifier = job.marker ?? (job.state === 'cancelled' ? job.reason : undefined);
-  return typeof qualifier === 'string' && qualifier !== '' ? `${job.state}(${qualifier})` : job.state;
+  const base = typeof qualifier === 'string' && qualifier !== '' ? `${job.state}(${qualifier})` : job.state;
+  return typeof job.attempt === 'number' && job.attempt > 1 ? `${base} [attempt ${job.attempt}]` : base;
 }
 
 // ── The rendering core ────────────────────────────────────────────────────────
@@ -138,7 +142,11 @@ function paneText(ev: FleetEvent, col: ColFn): string {
 
 function renderState(ev: FleetEvent, t: RenderTarget): string[] {
   if (t.kind === 'plain') {
-    const extras = [ev.reason && `reason=${ev.reason}`, ev.marker && `marker=${ev.marker}`]
+    const extras = [
+      ev.reason && `reason=${ev.reason}`,
+      ev.marker && `marker=${ev.marker}`,
+      ev.attempt !== undefined && `attempt=${ev.attempt}`,
+    ]
       .filter(Boolean)
       .join(' ');
     const body = `→ ${ev.state}${extras ? ` ${extras}` : ''}`;
