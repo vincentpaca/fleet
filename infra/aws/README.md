@@ -237,6 +237,31 @@ terraform -chdir=infra/aws test
 npm test                                                      # API-only pins
 ```
 
+### Shared provider plugin cache
+
+Do the one-time setup below before the first `init`, or every `.terraform/` directory
+gets its own ~780MB copy of the AWS provider — this unit, `examples/basic`, and a
+`.fleet/infra/aws` deployment already make three, 2.3GB of a dev checkout (#131), and
+each future unit or example adds another:
+
+```sh
+mkdir -p ~/.terraform.d/plugin-cache
+export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"   # put it in your shell profile
+```
+
+(Or the config-file equivalent, `plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"`
+in `~/.terraformrc`.) With the cache set, `init` installs the provider into the shared
+cache once and every `.terraform/` holds a symlink into it — one copy on disk no matter
+how many directories initialize.
+
+One caveat, because this repo gitignores `.terraform.lock.hcl`: a directory without a
+lock file still *downloads* the provider from the registry on its first `init` — since
+Terraform 1.4, a provider absent from the lock file is never trusted straight from the
+cache ([provider_installation docs](https://developer.hashicorp.com/terraform/cli/config/config-file#provider-plugin-cache)) —
+but the download lands in the shared cache and the `.terraform/` dir gets the symlink,
+so disk stays at one copy either way; only the network fetch repeats. Once the
+directory's lock file exists, re-`init` resolves entirely from the cache.
+
 `terraform test` plans the unit through all three network branches — public subnets, NAT
 gateway, reused VPC — against a mocked AWS provider (`tests/plan.tftest.hcl`): no
 credentials, no API calls, no state, but the real provider schema doing the rejecting. It
