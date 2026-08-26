@@ -358,3 +358,34 @@ run "runner_default_exceeding_tier_fails_at_plan" {
 
   expect_failures = [aws_ecs_task_definition.runner]
 }
+
+# --- worker break-glass (#198) ---------------------------------------------------
+
+# The ECS-optimized AL2023 AMI ships amazon-ssm-agent but does not enable it,
+# and the difference is invisible until the day a worker holds unrecoverable
+# work: the instance shows InService, the role carries
+# AmazonSSMManagedInstanceCore, and `ssm start-session` still answers
+# TargetNotConnected. The enablement lives in user_data, which nothing but this
+# assert would notice losing.
+run "worker_user_data_enables_the_ssm_agent" {
+  command = plan
+
+  assert {
+    condition = strcontains(
+      base64decode(aws_launch_template.instances.user_data),
+      "systemctl enable --now amazon-ssm-agent",
+    )
+    error_message = "worker user_data must enable and start amazon-ssm-agent, or workers never register with SSM and there is no break-glass path to a wedged instance (#198)"
+  }
+
+  # The agent is the break-glass path only while the cluster registration line
+  # is intact too — a user_data rewrite that keeps one and drops the other
+  # trades a rescue path for a cluster no instance ever joins.
+  assert {
+    condition = strcontains(
+      base64decode(aws_launch_template.instances.user_data),
+      ">> /etc/ecs/ecs.config",
+    )
+    error_message = "worker user_data must still register the instance with the ECS cluster"
+  }
+}

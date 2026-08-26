@@ -89,6 +89,22 @@ docker run --privileged --rm tonistiigi/binfmt --install amd64
 `daemon_image` is still available if you would rather point the service at an image
 you publish elsewhere.
 
+## Operations
+
+**Break-glass access to a worker instance** (a wedged job, an exited container
+holding unpushed work): every worker runs the SSM agent — user_data enables it,
+the instance role already carries `AmazonSSMManagedInstanceCore`, and no SSH or
+inbound rule exists by design — so a shell on the box is one line:
+
+```sh
+aws ssm start-session --target <instance-id> --region <region>
+```
+
+Verify registration after a fresh apply: a worker should appear in
+`aws ssm describe-instance-information --region <region>` within a few minutes
+of launching. An instance that never appears there has no rescue path — treat
+that as a deployment bug, not a quirk.
+
 ## Upgrading an existing deployment: the EFS access point moves FLEET_HOME
 
 **If you deployed before the daemon dropped root (#156), applying this unit makes your

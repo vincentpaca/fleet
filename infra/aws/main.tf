@@ -474,9 +474,21 @@ resource "aws_launch_template" "instances" {
     http_put_response_hop_limit = 1
   }
 
+  # The SSM agent line is the break-glass path (#198): the ECS-optimized AL2023
+  # AMI ships amazon-ssm-agent but does not enable it, so an InService worker —
+  # instance role holding AmazonSSMManagedInstanceCore and all — answered
+  # `ssm start-session` with TargetNotConnected during a live rescue, and the
+  # committed work still on its disk was unreachable. `systemctl enable --now`
+  # is AL2023's supported enablement. Network path: registration needs outbound
+  # HTTPS to the ssm/ec2messages/ssmmessages endpoints, which the instances SG's
+  # existing all-outbound egress already serves (the same public-IP or NAT path
+  # ECR pulls take) — no new rule, and still no inbound from anywhere.
+  # Pinned by tests/plan.tftest.hcl; break-glass usage is in the unit README's
+  # operations section.
   user_data = base64encode(<<-EOT
     #!/bin/bash
     echo "ECS_CLUSTER=${aws_ecs_cluster.this.name}" >> /etc/ecs/ecs.config
+    systemctl enable --now amazon-ssm-agent
   EOT
   )
 
