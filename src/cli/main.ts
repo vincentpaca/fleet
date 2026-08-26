@@ -24,6 +24,8 @@ import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
+import { COMPAT_MODE, SHAPE_DEFAULTS, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
+import { displayTarget, isIssueTarget, normalizeTarget } from '../shared/issue-ref.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
 import {
@@ -87,14 +89,18 @@ Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
                                            placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
-  delegate <target> [--mode m] [--finish rung] [--manifest path] [--watch]
+  delegate <target> [--publish] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
-                                           A PR target (pr/<n> or a GitHub PR URL) implies
-                                           --mode followthrough: the job adopts the PR's head
-                                           branch, addresses its review comments and failing
-                                           checks, and pushes to the same branch so the PR
-                                           updates in place. Open PRs only.
+                                           Defaults follow the target's shape: an issue number
+                                           (or a PR) publishes and aims at merge-ready; a prose
+                                           target is inspected-only and opens no PR. --publish
+                                           grants a prose dispatch push+PR authority.
+                                           A PR target (pr/<n> or a GitHub PR URL) adopts the
+                                           PR's head branch, addresses its review comments and
+                                           failing checks, and pushes to the same branch so the
+                                           PR updates in place. Open PRs only.
+                                           (--mode is deprecated (#36) and will be removed.)
                                            When harness.cli_version is set, computes the per-repo
                                            job image hash, builds on miss, passes tag to daemon.
   image build [--manifest path] [--push] [--registry ECR_URI] [--region AWS_REGION]
@@ -474,19 +480,59 @@ function loadDotEnv(fleetDir: string): Record<string, string> {
   }
 }
 
-type ModePreset = {
-  mode: string;
-  authority: unknown;
-  finish?: string;
-  report?: string;
-};
+/**
+ * A `presets/modes.json` entry, as far as the deprecated `--mode` flag reads it:
+ * a name that exists, and whether it granted publish. The file's other fields
+ * are no longer consulted (#36).
+ */
+type ModePreset = { authority?: { publish?: boolean } };
 
+/**
+ * `presets/modes.json`, which since #36 is the `--mode` mapping table and
+ * nothing else: the names the deprecated flag still accepts, and per name
+ * whether it granted publish. Order construction reads the shape table in
+ * `src/cli/dispatch.ts` instead. The file and this loader go with the flag in
+ * the follow-up release.
+ */
 function loadPresets(): Record<string, ModePreset> {
   const raw = readJsonFile(fileURLToPath(new URL('../../presets/modes.json', import.meta.url)), 'mode presets');
   // Repo-shipped presets/modes.json; shape enforced by test/presets.test.mjs.
   const presets = raw as { modes: Record<string, ModePreset> };
   if (typeof presets.modes !== 'object' || presets.modes === null) fail('mode presets file has no "modes" object');
   return presets.modes;
+}
+
+/**
+ * The deprecated `--mode` flag, mapped onto exactly what its preset used to
+ * mean, so an invocation that worked before #36 still does for the life of the
+ * flag. Unknown names are still refused.
+ *
+ *  - the read-only names (`assess`/`investigate`/`review`/`compare` — the
+ *    presets that granted no publish) ask for a read-only, `inspected` job.
+ *    Both halves are the operator's explicit request, so both outrank the
+ *    repo's `default_finish`.
+ *  - `implement`/`followthrough` asked to deliver, and nothing more specific:
+ *    publish, and NO opinion on the finish rung, so the repo default and then
+ *    the shape default decide. That is what makes `--mode implement 42`
+ *    identical to a bare `42` on every manifest — the alternative, pinning
+ *    merge-ready here, would have the deprecated flag quietly overriding a
+ *    repo's configured finish line.
+ *
+ * What this deliberately does NOT change: the compat `mode` written into the
+ * order, and therefore an un-regenerated repo gate's strictness. `--mode assess
+ * 42` gets read-only defaults and still pays the full issue readiness check on
+ * both the old gate and the new one — the inversion recorded in D17.
+ */
+function resolveModeFlag(
+  mode: string,
+  warn: (line: string) => void,
+): { publish: boolean; finish?: string } {
+  const presets = loadPresets();
+  const preset = presets[mode];
+  if (!preset) fail(`unknown mode "${mode}" — available: ${Object.keys(presets).join(', ')}`);
+  warn('fleet: warning: --mode is deprecated (#36) and will be removed — a target and a prompt is the whole dispatch');
+  if (preset.authority?.publish === true) return { publish: true };
+  return { publish: false, finish: SHAPE_DEFAULTS.prose.finish };
 }
 
 /** `pr/<n>` or a full GitHub PR URL → the PR number; anything else is not a PR target. */
@@ -546,7 +592,7 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
     fail(`cannot resolve PR target ${target}: gh reported no head branch`);
   }
   if (pr.state !== 'OPEN') {
-    fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — followthrough continues only open PRs`);
+    fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — only an open PR can be continued`);
   }
   const linked = Array.isArray(pr.closingIssuesReferences) && pr.closingIssuesReferences.length === 1
     ? (pr.closingIssuesReferences[0] as { number?: unknown })?.number
@@ -562,7 +608,10 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
 /** A dispatch as asked for, with somewhere to put its progress. */
 type DelegateRequest = {
   target: string;
+  /** Deprecated (#36); mapped onto the shape table for the life of the flag. */
   mode?: string;
+  /** Grant push + PR authority to a dispatch whose shape would not have it. */
+  publish?: boolean;
   finish?: string;
   manifestPath?: string;
   log: (line: string) => void;
@@ -603,7 +652,7 @@ async function resolveIssueTitle(target: string, signal?: AbortSignal): Promise<
  * same words for the same problem.
  */
 async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; state: string }> {
-  let target = req.target;
+  let target = normalizeTarget(req.target);
   const manifestPath = req.manifestPath ?? path.join('.fleet', 'manifest.json');
 
   const rawManifest = readJsonFile(manifestPath, 'manifest');
@@ -612,13 +661,15 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // Safe: validated against manifest.schema.json just above.
   const manifest = rawManifest as Manifest;
 
-  // Typed PR target (#80): pr/<n> or a GitHub PR URL implies followthrough and
-  // adopts the PR's head branch. Resolved via gh — and refused when the PR is
-  // not open — before anything is posted.
+  // Typed PR target (#80): pr/<n> or a GitHub PR URL adopts the PR's head
+  // branch. Resolved via gh — and refused when the PR is not open — before
+  // anything is posted.
   const prNumber = parsePrTarget(target);
   let continues: { pr: number; branch: string } | undefined;
   let prTitle: string | undefined;
   if (prNumber !== undefined) {
+    // Kept for the life of the deprecated flag: adoption implies delivery, and
+    // a no-publish adoption is undefined behavior we decline to define.
     if (req.mode !== undefined && req.mode !== 'followthrough') {
       fail(`a PR target implies --mode followthrough; it cannot be dispatched as ${req.mode}`);
     }
@@ -631,26 +682,38 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     req.log(`fleet: continuing PR #${resolved.number} (branch ${resolved.branch})`);
   }
 
-  const modes = loadPresets();
-  const modeName = req.mode ?? (continues !== undefined ? 'followthrough' : 'implement');
-  const preset = modes[modeName];
-  if (!preset) fail(`unknown mode "${modeName}" — available: ${Object.keys(modes).join(', ')}`);
-
-  const flagFinish = req.finish;
+  // Shape decides the defaults (#36). Precedence, tightest first:
+  //   publish: --publish > mapped --mode > shape
+  //   finish:  --finish > mapped --mode > manifest.gates.default_finish > shape
+  // The specific flags beat the deprecated bundle; a per-dispatch flag beats the
+  // repo's manifest default, which in turn beats the shape default — reviving a
+  // knob that presets/*.finish had shadowed into dead code since it was added.
+  // The repo default applies only where this dispatch could reach it; see
+  // reachableRepoDefault, and docs/decisions.md#d17 for why.
+  const shape = dispatchShape(target, continues);
+  const shapeDefault = SHAPE_DEFAULTS[shape];
+  const mapped = req.mode !== undefined ? resolveModeFlag(req.mode, req.warn) : undefined;
+  const publish = req.publish === true ? true : (mapped?.publish ?? shapeDefault.publish);
+  const finish = req.finish
+    ?? mapped?.finish
+    ?? reachableRepoDefault(manifest.gates?.default_finish, publish)
+    ?? shapeDefault.finish;
 
   // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
   // A PR target already resolved its title from the PR — one gh call, one truth.
   let issueTitle: string | undefined = prTitle;
-  if (issueTitle === undefined && /^\d+$/.test(target)) {
+  if (issueTitle === undefined && isIssueTarget(target)) {
     issueTitle = await resolveIssueTitle(target, req.signal);
   }
 
   const workOrder: Record<string, unknown> = {
-    mode: preset.mode,
+    // The one deprecated field the window release still writes, because an
+    // operator repo's un-regenerated pickup gate keys on it. See COMPAT_MODE;
+    // shapeAuthority explains why the other legacy fields are NOT written.
+    mode: COMPAT_MODE[shape],
     target,
-    finish: flagFinish ?? preset.finish ?? manifest.gates?.default_finish ?? 'merge-ready',
-    authority: preset.authority,
-    report: preset.report ?? 'status-first',
+    finish,
+    authority: shapeAuthority(publish),
   };
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   if (continues !== undefined) workOrder.continues = continues;
@@ -736,7 +799,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   const ledgerEntry: Record<string, string> = {
     jobId: created.job.id,
     target,
-    mode: preset.mode,
+    finish,
     daemonUrl: describeTarget(),
     at: new Date().toISOString(),
   };
@@ -755,13 +818,20 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
 async function cmdDelegate(args: string[]): Promise<number> {
   const { values, positionals } = parseCommand(
     args,
-    { mode: { type: 'string' }, finish: { type: 'string' }, manifest: { type: 'string' }, watch: { type: 'boolean' } },
+    {
+      mode: { type: 'string' },
+      publish: { type: 'boolean' },
+      finish: { type: 'string' },
+      manifest: { type: 'string' },
+      watch: { type: 'boolean' },
+    },
     1,
     1,
   );
   const created = await dispatchDelegate({
     target: positionals[0],
     mode: typeof values.mode === 'string' ? values.mode : undefined,
+    publish: values.publish === true,
     finish: typeof values.finish === 'string' ? values.finish : undefined,
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,
     log: (line) => console.log(line),
@@ -892,20 +962,23 @@ type Job = {
   reason?: string;
   /** Launch attempt (#30); rendered as [attempt N] when > 1. Absent = 1. */
   attempt?: number;
-  workOrder?: { mode?: string; target?: string; title?: string };
+  /** `mode` is deprecated (#36) and no longer rendered; old jobs still carry it. */
+  workOrder?: { finish?: string; target?: string; title?: string };
   updatedAt?: string;
 };
 
 function formatJob(job: Job): string {
   const state = formatJobState(job);
-  const mode = job.workOrder?.mode ?? '?';
+  // The finish rung, which every work order carries (schema-required) — so old
+  // jobs render theirs too, and '?' means a job record with no order at all.
+  const finish = job.workOrder?.finish ?? '?';
   const rawTarget = job.workOrder?.target ?? '?';
   const title = job.workOrder?.title;
   // Prefer "#<n> <title>" when both an issue number and title are present.
-  const ref = /^\d+$/.test(rawTarget) ? `#${rawTarget}` : rawTarget;
+  const ref = displayTarget(rawTarget);
   const target = title ? `${ref} ${title}`.slice(0, 60) : rawTarget;
   const updated = typeof job.updatedAt === 'string' ? `  updated=${job.updatedAt}` : '';
-  return `${job.id}  ${state}  mode=${mode}  target=${target}${updated}`;
+  return `${job.id}  ${state}  finish=${finish}  target=${target}${updated}`;
 }
 
 async function cmdStatus(args: string[]): Promise<number> {
@@ -1195,8 +1268,11 @@ async function cmdCockpit(): Promise<number> {
     cwd: process.cwd(),
     home: fleetHome(),
     env: process.env as Record<string, string | undefined>,
-    delegate: (req) =>
-      dispatchDelegate({ target: req.target, mode: req.mode, log: req.log, warn: req.warn, signal: req.signal }),
+    // Spread, deliberately: the cockpit's request type is a subset of
+    // DelegateRequest, and hand-listing the fields is how a flag gets parsed,
+    // threaded through four types, and then dropped here — silently, because
+    // this is the only hop with no test between the input line and the daemon.
+    delegate: (req) => dispatchDelegate({ ...req }),
   });
 }
 
@@ -1575,7 +1651,12 @@ async function cmdReclaim(args: string[]): Promise<number> {
 type LedgerEntry = {
   jobId: string;
   target: string;
-  mode: string;
+  /**
+   * The dispatch's finish rung. Optional because pre-#36 lines carry `mode`
+   * here instead and `fleet resume` must keep reading a ledger it did not write
+   * — remote is truth for everything but the pointer itself.
+   */
+  finish?: string;
   daemonUrl: string;
   at: string;
 };

@@ -38,7 +38,7 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 
 ## Design commitments
 
-- **Concepts invisible, behavior reliable.** Under the hood there is an evidence ladder, a state machine, six dispatch modes, and five schema contracts. You should experience them as: dispatch works, questions reach you, status never lies, the PR says what was verified. The contracts are the spine, not the face.
+- **Concepts invisible, behavior reliable.** Under the hood there is an evidence ladder, a state machine, and five schema contracts. You should experience them as: dispatch works, questions reach you, status never lies, the PR says what was verified. A dispatch is a target and a prompt — nothing to configure. The contracts are the spine, not the face.
 - **Truth before action.** A job that can't prove readiness doesn't start; a claim that wasn't verified doesn't ship. Reports say `PARTIAL` honestly instead of `READY` optimistically, and the daemon verifies claimed rungs mechanically where it can.
 - **Prompt-level permission is not enforcement.** Every rule worth having gets a checkpoint — a schema, a gate, or a test. Until a credential broker exists, Fleet says plainly: sandboxes carry operator credentials; single-operator use only.
 - **Humans are load-bearing, not decorative.** The pickup gate before model spend, the decision protocol mid-run, the merge at the end. Agents cannot answer their own questions — the answer API is unreachable with a job's credentials, by construction.
@@ -49,9 +49,9 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work. `fleet setup repo` writes it by interview, with the defaults read out of your checkout.
 2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. `fleet setup infra --destroy` takes it back down.
-3. `fleet delegate TICKET-123` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back.
+3. `fleet delegate 42` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back. A dispatch is a target and a prompt — nothing to configure: name an issue or a PR and the job delivers a draft PR, or write the ask in prose and it delivers a report and its files instead.
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
-5. The job ends as a draft pull request (or a report with downloadable artifacts, for investigation work). A human merges it. Fleet never merges and never deploys.
+5. The job ends as a draft pull request (or, for a prose dispatch, a report with downloadable artifacts). A human merges it. Fleet never merges and never deploys.
 
 From a machine that has never seen Fleet, that is the whole path:
 
@@ -62,7 +62,8 @@ fleet setup infra       # interview → plan → apply → .fleet/infra/aws/flee
 <fleet-checkout>/images/build.sh --redeploy-daemon    # publish the images, start the daemon on them
 fleet connect           # hold the SSM tunnel to the daemon
 fleet setup harness     # install the delegate skill into your coding harness
-fleet delegate TICKET-123
+fleet delegate 42                      # an issue: ends in a draft PR
+fleet delegate "why do queued jobs sit behind the capacity cap"   # prose: ends in a report
 ```
 
 `setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
@@ -76,7 +77,7 @@ fleet setup harness                      # detects what you have, asks, installs
 fleet setup harness --scope project      # this checkout only, and committable
 ```
 
-Then say *"delegate TICKET-123 to fleet"* in your session. It dispatches, reports the job id, polls quietly, and when the job blocks it asks **you** — the options verbatim, the recommended one marked, nothing auto-answered. Answering resumes the job; the settle report comes back status-first, with its artifacts listed if the mode produced any.
+Then say *"delegate issue 42 to fleet"* in your session. It dispatches, reports the job id, polls quietly, and when the job blocks it asks **you** — the options verbatim, the recommended one marked, nothing auto-answered. Answering resumes the job; the settle report comes back status-first, with its artifacts listed if the job produced any.
 
 Claude Code, Codex and OpenCode all discover skills as a `<name>/SKILL.md` directory, so there is exactly one canonical file — [`integrations/SKILL.md`](integrations/SKILL.md) — and the per-harness variants are generated from it at install time. Only two things differ per harness: which directory it goes in, and how that harness asks its human. Reruns are idempotent, an edited copy is never overwritten without `--force`, and no variant is ever committed to this repo (the test suite fails a forked copy). A harness Fleet has no convention for yet is a new record in `src/cli/setup-harnesses.ts`, not new code — integration is a skill file over the CLI, permanently ([D8](docs/decisions.md)).
 

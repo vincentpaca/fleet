@@ -27,10 +27,12 @@ function writeManifest(workspace: string, pickup: string): void {
   );
 }
 
-// #56: this repo's own gate, run for real by the runner. An investigate-mode
+// #56, re-keyed by #36: this repo's own gate, run for real by the runner. A
 // prose dispatch must clear it (no gh, no issue) and reach the artifact settle;
-// the same dispatch under the implement default must die at the gate instead.
-test("investigate-mode prose dispatch clears this repo's gate and settles with a report artifact", async () => {
+// an issue-shaped dispatch against an unready issue must die at the gate
+// instead. The fork lives in the gate script's main(), so only running the real
+// runner against the real gate proves the dispatch path.
+test("a bare prose dispatch clears this repo's gate and settles with a report artifact", async () => {
   const token = 'test-token-gate-mode';
   const daemon = await startMockDaemon({ token });
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-gate-mode-'));
@@ -39,12 +41,12 @@ test("investigate-mode prose dispatch clears this repo's gate and settles with a
     writeFileSync(
       join(workspace, '.fleet', 'order.json'),
       JSON.stringify({
-        mode: 'investigate',
+        // No mode field: the shape of the target is the whole declaration.
         target: 'why do queued jobs sit behind the capacity cap',
         finish: 'inspected',
       }),
     );
-    // Investigate harness: the deliverable is the artifact, not a branch.
+    // Prose harness: the deliverable is the artifact, not a branch.
     const harness =
       `node -e "const fs=require('node:fs');` +
       `fs.mkdirSync('.fleet/out/artifacts',{recursive:true});` +
@@ -52,12 +54,12 @@ test("investigate-mode prose dispatch clears this repo's gate and settles with a
       `fs.writeFileSync('.fleet/out/report.json',JSON.stringify(` +
       `{status:'READY',next_action:'read the findings',verification:['queue depth sampled'],not_done:[]}))"`;
 
-    // FLEET_MODE/FLEET_TARGET outrank the staged order inside the gate: if this
-    // test process is itself a fleet job, an inherited value would decide the
+    // FLEET_TARGET outranks the staged order inside the gate: if this test
+    // process is itself a fleet job, an inherited value would decide the
     // assertion instead of the fixture.
     const {
       FLEET_GIT_URL: _u, FLEET_GIT_NAME: _n, FLEET_GIT_EMAIL: _e,
-      FLEET_MODE: _m, FLEET_TARGET: _t, ...parentEnv
+      FLEET_TARGET: _t, ...parentEnv
     } = process.env;
     const child = spawn(process.execPath, [runnerMain], {
       env: {
@@ -98,24 +100,31 @@ test("investigate-mode prose dispatch clears this repo's gate and settles with a
   }
 });
 
-test("the same prose dispatch under the implement default dies at this repo's gate", async () => {
+test("an issue dispatch against an unready issue dies at this repo's gate", async () => {
   const token = 'test-token-gate-mode-2';
   const daemon = await startMockDaemon({ token });
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-gate-mode-'));
   try {
     writeManifest(workspace, `node ${repoGate}`);
+    // A numeric target: same prompt as the prose dispatch above would carry, but
+    // shaped as a ticket, so it pays the readiness check. The gate reaches for
+    // gh and git, both faked here — an unlabelled, acceptance-free issue in a
+    // checkout whose origin claims no branches.
     writeFileSync(
       join(workspace, '.fleet', 'order.json'),
-      JSON.stringify({
-        mode: 'implement',
-        target: 'why do queued jobs sit behind the capacity cap',
-        finish: 'merge-ready',
-      }),
+      JSON.stringify({ target: '424242', finish: 'merge-ready' }),
     );
+    const bin = mkdtempSync(join(tmpdir(), 'fleet-gate-bin-'));
+    writeFileSync(
+      join(bin, 'gh'),
+      '#!/bin/sh\ncat <<\'EOF\'\n{"state":"OPEN","labels":[],"body":"## Problem\\nonly prose"}\nEOF\n',
+      { mode: 0o755 },
+    );
+    writeFileSync(join(bin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
 
     const {
       FLEET_GIT_URL: _u2, FLEET_GIT_NAME: _n2, FLEET_GIT_EMAIL: _e2,
-      FLEET_MODE: _m2, FLEET_TARGET: _t2, ...parentEnv
+      FLEET_TARGET: _t2, ...parentEnv
     } = process.env;
     const child = spawn(process.execPath, [runnerMain], {
       env: {
@@ -125,6 +134,7 @@ test("the same prose dispatch under the implement default dies at this repo's ga
         FLEET_RUNNER_TOKEN: token,
         FLEET_WORKSPACE: workspace,
         FLEET_HARNESS_CMD: `node -e "process.exit(0)"`,
+        PATH: `${bin}:${process.env.PATH}`,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -137,7 +147,8 @@ test("the same prose dispatch under the implement default dies at this repo's ga
     const settle = daemon.events.find((event) => event.type === 'settle');
     const report = settle?.report;
     assert.ok(report && typeof report === 'object' && 'next_action' in report);
-    assert.match(String(report.next_action), /implement mode requires a ready GitHub issue/);
+    // The first finding is the readiness one, not a "not an issue number" abort.
+    assert.match(String(report.next_action), /issue 424242 lacks the "ready" label/);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
     await daemon.close();

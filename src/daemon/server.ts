@@ -538,8 +538,9 @@ export class FleetDaemon {
     if (!parsed) return;
     const { manifest, workOrder, env, sync, imageOverride } = parsed;
 
-    // Schema-validated above: work order requires mode + target strings.
-    const order = workOrder as { mode: string; target: string };
+    // Schema-validated above: work order requires a target string. `mode` is
+    // deprecated (#36) — accepted, ignored, and read by nothing here.
+    const order = workOrder as { target: string };
     // Schema-validated above: manifest setup.image is optional; limits.resources is optional.
     const manifestDoc = manifest as { setup?: { image?: string }; limits?: { resources?: { cpu?: number; memory?: number; disk?: number } } };
     const resources = manifestDoc.limits?.resources;
@@ -575,7 +576,10 @@ export class FleetDaemon {
     this.registry.createJob(record);
     this.registry.appendEvent(id, {
       type: "state", state: "queued",
-      meta: { kind: "delegated", label: `${order.mode}: ${order.target}`, target: order.target, where: this.#options.provider.name, fleet: [] },
+      // The label was "<mode>: <target>"; with modes gone (#36) the target is
+      // the whole label. Nothing parses it — it is display text for the queued
+      // event, and `target` travels beside it as the machine-readable field.
+      meta: { kind: "delegated", label: order.target, target: order.target, where: this.#options.provider.name, fleet: [] },
     });
 
     this.#initJobLimits(id, mergedLimits(

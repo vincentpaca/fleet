@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fleet.harnessx.net/schemas/work-order.schema.json",
   "title": "Fleet work order (dispatch contract)",
-  "description": "What a dispatch must say: a target, what authority it carries, where it stops. Generalizes battle-tested operator playbooks into a schema so the delegation contract is enforced, not restated in prose per prompt. Travels with `fleet delegate`. Dispatch shape — `continues` present means adoption, a numeric target means an issue, anything else is prose — is what the CLI keys defaults on and what a repo's pickup gate keys strictness on (#36, docs/decisions.md#d17). Migration window: `mode`, `report` and the unread `authority` subfields are accepted and ignored, and are removed in the follow-up release.",
+  "description": "What a dispatch must say: mode, target, truth, authority, scope, finish, report. Generalizes battle-tested operator playbooks into a schema so the delegation contract is enforced, not restated in prose per prompt. Travels with `fleet delegate`; mode presets keep dispatch terse.",
   "type": "object",
-  "required": ["target", "finish"],
+  "required": ["mode", "target", "finish"],
   "additionalProperties": false,
   "properties": {
     "mode": { "$ref": "#/$defs/mode" },
@@ -43,14 +43,13 @@
     "report": {
       "enum": ["status-first"],
       "default": "status-first",
-      "deprecated": true,
-      "description": "DEPRECATED (#36), accepted and ignored; removed in the follow-up release. One legal value and no reader — the settle payload shape is owned by the report schema, not requested per dispatch. Status line first (READY/BLOCKED/...), then rung reached vs target, SHAs/PR, verification, self-review, not-done, one exact next action."
+      "description": "Settle payload shape: Status line first (READY/BLOCKED/...), then rung reached vs target, SHAs/PR, verification, self-review, not-done, one exact next action."
     },
     "continues": {
       "type": "object",
       "required": ["pr", "branch"],
       "additionalProperties": false,
-      "description": "Post-settle feedback re-entry (#80): this dispatch adopts an existing open PR's head branch instead of creating a fresh job branch. The runner fetches and checks out `branch`, pushes work to it (the PR updates in place), and never opens a new PR. Its presence IS the adoption declaration (#36) — the repo's pickup gate subjects every continues-carrying order to the adopted PR's checks (open, head matches) plus the claim guard, which is where the guard against adoption-by-accident now lives.",
+      "description": "Post-settle feedback re-entry (#80): this dispatch adopts an existing open PR's head branch instead of creating a fresh job branch. The runner fetches and checks out `branch`, pushes work to it (the PR updates in place), and never opens a new PR. Only valid in followthrough mode — adoption is deliberate; every other mode still trips the claim guard.",
       "properties": {
         "pr": { "type": "integer", "minimum": 1, "description": "The open PR being continued." },
         "branch": { "type": "string", "minLength": 1, "description": "The PR's head branch, resolved by the CLI at dispatch." }
@@ -67,29 +66,31 @@
       }
     }
   },
+  "dependentSchemas": {
+    "continues": {
+      "properties": { "mode": { "const": "followthrough" } }
+    }
+  },
   "$defs": {
     "mode": {
       "enum": ["assess", "implement", "investigate", "followthrough", "review", "compare"],
-      "deprecated": true,
-      "description": "DEPRECATED (#36), accepted and ignored; removed in the follow-up release. The mode string never reached the harness, and dispatch shape now carries what it claimed to: `continues` present means adoption, a numeric target means an issue, anything else is prose. The window CLI still writes it, computed from shape, so an operator repo running a pre-#36 pickup gate keeps gating as it did — see docs/decisions.md#d17."
+      "description": "assess: binary ready/blocked + blockers, read-only. implement: worktree, smallest complete change, tests, draft PR. investigate: evidence before edits; classify code vs config/seed/permission/deployment; edit unlocks only after the cause is recorded. followthrough: take an existing PR to terminal state. review: read-only quality/PR review. compare: semantic conflict assessment of branches/designs."
     },
     "authority": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Capability grants — enforced by the broker (tokens), not requested in prose. v1 hard limits: merge and deploy are never grantable. `publish` is the one bit any code reads (the runner gates draft-PR creation on it); `edit`, `jira` and `runtime_read` are deprecated (#36) and removed in the follow-up release.",
+      "description": "Capability grants — enforced by the broker (tokens), not requested in prose. v1 hard limits: merge and deploy are never grantable.",
       "properties": {
-        "edit": { "type": "boolean", "default": false, "deprecated": true, "description": "DEPRECATED (#36), accepted and ignored; no reader. A job that can run a harness can edit its own workspace — the enforceable boundary is what it may push, which is `publish`." },
-        "publish": { "type": "boolean", "default": false, "description": "Push + PR create/update. Read by the runner at settle: false means no draft PR is opened, whatever rung the report claims." },
+        "edit": { "type": "boolean", "default": false },
+        "publish": { "type": "boolean", "default": false, "description": "Push + PR create/update." },
         "jira": {
           "type": "array",
           "uniqueItems": true,
-          "deprecated": true,
-          "description": "DEPRECATED (#36), accepted and ignored; no reader. Tracker capability arrives with a tracker integration, not before it.",
           "items": { "enum": ["read", "comment", "transition"] }
         },
         "merge": { "const": false, "description": "v1: never grantable. The GitHub token is minted without merge capability." },
         "deploy": { "const": false, "description": "v1: never grantable. Deploy is out of scope (Post-Build doctrine)." },
-        "runtime_read": { "type": "boolean", "default": false, "deprecated": true, "description": "DEPRECATED (#36), accepted and ignored; no reader. Runtime evidence is a manifest-level capability question, not a per-dispatch grant." }
+        "runtime_read": { "type": "boolean", "default": false, "description": "Read-only env/log evidence for investigate mode. The only runtime capability in v1." }
       }
     },
     "rung": {

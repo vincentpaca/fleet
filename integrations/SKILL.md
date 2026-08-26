@@ -26,11 +26,15 @@ Two consequences worth knowing before you debug anything: the resolution reads t
 ## Dispatch
 
 ```sh
-fleet delegate <target> [--mode <assess|implement|investigate|followthrough|review|compare>] [--finish <rung>]
+fleet delegate <target> [--publish] [--finish <rung>]
 ```
 
-- Default mode is `implement`. Use `assess` first when readiness is uncertain — it is read-only and cheap.
-- A PR target — `pr/<n>` or a full GitHub PR URL — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. This implies `--mode followthrough` and refuses non-open PRs before dispatching.
+A dispatch is a target and a prompt — there is nothing to configure. The target's shape sets the defaults:
+
+- **An issue number** (`42`, `#42`) or a **PR reference** — a delivery dispatch. It gets push and PR authority, and aims at whatever `gates.default_finish` in the manifest says, or `merge-ready` if it says nothing. The repo's pickup gate holds it to that repo's readiness rules, so an unready ticket dies before any model spend; relay the gate's words rather than working around them.
+- **Anything else is prose** — `fleet delegate "why do queued jobs sit behind the capacity cap"`. No publish authority: the deliverable is the report and whatever files the job writes to its artifact lane, and it opens no PR. (It still gets a job branch — the runner pushes one at creation so evidence survives the container — so "no PR", not "no writes".) This is the right shape for research, assessment, review and comparison, including assessing an issue that is not ready yet — phrase it as prose (`fleet delegate "assess issue 42: is it ready to implement"`) rather than passing the number.
+- Pass `--publish` when a prose dispatch should end in a draft PR, and `--finish <rung>` to move the finish line either way.
+- A PR target — `pr/<n>` or a full GitHub PR URL — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. Non-open PRs are refused before dispatching.
 - The command prints a job id. Report it to the human immediately with one line about what was dispatched.
 - Sync files and env vars are read from the current shell and repo; if `delegate` fails naming a missing var or file, relay that verbatim.
 

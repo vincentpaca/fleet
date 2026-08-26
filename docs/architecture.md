@@ -57,7 +57,7 @@ Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
 | Contract | Schema | Consumed by |
 | --- | --- | --- |
 | Manifest — what a sandbox needs to be this repo's environment | `schemas/manifest.schema.json` | CLI (lint, delegate), daemon (dispatch validation), runner (gate, harness command) |
-| Work order — what one dispatch says: mode, target, permissions, finish line | `schemas/work-order.schema.json` | CLI (built from `presets/modes.json` + flags), daemon |
+| Work order — what one dispatch says: target, permissions, finish line | `schemas/work-order.schema.json` | CLI (built from the dispatch's shape + flags), daemon |
 | Events — what a running job emits | `schemas/events.schema.json` | runner (emits), daemon (validates at intake), CLI and any UI (render) |
 | Decision file — how a sandboxed agent asks a human a question | `schemas/decision-file.schema.json` | the repo's harness commands (write it), runner (validates, forwards) |
 | Job states | `schemas/job-states.json` | daemon (enforces transitions) |
@@ -110,7 +110,7 @@ What a job hands back is decided by where its delivery contract lives — three 
 2. **The prompt owns it (supported, degraded).** A detailed dispatch can carry the workflow inline ("do X, then open a PR"). Mechanically identical, but it is a prompt-level contract — no reusable gate, no wired critic, re-typed per dispatch. Right for one-offs; an ad-hoc prompt that worked twice should be promoted into a command.
 3. **Nobody owns it.** Then the delivery is the evidence itself — and that is not a fallback but the universal floor: every job delivers its transcript, its settle report, and its artifacts (`.fleet/out/artifacts/`, listed in `produced[]`). Stronger deliveries stack on top of the floor, never replace it.
 
-Vagueness changes the **mode**, not the mechanism: an open-ended request is an honest `assess`/`investigate` dispatch whose deliverable is the report artifact, while a vague `implement` dispatch should die at the pickup gate — implement-mode readiness requires acceptance criteria. The layering underneath: **capability** comes from the manifest (env, services; enforced physically from the credentials phase on), the **contract** comes from the command or the prompt, and the **evidence** comes from Fleet regardless.
+Vagueness changes the **deliverable**, not the mechanism: an open-ended request is an honest prose dispatch whose deliverable is the report artifact, while a vague dispatch against a ticket should die at the pickup gate — issue readiness requires acceptance criteria. That is not a mode the operator picks; it is the shape of what they typed (`docs/decisions.md#d17`). The layering underneath: **capability** comes from the manifest (env, services; enforced physically from the credentials phase on), the **contract** comes from the command or the prompt, and the **evidence** comes from Fleet regardless.
 
 ## Security model, current honesty
 

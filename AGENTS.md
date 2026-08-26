@@ -52,7 +52,7 @@ This repo is two things, and every path belongs to exactly one. **SHIP** = what 
 | `schemas/` | SHIP | The five contracts — source of truth for every data shape |
 | `src/cli/` `src/daemon/` `src/runner/` `src/providers/` `src/shared/` | SHIP | The product: CLI, coordinator, in-sandbox runner, cloud providers, helpers (`docs/architecture.md#the-pieces`) |
 | `src/validate.mjs` | SHIP | Schema validators |
-| `presets/` | SHIP | The six dispatch-mode defaults |
+| `presets/` | SHIP | The deprecated `--mode` mapping table (#36); deleted with the flag in the follow-up release |
 | `examples/` | SHIP | Reference manifests and work orders — generic, always |
 | `integrations/` | SHIP | Skill files users copy into their coding harness |
 | `images/` | SHIP | Runner base Dockerfile + build script; consumed via git source, not npm (`docs/architecture.md#two-layer-job-images`) |

@@ -37,7 +37,7 @@ function roster(jobs: BoardJob[], selection = -1, width = 100, now = 0, pulseOn 
 
 test('elapsed: settled jobs freeze at total runtime; live jobs keep counting', () => {
   const done: BoardJob = {
-    id: 'job-done', state: 'done', workOrder: { mode: 'implement', target: '3' },
+    id: 'job-done', state: 'done', workOrder: { finish: 'merge-ready', target: '3' },
     createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:12:00Z',
   };
   const run: BoardJob = { ...done, id: 'job-run', state: 'running' };
@@ -66,7 +66,7 @@ test('sortJobs: blocked before running before terminal, stable within a rank', (
 test('a cancelled job shows its reason — cancelled(stall) is not cancelled(wall-clock)', () => {
   const stalled: BoardJob = {
     id: 'job-stall', state: 'cancelled', reason: 'stall',
-    workOrder: { mode: 'implement', target: '39' },
+    workOrder: { finish: 'merge-ready', target: '39' },
     createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:25:00Z',
   };
   const budget: BoardJob = { ...stalled, id: 'job-budget', reason: 'wall-clock' };
@@ -80,7 +80,7 @@ test('decision options render verbatim; recommended marked, others not', () => {
   const blocked: BoardJob = {
     id: 'job-blk',
     state: 'blocked',
-    workOrder: { mode: 'implement', target: 'app' },
+    workOrder: { finish: 'merge-ready', target: 'app' },
     decision: {
       id: 'd1',
       question: 'Rename the endpoint?',
@@ -127,12 +127,12 @@ test('roster rows are clipped to the given width', () => {
     {
       id: 'job-with-a-very-long-identifier-that-overflows',
       state: 'running',
-      workOrder: { mode: 'implement', target: 'a-target-name-that-is-also-unreasonably-long' },
+      workOrder: { finish: 'merge-ready', target: 'a-target-name-that-is-also-unreasonably-long' },
     },
     {
       id: 'blocked-job',
       state: 'blocked',
-      workOrder: { mode: 'assess', target: 'some-repo' },
+      workOrder: { finish: 'inspected', target: 'some-repo' },
       decision: {
         id: 'd1',
         question: 'A question that is also extremely long and will definitely exceed the terminal width on its own',
@@ -163,7 +163,7 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
     {
       id: 'job-blk',
       state: 'blocked',
-      workOrder: { mode: 'assess', target: 'docs' },
+      workOrder: { finish: 'inspected', target: 'docs' },
       decision: {
         id: 'd1',
         question: 'Deploy now?',
@@ -173,25 +173,29 @@ test('roster rows: NO_COLOR output is stable (snapshot)', () => {
         ],
       },
     },
-    { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: 'app' } },
-    { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'notes' }, artifacts: 3 },
+    { id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: 'app' } },
+    { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'notes' }, artifacts: 3 },
   ];
+  // At 80 columns the widened FINISH column (#36: 13, so every targetable rung
+  // fits and TARGET stays on one column) pushes the artifact marker past the
+  // edge — the same clipping any job with an elapsed time already hit here. The
+  // marker's own coverage is the next test, which renders at 100.
   assert.equal(roster(jobs, 0, 80), [
-    '▶ !! job-blk                 blocked    assess      docs               ',
+    '▶ !! job-blk                 blocked    inspected      docs               ',
     '     Deploy now?',
     '     [go] Deploy now ★',
     '     [wait] Wait for review',
     '     answer: type an option id below — go | wait',
     '',
-    '  ●  job-run                 running    implement   app                ',
-    '  ·  job-done                done       assess      notes                3 files',
+    '  ●  job-run                 running    merge-ready    app                ',
+    '  ·  job-done                done       inspected      notes                3 f…',
   ].join('\n'));
 });
 
 test('a done row shows its delivered-artifact count; empty or live rows do not (#81)', () => {
   // The delivery guarantee has to be visible where the job reads as finished:
   // a done job with files waiting must not look identical to an empty-handed one.
-  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { mode: 'assess', target: 'docs' }, artifacts: 3 };
+  const done: BoardJob = { id: 'job-done', state: 'done', workOrder: { finish: 'inspected', target: 'docs' }, artifacts: 3 };
   assert.match(roster([done]), /job-done.*3 files/);
   // Singular for one file — "1 files" reads as a bug.
   assert.match(roster([{ ...done, artifacts: 1 }]), /job-done.*1 file(?!s)/);
@@ -216,12 +220,32 @@ test('the blocked marker pulses, and only the blocked one', () => {
   assert.equal(runOff, runOn, 'a running row must not flicker');
 });
 
+test('the FINISH column renders for new and old jobs alike (#36)', () => {
+  // The column replaced MODE. Every work order carries a finish rung — it is
+  // schema-required and always was — so a job dispatched before #36, whose
+  // stored order still carries `mode`, renders its rung and not a '?'. The bug
+  // this catches: keying the column on a field only new orders have, which
+  // would blank the column for every job already on the board.
+  const newJob: BoardJob = { id: 'job-new', state: 'running', workOrder: { finish: 'inspected', target: 'a question' } };
+  const oldJob = {
+    id: 'job-old', state: 'running',
+    workOrder: { mode: 'implement', finish: 'merge-ready', target: '42' },
+  } as unknown as BoardJob;
+  const rows = roster([newJob, oldJob], -1, 120);
+  assert.match(rows, /job-new\s+running\s+inspected/);
+  assert.match(rows, /job-old\s+running\s+merge-ready/, 'a pre-#36 job renders its stored rung');
+  assert.doesNotMatch(rows, /implement/, 'and never its retired mode');
+  assert.match(renderJobLine(oldJob, { noColor: true }), /merge-ready/, 'the drill-down header too');
+  // A job record with no work order at all is the only '?': nothing to render.
+  assert.match(roster([{ id: 'job-bare', state: 'queued' }], -1, 120), /job-bare\s+queued\s+\?/);
+});
+
 test('title renders as #<n> <title> in the roster and #<n>: <title> in a job line', () => {
-  const job: BoardJob = { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: '42', title: 'Fix login' } };
+  const job: BoardJob = { id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: '42', title: 'Fix login' } };
   assert.match(roster([job], -1, 120), /#42 Fix login/);
   assert.match(renderJobLine(job, { noColor: true }), /#42: Fix login/);
   // Without a title, a numeric target renders bare — no invented # prefix.
-  const bare: BoardJob = { id: 'job-run', state: 'running', workOrder: { mode: 'implement', target: '42' } };
+  const bare: BoardJob = { id: 'job-run', state: 'running', workOrder: { finish: 'merge-ready', target: '42' } };
   assert.doesNotMatch(roster([bare], -1, 120), /#42/);
 });
 
@@ -384,7 +408,7 @@ test('renderContextStrip: context, counts and tunnel ownership all appear', () =
 test('renderContextStrip: the job-line row is exactly terminal width in colour mode', () => {
   // Catches the ANSI-blind padEnd bug: String.padEnd counts escape bytes, which
   // leaves the closing │ at the wrong visual column.
-  const job: BoardJob = { id: 'job-blk', state: 'blocked', workOrder: { mode: 'assess', target: '#42' } };
+  const job: BoardJob = { id: 'job-blk', state: 'blocked', workOrder: { finish: 'inspected', target: '#42' } };
   for (const noColor of [true, false]) {
     const strip = renderContextStrip(1, 0, 0, 80, { noColor }, renderJobLine(job, { noColor }));
     assert.equal(visualLength(strip.split('\n')[1]), 80, `colour=${!noColor} job row must fill the width`);
@@ -392,7 +416,7 @@ test('renderContextStrip: the job-line row is exactly terminal width in colour m
 });
 
 test('renderTableHeader: two lines, clipped, dim', () => {
-  assert.match(renderTableHeader(100, true).split('\n')[0], /JOB\s+STATE\s+MODE\s+TARGET\s+ELAPSED/);
+  assert.match(renderTableHeader(100, true).split('\n')[0], /JOB\s+STATE\s+FINISH\s+TARGET\s+ELAPSED/);
   const header = renderTableHeader(60, true).split('\n');
   assert.equal(header.length, 2);
   for (const line of header) assert.ok(line.length <= 60);
@@ -432,7 +456,7 @@ test('fetchBoardJobs enriches a blocked job with the decision it is waiting on',
   const daemon = await startMockDaemon({
     'GET /jobs': (_req: MockRequest, res: ServerResponse) =>
       sendJson(res, 200, {
-        jobs: [{ id: 'job-blk', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { mode: 'assess', target: 'docs' } }],
+        jobs: [{ id: 'job-blk', state: 'blocked', updatedAt: '2026-01-01T00:00:00Z', workOrder: { finish: 'inspected', target: 'docs' } }],
       }),
     'GET /jobs/job-blk/events': (_req: MockRequest, res: ServerResponse) => sendNdjson(res, DECISION_EVENTS),
   });

@@ -364,6 +364,18 @@ test('composeDraftPrText: thin inputs degrade honestly, not to machine exhaust',
   assert.doesNotMatch(body, /Closes/, 'non-issue targets never claim to close an issue');
 });
 
+test('composeDraftPrText: a #-prefixed target is the same issue, referenced once', () => {
+  // A stored order may carry `#42`: the pre-#36 CLI did not strip the hash. The
+  // old inline /^\d+$/ read that as a non-issue, so the PR silently dropped its
+  // `Closes` line and auto-close broke. The shared predicate normalizes it —
+  // and the bug on the other side of that fix is double-prefixing, which is why
+  // the reference is asserted exactly.
+  const { title, body } = composeDraftPrText({ target: '#42', issueTitle: 'Fix login', jobId: 'job-h' });
+  assert.equal(title, '#42: Fix login');
+  assert.doesNotMatch(body, /##42/, 'the hash must not be applied twice');
+  assert.equal((body.match(/Closes #42\./g) ?? []).length, 1, 'exactly one Closes line, for issue 42');
+});
+
 test('pushWork delivers commits the agent made itself (not just uncommitted changes)', () => {
   // #34's second run: the agent committed per the playbook, pushWork saw a
   // clean status and skipped the push - the delivery vanished with the workspace.

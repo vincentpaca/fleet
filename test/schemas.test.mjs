@@ -68,20 +68,59 @@ test('work order rejects non-targetable finish rungs', () => {
   assert.equal(validateWorkOrder({ ...base, finish: 'merge-ready' }).ok, true);
 });
 
-test('work order continues (#80): additive, followthrough-only, both fields required', () => {
-  const ft = { mode: 'followthrough', target: '80', finish: 'merge-ready' };
+test('work order continues (#80): additive, mode-independent, both fields required', () => {
+  const base = { target: '80', finish: 'merge-ready' };
   const c = { pr: 77, branch: 'fleet/77-job-abc' };
-  assert.equal(validateWorkOrder(ft).ok, true, 'orders without continues must stay valid — the field is additive');
-  assert.equal(validateWorkOrder({ ...ft, continues: c }).ok, true, 'followthrough may carry continues');
-  // The bug this catches: adoption leaking into other modes — an implement
-  // dispatch carrying continues would bypass the claim guard by design.
-  assert.equal(validateWorkOrder({ ...ft, mode: 'implement', continues: c }).ok, false, 'continues is followthrough-only');
-  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77 } }).ok, false, 'branch is required');
-  assert.equal(validateWorkOrder({ ...ft, continues: { branch: 'x' } }).ok, false, 'pr is required');
-  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 0, branch: 'x' } }).ok, false, 'pr must be >= 1');
-  assert.equal(validateWorkOrder({ ...ft, continues: { pr: '77', branch: 'x' } }).ok, false, 'pr must be a number, not a string');
-  assert.equal(validateWorkOrder({ ...ft, continues: { pr: 77, branch: '' } }).ok, false, 'branch must be non-empty');
-  assert.equal(validateWorkOrder({ ...ft, continues: { ...c, extra: true } }).ok, false, 'unknown continues fields are rejected');
+  assert.equal(validateWorkOrder(base).ok, true, 'orders without continues must stay valid — the field is additive');
+  assert.equal(validateWorkOrder({ ...base, continues: c }).ok, true, 'continues needs no companion field');
+  // #36 retired the followthrough-const rule: continues IS the adoption
+  // declaration, so it must validate with any mode value or none. The guard
+  // that rule provided (an adoption walking past the claim guard by accident)
+  // is the pickup gate's now — test/gate.test.ts owns it.
+  for (const mode of [undefined, 'followthrough', 'implement', 'assess']) {
+    const order = mode === undefined ? { ...base, continues: c } : { ...base, mode, continues: c };
+    assert.equal(validateWorkOrder(order).ok, true, `continues must validate with mode=${mode}`);
+  }
+  assert.equal(validateWorkOrder({ ...base, continues: { pr: 77 } }).ok, false, 'branch is required');
+  assert.equal(validateWorkOrder({ ...base, continues: { branch: 'x' } }).ok, false, 'pr is required');
+  assert.equal(validateWorkOrder({ ...base, continues: { pr: 0, branch: 'x' } }).ok, false, 'pr must be >= 1');
+  assert.equal(validateWorkOrder({ ...base, continues: { pr: '77', branch: 'x' } }).ok, false, 'pr must be a number, not a string');
+  assert.equal(validateWorkOrder({ ...base, continues: { pr: 77, branch: '' } }).ok, false, 'branch must be non-empty');
+  assert.equal(validateWorkOrder({ ...base, continues: { ...c, extra: true } }).ok, false, 'unknown continues fields are rejected');
+});
+
+test('work order (#36): mode is optional, and the legacy fields are accepted and ignored', () => {
+  // The optionality every later compatibility claim rests on. Without it a
+  // window CLI that stops writing `mode` 422s at intake, and every claim about
+  // the follow-up release is unfounded.
+  assert.equal(validateWorkOrder({ target: '36', finish: 'inspected' }).ok, true, 'an order with NO mode must validate');
+  assert.equal(
+    validateWorkOrder({ target: '36', finish: 'inspected', authority: { publish: false, merge: false, deploy: false } }).ok,
+    true,
+    'publish alone is a complete authority block',
+  );
+  // A full pre-migration order: mode, report, every dead authority subfield,
+  // and a followthrough carrying continues against an issue-number target —
+  // exactly what a parked job re-enters with.
+  const preMigration = {
+    mode: 'followthrough',
+    target: '80',
+    title: 'Post-settle feedback re-entry',
+    finish: 'merge-ready',
+    report: 'status-first',
+    authority: {
+      edit: true, publish: true, jira: ['read', 'comment', 'transition'],
+      merge: false, deploy: false, runtime_read: false,
+    },
+    continues: { pr: 77, branch: 'fleet/80-job-old' },
+  };
+  const { ok, errors } = validateWorkOrder(preMigration);
+  assert.equal(ok, true, JSON.stringify(errors));
+  // Deprecated does not mean unvalidated: a bad value in a legacy field is
+  // still a bad order, so a producer cannot smuggle nonsense through one.
+  assert.equal(validateWorkOrder({ ...preMigration, mode: 'conquer' }).ok, false, 'unknown mode value still rejected');
+  assert.equal(validateWorkOrder({ ...preMigration, report: 'freeform' }).ok, false, 'unknown report value still rejected');
+  assert.equal(validateWorkOrder({ ...preMigration, authority: { runtime_read: 'yes' } }).ok, false, 'runtime_read is still boolean');
 });
 
 test('wall_clock forbids zero in both schemas (#134): an instant death sentence is a typo', () => {
@@ -98,14 +137,22 @@ test('wall_clock forbids zero in both schemas (#134): an instant death sentence 
   assert.equal(validateWorkOrder({ ...base, limits: { wall_clock: '1m' } }).ok, true, 'a real override still validates');
 });
 
-test('limit defaults have exactly one source of truth (#134): no "default" annotations in the schema', () => {
+test('defaults have exactly one source of truth (#134, #36): no "default" annotations in the schema', () => {
   // Ajv is built without useDefaults, so a "default" annotation here is inert —
-  // a second, false source of truth beside src/shared/time.ts. The descriptions
-  // name the defaults and where they live; the annotation must stay deleted.
+  // a second, false source of truth beside the code that resolves the value.
+  // The descriptions name the defaults and where they live; the annotations must
+  // stay deleted. gates.default_finish joined the list with #36, which made its
+  // resolution shape- and rung-dependent (src/cli/dispatch.ts) — a flat
+  // "merge-ready" in the schema was already wrong for every prose dispatch.
   const props = manifestSchema.properties.limits.properties;
   for (const key of ['wall_clock', 'idle', 'block_hot', 'decision_timeout']) {
     assert.equal('default' in props[key], false, `manifest limits.${key} must carry no inert "default" annotation`);
   }
+  assert.equal(
+    'default' in manifestSchema.properties.gates.properties.default_finish,
+    false,
+    'manifest gates.default_finish must carry no inert "default" annotation',
+  );
 });
 
 test('job state machine transitions are closed over declared states', () => {
