@@ -408,7 +408,7 @@ export class FleetDaemon {
     if (parts.length === 1) return this.#routeJobCollection(url, method, req, res);
     const job = this.registry.getJob(parts[1] ?? "");
     if (!job) return sendJson(res, 404, { error: `unknown job: ${parts[1]}` });
-    if (parts.length === 2 && method === "GET") return sendJson(res, 200, { job: publicJob(job) });
+    if (parts.length === 2 && method === "GET") return sendJson(res, 200, { job: this.#jobPayload(job) });
     return this.#routeJob(url, method, parts, job, req, res);
   }
 
@@ -418,7 +418,7 @@ export class FleetDaemon {
     if (method === "GET") {
       const jobs = boundJobList(this.registry.listJobs(), url.searchParams.get("all") === "1")
         .sort((a, b) => RANK[a.state] - RANK[b.state] || a.createdAt.localeCompare(b.createdAt))
-        .map(publicJob);
+        .map((job) => this.#jobPayload(job));
       return sendJson(res, 200, { jobs });
     }
     sendJson(res, 405, { error: `method not allowed: ${method} /jobs` });
@@ -1948,6 +1948,21 @@ export class FleetDaemon {
       }
     }
     return files;
+  }
+
+  /**
+   * Read payload for one job (#195): the public record plus the artifact tally
+   * derived from the per-job index bookkeeping — what is actually fetchable,
+   * never the settle event's produced[] claim, so a job cancelled after a
+   * partial upload reports its real count. Absent entirely when nothing was
+   * delivered, so an artifact-less job's payload is unchanged. Rides both
+   * GET /jobs and GET /jobs/:id (#167: listed jobs always carry it).
+   */
+  #jobPayload(record: JobRecord): Omit<JobRecord, "runnerToken"> & { artifacts?: { count: number; totalBytes: number } } {
+    const base = publicJob(record);
+    const meta = this.#artifactMetaOf(record.id);
+    if (meta.files.size === 0) return base;
+    return { ...base, artifacts: { count: meta.files.size, totalBytes: meta.total } };
   }
 
   /** $FLEET_HOME/jobs/<id>/artifacts.json — sits beside the artifact tree, never inside it. */

@@ -315,6 +315,99 @@ test('overwrite replaces the entry: charged the delta, listed once', async (t) =
   assert.equal(Buffer.from(got.content, 'base64').toString(), 'two');
 });
 
+// ---- #195: artifact tally on the job payload ----
+
+/** Post a settle event claiming `produced` — the claim the payload must ignore. */
+async function postSettle(
+  port: number,
+  jobId: string,
+  token: string,
+  produced: { id: string; type: string; title: string; path?: string }[],
+): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/internal/jobs/${encodeURIComponent(jobId)}/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-fleet-runner-token': token },
+    body: JSON.stringify({
+      job: jobId, seq: 1, type: 'settle', rung: 'implemented', minutes: 1,
+      outcome: { produced, findings: 0, decisions: 0 },
+    }),
+  });
+}
+
+type JobPayload = { state: string; artifacts?: { count: number; totalBytes: number } };
+
+async function fetchJobPayload(port: number, jobId: string): Promise<JobPayload> {
+  const res = await fetch(`http://127.0.0.1:${port}/jobs/${encodeURIComponent(jobId)}`);
+  assert.equal(res.status, 200);
+  const body = await res.json() as { job: JobPayload };
+  return body.job;
+}
+
+test('job payload: artifact tally comes from the index, never the settle claim', async (t) => {
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new StubProvider(), port: 0, longPollMs: 500 });
+  await daemon.start();
+  t.after(() => daemon.stop());
+
+  const { jobId, token } = await makeJob(daemon);
+
+  // Nothing delivered yet: the payload carries no artifacts field at all.
+  assert.ok(!('artifacts' in await fetchJobPayload(daemon.port!, jobId)), 'no artifacts field before any upload');
+
+  assert.equal((await postArtifact(daemon.port!, jobId, token, 'a.txt', 'five!')).status, 200);
+  assert.equal((await postArtifact(daemon.port!, jobId, token, 'charts/b.png', 'png')).status, 200);
+
+  // The settle claims three deliverables; only two were ever uploaded. The
+  // payload must report what is actually fetchable — reading produced[]
+  // length here is the #195 bug.
+  const settled = await postSettle(daemon.port!, jobId, token, [
+    { id: 'a', type: 'file', title: 'a', path: 'a.txt' },
+    { id: 'b', type: 'file', title: 'b', path: 'charts/b.png' },
+    { id: 'ghost', type: 'file', title: 'claimed but never uploaded', path: 'ghost.bin' },
+  ]);
+  assert.equal(settled.status, 200, await settled.text());
+
+  const job = await fetchJobPayload(daemon.port!, jobId);
+  assert.deepEqual(job.artifacts, { count: 2, totalBytes: 8 }, 'index tally: 2 files, 5+3 bytes');
+
+  // The listing carries the same tally (#167: listed jobs always carry it).
+  const listRes = await fetch(`http://127.0.0.1:${daemon.port}/jobs`);
+  assert.equal(listRes.status, 200);
+  const listed = await listRes.json() as { jobs: ({ id: string } & JobPayload)[] };
+  const row = listed.jobs.find((j) => j.id === jobId);
+  assert.ok(row);
+  assert.deepEqual(row.artifacts, { count: 2, totalBytes: 8 });
+});
+
+test('job payload: a job with zero artifacts shows nothing new, on the item and the listing', async (t) => {
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new StubProvider(), port: 0, longPollMs: 500 });
+  await daemon.start();
+  t.after(() => daemon.stop());
+
+  const { jobId } = await makeJob(daemon);
+  assert.ok(!('artifacts' in await fetchJobPayload(daemon.port!, jobId)));
+  const listRes = await fetch(`http://127.0.0.1:${daemon.port}/jobs`);
+  const listed = await listRes.json() as { jobs: ({ id: string } & JobPayload)[] };
+  const row = listed.jobs.find((j) => j.id === jobId);
+  assert.ok(row);
+  assert.ok(!('artifacts' in row), 'an empty-handed job payload is unchanged');
+});
+
+test('job payload: cancelled after a partial upload shows the real partial count', async (t) => {
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new StubProvider(), port: 0, longPollMs: 500 });
+  await daemon.start();
+  t.after(() => daemon.stop());
+
+  const { jobId, token } = await makeJob(daemon);
+  assert.equal((await postArtifact(daemon.port!, jobId, token, 'partial.txt', 'only one landed')).status, 200);
+
+  const cancelRes = await fetch(`http://127.0.0.1:${daemon.port}/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+  assert.equal(cancelRes.status, 200, await cancelRes.text());
+
+  const job = await fetchJobPayload(daemon.port!, jobId);
+  assert.equal(job.state, 'cancelled');
+  assert.deepEqual(job.artifacts, { count: 1, totalBytes: Buffer.byteLength('only one landed') });
+});
+
 test('wrong runner token: 401', async (t) => {
   const daemon = new FleetDaemon({ home: tempHome(), provider: new StubProvider(), port: 0, longPollMs: 500 });
   await daemon.start();
