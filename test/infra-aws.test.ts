@@ -288,3 +288,33 @@ test('the ingress gate rejects CIDR-based, variable-sourced, and source-less rul
     assert.deepEqual(unguardedIngresses(accepted), [], `should be accepted: ${JSON.stringify(accepted)}`);
   }
 });
+
+// #187: the reconcile sweep (#147/#171) shipped without its IAM grants — the
+// daemon's dispatch policy allowed RunTask/StopTask/PassRole but not the two
+// read actions the sweep's first AWS call needs, so POST /reconcile answered
+// 500 on a live deployment. No mocked test or plan can see a live IAM denial
+// (the policy JSON embeds computed ARNs, unknown at plan), so the grant is
+// pinned at the source level like the other API-only constraints here.
+test('the daemon dispatch policy grants the reconcile sweep its two read actions', () => {
+  const text = readFileSync(join(INFRA, 'aws', 'main.tf'), 'utf8');
+  const start = text.indexOf('resource "aws_iam_role_policy" "daemon_dispatch"');
+  assert.notEqual(start, -1, 'daemon_dispatch policy resource must exist');
+  const body = text.slice(start, text.indexOf('\nresource ', start + 1));
+  for (const action of ['ecs:ListTasks', 'ecs:DescribeTasks']) {
+    assert.match(
+      body,
+      new RegExp(`"${action}"`),
+      `daemon_dispatch must grant ${action} or the reconcile sweep 500s live (#187)`,
+    );
+  }
+  // Cluster-scoped, matching the RunTask statement's shape: a read grant that
+  // widens past the cluster is a diff a reviewer must see. Each action's
+  // statement is small; the condition must appear before the next statement's
+  // Effect line.
+  for (const action of ['ecs:ListTasks', 'ecs:DescribeTasks']) {
+    const at = body.indexOf(`"${action}"`);
+    const next = body.indexOf('Effect', at);
+    const statement = body.slice(at, next === -1 ? at + 400 : next);
+    assert.match(statement, /ecs:cluster/, `the ${action} grant must stay cluster-scoped (#187)`);
+  }
+});
