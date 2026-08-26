@@ -2,6 +2,15 @@
  * Stall detection (issue #39): the runner cancels on silence, not just on the
  * wall-clock budget.
  *
+ * Scope after #197: the run-phase keepalive re-marks the idle clock while the
+ * harness process lives, so with production ratios (window = idle/3) a silent
+ * but live process is NOT a stall — see the keepalive test in
+ * runner-heartbeat.test.ts. These cases run with idle limits far below the
+ * keepalive window's 30s floor, where the clock still expires; they pin the
+ * expiry-and-kill machinery itself, which #197 leaves in place for the wedge
+ * process liveness cannot vouch for (a dead harness whose leaked child holds
+ * the stdout pipe open).
+ *
  * 1. A harness that goes silent past limits.idle is killed at the threshold:
  *    partial work still reaches the branch, the settle report carries the idle
  *    duration, and the job cancels with reason "stall".
