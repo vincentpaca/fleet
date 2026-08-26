@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateManifest, validateWorkOrder, jobStates } from '../validate.mjs';
-import { fleetHome } from '../shared/home.ts';
+import { fleetHome, operatorTokenPath } from '../shared/home.ts';
 import { gitValue } from '../shared/git.ts';
 import {
   clearRetainedRecord,
@@ -18,7 +18,7 @@ import {
   type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch } from '../runner/git.ts';
-import { request, describeTarget, daemonTarget, DaemonTargetError, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
@@ -936,6 +936,9 @@ async function daemonCall(
     // daemon_url — #125/#135): its message is the whole story, and asking
     // describeTarget below would only throw the same thing again.
     if (err instanceof DaemonTargetError) fail(err.message);
+    // The daemon answered but refused every token we could offer (#188): the
+    // daemon is reachable, so the tunnel hint below would misdiagnose it.
+    if (err instanceof OperatorTokenError) fail(err.message);
     // A TCP address means a port-forward is carrying this call, and a dead
     // session is the likeliest cause (#57) — say where to look, not just what broke.
     const tcpHint = '\n  the daemon is reached through a tunnel — open it with `fleet connect`, or run `fleet doctor` for its state';
@@ -1456,6 +1459,63 @@ async function doctorOrphans(): Promise<{ notes: string[]; findings: string[] }>
   };
 }
 
+/**
+ * Operator token state for doctor (#188): a fresh apply regenerates the
+ * daemon's token, so a locally cached copy going stale is routine — and it
+ * must never surface as a bare 401 the operator has to decode. The probe is
+ * an authenticated GET /jobs; the client's own local-file → SSM-fetch →
+ * 401-refetch resolution runs under it, so a healthy report may be "it was
+ * stale and has been refetched". `tokenBefore` is the local file's content
+ * from before cmdDoctor's first daemon call, because any earlier section's
+ * request may already have healed the file. Silent when no daemon answers
+ * (the tunnel section reports that) and on statuses that say nothing about
+ * the token — not knowing is not a defect.
+ */
+async function doctorToken(home: string, tokenBefore: string | undefined): Promise<{ notes: string[]; findings: string[] }> {
+  const tokenFile = operatorTokenPath(home);
+  let res: DaemonResponse;
+  try {
+    res = await request('GET', '/jobs');
+  } catch (err) {
+    if (err instanceof OperatorTokenError) return { notes: [], findings: [err.message] };
+    return { notes: [], findings: [] };
+  }
+  if (res.status === 401) {
+    return {
+      notes: [],
+      findings: [
+        tokenBefore === undefined
+          ? `operator token missing: the daemon requires one and ${tokenFile} does not exist — an ECS deployment publishes it to SSM (rerun with AWS credentials to fetch it); otherwise copy $FLEET_HOME/operator-token from the daemon`
+          : `operator token mismatch: the daemon refused ${tokenFile} — an ECS deployment refetches it from SSM automatically; otherwise copy $FLEET_HOME/operator-token from the daemon over it`,
+      ],
+    };
+  }
+  if (res.status !== 200) return { notes: [], findings: [] };
+  return { notes: [healthyTokenNote(tokenFile, tokenBefore)], findings: [] };
+}
+
+/** The one healthy-state line doctorToken prints: accepted, fetched, or healed. */
+function healthyTokenNote(tokenFile: string, before: string | undefined): string {
+  const after = readTokenFile(tokenFile);
+  if (before === undefined && after !== undefined) {
+    return `operator token: fetched from the deployment and cached at ${tokenFile}`;
+  }
+  if (before !== undefined && after !== before) {
+    return `operator token: ${tokenFile} was stale — refetched from the deployment and accepted`;
+  }
+  return after === undefined ? 'operator token: daemon does not require one' : `operator token: ${tokenFile} accepted`;
+}
+
+/** Content of the local operator token file, or undefined when absent/empty. */
+function readTokenFile(tokenFile: string): string | undefined {
+  try {
+    const raw = fs.readFileSync(tokenFile, 'utf8').trim();
+    return raw === '' ? undefined : raw;
+  } catch {
+    return undefined;
+  }
+}
+
 async function cmdDoctor(args: string[]): Promise<number> {
   const { values } = parseCommand(args, { manifest: { type: 'string' } }, 0, 0);
   const manifestPath =
@@ -1538,6 +1598,11 @@ async function cmdDoctor(args: string[]): Promise<number> {
     }
   }
 
+  // Snapshot the local token before the first daemon call below: the client
+  // heals a stale token transparently (#188), and doctorToken has to be able
+  // to say "was stale, refetched" rather than pretending it always matched.
+  const tokenBefore = readTokenFile(operatorTokenPath(fleetHome()));
+
   // 6. Tunnel (#57): when the daemon lives behind a port-forward, say what the
   //    tunnel is doing rather than letting every command report ECONNREFUSED.
   const tunnel = await doctorTunnel(fleetHome());
@@ -1560,6 +1625,13 @@ async function cmdDoctor(args: string[]): Promise<number> {
   const orphans = await doctorOrphans();
   for (const note of orphans.notes) console.log(note);
   findings.push(...orphans.findings);
+
+  // 9. Operator token (#188): say whether the daemon accepts ours — and when
+  //    it does not, name the file and the fix instead of leaving the next
+  //    command to print a bare 401.
+  const token = await doctorToken(fleetHome(), tokenBefore);
+  for (const note of token.notes) console.log(note);
+  findings.push(...token.findings);
 
   if (findings.length === 0) {
     console.log('doctor: clean');
@@ -2063,6 +2135,11 @@ async function main(argv: string[]): Promise<number> {
     // Daemon-address resolution refused outside a daemonCall (the cockpit's
     // startup, doctor's tunnel section): still a one-line failure, not a stack.
     if (err instanceof DaemonTargetError) {
+      console.error(err.message);
+      return EXIT_FAILURE;
+    }
+    // Same shape for a token the daemon refused even after a refetch (#188).
+    if (err instanceof OperatorTokenError) {
       console.error(err.message);
       return EXIT_FAILURE;
     }
