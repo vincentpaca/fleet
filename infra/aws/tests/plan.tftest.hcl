@@ -136,7 +136,7 @@ run "public_subnets_give_the_daemon_a_public_ip" {
 
   # Scale-to-zero is a design commitment, not a suggestion (#67): by default
   # the worker ASG floors at zero so idle costs nothing. A default that drifts
-  # above zero bills the operator ~$30/mo per always-on t3.medium — more than
+  # above zero bills the operator an always-on instance (~$120/mo on-demand t3.xlarge) — more than
   # the rest of a Fleet deployment combined — without anyone choosing it.
   assert {
     condition = (
@@ -326,4 +326,35 @@ run "a_floor_above_the_cap_is_held_by_the_precondition" {
   }
 
   expect_failures = [aws_autoscaling_group.instances]
+}
+
+# The worker tier is one coherent unit (#191): the default instance hosts the
+# default task, and the task default claims the full offered tier so a job gets
+# the performance the tier advertises. A 2-vCPU default starved suite-heavy
+# jobs into their wall-clock budgets.
+run "worker_tier_is_coherent" {
+  command = plan
+
+  assert {
+    condition     = aws_launch_template.instances.instance_type == "t3.xlarge"
+    error_message = "the default worker instance type must be t3.xlarge (#191) — change it only together with the offered_* and runner_* defaults"
+  }
+  assert {
+    condition     = var.runner_cpu == 4096 && var.runner_memory == 15360
+    error_message = "the default runner task must claim the full offered tier (4096 cpu units / 15360 MiB) — the precondition on the task definition ties these to what actually ships"
+  }
+  assert {
+    condition     = output.fleet_config.capacity_tiers[0].cpu == 4096 && output.fleet_config.capacity_tiers[0].memory == 15360
+    error_message = "fleet_config must advertise the new tier so the daemon's checkResources matches the deployment"
+  }
+}
+
+run "runner_default_exceeding_tier_fails_at_plan" {
+  command = plan
+
+  variables {
+    runner_cpu = 8192
+  }
+
+  expect_failures = [aws_ecs_task_definition.runner]
 }

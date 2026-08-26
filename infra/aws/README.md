@@ -130,21 +130,21 @@ the right ownership on first mount.
 | `vpc_cidr` | `string` | `"10.42.0.0/16"` | CIDR for the module-created VPC. |
 | `az_count` | `number` | `2` | AZs / subnets per tier for the module-created VPC. |
 | `enable_nat_gateway` | `bool` | `false` | `true`: private subnets behind NAT; `false`: public subnets with public-IP egress. Never any inbound either way. |
-| `instance_type` | `string` | `"t3.medium"` | EC2 instance type for container instances. |
+| `instance_type` | `string` | `"t3.xlarge"` | EC2 instance type for container instances. Moves together with `offered_*` and `runner_*` (one tier). 2-vCPU boxes starve suite-heavy jobs into their wall-clock budgets (#191); Spot price difference is cents per job-hour. |
 | `max_instances` | `number` | `4` | ASG maximum (must be ≥ 1, and ≥ `min_instances`). |
 | `min_instances` | `number` | `0` | Warm capacity floor: instances kept running at idle so a job skips the ~3-4 min cold start. **Each always-on `t3.medium` bills 24/7 — roughly $30/mo, more than the rest of a Fleet deployment combined.** See [Warm capacity floor](#warm-capacity-floor). |
 | `on_demand_base_capacity` | `number` | `0` | Instances always launched on-demand before the Spot split applies. See [Spot by default](#spot-by-default). |
 | `on_demand_percentage_above_base` | `number` | `0` | Percentage of capacity above the base that is on-demand (0 = all Spot, 100 = all on-demand). See [Spot by default](#spot-by-default). |
 | `scaling_cooldown_seconds` | `number` | `300` | ASG cooldown between scaling events. Raise it if jobs die to aggressive scale-in. |
-| `offered_cpu_units` | `number` | `2048` | Largest CPU request (ECS units) a single runner task may make; the daemon rejects bigger manifests at dispatch. Size to `instance_type`. |
-| `offered_memory_mib` | `number` | `3584` | Largest memory request (MiB) a single runner task may make; sized to leave headroom for the ECS agent on `instance_type`. |
+| `offered_cpu_units` | `number` | `4096` | Largest CPU request (ECS units) a single runner task may make; the daemon rejects bigger manifests at dispatch. Size to `instance_type`. |
+| `offered_memory_mib` | `number` | `15360` | Largest memory request (MiB) a single runner task may make; sized to leave ~1 GiB headroom for the ECS agent on `instance_type`. |
 | `project_repos` | `list(string)` | `[]` | Extra ECR repositories, one per project image. |
 | `daemon_image` | `string` | `""` | Daemon container image; empty means `<runner repo>:daemon`. |
 | `daemon_cpu` | `number` | `256` | CPU units for the daemon Fargate task (must be a valid Fargate value: 256/512/1024/2048/4096). |
 | `daemon_memory` | `number` | `512` | Memory (MiB) for the daemon Fargate task (must be valid for the chosen CPU — the unit rejects an invalid pairing at plan). |
 | `daemon_tcp_port` | `number` | `9000` | TCP port the daemon binds inside its container; operators reach it via SSM port-forward. |
-| `runner_cpu` | `number` | `256` | CPU units reserved for a runner container. |
-| `runner_memory` | `number` | `1024` | Hard memory limit (MiB) for a runner container. |
+| `runner_cpu` | `number` | `4096` | CPU units for a runner task when the manifest requests nothing — defaults to the full offered tier (one job per instance). Must not exceed `offered_cpu_units` (plan-time precondition). |
+| `runner_memory` | `number` | `15360` | Hard memory limit (MiB) for a runner task when the manifest requests nothing — full offered tier. Must not exceed `offered_memory_mib` (plan-time precondition). |
 | `fleet_home_path` | `string` | `"/var/lib/fleet"` | Container path for `FLEET_HOME` (EFS-backed). |
 | `log_retention_days` | `number` | `30` | CloudWatch log retention. |
 
