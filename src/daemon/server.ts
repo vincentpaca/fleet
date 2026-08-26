@@ -130,6 +130,18 @@ export type DaemonOptions = { // contract pin: test-only export, asserted by the
    */
   idleBackstopMarginMs?: number;
   /**
+   * How long a backstop waits after provider.terminate() for the runner's own
+   * teardown to settle before synthesising events (#197). terminate() is a
+   * signal, not a death: ECS StopTask and the process provider's SIGTERM both
+   * return while the runner's cancel teardown (WIP push, artifact collection,
+   * settle — bounded by FLEET_CANCEL_DEADLINE_MS, 20s) is still running.
+   * Synthesising immediately marked the job terminal and 422-rejected every
+   * teardown event, so the journal showed produced:[] while the runner was
+   * pushing the work. Default: 25_000 — the runner's deadline plus slack.
+   * Set smaller in tests that want the synthetic path.
+   */
+  backstopSettleWaitMs?: number;
+  /**
    * gh CLI seam for deferred rung verification (#117); tests inject stubs.
    * Default shells out to `gh` via async execFile with GH_VERIFY_TIMEOUT_MS.
    * Only ever called off the intake path — see #scheduleRungVerification.
@@ -205,6 +217,13 @@ function defaultGhRunner(): GhRunnerAsync {
  * destroy the request mid-poll instead of letting the daemon answer.
  */
 export const DEFAULT_LONG_POLL_MS = 25_000; // contract pin: test-only export, asserted by the suite
+
+/**
+ * Default for backstopSettleWaitMs (#197): the runner's cancel deadline
+ * (FLEET_CANCEL_DEADLINE_MS, 20s) plus slack for signal delivery and event
+ * posts. Past it the runner is presumed dead and the backstop synthesises.
+ */
+const DEFAULT_BACKSTOP_SETTLE_WAIT_MS = 25_000;
 
 /** Work-order target for operator-facing messages; a placeholder when unreadable. */
 function orderTarget(workOrder: unknown): string {
@@ -1481,6 +1500,15 @@ export class FleetDaemon {
   /** The backstop's actual work; guarded by #timeoutBackstop against re-entry. */
   async #cancelFromBackstop(job: JobRecord, cause: { reason: string; nextAction: string }): Promise<void> {
     if (job.handle) {
+      // The journal names the cause before the container goes down: the
+      // runner's own teardown only knows it received a signal, so without
+      // this line a backstop cancel whose teardown settles first (#197)
+      // would leave a transcript that never says why the job was killed.
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `${cause.reason} backstop: terminating the container — ${cause.nextAction}`,
+        who: "daemon",
+      });
       try {
         await this.#options.provider.terminate(job.handle);
       } catch (error) {
@@ -1490,9 +1518,15 @@ export class FleetDaemon {
           who: "daemon",
         });
       }
+      // terminate() is a signal, not a death (#197): the runner's cancel
+      // teardown is still pushing WIP, collecting artifacts and settling.
+      // Give it the window to deliver its own account before this path
+      // synthesises a produced:[] settle and slams the job terminal —
+      // which 422-rejects every teardown event still in flight.
+      await this.#awaitRunnerSettle(job.id);
     }
 
-    // Re-check after async terminate; runner may have settled in the meantime.
+    // Re-check after the wait; the runner settles for itself when it can.
     const afterTerminate = this.registry.getJob(job.id);
     if (!afterTerminate || isTerminal(afterTerminate.state)) return;
 
@@ -1529,6 +1563,22 @@ export class FleetDaemon {
     const doneCheck = verifyRung(updated.settle, target);
     this.registry.updateJob(job.id, { doneCheck: { target, ...doneCheck } });
     this.#scheduleRungVerification(job.id);
+  }
+
+  /**
+   * Bounded wait for the runner's own teardown to reach a terminal state
+   * (#197). Polling, not an event hook: the terminal transition arrives
+   * through the ordinary intake path, and the sweep's re-entry guard
+   * (#backstopping) already covers this whole window.
+   */
+  async #awaitRunnerSettle(id: string): Promise<void> {
+    const waitMs = this.#options.backstopSettleWaitMs ?? DEFAULT_BACKSTOP_SETTLE_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      const job = this.registry.getJob(id);
+      if (!job || isTerminal(job.state)) return;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
+    }
   }
 
   /**
