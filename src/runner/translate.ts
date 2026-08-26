@@ -32,7 +32,7 @@ import {
   MAX_RESULT_ERROR,
 } from '../shared/tool-text.ts';
 
-export type Translated =
+export type Translated = // contract pin: test-only export, asserted by the suite
   | { type: 'think'; text: string; who?: string }
   | { type: 'log'; text: string; who?: string }
   | { type: 'result'; payload: Record<string, unknown> };

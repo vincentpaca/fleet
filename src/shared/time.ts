@@ -17,7 +17,7 @@ export function parseDurationMs(value: string): number | undefined {
  * idle detection is always armed: silence is never the intended state of a
  * running job, so the default has to be a real number rather than "off".
  */
-export const DEFAULT_IDLE_MS = 20 * 60_000;
+const DEFAULT_IDLE_MS = 20 * 60_000;
 
 /**
  * How long a blocked container stays hot before parking when
@@ -26,14 +26,14 @@ export const DEFAULT_IDLE_MS = 20 * 60_000;
  * manifest with no limits block kept a blocked container hot forever —
  * the opposite of the advertised cost model.
  */
-export const DEFAULT_BLOCK_HOT_MS = 30 * 60_000;
+export const DEFAULT_BLOCK_HOT_MS = 30 * 60_000; // contract pin: test-only export, asserted by the suite
 
 /**
  * How long an unanswered decision waits before the daemon marks the job
  * stale, when `limits.decision_timeout` is absent (issue #134). 24h per the
  * same docs promise as DEFAULT_BLOCK_HOT_MS.
  */
-export const DEFAULT_DECISION_TIMEOUT_MS = 24 * 3_600_000;
+export const DEFAULT_DECISION_TIMEOUT_MS = 24 * 3_600_000; // contract pin: test-only export, asserted by the suite
 
 /** One limit key as ms, or the fallback when absent/unparseable. */
 function limitMs(limits: unknown, key: string, fallback: number): number {

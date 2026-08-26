@@ -8,7 +8,7 @@
 import type { GhRunnerAsync } from "../shared/git.ts";
 
 /** The unified evidence ladder, weakest to strongest (work-order.schema.json #/$defs/rung). */
-export const RUNG_LADDER = [
+export const RUNG_LADDER = [ // contract pin: test-only export, asserted by the suite
   "inspected",
   "implemented",
   "focused-green",
@@ -24,7 +24,7 @@ export const RUNG_LADDER = [
   "runtime-accepted",
 ] as const;
 
-export type Rung = (typeof RUNG_LADDER)[number];
+type Rung = (typeof RUNG_LADDER)[number];
 
 const LOCALLY_VERIFIABLE: Record<string, true> = { inspected: true, implemented: true };
 const GH_DEPENDENT: Record<string, true> = {
@@ -37,12 +37,12 @@ const GH_DEPENDENT: Record<string, true> = {
   merged: true,
 };
 
-export type SettleFacts = {
+export type SettleFacts = { // contract pin: test-only export, asserted by the suite
   rung?: string;
   report?: { status?: string; pr?: string } & Record<string, unknown>;
 } & Record<string, unknown>;
 
-export type RungVerification = {
+type RungVerification = {
   verified: boolean;
   reached: string | null;
   notes: string[];
@@ -159,6 +159,9 @@ async function verifyWithGh(
   if (!prUrl || typeof prUrl !== "string") {
     return { verified: false, reached, notes: ["unverified: no PR URL in settle report"] };
   }
+  if (!PR_URL_SHAPE.test(prUrl)) {
+    return { verified: false, reached, notes: [INVALID_PR_NOTE] };
+  }
 
   try {
     return await dispatchRungCheck(prUrl, targetRung, reached, ghRunner);
@@ -168,9 +171,22 @@ async function verifyWithGh(
   }
 }
 
-/** gh pr view wrapper — returns parsed JSON. */
+/**
+ * report.pr is authored inside the job sandbox — it crosses the same trust
+ * boundary the runner token guards, so it must never be able to act as a gh
+ * flag under the daemon's GitHub auth (#175). Only the exact shape the runner
+ * produces (createDraftPr returns `gh pr create`'s stdout: a full https PR
+ * URL) may reach argv; flags, bare numbers, owner/repo#n, and anything else
+ * are rejected before argv is built.
+ */
+const PR_URL_SHAPE = /^https:\/\/[A-Za-z0-9.-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/pull\/[0-9]+$/;
+
+/** The honest note recorded when report.pr fails the shape check. */
+export const INVALID_PR_NOTE = "unverified: report.pr is not a well-formed GitHub PR URL";
+
+/** gh pr view wrapper — returns parsed JSON. `--` keeps the job-authored URL positional. */
 async function prView(prUrl: string, fields: string[], ghRunner: GhRunnerAsync): Promise<Record<string, unknown>> {
-  const out = await ghRunner(["pr", "view", prUrl, "--json", fields.join(",")]);
+  const out = await ghRunner(["pr", "view", "--json", fields.join(","), "--", prUrl]);
   return JSON.parse(out) as Record<string, unknown>;
 }
 

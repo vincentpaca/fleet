@@ -15,8 +15,8 @@ type JobStatesDoc = {
 
 const doc = jobStates as JobStatesDoc;
 
-export const STATES: readonly JobState[] = doc.states;
-export const INITIAL_STATE: JobState = doc.initial;
+export const STATES: readonly JobState[] = doc.states; // contract pin: test-only export, asserted by the suite
+export const INITIAL_STATE: JobState = doc.initial; // contract pin: test-only export, asserted by the suite
 
 const terminal: ReadonlySet<JobState> = new Set(doc.terminal);
 const legal: ReadonlySet<string> = new Set(doc.transitions.map((t) => `${t.from}>${t.to}`));

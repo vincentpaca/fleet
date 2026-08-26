@@ -59,7 +59,6 @@ test('full happy path: running → gate ok → harness replay → settle → don
     const report = {
       status: 'READY',
       next_action: 'open the pull request',
-      implemented: ['generic feature'],
       verification: ['fixture replay completed'],
     };
 

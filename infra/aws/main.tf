@@ -473,11 +473,27 @@ resource "aws_launch_template" "instances" {
 }
 
 resource "aws_autoscaling_group" "instances" {
-  name                = "${var.name}-instances"
-  min_size            = 0
-  max_size            = var.max_instances
-  desired_capacity    = 0
+  name     = "${var.name}-instances"
+  min_size = var.min_instances
+  max_size = var.max_instances
+  # Initial desired capacity only (ignore_changes below hands it to ECS managed
+  # scaling). It must start at the floor, not 0: the ASG API rejects a desired
+  # capacity below min_size at create — an apply-time failure no plan reaches.
+  desired_capacity    = var.min_instances
   vpc_zone_identifier = local.subnet_ids
+
+  lifecycle {
+    ignore_changes = [desired_capacity] # ECS managed scaling owns this
+
+    # min <= max needs both variables, so it cannot be a variable validation:
+    # the module supports terraform 1.5, and cross-variable validation needs
+    # 1.9 (same fork as the daemon cpu/memory pairing). The ASG API rejects
+    # min_size > max_size only at apply; this precondition rejects it at plan.
+    precondition {
+      condition     = var.min_instances <= var.max_instances
+      error_message = "min_instances=${var.min_instances} exceeds max_instances=${var.max_instances}: the ASG cannot hold a minimum above its maximum. Raise max_instances or lower the warm floor."
+    }
+  }
 
   # Required for ECS managed termination protection.
   protect_from_scale_in = true
@@ -507,10 +523,6 @@ resource "aws_autoscaling_group" "instances" {
     key                 = "AmazonECSManaged"
     value               = "true"
     propagate_at_launch = true
-  }
-
-  lifecycle {
-    ignore_changes = [desired_capacity] # ECS managed scaling owns this
   }
 }
 
@@ -774,6 +786,10 @@ locals {
     # exceed every tier here, surfacing the mismatch at dispatch rather than
     # letting the job queue forever against capacity it can never obtain.
     capacity_tiers = [{ cpu = var.offered_cpu_units, memory = var.offered_memory_mib }]
+    # Warm capacity floor (#67): carried so `fleet doctor`/cockpit can say why
+    # instances exist at idle — 0 means any idle instance is a scale-in lag,
+    # above 0 it is paid-for warm capacity.
+    min_instances = var.min_instances
   }
 }
 
@@ -918,7 +934,8 @@ resource "aws_ecs_service" "daemon" {
 }
 
 # Deliberately no billing/budget resources: Fleet bounds spend structurally
-# (ASG min 0 / max_instances cap here; per-job wall-clock in core). Billing
+# (ASG min_instances floor, default 0, / max_instances cap here; per-job
+# wall-clock in core). Billing
 # alarms are the operator's own — a budget provisioned by the unit meters the
 # whole account unless cost-allocation tags are activated, and either way it
 # is monitoring, not control. See docs/decisions.md#d12 (amended 2026-08-19).

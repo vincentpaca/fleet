@@ -20,6 +20,8 @@ export type BoardJob = {
   marker?: string;
   /** Cancellation reason (stall, wall-clock, ...) — rendered as cancelled(<reason>). */
   reason?: string;
+  /** Launch attempt (#30); rendered as [attempt N] when > 1. Absent = 1. */
+  attempt?: number;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -98,7 +100,7 @@ function cube256([r, g, b]: [number, number, number]): number {
   return 16 + 36 * q(r) + 6 * q(g) + q(b);
 }
 
-export type ColorLevel = '24bit' | '256';
+type ColorLevel = '24bit' | '256';
 
 /** Detect the terminal's colour depth from the environment. */
 export function detectColorLevel(env: Record<string, string | undefined>): ColorLevel {
@@ -153,7 +155,7 @@ function buildBanner(level?: ColorLevel): string[] {
 }
 
 /** Small Fleet wordmark, plain form. Shown when the board starts; also `fleet --help`. */
-export const FLEET_BANNER = buildBanner().join('\n');
+export const FLEET_BANNER = buildBanner().join('\n'); // contract pin: test-only export, asserted by the suite
 
 // ── Terminal sequences ────────────────────────────────────────────────────────
 
@@ -316,7 +318,7 @@ export function renderJobLine(job: BoardJob, opts: FrameOpts): string {
 
 // ── Job ordering ──────────────────────────────────────────────────────────────
 
-export function stateRank(j: BoardJob): number {
+function stateRank(j: BoardJob): number {
   if (j.state === 'blocked') return 0;
   if (j.state === 'running' || j.state === 'queued') return 1;
   return 2;
@@ -496,6 +498,7 @@ type RawJob = {
   state: string;
   marker?: string;
   reason?: string;
+  attempt?: number;
   workOrder?: { mode?: string; target?: string; title?: string };
   createdAt?: string;
   updatedAt?: string;
@@ -605,6 +608,7 @@ export async function fetchBoardJobs(
       state: r.state,
       marker: r.marker,
       reason: r.reason,
+      attempt: r.attempt,
       workOrder: r.workOrder,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
@@ -696,7 +700,7 @@ export async function cancelJob(
  * Long-poll timeout: the daemon holds a `follow=1` read open, so this is not a
  * stall. Must exceed the daemon's long-poll window (exported so a test pins it).
  */
-export const FOLLOW_TIMEOUT_MS = 30_000;
+export const FOLLOW_TIMEOUT_MS = 30_000; // contract pin: test-only export, asserted by the suite
 
 /** Pause before reopening a follow that failed or returned at once, so nothing is hammered. */
 const FOLLOW_RETRY_MS = 1_000;

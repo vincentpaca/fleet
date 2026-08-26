@@ -62,7 +62,7 @@ import { holdTunnel, portAccepts, resolveTunnel, tunnelReport, type HeldTunnel }
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /** Who owns the tunnel this cockpit's daemon address is reached through. */
-export type TunnelStatus =
+type TunnelStatus =
   | { kind: 'none' }                    // a unix socket: there is no tunnel to own
   | { kind: 'probing' }
   | { kind: 'adopted' }                 // someone else's, healthy — never ours to close
@@ -70,13 +70,13 @@ export type TunnelStatus =
   | { kind: 'failed'; why: string };
 
 /** Board (stacked panes) or one job expanded. */
-export type CockpitView = 'board' | 'job';
+type CockpitView = 'board' | 'job';
 
 /**
  * Everything a frame is drawn from. Held by `runCockpit`, mutated only there,
  * and passed to `renderCockpit` as data — no getters, no callbacks, no clock.
  */
-export type CockpitModel = {
+export type CockpitModel = { // contract pin: test-only export, asserted by the suite
   /** Jobs in board order (`sortJobs`): blocked, then live, then settled. */
   jobs: BoardJob[];
   /** Index into `jobs`; -1 when the board is empty and there is nothing to select. */
@@ -96,7 +96,7 @@ export type CockpitModel = {
 };
 
 /** The selected job, or undefined when the board is empty. */
-export function selectedJob(m: CockpitModel): BoardJob | undefined {
+function selectedJob(m: CockpitModel): BoardJob | undefined {
   return m.selection >= 0 ? m.jobs[m.selection] : undefined;
 }
 
@@ -105,7 +105,7 @@ export function selectedJob(m: CockpitModel): BoardJob | undefined {
  * `keep` at the input line an answer rather than a dispatch, so it is read from
  * the job's own open decision and nothing else.
  */
-export function openOptionIds(m: CockpitModel): string[] {
+function openOptionIds(m: CockpitModel): string[] {
   const job = selectedJob(m);
   if (!job || job.state !== 'blocked' || !job.decision) return [];
   return job.decision.options.map((o) => o.id);
@@ -117,13 +117,13 @@ export function openOptionIds(m: CockpitModel): string[] {
  * Narrower than this and the table columns stop meaning anything; lines clip
  * rather than wrap, because a wrapped line breaks every row below it.
  */
-export const MIN_COLUMNS = 40;
+export const MIN_COLUMNS = 40; // contract pin: test-only export, asserted by the suite
 
 /** The banner is the product's face, but not at the cost of the panes. */
-export const BANNER_MIN_ROWS = 22;
+export const BANNER_MIN_ROWS = 22; // contract pin: test-only export, asserted by the suite
 
 /** Key hints, and the raw keys that must reach a handler for each. Parity is tested. */
-export const COCKPIT_FOOTER_KEYS: Array<{ label: string; rawKeys: string[] }> = [
+export const COCKPIT_FOOTER_KEYS: Array<{ label: string; rawKeys: string[] }> = [ // contract pin: test-only export, asserted by the suite
   { label: '↑↓ select', rawKeys: ['\x1b[A', '\x1b[B', 'k', 'j'] },
   { label: 'enter open', rawKeys: ['\r', '\n'] },
   { label: 'esc back', rawKeys: ['\x1b'] },
@@ -141,7 +141,7 @@ const PROMPT = '› ';
  * own rows on screen. Scrolling is by job, never mid-job: a decision card cut
  * away from its question is worse than a shorter list.
  */
-export function windowRosterRows(rows: RosterRow[], selection: number, budget: number): string[] {
+export function windowRosterRows(rows: RosterRow[], selection: number, budget: number): string[] { // contract pin: test-only export, asserted by the suite
   if (budget <= 0) return [];
   const target = Math.max(0, Math.min(selection, rows.length - 1));
   // One running sum, shrunk as the window slides: re-summing rows[start..target]
@@ -168,7 +168,7 @@ function exactly(lines: string[], n: number): string[] {
  * which is what a live view has to do by default — the operator scrolls back
  * deliberately, and PgDn to the bottom re-sticks.
  */
-export function windowTail(lines: string[], scroll: number, budget: number): string[] {
+export function windowTail(lines: string[], scroll: number, budget: number): string[] { // contract pin: test-only export, asserted by the suite
   if (budget <= 0) return [];
   const maxScroll = Math.max(0, lines.length - budget);
   const back = Math.max(0, Math.min(scroll, maxScroll));
@@ -273,7 +273,7 @@ function renderBoardView(
  * always exactly as tall as the terminal: writing more lines than there are rows
  * scrolls the screen, which is the one thing a full-screen view must never do.
  */
-export function renderCockpit(
+export function renderCockpit( // contract pin: test-only export, asserted by the suite
   m: CockpitModel,
   width: number,
   height: number,
@@ -293,10 +293,10 @@ export function renderCockpit(
 // ── Keys ──────────────────────────────────────────────────────────────────────
 
 /** How far PgUp/PgDn move the tail. */
-export const SCROLL_LINES = 5;
+export const SCROLL_LINES = 5; // contract pin: test-only export, asserted by the suite
 
 /** What a keystroke means once the model's state is taken into account. */
-export type CockpitAction =
+type CockpitAction =
   | { kind: 'select'; delta: number }
   | { kind: 'open' }
   | { kind: 'back' }
@@ -384,7 +384,7 @@ function parseNavOrPrintableKey(
  * escape sequence. An escape sequence with no meaning here is ignored rather
  * than typed: unknown keys must never leak into the line as stray letters.
  */
-export function cockpitKeyAction(
+export function cockpitKeyAction( // contract pin: test-only export, asserted by the suite
   key: string,
   state: { inputEmpty: boolean; confirming?: boolean; optionIds?: string[] },
 ): CockpitAction {
@@ -400,10 +400,10 @@ export function cockpitKeyAction(
 // ── The command line ──────────────────────────────────────────────────────────
 
 /** The verbs the input line understands. The same ones the CLI has (#36). */
-export const COCKPIT_VERBS = ['delegate', 'answer', 'logs', 'attach', 'cancel', 'help', 'quit'];
+const COCKPIT_VERBS = ['delegate', 'answer', 'logs', 'attach', 'cancel', 'help', 'quit'];
 
 /** A submitted line, resolved to an intent. Nothing here talks to the daemon. */
-export type CockpitCommand =
+type CockpitCommand =
   | { kind: 'delegate'; target: string; mode?: string }
   | { kind: 'answer'; option?: string; text?: string }
   | { kind: 'cancel'; jobId?: string }
@@ -492,7 +492,7 @@ function parseFocusCommand(rest: string[]): CockpitCommand {
   return jobId !== undefined ? { kind: 'focus', jobId } : { kind: 'focus' };
 }
 
-export function parseCockpitInput(line: string, ctx?: ParseCockpitCtx): CockpitCommand {
+export function parseCockpitInput(line: string, ctx?: ParseCockpitCtx): CockpitCommand { // contract pin: test-only export, asserted by the suite
   const trimmed = line.trim();
   if (trimmed === '') return { kind: 'nothing' };
   const parts = trimmed.split(WORDS_RE);
@@ -538,7 +538,7 @@ function commonPrefix(words: string[]): string {
  * one against the job ids on the board. Unambiguous completions gain a trailing
  * space; ambiguous ones extend to the common prefix and wait.
  */
-export function completeCockpitInput(line: string, ctx: { jobIds?: string[] } = {}): string {
+export function completeCockpitInput(line: string, ctx: { jobIds?: string[] } = {}): string { // contract pin: test-only export, asserted by the suite
   const head = line.slice(0, line.lastIndexOf(' ') + 1);
   const word = line.slice(head.length);
   if (word === '') return line;
@@ -552,7 +552,7 @@ export function completeCockpitInput(line: string, ctx: { jobIds?: string[] } = 
  * The input line's history: newest last, no duplicate of the previous entry, and
  * a cursor that walks it. Kept in memory only — a command line is a view too.
  */
-export class InputHistory {
+export class InputHistory { // contract pin: test-only export, asserted by the suite
   readonly entries: string[] = [];
   private cursor = 0;
 
@@ -594,7 +594,7 @@ const ESCAPE_KEY = /^\x1b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])/;
  * Iterated by code point, so a multi-byte character is one key rather than two
  * broken halves.
  */
-export function splitKeys(chunk: string): string[] {
+export function splitKeys(chunk: string): string[] { // contract pin: test-only export, asserted by the suite
   const keys: string[] = [];
   let rest = chunk;
   while (rest !== '') {
@@ -636,7 +636,7 @@ const MAX_TAIL_EVENTS = 2_000;
 /** Never re-examine the tunnel more often than this, however badly the daemon is doing. */
 const TUNNEL_RECHECK_MS = 15_000;
 
-export type CockpitDeps = {
+type CockpitDeps = {
   cwd: string;
   home: string;
   env: Record<string, string | undefined>;

@@ -48,9 +48,9 @@ export type RequestOptions = {
 };
 
 /** Applied when a caller passes no timeoutMs: long polls fit, hangs do not. */
-export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_TIMEOUT_MS = 60_000; // contract pin: test-only export, asserted by the suite
 
-export type HttpResponse = {
+export type HttpResponse = { // contract pin: test-only export, asserted by the suite
   status: number;
   headers: Record<string, string | string[] | undefined>;
   body: string;
@@ -113,21 +113,4 @@ export function request(opts: RequestOptions): Promise<HttpResponse> {
   req.on("error", reject);
   req.end(opts.body);
   return promise;
-}
-
-/** `request` + JSON body/headers both ways. `json` is null when the body is not JSON. */
-export async function requestJson(
-  opts: Omit<RequestOptions, "body"> & { body?: unknown },
-): Promise<HttpResponse & { json: unknown }> {
-  const body = opts.body === undefined ? undefined : JSON.stringify(opts.body);
-  const headers = { ...opts.headers };
-  if (body !== undefined) headers["content-type"] = "application/json";
-  const res = await request({ ...opts, headers, body });
-  let json: unknown = null;
-  try {
-    json = JSON.parse(res.body);
-  } catch {
-    // non-JSON body (e.g. ndjson dump); caller reads res.body directly
-  }
-  return { ...res, json };
 }

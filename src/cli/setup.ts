@@ -43,7 +43,7 @@ export class SetupError extends Error {}
 // ---------- asking ----------
 
 /** Reads one answer at a time. Injected so the merge logic is testable without a terminal. */
-export type Asker = {
+type Asker = {
   question: (prompt: string) => Promise<string>;
   close: () => void;
 };
@@ -61,7 +61,7 @@ export type Asker = {
  * Input that runs out is an error, never a wait: "never hang waiting for input"
  * has to hold for a stdin that ends mid-interview too, not only for no stdin.
  */
-export async function stdinAsker(): Promise<Asker> {
+async function stdinAsker(): Promise<Asker> {
   const readline = await import('node:readline/promises'); // lazy: only when there is someone to ask
   // No `output`: the prompt text is written by the caller, so every line the
   // wizard prints goes through one path and tests can read it from stdout.
@@ -79,13 +79,13 @@ export async function stdinAsker(): Promise<Asker> {
 }
 
 /** One prompt's rendered question line: what is asked, and what Enter accepts. */
-export function promptLine(spec: PromptSpec, fallback: string | undefined): string {
+function promptLine(spec: PromptSpec, fallback: string | undefined): string {
   if (fallback === undefined) return `${spec.question}: `;
   if (fallback === '') return `${spec.question} [none]: `;
   return `${spec.question} [${fallback}]: `;
 }
 
-export type InterviewOptions = {
+type InterviewOptions = {
   /** Values pre-supplied by flags, keyed by prompt key. */
   flags: Record<string, string | undefined>;
   env: Record<string, string | undefined>;
@@ -94,7 +94,7 @@ export type InterviewOptions = {
   log: (line: string) => void;
 };
 
-export type Interview = {
+type Interview = {
   answers: Answers;
   /** Flags a headless caller had to supply and did not, in prompt order. */
   missing: string[];
@@ -111,7 +111,7 @@ export type Interview = {
  * is collected rather than thrown on, so one exit can name every missing flag
  * instead of the operator discovering them one rerun at a time.
  */
-export async function interview(prompts: PromptSpec[], opts: InterviewOptions): Promise<Interview> {
+export async function interview(prompts: PromptSpec[], opts: InterviewOptions): Promise<Interview> { // contract pin: test-only export, asserted by the suite
   const answers: Answers = {};
   const missing: string[] = [];
 
@@ -193,7 +193,7 @@ export function flagName(key: string): string {
 }
 
 /** A yes/no gate. Anything but an explicit yes is a no — the default protects the account. */
-export async function confirm(question: string, ask: Asker): Promise<boolean> {
+async function confirm(question: string, ask: Asker): Promise<boolean> {
   const answer = (await ask.question(`${question} [y/N]: `)).trim().toLowerCase();
   return answer === 'y' || answer === 'yes';
 }
@@ -214,14 +214,14 @@ echo "fleet setup: replace this stub with your project's setup steps (e.g. npm c
 // on the same repo can point at different infra). .env holds secrets — only
 // .env.example (the key template) belongs in git. dispatched.jsonl is a
 // local pointer ledger — per-checkout, never shared.
-export const FLEET_GITIGNORE = `out/
+const FLEET_GITIGNORE = `out/
 infra/
 .env
 dispatched.jsonl
 `;
 
 // Template only — the operator fills in real values in .fleet/.env (gitignored).
-export const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in real values.
+const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in real values.
 # .env is gitignored; this file is the template that lives in the repo.
 # Declare the same keys in manifest.json env.vars so Fleet picks them up.
 # EXAMPLE_VAR=replace-with-real-value
@@ -236,7 +236,7 @@ export const DOT_ENV_EXAMPLE = `# Repo-local env — copy to .env and fill in re
  *
  * Entries already covered by their root-anchored form (`/.env`) are left alone.
  */
-export function ensureFleetGitignore(fleetDir: string, required: string[]): void {
+function ensureFleetGitignore(fleetDir: string, required: string[]): void {
   fs.mkdirSync(fleetDir, { recursive: true });
   const gitignorePath = path.join(fleetDir, '.gitignore');
   if (createIfAbsent(gitignorePath, FLEET_GITIGNORE)) return;
@@ -302,7 +302,7 @@ export function writeScaffold(
  * yours, and inventing one would generate terraform that applies somebody
  * else's infrastructure into your account.
  */
-export function resolveModuleSource(opts: {
+export function resolveModuleSource(opts: { // contract pin: test-only export, asserted by the suite
   provider: string;
   flag?: string;
   env: Record<string, string | undefined>;
@@ -343,7 +343,7 @@ function alignedArgs(args: Array<[string, string]>, indent: string): string {
   return args.map(([key, value]) => `${indent}${key.padEnd(width)} = ${value}`).join('\n');
 }
 
-export type RenderOptions = {
+type RenderOptions = {
   unit: SetupUnit;
   answers: Answers;
   moduleSource: string;
@@ -366,7 +366,7 @@ export type RenderOptions = {
  * a root module: without the passthrough, the capture that every other Fleet
  * command depends on cannot be read at all.
  */
-export function renderMainTf(opts: RenderOptions): string {
+export function renderMainTf(opts: RenderOptions): string { // contract pin: test-only export, asserted by the suite
   const { unit, answers } = opts;
   const providers = unit.requiredProviders
     .map((p) => `    ${p.name} = {\n      source  = ${JSON.stringify(p.source)}\n      version = ${JSON.stringify(p.version)}\n    }`)
@@ -410,16 +410,16 @@ output "connect_hint" {
 
 // ---------- running terraform ----------
 
-export type RunResult = { status: number; stdout: string; stderr: string; missing: boolean };
+type RunResult = { status: number; stdout: string; stderr: string; missing: boolean };
 
 /**
  * Run a command for setup. `capture` reads stdout (JSON we parse); without it
  * the child inherits this terminal, because a terraform plan is for the
  * operator to read, and relaying it through us would only make it worse.
  */
-export type Runner = (argv: string[], opts: { cwd: string; capture?: boolean }) => RunResult;
+type Runner = (argv: string[], opts: { cwd: string; capture?: boolean }) => RunResult;
 
-export const spawnRunner: Runner = (argv, opts) => {
+const spawnRunner: Runner = (argv, opts) => {
   const res = spawnSync(argv[0], argv.slice(1), {
     cwd: opts.cwd,
     encoding: 'utf8',
@@ -437,7 +437,7 @@ export const spawnRunner: Runner = (argv, opts) => {
  * and — worse — an operator who answers "name" three times learns nothing about
  * why nothing is being created.
  */
-export function preflight(unit: SetupUnit, cwd: string, run: Runner): void {
+function preflight(unit: SetupUnit, cwd: string, run: Runner): void {
   const terraform = run(['terraform', 'version'], { cwd, capture: true });
   if (terraform.missing) {
     throw new SetupError(
@@ -462,7 +462,7 @@ export function preflight(unit: SetupUnit, cwd: string, run: Runner): void {
  * a `required_version` the preflight does not know about is a check that only
  * runs after the interview.
  */
-export const MIN_TERRAFORM = '1.5.0';
+export const MIN_TERRAFORM = '1.5.0'; // contract pin: test-only export, asserted by the suite
 
 /**
  * Rejection message when `terraform version`'s output names a version older
@@ -470,7 +470,7 @@ export const MIN_TERRAFORM = '1.5.0';
  * the output is not recognisable — refusing on an unparsed version would block
  * a terraform that works on the strength of a string we failed to read.
  */
-export function terraformTooOld(versionOutput: string): string | undefined {
+export function terraformTooOld(versionOutput: string): string | undefined { // contract pin: test-only export, asserted by the suite
   const found = versionOutput.match(/Terraform v(\d+)\.(\d+)\.(\d+)/);
   if (!found) return undefined;
   const version = found.slice(1, 4).map(Number);
@@ -493,11 +493,11 @@ function terraformStep(run: Runner, dir: string, args: string[], what: string): 
 // ---------- fleet setup infra ----------
 
 /** Where a deployment's generated terraform, state, and capture live. */
-export function infraDir(cwd: string, provider: string): string {
+function infraDir(cwd: string, provider: string): string {
   return path.join(cwd, '.fleet', 'infra', provider);
 }
 
-export type SetupInfraOptions = {
+type SetupInfraOptions = {
   cwd: string;
   env: Record<string, string | undefined>;
   /** Root of this Fleet installation, for module-source resolution. */
@@ -629,7 +629,7 @@ async function interviewAndApply(
  * operator to paste that line in by hand — the last manual step of the old
  * bring-up — is exactly the handoff this command exists to close.
  */
-export function captureFleetConfig(dir: string, run: Runner): string {
+function captureFleetConfig(dir: string, run: Runner): string {
   const configPath = path.join(dir, 'fleet-config.json');
   const res = run(['terraform', 'output', '-json', 'fleet_config'], { cwd: dir, capture: true });
   if (res.status !== 0) {
@@ -687,7 +687,7 @@ function indented(stderr: string): string {
 const TF_NAME_PATTERN = /^\s*name\s*=\s*"([^"]+)"/m;
 
 /** The deployment name the generated root module was written with, for messages. */
-export function generatedName(mainTf: string): string | undefined {
+function generatedName(mainTf: string): string | undefined {
   const match = mainTf.match(TF_NAME_PATTERN);
   return match?.[1];
 }
@@ -885,7 +885,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest): PromptSpec[] 
 }
 
 /** Assemble the manifest from answers. Optional sections are omitted, never empty. */
-export function repoManifest(answers: Answers): RepoManifest {
+export function repoManifest(answers: Answers): RepoManifest { // contract pin: test-only export, asserted by the suite
   const sync = splitList(answers.sync ?? '');
   const vars = splitList(answers.env_vars ?? '');
   const manifest: RepoManifest = {
@@ -905,7 +905,7 @@ export function repoManifest(answers: Answers): RepoManifest {
 }
 
 /** The setup script for a one-line setup command. */
-export function setupScriptFor(command: string): string {
+function setupScriptFor(command: string): string {
   return `#!/usr/bin/env sh
 # Fleet setup script: everything the job image needs before the harness runs
 # (dependencies, build, seed data). Runs with unrestricted egress.
@@ -915,7 +915,7 @@ ${command}
 `;
 }
 
-export type SetupRepoOptions = {
+type SetupRepoOptions = {
   cwd: string;
   env: Record<string, string | undefined>;
   flags: Record<string, string | undefined>;
@@ -1043,7 +1043,7 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
  * frontmatter is two single-line fields. Zero runtime dependencies is a rule,
  * and a general YAML parser here would be a second convention to keep honest.
  */
-export type CanonicalSkill = { frontmatter: string; name: string; description: string; body: string };
+type CanonicalSkill = { frontmatter: string; name: string; description: string; body: string };
 
 /**
  * Line endings as everything below reasons about them.
@@ -1058,7 +1058,7 @@ function lf(text: string): string {
   return text.replace(/\r\n/g, '\n');
 }
 
-export function parseSkill(raw: string, source: string): CanonicalSkill {
+export function parseSkill(raw: string, source: string): CanonicalSkill { // contract pin: test-only export, asserted by the suite
   const text = lf(raw);
   const found = text.match(/^---\n([\s\S]*?)\n---\n/);
   if (!found) throw new SetupError(`${source} has no frontmatter block — a skill file starts with --- name/description ---`);
@@ -1114,7 +1114,7 @@ function sha256(text: string): string {
 }
 
 /** What a stamped file claims about itself: its recorded hash, and the content that hash covers. */
-export function readStamp(raw: string): { hash: string; content: string } | undefined {
+export function readStamp(raw: string): { hash: string; content: string } | undefined { // contract pin: test-only export, asserted by the suite
   const text = lf(raw);
   const found = text.match(STAMP_RE);
   if (!found) return undefined;
@@ -1124,7 +1124,7 @@ export function readStamp(raw: string): { hash: string; content: string } | unde
 }
 
 /** Is this text a Fleet-generated variant that nobody has edited since? */
-export function isGenerated(text: string): boolean {
+export function isGenerated(text: string): boolean { // contract pin: test-only export, asserted by the suite
   const found = readStamp(text);
   return found !== undefined && sha256(found.content) === found.hash;
 }
@@ -1175,7 +1175,7 @@ function harnessNote(harness: HarnessTarget, name: string, destination: string):
   ].join('\n');
 }
 
-export type VariantOptions = {
+type VariantOptions = {
   canonical: CanonicalSkill;
   harness: HarnessTarget;
   scope: SkillScope;
@@ -1193,7 +1193,7 @@ export type VariantOptions = {
  * canonical/pointer rule `agents/` follows, and enforced the same way
  * (test/harness-mirrors.test.ts).
  */
-export function renderVariant(opts: VariantOptions): { text: string; content: string; destination: string } {
+export function renderVariant(opts: VariantOptions): { text: string; content: string; destination: string } { // contract pin: test-only export, asserted by the suite
   const destination = skillPath(opts.harness, opts.scope, opts.canonical.name, opts.roots);
   const shown = friendlyPath(destination, opts.scope, opts.roots);
   // Frontmatter first, always: it is what makes the file discoverable, so the
@@ -1235,7 +1235,7 @@ export function harnessPrompts(detected: string[] = []): PromptSpec[] {
   ];
 }
 
-export type SetupHarnessOptions = {
+type SetupHarnessOptions = {
   cwd: string;
   /** The operator's home directory — where user-scope variants go. */
   home: string;

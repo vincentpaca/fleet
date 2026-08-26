@@ -29,6 +29,8 @@ export type FleetEvent = {
   state?: string;
   reason?: string;
   marker?: string;
+  /** Launch attempt this state event begins (#30); absent = attempt 1. */
+  attempt?: number;
   text?: string;
   value?: number;
   id?: string;

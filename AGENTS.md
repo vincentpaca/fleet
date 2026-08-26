@@ -10,6 +10,7 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 - **Zero new runtime dependencies.** Node builtins + the existing `ajv`/`ajv-formats`. Shelling out to `git`, `gh`, `docker`, `aws` is fine.
 - Terraform: `terraform fmt` clean; validate via the unit's `examples/basic`; no inbound from outside the VPC — intra-VPC SG-referenced ingress is allowed where documented inline (`infra/aws/main.tf`), enforced by `test/infra-aws.test.ts`.
 - **Every infra change runs the plan smoke by hand** — `terraform -chdir=infra/<cloud> init -backend=false && terraform -chdir=infra/<cloud> test` (terraform ≥ 1.7, no credentials: the unit's `tests/*.tftest.hcl` mock the provider). fmt and validate pass values the provider rejects at plan; #9 paid for four applies to find that out. CI's terraform job runs it too (`.github/workflows/tests.yml`, #48), but run it locally first — finding out from a pushed PR is the slow loop. API-only constraints, which no plan reaches, are pinned in `test/infra-aws.test.ts`.
+- **Set `TF_PLUGIN_CACHE_DIR` before you ever run that smoke.** Each `terraform init` otherwise downloads a private ~780MB copy of the AWS provider into that directory's `.terraform/` — the unit, its `examples/basic`, and a `.fleet/infra` deployment make three, and a checkout hits 2.3GB (#131). One-time setup: `mkdir -p ~/.terraform.d/plugin-cache` and `export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"` in your shell profile (or `plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"` in `~/.terraformrc`). Every `.terraform/` then symlinks the one shared copy. Caveat in `infra/aws/README.md#shared-provider-plugin-cache`.
 
 ## Invariants that break if you're not looking
 
@@ -26,6 +27,7 @@ Fleet runs coding-agent jobs in containers in the owner's own cloud. `docs/archi
 - **A static-analysis finding resolves into git, not into a UI click.** Three endings: a code change; a scoped exclusion in `.github/codeql/codeql-config.yml` or `.codacy.yaml`; a threat-model call written into `docs/decisions.md` that the dismissal cites.
 - **Widening an analyzer exclusion is a human's call.** Silencing the scanner is the cheapest route to a green check. `test/analyzer-scope.test.ts` fails if either exclusion list reaches past the build harness, so the move costs a visible diff.
 - **Reuse the existing pattern.** A second convention living beside an existing one (a new helper duplicating `src/shared/`, a hand-rolled validator beside ajv, a second event-rendering path) is a defect even when it works.
+- **An `export` in `src/` needs a consumer.** A symbol only its own file uses is not exported; one only tests import carries `// contract pin` on its declaration so deliberate seams are distinguishable from drift (#129). Prompt-level for now — no test enforces the marker.
 
 ## Rules with reasons
 
@@ -49,7 +51,7 @@ This repo is two things, and every path belongs to exactly one. **SHIP** = what 
 |---|---|---|
 | `schemas/` | SHIP | The five contracts — source of truth for every data shape |
 | `src/cli/` `src/daemon/` `src/runner/` `src/providers/` `src/shared/` | SHIP | The product: CLI, coordinator, in-sandbox runner, cloud providers, helpers (`docs/architecture.md#the-pieces`) |
-| `src/validate.mjs` `src/history-events.mjs` | SHIP | Schema validators; history⇄events converter |
+| `src/validate.mjs` | SHIP | Schema validators |
 | `presets/` | SHIP | The six dispatch-mode defaults |
 | `examples/` | SHIP | Reference manifests and work orders — generic, always |
 | `integrations/` | SHIP | Skill files users copy into their coding harness |
@@ -58,7 +60,7 @@ This repo is two things, and every path belongs to exactly one. **SHIP** = what 
 | `docs/` | SHIP | Architecture, decisions, roadmap — issues link here; keep anchors stable |
 | `AGENTS.md` `CLAUDE.md` `agents/` `.claude/` | BUILD | This repo's own harness: rules, canonical playbooks, per-harness pointers |
 | `.fleet/` | BUILD | This repo as a Fleet target: manifest, setup script, issue-readiness gate |
-| `test/` `fixtures/` | BUILD | The suite (incl. sanitization, mirror-drift, cloud-agnostic, packaging gates); executable fixtures + synthetic data |
+| `test/` `fixtures/` | BUILD | The suite (incl. sanitization, mirror-drift, cloud-agnostic, packaging gates); executable fixtures + synthetic data; the history⇄events converter (`test/history-events.mjs`) backing the `FLEET_DEMO_HISTORY` round-trip |
 
 
 ## Sandboxed runs (when you ARE the delegated job)

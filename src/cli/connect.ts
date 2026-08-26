@@ -30,16 +30,16 @@ import { configDaemonUrl, describeTarget, daemonTarget, fleetConfigFiles } from 
 import { refreshDeployment, tunnelOpenerFor, type CloudRunner, type Deployment } from './tunnel-openers.ts';
 
 /** Reopen delays, in order; the last one repeats. A dead session is retried fast, then patiently. */
-export const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+export const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000]; // contract pin: test-only export, asserted by the suite
 
 /** A session that survived this long counts as good: the next failure starts the backoff over. */
-export const HEALTHY_SESSION_MS = 30_000;
+export const HEALTHY_SESSION_MS = 30_000; // contract pin: test-only export, asserted by the suite
 
 /** How long /health may take to answer after the forward starts (SSM handshake included). */
-export const HEALTH_TIMEOUT_MS = 20_000;
+export const HEALTH_TIMEOUT_MS = 20_000; // contract pin: test-only export, asserted by the suite
 
 /** Poll interval while waiting for /health. */
-export const HEALTH_INTERVAL_MS = 500;
+export const HEALTH_INTERVAL_MS = 500; // contract pin: test-only export, asserted by the suite
 
 /**
  * How long SSM Session Manager leaves an idle session open before killing it
@@ -47,24 +47,24 @@ export const HEALTH_INTERVAL_MS = 500;
  * account preference that sets it is not something we can read, so it is here
  * as the documented motivation for the keepalive, never as a target to tune to.
  */
-export const IDLE_TIMEOUT_MS = 20 * 60_000;
+export const IDLE_TIMEOUT_MS = 20 * 60_000; // contract pin: test-only export, asserted by the suite
 
 /**
  * How often to poll /health through a live forward. Well inside the shortest
  * idle window we know of, so a tunnel nobody types a command through still
  * carries traffic and is never reaped for silence.
  */
-export const KEEPALIVE_INTERVAL_MS = 120_000;
+export const KEEPALIVE_INTERVAL_MS = 120_000; // contract pin: test-only export, asserted by the suite
 
 /**
  * Consecutive keepalive polls that must miss before a still-running forward is
  * treated as dead. One miss is a daemon restart or a slow answer; reopening
  * costs cloud calls and a new session, so it takes two.
  */
-export const KEEPALIVE_MISSES = 2;
+export const KEEPALIVE_MISSES = 2; // contract pin: test-only export, asserted by the suite
 
 /** How long an interrupted connect waits for its forward to die before leaving anyway. */
-export const FORWARD_SHUTDOWN_MS = 3_000;
+export const FORWARD_SHUTDOWN_MS = 3_000; // contract pin: test-only export, asserted by the suite
 
 // ---------- deployment resolution ----------
 
@@ -95,7 +95,7 @@ function hasDaemonAccess(config: Record<string, unknown>): boolean {
  * connect cannot end up tunnelling for a different deployment than every other
  * command talks to.
  */
-export async function resolveDeployment(cwd: string, run?: CloudRunner): Promise<Deployment> {
+export async function resolveDeployment(cwd: string, run?: CloudRunner): Promise<Deployment> { // contract pin: test-only export, asserted by the suite
   const described = [...fleetConfigFiles(cwd)].filter(
     (file) => typeof file.config.provider === 'string' && file.config.provider !== '',
   );
@@ -153,7 +153,7 @@ export function chooseLocalPort(
  * unreachable instead of relaying ECONNREFUSED. Tolerant reads, no schema —
  * this never crosses a wire.
  */
-export type TunnelRecord = {
+type TunnelRecord = {
   port: number;
   /** pid of the supervising `fleet connect`, so doctor can say the session is gone. */
   pid: number;
@@ -164,17 +164,17 @@ export type TunnelRecord = {
   at: string;
 };
 
-export function tunnelRecordPath(home: string, port: number): string {
+function tunnelRecordPath(home: string, port: number): string {
   return path.join(home, 'tunnels', `${port}.json`);
 }
 
-export function writeTunnelRecord(home: string, record: TunnelRecord): void {
+export function writeTunnelRecord(home: string, record: TunnelRecord): void { // contract pin: test-only export, asserted by the suite
   const file = tunnelRecordPath(home, record.port);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
 }
 
-export function readTunnelRecord(home: string, port: number): TunnelRecord | undefined {
+export function readTunnelRecord(home: string, port: number): TunnelRecord | undefined { // contract pin: test-only export, asserted by the suite
   try {
     const parsed = JSON.parse(fs.readFileSync(tunnelRecordPath(home, port), 'utf8')) as TunnelRecord;
     if (typeof parsed?.port !== 'number' || typeof parsed?.endpointId !== 'string') return undefined;
@@ -189,14 +189,14 @@ export function readTunnelRecord(home: string, port: number): TunnelRecord | und
  * on a port someone else already holds must not delete the live session's
  * record on its way out — that is precisely when doctor needs it.
  */
-export function clearTunnelRecord(home: string, port: number, pid = process.pid): void {
+export function clearTunnelRecord(home: string, port: number, pid = process.pid): void { // contract pin: test-only export, asserted by the suite
   const record = readTunnelRecord(home, port);
   if (record !== undefined && record.pid !== pid) return;
   fs.rmSync(tunnelRecordPath(home, port), { force: true });
 }
 
 /** Every tunnel session on record for this FLEET_HOME, in port order. */
-export function listTunnelRecords(home: string): TunnelRecord[] {
+export function listTunnelRecords(home: string): TunnelRecord[] { // contract pin: test-only export, asserted by the suite
   let names: string[];
   try {
     names = fs.readdirSync(path.join(home, 'tunnels'));
@@ -212,14 +212,10 @@ export function listTunnelRecords(home: string): TunnelRecord[] {
   return records;
 }
 
-// pidAlive moved to src/shared/process.ts (the process provider needs it too);
-// re-exported so existing imports of this module keep working.
-export { pidAlive };
-
 // ---------- supervision ----------
 
 /** A running forward process, as the supervisor sees it. */
-export type ForwardHandle = {
+export type ForwardHandle = { // contract pin: test-only export, asserted by the suite
   /** Resolves — never rejects — when the forward exits, with a short description of how. */
   exited: Promise<ForwardExit>;
   /** Kill it (operator interrupt, or shutdown). */
@@ -228,7 +224,7 @@ export type ForwardHandle = {
 };
 
 /** How a forward ended. */
-export type ForwardExit = {
+export type ForwardExit = { // contract pin: test-only export, asserted by the suite
   /** One line, for the operator: exit code or signal, plus the last thing it said. */
   how: string;
   /**
@@ -238,7 +234,7 @@ export type ForwardExit = {
   startFailed?: boolean;
 };
 
-export type SuperviseDeps = {
+export type SuperviseDeps = { // contract pin: test-only export, asserted by the suite
   /** Re-resolves the deployment's endpoint; called once per session. */
   open: TunnelOpener;
   spawnForward: (argv: string[]) => ForwardHandle;
@@ -370,7 +366,7 @@ function logHealthStatus(deps: SuperviseDeps, health: string, localPort: number)
  * A session is not just waited on: `keepAlive` polls /health through it, which
  * is what stops the far end from reaping it for silence.
  */
-export async function superviseTunnel(localPort: number, deps: SuperviseDeps): Promise<void> {
+export async function superviseTunnel(localPort: number, deps: SuperviseDeps): Promise<void> { // contract pin: test-only export, asserted by the suite
   // Consecutive attempts that failed or died young. A session that stayed up
   // clears it, so the delay tracks "is this deployment broken right now",
   // not "how long has this tunnel been running".
@@ -432,7 +428,7 @@ export async function superviseTunnel(localPort: number, deps: SuperviseDeps): P
  * orphans it, the port stays bound, and the next connect appears to work while
  * forwarding into a container that is gone.
  */
-export function spawnForward(argv: string[]): ForwardHandle {
+function spawnForward(argv: string[]): ForwardHandle {
   const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   let stderrTail = '';
   child.stderr?.setEncoding('utf8');
@@ -468,7 +464,7 @@ export function spawnForward(argv: string[]): ForwardHandle {
 }
 
 /** GET /health on the forwarded local port. True only on a 200. */
-export async function probeDaemonHealth(host: string, port: number, timeoutMs = 3_000): Promise<boolean> {
+export async function probeDaemonHealth(host: string, port: number, timeoutMs = 3_000): Promise<boolean> { // contract pin: test-only export, asserted by the suite
   try {
     const res = await request({ host, port, path: '/health', timeoutMs });
     return res.status === 200;
@@ -494,7 +490,7 @@ export function portAccepts(host: string, port: number, timeoutMs = 2_000): Prom
 // ---------- holding a tunnel, for whoever needs one ----------
 
 /** A deployment resolved to the one thing a supervisor needs: how to open a forward, and where. */
-export type ResolvedTunnel = {
+type ResolvedTunnel = {
   /** Re-resolves the endpoint and builds the forward command; called once per session. */
   open: TunnelOpener;
   /** The local port the forward binds — the one every other command must talk to. */
@@ -622,7 +618,7 @@ export function holdTunnel(
 
 // ---------- the command ----------
 
-export type ConnectOptions = {
+type ConnectOptions = {
   cwd: string;
   home: string;
   /** --port: force the local port instead of following daemon_url. */
@@ -719,7 +715,7 @@ export async function runConnect(opts: ConnectOptions): Promise<number> {
 
 // ---------- doctor: tunnel state ----------
 
-export type TunnelReport = {
+type TunnelReport = {
   /** Lines for stdout: the tunnel is fine and this says so. */
   notes: string[];
   /** Lines for stderr: doctor findings. */

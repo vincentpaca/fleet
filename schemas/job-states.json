@@ -20,6 +20,7 @@
   },
   "rules": [
     "settle is emitted on done AND on cancelled (partial outcome).",
+    "auto-retry (#30): a first harness-exit with zero answered decisions and remaining wall-clock budget is re-queued by the daemon (journal: cancelled(harness-exit) then queued reason=retry attempt=2) — the RECORD never rests on cancelled in that path, so terminal stays exit-free. A second harness-exit settles cancelled for real and needs an operator (fleet reclaim).",
     "wall_clock counts agent runtime only; the meter pauses while blocked.",
     "blocked-first ordering everywhere a job list renders (demo RANK: anything waiting on you sorts first)."
   ]

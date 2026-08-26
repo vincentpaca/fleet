@@ -15,7 +15,7 @@ export type DaemonResponse = {
   json: unknown;
 };
 
-export type RequestOptions = {
+type RequestOptions = {
   /** Called once per complete NDJSON line as chunks arrive (streaming reads). */
   onLine?: (line: string) => void;
   /** Env to resolve the daemon address from; defaults to process.env. */
@@ -35,7 +35,7 @@ export type RequestOptions = {
   headers?: Record<string, string>;
 };
 
-export type Target =
+type Target =
   | { kind: 'socket'; socketPath: string }
   | { kind: 'tcp'; host: string; port: number; basePath: string };
 
@@ -57,7 +57,7 @@ export const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localh
  * against daemons constructed without operatorToken, keep working.
  */
 const operatorTokenCache = new Map<string, string | undefined>();
-export function readOperatorToken(env: Record<string, string | undefined> = process.env): string | undefined {
+function readOperatorToken(env: Record<string, string | undefined> = process.env): string | undefined {
   const tokenPath = operatorTokenPath(fleetHome(env));
   if (operatorTokenCache.has(tokenPath)) return operatorTokenCache.get(tokenPath);
   let token: string | undefined;
@@ -72,7 +72,7 @@ export function readOperatorToken(env: Record<string, string | undefined> = proc
 }
 
 /** One captured deployment description: the file it came from, and its contents. */
-export type FleetConfigFile = { path: string; config: Record<string, unknown> };
+type FleetConfigFile = { path: string; config: Record<string, unknown> };
 
 /**
  * Every parseable `.fleet/infra/<provider>/fleet-config.json` under cwd, in

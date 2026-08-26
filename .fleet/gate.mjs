@@ -112,11 +112,21 @@ export function evaluate(facts) {
   return { ready: findings.length === 0, findings };
 }
 
-/** The claim-collision guard: fleet/<issue>-* branches other than the job's own (and, on adoption, the adopted branch). */
+/**
+ * Released claims (#30): a `-attempt<n>` suffix marks a branch a retry or
+ * `fleet reclaim` renamed out of the way — evidence retained, claim released.
+ * It starts with the same `fleet/<issue>-` prefix, so without this exemption
+ * every re-dispatch after a failed attempt would trip on its own history.
+ */
+const RELEASED_CLAIM = /-attempt\d+$/;
+
+/** The claim-collision guard: fleet/<issue>-* branches other than the job's own (and, on adoption, the adopted branch). Renamed `-attempt<n>` branches are released claims, not rivals. */
 function claimFindings({ issue, jobId, branches, adopted }) {
   const prefix = `fleet/${issue}-`;
   const own = jobId ? `${prefix}${jobId}` : undefined;
-  const taken = branches.filter((b) => b.startsWith(prefix) && b !== own && b !== adopted);
+  const taken = branches.filter(
+    (b) => b.startsWith(prefix) && !RELEASED_CLAIM.test(b) && b !== own && b !== adopted,
+  );
   if (taken.length > 0) {
     return [`branch already claims this issue: ${taken.join(', ')}`];
   }

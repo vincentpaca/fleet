@@ -27,17 +27,17 @@ import { hostname } from "node:os";
 import { createIfAbsent } from "../shared/fs.ts";
 
 /** How often the holder refreshes the lock. */
-export const HEARTBEAT_MS = 5_000;
+const HEARTBEAT_MS = 5_000;
 
 /**
  * Age at which a lock is considered abandoned. Three heartbeats: a holder that
  * misses one to GC or a slow EFS write must not lose its home.
  */
-export const STALE_AFTER_MS = 3 * HEARTBEAT_MS;
+export const STALE_AFTER_MS = 3 * HEARTBEAT_MS; // contract pin: test-only export, asserted by the suite
 
 type LockFile = { pid: number; host: string; startedAt: string; updatedAt: number };
 
-export class HomeLockedError extends Error {
+class HomeLockedError extends Error {
   constructor(home: string, held: LockFile, ageMs: number) {
     super(
       `fleet: another daemon holds ${home} (pid ${held.pid} on ${held.host}, ` +

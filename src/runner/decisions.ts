@@ -21,7 +21,7 @@ import type { EventSink } from './events.ts';
 import type { WallClockTimer } from './wall-clock.ts';
 import type { IdleTimer } from './idle.ts';
 
-export type Answer = { option?: string; text?: string };
+type Answer = { option?: string; text?: string };
 
 /**
  * A meter that must not run while the job waits on an operator: the wall-clock

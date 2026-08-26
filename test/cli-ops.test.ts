@@ -189,6 +189,23 @@ test('formatJobState: cancellations name their kind; blocked keeps its marker', 
   assert.equal(formatJobState({ state: 'done' }), 'done');
 });
 
+test('formatJobState: attempt count shows on retried jobs — twice-failed must not look once-failed (#30)', () => {
+  assert.equal(
+    formatJobState({ state: 'cancelled', reason: 'harness-exit', attempt: 2 }),
+    'cancelled(harness-exit) [attempt 2]',
+  );
+  assert.equal(formatJobState({ state: 'running', attempt: 2 }), 'running [attempt 2]');
+  assert.equal(formatJobState({ state: 'done', attempt: 2 }), 'done [attempt 2]');
+  // Attempt 1 is the default and stays unadorned.
+  assert.equal(formatJobState({ state: 'cancelled', reason: 'harness-exit' }), 'cancelled(harness-exit)');
+  assert.equal(formatJobState({ state: 'cancelled', reason: 'harness-exit', attempt: 1 }), 'cancelled(harness-exit)');
+});
+
+test('renderState: the retry re-queue event carries its reason and attempt in plain logs (#30)', () => {
+  const line = formatEvent({ seq: 7, type: 'state', state: 'queued', reason: 'retry', attempt: 2 }, true);
+  assert.equal(line, '[7] state → queued reason=retry attempt=2');
+});
+
 test('status shows cancelled(stall) distinctly from cancelled(wall-clock)', async (t) => {
   const daemon = await startMockDaemon({
     'GET /jobs': (_req: MockRequest, res: ServerResponse) => {

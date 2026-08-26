@@ -4,7 +4,7 @@
  * setups) overrides everything and is used verbatim.
  */
 
-export type HarnessPlan = {
+type HarnessPlan = {
   cmd: string;
   /** Non-fatal findings to surface as log events (version drift, fallbacks). */
   notes: string[];
@@ -26,7 +26,7 @@ const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', '
  * load-bearing instruction is this one. Pinned verbatim by
  * test/runner-harness.test.ts: rewording it is a deliberate contract change.
  */
-export const OUTPUT_CONTRACT =
+export const OUTPUT_CONTRACT = // contract pin: test-only export, asserted by the suite
   'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.';
 
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
@@ -55,7 +55,7 @@ function compareVersion(a: number[], b: number[]): number {
  * Supports ">=x.y.z" and exact-prefix pins ("2.1"); anything else is
  * reported unsatisfiable rather than guessed.
  */
-export function versionSatisfies(actual: string, requirement: string): boolean | undefined {
+export function versionSatisfies(actual: string, requirement: string): boolean | undefined { // contract pin: test-only export, asserted by the suite
   const want = requirement.trim();
   if (want.startsWith('>=')) {
     const min = parseVersion(want);
@@ -66,7 +66,7 @@ export function versionSatisfies(actual: string, requirement: string): boolean |
   return undefined;
 }
 
-export type HarnessInputs = {
+type HarnessInputs = {
   manifest: Record<string, unknown>;
   target: string;
   /** FLEET_HARNESS_CMD, when set. */

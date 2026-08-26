@@ -45,7 +45,6 @@ test('valid report.json is included in the settle', () => {
     const report = {
       status: 'READY',
       next_action: 'open the pull request',
-      implemented: ['feature toggle'],
       verification: ['unit tests pass'],
     };
     writeFileSync(join(workspace, '.fleet', 'out', 'report.json'), JSON.stringify(report));

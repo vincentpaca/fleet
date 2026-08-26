@@ -11,14 +11,14 @@ import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempF
 const run = promisify(execFile);
 
 /** One capacity tier offered by the infra: max cpu/memory a task may request. */
-export type CapacityTier = {
+type CapacityTier = {
   /** Max CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU). */
   cpu: number;
   /** Max memory in MiB. */
   memory: number;
 };
 
-export type EcsConfig = {
+type EcsConfig = {
   cluster: string;
   taskDefinition: string;
   /** Container name in the task definition receiving the env overrides. */
@@ -91,7 +91,7 @@ export type FleetConfig = {
 };
 
 /** Build an EcsConfig from a parsed fleet_config value, validating required fields. */
-export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig {
+export function ecsConfigFromFleetConfig(config: FleetConfig): EcsConfig { // contract pin: test-only export, asserted by the suite
   const required = (key: string, val: string | undefined): string => {
     if (!val) throw new Error(`fleet_config missing required field: ${key}`);
     return val;
@@ -126,7 +126,7 @@ function withRegion(args: string[], region: string | undefined): string[] {
  * Throws with the exact requested vs available numbers when nothing fits.
  * Pure function — exported for unit testing without a live ECS config.
  */
-export function checkResourceFit(resources: ResourceRequest, tiers: CapacityTier[]): void {
+export function checkResourceFit(resources: ResourceRequest, tiers: CapacityTier[]): void { // contract pin: test-only export, asserted by the suite
   if (tiers.length === 0) return; // no tiers declared → no check (legacy config)
   const { cpu, memory } = resources;
   if (cpu == null && memory == null) return; // nothing requested → always fits
@@ -218,7 +218,7 @@ export function ecsConfigFromEnv(env: Record<string, string | undefined> = proce
 // pure, unit-tested without AWS — plus one thin opener that shells out.
 
 /** What `fleet connect` needs to address this deployment's daemon container. */
-export type EcsDaemonAccess = {
+type EcsDaemonAccess = {
   cluster: string;
   /** ECS service holding the daemon task. Re-queried every session: task ids change. */
   service: string;
@@ -257,7 +257,7 @@ export function ecsDaemonAccessFromFleetConfig(config: FleetConfig): EcsDaemonAc
 }
 
 /** argv after `aws` for listing the daemon service's running tasks. */
-export function buildListDaemonTasksArgs(access: EcsDaemonAccess): string[] {
+export function buildListDaemonTasksArgs(access: EcsDaemonAccess): string[] { // contract pin: test-only export, asserted by the suite
   return withRegion(
     [
       "ecs",
@@ -276,7 +276,7 @@ export function buildListDaemonTasksArgs(access: EcsDaemonAccess): string[] {
 }
 
 /** argv after `aws` for describing one task. */
-export function buildDescribeDaemonTaskArgs(access: EcsDaemonAccess, taskArn: string): string[] {
+export function buildDescribeDaemonTaskArgs(access: EcsDaemonAccess, taskArn: string): string[] { // contract pin: test-only export, asserted by the suite
   return withRegion(
     ["ecs", "describe-tasks", "--cluster", access.cluster, "--tasks", taskArn, "--output", "json"],
     access.region,
@@ -284,7 +284,7 @@ export function buildDescribeDaemonTaskArgs(access: EcsDaemonAccess, taskArn: st
 }
 
 /** First task ARN from an `ecs list-tasks --output json` response. Throws when the service has none. */
-export function parseDaemonTaskArn(listJson: string, access: EcsDaemonAccess): string {
+export function parseDaemonTaskArn(listJson: string, access: EcsDaemonAccess): string { // contract pin: test-only export, asserted by the suite
   const parsed = JSON.parse(listJson) as { taskArns?: string[] };
   const arn = parsed.taskArns?.[0];
   if (!arn) {
@@ -301,7 +301,7 @@ export function parseDaemonTaskArn(listJson: string, access: EcsDaemonAccess): s
  * would otherwise forward to whichever container ECS happened to list first.
  * A task still starting has no runtime id — that is a wait, not a target.
  */
-export function parseDaemonRuntimeId(describeJson: string, containerName: string): string {
+export function parseDaemonRuntimeId(describeJson: string, containerName: string): string { // contract pin: test-only export, asserted by the suite
   const parsed = JSON.parse(describeJson) as {
     tasks?: { lastStatus?: string; containers?: { name?: string; runtimeId?: string }[] }[];
   };
@@ -324,13 +324,13 @@ export function parseDaemonRuntimeId(describeJson: string, containerName: string
  * Underscore-separated and taking the task *id* (the ARN's last segment), because
  * the SSM API's target regex rejects both commas and slashes.
  */
-export function ssmSessionTarget(cluster: string, taskArn: string, runtimeId: string): string {
+export function ssmSessionTarget(cluster: string, taskArn: string, runtimeId: string): string { // contract pin: test-only export, asserted by the suite
   const taskId = taskArn.slice(taskArn.lastIndexOf("/") + 1);
   return `ecs:${cluster}_${taskId}_${runtimeId}`;
 }
 
 /** argv after `aws` for the port-forward session that holds the tunnel open. */
-export function buildPortForwardArgs(
+export function buildPortForwardArgs( // contract pin: test-only export, asserted by the suite
   target: string,
   remotePort: number,
   localPort: number,
@@ -361,7 +361,7 @@ export function buildPortForwardArgs(
  * is minutes, and an unkilled child keeps the CLI's event loop alive long after
  * the caller has given up on the promise.
  */
-export const AWS_CLI_TIMEOUT_MS = 10_000;
+export const AWS_CLI_TIMEOUT_MS = 10_000; // contract pin: test-only export, asserted by the suite
 
 /**
  * Dispatch and cancel budgets (#122): `run-task` provisions capacity, so it
@@ -369,8 +369,8 @@ export const AWS_CLI_TIMEOUT_MS = 10_000;
  * CLI settles the daemon's launch or cancel path into its error handling
  * instead of hanging it forever. Pinned by test/daemon-providers.test.ts.
  */
-export const ECS_RUN_TASK_TIMEOUT_MS = 120_000;
-export const ECS_STOP_TASK_TIMEOUT_MS = 30_000;
+export const ECS_RUN_TASK_TIMEOUT_MS = 120_000; // contract pin: test-only export, asserted by the suite
+export const ECS_STOP_TASK_TIMEOUT_MS = 30_000; // contract pin: test-only export, asserted by the suite
 
 /**
  * Shell out to `aws` and return stdout, killing the child at `timeoutMs`
@@ -406,13 +406,13 @@ const CONTAINER_WORKSPACE = "/workspace";
  * sweep parses it back out of describe-tasks — so the launcher and the sweep
  * cannot drift on the one string that ties a task to its job.
  */
-export const STARTED_BY_PREFIX = "fleet:";
+const STARTED_BY_PREFIX = "fleet:";
 
 /**
  * ECS DescribeTasks accepts at most 100 task ARNs per call (API constraint —
  * no plan reaches it; pinned by test/daemon-providers.test.ts).
  */
-export const DESCRIBE_TASKS_BATCH = 100;
+const DESCRIBE_TASKS_BATCH = 100;
 
 /**
  * The fleet-launched tasks in an `ecs describe-tasks --output json` response:
@@ -421,7 +421,7 @@ export const DESCRIBE_TASKS_BATCH = 100;
  * hand-run task) are not fleet's to touch and are dropped here, before any
  * caller can conflate them with a job. Pure function — testable without AWS.
  */
-export function parseFleetTasks(describeJson: string): JobSandbox[] {
+export function parseFleetTasks(describeJson: string): JobSandbox[] { // contract pin: test-only export, asserted by the suite
   const parsed = JSON.parse(describeJson) as { tasks?: { taskArn?: string; startedBy?: string }[] };
   const found: JobSandbox[] = [];
   for (const task of parsed.tasks ?? []) {
@@ -433,7 +433,7 @@ export function parseFleetTasks(describeJson: string): JobSandbox[] {
 }
 
 /** EcsProvider construction options. */
-export type EcsProviderOptions = {
+type EcsProviderOptions = {
   /** Shell-out to `aws`; defaults to the budget-killing awsCli. Injectable for tests. */
   aws?: CloudCliRunner;
 };

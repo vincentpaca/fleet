@@ -19,7 +19,7 @@ import { fleetHome } from "../shared/home.ts";
 import { pidAlive, processStartTime } from "../shared/process.ts";
 import { hasRetainRequest, readRetainRequest, writeRetainedRecord } from "../shared/retained.ts";
 
-export type ProcessProviderOptions = {
+type ProcessProviderOptions = {
   /** Runner entrypoint; defaults to the in-repo runner. Tests point this at a fake. */
   runnerPath?: string;
   /** Parent directory for job workspaces; defaults to the OS temp dir. */
@@ -31,7 +31,7 @@ export type ProcessProviderOptions = {
 };
 
 /** Materialise manifest + synced files into a fresh workspace directory. */
-export function prepareWorkspace(spec: LaunchSpec, root: string): string {
+export function prepareWorkspace(spec: LaunchSpec, root: string): string { // contract pin: test-only export, asserted by the suite
   const workspace = mkdtempSync(join(root, `fleet-${spec.jobId}-`));
   const fleetDir = join(workspace, ".fleet");
   mkdirSync(join(fleetDir, "out"), { recursive: true });
@@ -64,7 +64,7 @@ export function prepareWorkspace(spec: LaunchSpec, root: string): string {
  * src/shared/retained.ts: one JSON file per job under `$FLEET_HOME/runners/`,
  * tolerant reads, no schema — it never crosses a wire.
  */
-export type RunnerRecord = {
+type RunnerRecord = {
   jobId: string;
   pid: number;
   /**
@@ -78,7 +78,7 @@ export type RunnerRecord = {
 };
 
 /** Live-runner registry directory: $FLEET_HOME/runners. */
-export function runnersDir(home: string): string {
+function runnersDir(home: string): string {
   return join(home, "runners");
 }
 
@@ -121,7 +121,7 @@ function readRunnerRecord(path: string): RunnerRecord | undefined {
 }
 
 /** Every runner record on disk. Empty when the registry is absent. */
-export function listRunnerRecords(home: string): RunnerRecord[] {
+function listRunnerRecords(home: string): RunnerRecord[] {
   const dir = runnersDir(home);
   if (!existsSync(dir)) return [];
   const records: RunnerRecord[] = [];
