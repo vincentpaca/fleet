@@ -9,8 +9,8 @@
  *
  * Scope: github.com only. Other hosts keep their URL untouched — rewriting
  * without a credential that can serve the host would break what ssh-agent
- * still covers on the process provider. Generic hosts arrive with the
- * credential broker (phase 2).
+ * still covers on the process provider. Generic hosts wait for a credential
+ * broker that can serve them.
  */
 
 /** ssh github.com remote (scp-like or ssh://) → https; anything else verbatim. */
