@@ -32,7 +32,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
-import { runSetupScript } from './setup.ts';
+import { runSetupScript, dropPrivileges } from './setup.ts';
 import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
@@ -54,6 +54,24 @@ function requireEnv(name: string): string {
     process.exit(2);
   }
   return value;
+}
+
+/**
+ * Privilege boundary (#196): root belongs to setup, never to the job. The
+ * container starts as root so the operator-authored setup.script can install
+ * system packages; this drops to the unprivileged job user (no-op off-root)
+ * and aborts the job if the drop fails — continuing would hand the harness
+ * uid 0, the exact thing the boundary exists to prevent.
+ */
+async function dropOrAbort(sink: EventSink, workspace: string): Promise<void> {
+  const drop = dropPrivileges(workspace);
+  if (drop.kind === 'skipped') return;
+  await sink.emit({ type: 'log', text: drop.note, who: 'runner' });
+  if (drop.kind === 'failed') {
+    await settleBlocked(sink, `fix privilege drop: ${drop.detail}`);
+    await sink.emit({ type: 'state', state: 'cancelled', reason: 'privilege-drop' });
+    process.exit(1);
+  }
 }
 
 async function main(): Promise<void> {
@@ -114,6 +132,18 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'cancelled', reason: 'manifest' });
     console.error(`runner: cannot read manifest: ${String(err)}`);
     process.exit(1);
+  }
+
+  // --- Privilege boundary, early half (#196). ---
+  // No setup.script declared → no root work is coming: drop before the clone,
+  // the order read, everything. With a script declared the runner stays root
+  // through the clone (the script runs in the cloned workspace) and drops
+  // right after the setup outcome below — even when the marker says the image
+  // baked it, because that check itself must read the boot user's $HOME.
+  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
+  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
+  if (setupScript === '') {
+    await dropOrAbort(sink, workspace);
   }
 
   // Work-order target: names the job branch and rides into the harness prompt.
@@ -209,8 +239,6 @@ async function main(): Promise<void> {
   // the gate probes the environment the manifest actually promised. The
   // announce line is awaited before the blocking spawnSync for the same
   // reason the gate's is: it dates the silence the stall backstops measure.
-  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
-  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
   if (setupScript !== '') {
     await sink.emit({ type: 'log', text: `setup script: ${setupScript}`, who: 'runner' });
     const setupOutcome = runSetupScript({
@@ -228,6 +256,9 @@ async function main(): Promise<void> {
       await sink.emit({ type: 'state', state: 'cancelled', reason: 'setup-script' });
       process.exit(1);
     }
+    // Privilege boundary, late half (#196): setup — the only root work — is
+    // done (ran, baked, or missing). Everything after runs as the job user.
+    await dropOrAbort(sink, workspace);
   }
 
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
