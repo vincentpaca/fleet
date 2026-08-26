@@ -29,11 +29,11 @@ import { WallClockTimer } from './wall-clock.ts';
 import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
-import { setupWorkspace, pushWork, pushWip, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
 import { materializeWorkspace } from './workspace.ts';
-import { runSetupScript } from './setup.ts';
-import { parseDurationMs, idleLimitMs, blockHotLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
+import { runSetupScript, dropPrivileges } from './setup.ts';
+import { parseDurationMs, idleLimitMs, blockHotLimitMs, checkpointLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
 
@@ -54,6 +54,24 @@ function requireEnv(name: string): string {
     process.exit(2);
   }
   return value;
+}
+
+/**
+ * Privilege boundary (#196): root belongs to setup, never to the job. The
+ * container starts as root so the operator-authored setup.script can install
+ * system packages; this drops to the unprivileged job user (no-op off-root)
+ * and aborts the job if the drop fails — continuing would hand the harness
+ * uid 0, the exact thing the boundary exists to prevent.
+ */
+async function dropOrAbort(sink: EventSink, workspace: string): Promise<void> {
+  const drop = dropPrivileges(workspace);
+  if (drop.kind === 'skipped') return;
+  await sink.emit({ type: 'log', text: drop.note, who: 'runner' });
+  if (drop.kind === 'failed') {
+    await settleBlocked(sink, `fix privilege drop: ${drop.detail}`);
+    await sink.emit({ type: 'state', state: 'cancelled', reason: 'privilege-drop' });
+    process.exit(1);
+  }
 }
 
 async function main(): Promise<void> {
@@ -114,6 +132,18 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'cancelled', reason: 'manifest' });
     console.error(`runner: cannot read manifest: ${String(err)}`);
     process.exit(1);
+  }
+
+  // --- Privilege boundary, early half (#196). ---
+  // No setup.script declared → no root work is coming: drop before the clone,
+  // the order read, everything. With a script declared the runner stays root
+  // through the clone (the script runs in the cloned workspace) and drops
+  // right after the setup outcome below — even when the marker says the image
+  // baked it, because that check itself must read the boot user's $HOME.
+  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
+  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
+  if (setupScript === '') {
+    await dropOrAbort(sink, workspace);
   }
 
   // Work-order target: names the job branch and rides into the harness prompt.
@@ -209,8 +239,6 @@ async function main(): Promise<void> {
   // the gate probes the environment the manifest actually promised. The
   // announce line is awaited before the blocking spawnSync for the same
   // reason the gate's is: it dates the silence the stall backstops measure.
-  const setupDecl = ((manifest.setup ?? {}) as Record<string, unknown>).script;
-  const setupScript = typeof setupDecl === 'string' ? setupDecl : '';
   if (setupScript !== '') {
     await sink.emit({ type: 'log', text: `setup script: ${setupScript}`, who: 'runner' });
     const setupOutcome = runSetupScript({
@@ -228,6 +256,9 @@ async function main(): Promise<void> {
       await sink.emit({ type: 'state', state: 'cancelled', reason: 'setup-script' });
       process.exit(1);
     }
+    // Privilege boundary, late half (#196): setup — the only root work — is
+    // done (ran, baked, or missing). Everything after runs as the job user.
+    await dropOrAbort(sink, workspace);
   }
 
   // --- Pickup gate: must exit 0 or the job aborts before model spend. ---
@@ -407,14 +438,17 @@ async function main(): Promise<void> {
       lines.resume();
     }
   };
-  // Liveness coalescing (#50). The translator drops the harness's own
-  // heartbeats, so a job inside one long tool call is alive on stdout and
-  // silent on the event stream — and the daemon's backstop only sees the
-  // event stream, where it terminates the container without pushing WIP.
-  // One bounded line per window keeps that visible without the flood.
+  // Liveness coalescing (#50), timer-driven (#197). The translator drops the
+  // harness's own heartbeats, so a job inside one long tool call is alive on
+  // stdout and silent on the event stream — and the daemon's backstop only
+  // sees the event stream. One bounded line per window keeps that visible
+  // without the flood; the timer (startKeepalive, armed below) owns emitting
+  // it, so a harness that goes FULLY silent — no stdout at all, waiting on a
+  // backgrounded command — still beats. `liveness.lastEmitAt` is the shared
+  // coalescing mark: the stdout handler stamps it on every emitted event.
   const heartbeatWindow =
     parseInt(process.env.FLEET_HEARTBEAT_MS ?? '', 10) || heartbeatMs(idleMs);
-  let lastEmitAt = startedAt;
+  const liveness = { lastEmitAt: startedAt };
   // Line-length cap (#139): truncate, mark, and continue — never crash on an
   // unbounded line. Only the first truncation is announced; a harness that
   // streams many oversized lines must not turn the cap into its own flood.
@@ -441,25 +475,15 @@ async function main(): Promise<void> {
       captureStream.write(line + '\n');
     }
     const translated = translateLine(line);
-    if (translated.length === 0) {
-      // The translator dropped this line. Coalesce: one heartbeat per window,
-      // never one per dropped line — the flood is what #50 was about.
-      const now = Date.now();
-      if (now - lastEmitAt >= heartbeatWindow) {
-        lastEmitAt = now;
-        forget(sink.emit({
-          type: 'log',
-          who: 'runner',
-          text: `harness working — ${toMinutes(now - startedAt)}m elapsed, no reportable output`,
-        }));
-      }
-      return;
-    }
+    // A dropped line is proof of life but not an event: the keepalive timer
+    // owns the "harness working" line now (#197), one per window whether the
+    // dropped lines arrive in a flood (#50) or stop arriving entirely.
+    if (translated.length === 0) return;
     // {"type":"result"} marks the end of the run; it precedes settle and is
     // not itself an event — and it is not a silent line either, so it must not
-    // trigger a heartbeat one line before the settle.
+    // trigger a keepalive one line before the settle.
     const bodies = translated.filter((item) => item.type !== 'result');
-    lastEmitAt = Date.now();
+    liveness.lastEmitAt = Date.now();
     if (bodies.length === 1) forget(sink.emit(bodies[0]));
     else if (bodies.length > 1) forget(sink.emitBatch(bodies));
   });
@@ -495,6 +519,52 @@ async function main(): Promise<void> {
 
   const linesDone = Promise.withResolvers<void>();
   lines.once('close', () => linesDone.resolve());
+
+  // Bounded pushes (#152): every push the runner makes shells out to git,
+  // which hangs without bound on a black-holed remote or a credential helper
+  // waiting on a prompt. execFileSync blocks the event loop, so a hung push
+  // doesn't just eat a budget — it stops every runner-side timer from firing,
+  // wedging the runner until the provider's outer SIGKILL. The park and stall
+  // paths have no outer deadline at all; there the wedge lasts until the
+  // daemon's backstop reaps the job, and the backstop cannot push. Generous by
+  // default — its only job is to exist.
+  const GIT_TIMEOUT_MS =
+    parseInt(process.env.FLEET_GIT_TIMEOUT_MS ?? '', 10) || 120_000;
+
+  // Keepalive (#197): timer-driven for the harness process's entire lifetime.
+  // Liveness is the process, not its stdout — see startKeepalive. Every path
+  // out of the race below clears it; the settle heartbeat (#139) takes over.
+  const harnessAlive = (): boolean =>
+    !harnessClosed && child.exitCode === null && child.signalCode === null;
+  const keepalive = startKeepalive({
+    sink,
+    idle,
+    startedAt,
+    windowMs: heartbeatWindow,
+    liveness,
+    harnessAlive,
+    forget,
+  });
+
+  // Checkpoint WIP pushes (#190): armed only for git-backed jobs, cleared by
+  // every teardown path before it makes its own push.
+  const checkpoints = gitUrl && branch !== undefined
+    ? startCheckpoints({
+        workspace,
+        branch,
+        jobId,
+        sink,
+        forget,
+        intervalMs: checkpointLimitMs(limits),
+        pushTimeoutMs: GIT_TIMEOUT_MS,
+        active: harnessAlive,
+      })
+    : undefined;
+  /** Every exit from the run phase funnels through here before it pushes. */
+  const stopRunPhaseTimers = (): void => {
+    clearInterval(keepalive);
+    if (checkpoints !== undefined) clearInterval(checkpoints);
+  };
 
   // --- Harness exit race: wall-clock, stall, block_hot (park), or normal exit ---
   // All four are armed regardless; whichever fires first wins.
@@ -576,16 +646,6 @@ async function main(): Promise<void> {
   // a margin and the teardown room to finish.
   const CANCEL_DEADLINE_MS =
     parseInt(process.env.FLEET_CANCEL_DEADLINE_MS ?? '', 10) || 20_000;
-  // Bounded pushes (#152): every push the runner makes after the harness is
-  // done shells out to git, which hangs without bound on a black-holed remote
-  // or a credential helper waiting on a prompt. execFileSync blocks the event
-  // loop, so a hung push doesn't just eat a budget — it stops the cancel
-  // deadline timer from ever firing, wedging the runner until the provider's
-  // outer SIGKILL. The park and stall paths have no outer deadline at all;
-  // there the wedge lasts until the daemon's backstop reaps the job, and the
-  // backstop cannot push. Generous by default — its only job is to exist.
-  const GIT_TIMEOUT_MS =
-    parseInt(process.env.FLEET_GIT_TIMEOUT_MS ?? '', 10) || 120_000;
   // Killing the harness gets a slice of the cancel budget, not all of it.
   // endHarness and drainOutput default to `graceMs` — the wall-clock grace, 30s
   // — which on a SIGTERM-trapping harness (the case this exists for) exhausts
@@ -602,9 +662,12 @@ async function main(): Promise<void> {
   const cancelPushTimeoutMs =
     Math.min(GIT_TIMEOUT_MS, Math.max(1_000, Math.floor(CANCEL_DEADLINE_MS * 0.4)));
   /** Best-effort WIP push: the job is cancelled, but partial work may be
-   *  recoverable. pushWip commits and pushes only when there are changes. */
-  const cancelPushWip = async (signal: NodeJS.Signals): Promise<void> => {
-    if (!gitUrl || !branch) return;
+   *  recoverable. pushWip commits uncommitted changes and pushes whatever is
+   *  ahead of the remote — a commit the harness made but never pushed is
+   *  exactly the delivery a stall teardown must not drop (#197). Returns
+   *  whether work landed, for the settle's empty-handed accounting. */
+  const cancelPushWip = async (signal: NodeJS.Signals): Promise<boolean> => {
+    if (!gitUrl || !branch) return false;
     try {
       const outcome = pushWip(workspace, `cancelled: ${signal}`, cancelPushTimeoutMs);
       await sink.emit({
@@ -614,27 +677,42 @@ async function main(): Promise<void> {
           : `workspace clean at cancel; no new commit beyond ${branch}`,
         who: 'runner',
       });
+      return outcome === 'pushed';
     } catch (err) {
       await sink.emit({
         type: 'log',
         text: `wip push failed (cancelling anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
         who: 'runner',
       });
+      return false;
     }
   };
 
-  /** Best-effort settle: a PARTIAL report so the transcript explains itself. */
-  const cancelSettle = async (signal: NodeJS.Signals): Promise<void> => {
+  /** Best-effort settle: a PARTIAL report so the transcript explains itself.
+   *  Collects what already exists in .fleet/out/artifacts first (#197): the
+   *  container dies with the cancel, so an artifact not uploaded here is
+   *  gone — job-mt9y7vel's answer.md died exactly this way. Tightly bounded:
+   *  the settle itself still outranks everything (#152). */
+  const cancelSettle = async (signal: NodeJS.Signals, workPushed: boolean): Promise<void> => {
     try {
+      const artifacts = await collectArtifacts({
+        workspace,
+        jobId,
+        daemonUrl,
+        token,
+        uploadTimeoutMs: Math.max(1_000, Math.floor(CANCEL_DEADLINE_MS * 0.1)),
+      });
       const { body, notes } = composeSettle({
         jobId,
         startedAt,
         decisions: watcher.count,
         workspace,
+        produced: artifacts.produced,
+        workPushed,
         ...(sink.dropped > 0 ? { droppedEvents: sink.dropped } : {}),
       });
       body.report = { status: 'PARTIAL', next_action: `job cancelled: runner received ${signal}` };
-      for (const note of notes) {
+      for (const note of [...artifacts.notes, ...notes]) {
         await sink.emit({ type: 'log', text: note, who: 'runner' });
       }
       await sink.emit(body);
@@ -649,6 +727,9 @@ async function main(): Promise<void> {
 
   cancelTeardown = async (signal) => {
     cancelPromise.resolve();
+    // First act: a checkpoint tick firing mid-teardown would block the event
+    // loop for its push bound and eat the deadline the teardown lives inside.
+    stopRunPhaseTimers();
     const deadline = delay(CANCEL_DEADLINE_MS).then(() => 'timeout' as const);
     const teardown = (async () => {
       await sink.emit({
@@ -661,8 +742,8 @@ async function main(): Promise<void> {
       await endCapture();
       await watcher.stop();
       await sink.flush();
-      await cancelPushWip(signal);
-      await cancelSettle(signal);
+      const workPushed = await cancelPushWip(signal);
+      await cancelSettle(signal, workPushed);
       await sink.emit({ type: 'state', state: 'cancelled', reason: 'signal' });
       await sink.flush();
       return 'done' as const;
@@ -707,8 +788,11 @@ async function main(): Promise<void> {
       })()
     : new Promise<void>(() => {}); // never
 
-  // Stall: resolves when the harness has been silent (and unblocked) for the
-  // idle threshold. Always armed — see idleLimitMs's default.
+  // Stall: resolves when the idle clock runs out. Always armed — but the
+  // keepalive re-marks the clock while the harness PROCESS is alive (#197), so
+  // in practice this fires only for the wedge process liveness cannot vouch
+  // for: the harness process exited while a leaked child holds the stdout pipe
+  // open, so 'close' never fires and the exit race never resolves.
   const idleExpired: Promise<void> = (async () => {
     while (!idle.expired()) {
       await delay(Math.min(250, Math.max(1, idle.remainingMs())));
@@ -722,6 +806,11 @@ async function main(): Promise<void> {
     parkPromise,
     cancelPromise.promise.then(() => ({ kind: 'cancel' as const })),
   ]);
+
+  // Run phase over: the settle/park path owns every push from here, and the
+  // settle heartbeat (#139) owns liveness. Idempotent with the cancel
+  // teardown's own clear.
+  stopRunPhaseTimers();
 
   if (result.kind === 'cancel') {
     // Stand down: the teardown owns push, settle and exit from here. It always
@@ -986,6 +1075,100 @@ async function main(): Promise<void> {
 function retryAttemptEnv(): number | undefined {
   const parsed = parseInt(process.env.FLEET_RETRY_ATTEMPT ?? '', 10);
   return Number.isInteger(parsed) && parsed > 1 ? parsed : undefined;
+}
+
+/**
+ * Run-phase keepalive (#197): one bounded "harness working" line per window,
+ * timer-driven for the harness process's entire lifetime. The previous
+ * implementation lived in the stdout handler and fired only when a dropped
+ * line ARRIVED — a harness waiting silently on a backgrounded command emitted
+ * nothing, the daemon's idle sweep read the event silence as a dead runner,
+ * and job-mt9y7vel was terminated while it was actively finishing.
+ *
+ * Each beat also re-marks the runner's own stall clock: a live harness process
+ * is not a stall, however quiet its stdout — silence is normal inside a long
+ * tool call or behind a backgrounded command. The stall path still catches the
+ * one wedge process liveness cannot vouch for: a harness whose process is gone
+ * while a leaked child holds the stdout pipe open, so 'close' never fires.
+ */
+function startKeepalive(opts: {
+  sink: EventSink;
+  idle: IdleTimer;
+  startedAt: number;
+  windowMs: number;
+  /** Shared with the stdout handler: when the last event was emitted. */
+  liveness: { lastEmitAt: number };
+  harnessAlive: () => boolean;
+  forget: (pending: Promise<unknown>) => void;
+}): ReturnType<typeof setInterval> {
+  const tick = (): void => {
+    if (!opts.harnessAlive()) return;
+    const now = Date.now();
+    if (now - opts.liveness.lastEmitAt < opts.windowMs) return;
+    opts.liveness.lastEmitAt = now;
+    opts.idle.touch(now);
+    opts.forget(opts.sink.emit({
+      type: 'log',
+      who: 'runner',
+      text: `harness working — ${toMinutes(now - opts.startedAt)}m elapsed, no reportable output`,
+    }));
+  };
+  // Sub-second ticking costs nothing and keeps the coalescing check (above)
+  // the only cadence that matters — including under test-sized windows.
+  const timer = setInterval(tick, Math.max(25, Math.min(opts.windowMs, 1_000)));
+  timer.unref();
+  return timer;
+}
+
+/**
+ * Checkpoint WIP pushes (#190): commit-and-push the workspace to the job
+ * branch every interval, so a container killed at any moment — wall-clock
+ * cliff, a stall cancel whose teardown push then fails, a plain SIGKILL —
+ * loses at most one interval of work instead of all of it. Same bounded
+ * commit-and-push machinery as the park/cancel pushes (#152). Failures log
+ * and the run continues: never fatal, and the interval guard retries at the
+ * next checkpoint rather than in a tight loop. The teardown/settle pushes
+ * then move an incremental delta, shrinking the very window #152 raced.
+ */
+function startCheckpoints(opts: {
+  workspace: string;
+  branch: string;
+  jobId: string;
+  sink: EventSink;
+  intervalMs: number;
+  pushTimeoutMs: number;
+  /** False once the harness is down: the settle/teardown owns pushes then. */
+  active: () => boolean;
+  forget: (pending: Promise<unknown>) => void;
+}): ReturnType<typeof setInterval> {
+  let lastAttemptAt = Date.now();
+  const tick = (): void => {
+    if (!opts.active()) return;
+    const now = Date.now();
+    // The push is execFileSync, so a slow one queues missed ticks behind it;
+    // the re-check keeps it to one attempt per interval, never a burst.
+    if (now - lastAttemptAt < opts.intervalMs) return;
+    lastAttemptAt = now;
+    try {
+      const outcome = pushCheckpoint(opts.workspace, `fleet job ${opts.jobId}`, opts.pushTimeoutMs);
+      if (outcome === 'pushed') {
+        opts.forget(opts.sink.emit({
+          type: 'log',
+          who: 'runner',
+          text: `checkpoint: wip pushed to ${opts.branch}`,
+        }));
+      }
+    } catch (err) {
+      opts.forget(opts.sink.emit({
+        type: 'log',
+        who: 'runner',
+        text: `checkpoint push failed (continuing): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+      }));
+    }
+  };
+  const timer = setInterval(tick, Math.max(25, Math.min(opts.intervalMs, 1_000)));
+  timer.unref();
+  return timer;
 }
 
 /** Contract shape for aborts before/without a harness result. */

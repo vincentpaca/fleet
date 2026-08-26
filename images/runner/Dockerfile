@@ -77,23 +77,25 @@ RUN npm ci --omit=dev
 COPY src/ src/
 COPY schemas/ schemas/
 
-# Drop root. A job's harness is the least trusted code Fleet runs — it is an
-# agent executing a work order against a cloned repo — and until now it ran as
-# uid 0 inside the container, one kernel bug away from the host (Hadolint
-# missing-user / Opengrep missing-user-entrypoint).
+# Privilege contract (#196): the container starts as root, and root belongs to
+# setup — never to the job. The image carried `USER node` from #155 until the
+# operator-authored manifest setup.script (laptop trust class) proved
+# uninstallable prerequisites: `apt-get install` is root work. Trust follows
+# authorship, so the runner keeps root exactly as long as setup needs it and
+# then irreversibly drops to uid 1000 (`node`, from the base image) — before
+# the pickup gate, the harness, and the settle (dropPrivileges in
+# src/runner/setup.ts). A job with no setup.script drops immediately. The
+# harness is still the least trusted code Fleet runs and never sees uid 0;
+# asserted on live jobs in test/cli-image.test.ts (harness `id -u` is 1000),
+# not by grepping this file.
 #
-# `node` (uid 1000) ships in the base image. Everything above this line still
-# runs as root because it has to: apt, the gh APT source, and `npm install -g`
-# all write outside $HOME. Nothing below needs to.
-#
-# /workspace is created here rather than by the runner, which is the one thing
-# that breaks without root: materializeWorkspace mkdirs FLEET_WORKSPACE, and
-# creating a directory at the filesystem root is not something uid 1000 can do.
-# The container is ephemeral and mounts no volume, so there is no host-side
-# ownership to reconcile — unlike the daemon image, which writes to EFS and
-# cannot drop root without relocating or chowning a live filesystem.
+# /workspace is still created and owned by the job user here: the drop chowns
+# whatever root materialised, but uid 1000 could never mkdir at the filesystem
+# root itself. The container is ephemeral and mounts no volume, so there is no
+# host-side ownership to reconcile — unlike the daemon image, which writes to
+# EFS and keeps uid 1000 via its EFS access point (#156).
 RUN mkdir -p /workspace && chown node:node /workspace
-USER node
 
-# Entrypoint: the runner. API keys arrive via docker run -e, never baked in.
+# Entrypoint: the runner, deliberately as root until setup settles (see above).
+# API keys arrive via docker run -e, never baked in.
 ENTRYPOINT ["node", "/opt/fleet/src/runner/main.ts"]

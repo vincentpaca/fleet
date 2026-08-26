@@ -249,8 +249,11 @@ function runDockerBuild(
  *       RUN sh /tmp/fleet-setup.sh && touch "$HOME/<marker>"
  *     The marker rides the same layer as the script run (#49): the runner
  *     executes setup.script itself before the pickup gate unless this file
- *     exists (src/runner/setup.ts). `$HOME`, never /etc — the runner base
- *     drops to USER node before any job-image layer runs.
+ *     exists (src/runner/setup.ts). `$HOME`, never /etc — the runner checks
+ *     the marker before the privilege drop (#196), so bake-time and
+ *     check-time $HOME agree on every substrate, including the process
+ *     provider where /etc was never writable. Baked setup runs as root, the
+ *     same trust the runtime pass gets.
  *   - `setup.devcontainer` set → comment only; builds as a plain runner-base alias.
  */
 export function jobImageDockerfile(baseTag: string, manifest: ImageManifest): string { // contract pin: test-only export, asserted by the suite

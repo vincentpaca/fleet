@@ -191,8 +191,10 @@ describe('jobImageDockerfile', () => {
       dockerfile,
       new RegExp(`RUN sh /tmp/fleet-setup\\.sh && touch "\\$HOME/${SETUP_BAKED_BASENAME}"`),
     );
-    // $HOME, never /etc: the runner base drops to USER node before this layer.
-    assert.ok(!dockerfile.includes('/etc/'), 'job-image layers run as node and cannot write /etc');
+    // $HOME, never /etc: the runner resolves the marker before the privilege
+    // drop (#196), so bake-time and check-time $HOME agree on every substrate —
+    // including the process provider, where /etc was never writable.
+    assert.ok(!dockerfile.includes('/etc/'), 'the marker must live under $HOME, not /etc');
   });
 
   test('no setup.script → plain base alias, and no marker', () => {
@@ -321,30 +323,36 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     cleanup.push(BASE_TAG);
   });
 
-  // The harness is the least trusted code Fleet runs, so the container it runs
-  // in must not be root. Asserted on the built image rather than by reading the
-  // Dockerfile: a later `USER root`, a base-image change, or an ENTRYPOINT that
-  // re-escalates would all pass a grep and fail here.
-  test('the runner image runs as a non-root user that can still do the job', () => {
-    const sh = (script: string): string =>
-      execFileSync('docker', ['run', '--rm', '--entrypoint', 'sh', BASE_TAG, '-c', script], {
-        encoding: 'utf8',
-      }).trim();
+  // Privilege contract (#196): the container starts as root so the
+  // operator-authored setup.script can install system packages, and the runner
+  // drops to uid 1000 before the gate/harness/settle. The agent-never-root
+  // guarantee therefore no longer lives in the image USER — it is pinned on
+  // live jobs below ('one-layer setup.script runs as root …' asserts `id -u`
+  // from inside the harness). What the image itself must guarantee: the boot
+  // user is root (or one-layer setup cannot install anything) and the dropped
+  // identity can still do the job.
+  test('the runner image boots as root for setup, and uid 1000 can still do the job', () => {
+    const sh = (script: string, user?: string): string =>
+      execFileSync(
+        'docker',
+        ['run', '--rm', ...(user !== undefined ? ['--user', user] : []), '--entrypoint', 'sh', BASE_TAG, '-c', script],
+        { encoding: 'utf8' },
+      ).trim();
 
-    assert.equal(sh('id -u'), '1000', 'the runner must not run as root');
+    assert.equal(sh('id -u'), '0', 'the boot user must be root: one-layer setup.script installs system packages before the drop');
 
-    // Non-root is worthless if it cannot work. These are the four things the
-    // runner does before the harness produces a line: create the workspace,
-    // clone into it, find its own entrypoint, and write its own home.
+    // The drop is worthless if uid 1000 cannot work. These are the four things
+    // the job does after the drop: write the workspace, clone into it, find
+    // the runner's entrypoint, and write the harness home.
     assert.equal(
-      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"'),
+      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"', '1000'),
       'ok',
-      'the runner must be able to materialise FLEET_WORKSPACE',
+      'the dropped user must be able to write FLEET_WORKSPACE',
     );
-    assert.equal(sh('git init -q /workspace/repo && echo ok'), 'ok');
-    assert.equal(sh('[ -w "$HOME" ] && echo ok'), 'ok', 'the harness writes config under $HOME');
+    assert.equal(sh('git init -q /workspace/repo && echo ok', '1000'), 'ok');
+    assert.equal(sh('[ -w /home/node ] && echo ok', '1000'), 'ok', 'the harness writes config under the dropped user home');
     assert.equal(
-      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"'),
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"', '1000'),
       'ok',
     );
   });
@@ -445,27 +453,31 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     );
   });
 
-  // AC1: docker-provider job runs gate → fake harness → decision → answer → settle
+  // ---------- shared docker-loop scaffolding ----------
   //
-  // The fake harness is delivered as a synced file (.fleet/fake-harness.mjs)
-  // so no shell-quoting of JSON is needed. FLEET_HARNESS_CMD points at it.
-  // FLEET_SYNC_JSON carries the file to the container; materializeWorkspace()
-  // in the runner writes it to /workspace before anything else runs.
-  test('docker-provider job runs gate → fake harness → decision → answer → settle', async (t) => {
+  // Daemon on a TCP port + DockerProvider wrapped to:
+  //  1. Swap 127.0.0.1 → dockerHostAddr in FLEET_DAEMON_URL so the container
+  //     can reach the daemon on the host.
+  //  2. Add --add-host host.docker.internal:host-gateway for Linux.
+  // Used by the full-loop test and the privilege-drop acceptance tests (#196).
+  type LoopHandle = {
+    port: number;
+    dockerHostAddr: string;
+    /** POST /jobs; asserts 201, registers container cleanup, returns the job id. */
+    postJob(body: Record<string, unknown>): Promise<string>;
+    /** Poll GET /jobs/:id until pred(state); throws with the last state on timeout. */
+    waitFor(jobId: string, pred: (s: string) => boolean, label: string, ms?: number): Promise<string>;
+    /** All events for the job (NDJSON endpoint), parsed, in daemon-seq order. */
+    events(jobId: string): Promise<Array<{ type: string; text?: string }>>;
+  };
+
+  async function startDockerLoop(t: { after(fn: () => void): void }, image: string): Promise<LoopHandle> {
     const { FleetDaemon } = await import('../src/daemon/server.ts');
     const { DockerProvider } = await import('../src/providers/docker.ts');
     const { writeSecretTempFile } = await import('../src/providers/provider.ts');
     const { promisify } = await import('node:util');
     const { execFile } = await import('node:child_process');
-
     const runCmd = promisify(execFile);
-
-    const manifest: ImageManifest = {
-      harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
-      setup: { image: 'node:22' },
-    };
-    const hash = computeImageHash(manifest);
-    const tag = jobImageTag(hash);
 
     // Host address reachable from inside the Docker container.
     const dockerHostAddr = process.env.FLEET_DOCKER_HOST_ADDR ?? 'host.docker.internal';
@@ -473,11 +485,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     const home = mkdtempSync(join(tmpdir(), 'fleet-docker-loop-'));
     t.after(() => rmSync(home, { recursive: true, force: true }));
 
-    // Wrap DockerProvider to:
-    //  1. Swap 127.0.0.1 → dockerHostAddr in FLEET_DAEMON_URL so the container
-    //     can reach the daemon on the host.
-    //  2. Add --add-host host.docker.internal:host-gateway for Linux.
-    const innerProvider = new DockerProvider({ defaultImage: tag });
+    const innerProvider = new DockerProvider({ defaultImage: image });
     const provider = {
       name: 'docker',
       async launch(spec: Parameters<typeof innerProvider.launch>[0]) {
@@ -487,8 +495,9 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
         try {
           const args = innerProvider.buildRunArgs(hostSpec, envFile.path);
           // Insert host resolution before the image tag.
-          const imageIdx = args.indexOf(tag);
-          if (imageIdx < 0) throw new Error(`image tag ${tag} not found in docker run args`);
+          const imageRef = (hostSpec as { image?: string }).image ?? image;
+          const imageIdx = args.indexOf(imageRef);
+          if (imageIdx < 0) throw new Error(`image tag ${imageRef} not found in docker run args`);
           args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
           const { stdout } = await runCmd('docker', args);
           const containerId = stdout.trim();
@@ -512,58 +521,84 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     t.after(() => daemon.stop());
     assert.ok(port, 'daemon must bind a TCP port for container-to-host reachability');
 
-    // The fake harness is injected as a synced file; FLEET_HARNESS_CMD points
-    // at it. The runner's materializeWorkspace writes it to the workspace before
-    // running the pickup gate.
-    const fakeHarnessB64 = Buffer.from(FAKE_HARNESS_CONTENT).toString('base64');
-
-    const created = await fetch(`http://127.0.0.1:${port}/jobs`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        workOrder: DOCKER_WORK_ORDER,
-        manifest: DOCKER_TEST_MANIFEST,
-        env: { FLEET_HARNESS_CMD: 'node /workspace/.fleet/fake-harness.mjs' },
-        sync: { '.fleet/fake-harness.mjs': fakeHarnessB64 },
-        image: tag,
-      }),
-    });
-    // Read the body once. A template literal in an assertion message is
-    // evaluated eagerly, so `${await created.text()}` consumed the body whether
-    // the assertion passed or not and the next line threw "Body has already
-    // been read" — meaning this test could never pass, and being gated behind
-    // FLEET_TEST_DOCKER=1 meant nobody found out.
-    const createdBody = await created.text();
-    assert.equal(created.status, 201, `job creation failed: ${createdBody}`);
-    const { job } = JSON.parse(createdBody) as { job: { id: string } };
-    const jobId = job.id;
-
-    t.after(() => {
-      try { execFileSync('docker', ['rm', '-f', `fleet-${jobId}`], { stdio: 'ignore' }); } catch { /* best effort */ }
-    });
+    const postJob = async (body: Record<string, unknown>): Promise<string> => {
+      const created = await fetch(`http://127.0.0.1:${port}/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      // Read the body once. A template literal in an assertion message is
+      // evaluated eagerly, so `${await created.text()}` consumed the body whether
+      // the assertion passed or not and the next line threw "Body has already
+      // been read" — meaning this test could never pass, and being gated behind
+      // FLEET_TEST_DOCKER=1 meant nobody found out.
+      const createdBody = await created.text();
+      assert.equal(created.status, 201, `job creation failed: ${createdBody}`);
+      const { job } = JSON.parse(createdBody) as { job: { id: string } };
+      t.after(() => {
+        try { execFileSync('docker', ['rm', '-f', `fleet-${job.id}`], { stdio: 'ignore' }); } catch { /* best effort */ }
+      });
+      return job.id;
+    };
 
     const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-    const getState = async () => {
-      const r = await fetch(`http://127.0.0.1:${port}/jobs/${jobId}`);
-      return ((await r.json()) as { job: { state: string } }).job.state;
-    };
-    const waitFor = async (pred: (s: string) => boolean, label: string, ms = 90_000) => {
+    const waitFor = async (jobId: string, pred: (s: string) => boolean, label: string, ms = 90_000) => {
       const deadline = Date.now() + ms;
       for (;;) {
-        const s = await getState();
+        const r = await fetch(`http://127.0.0.1:${port}/jobs/${jobId}`);
+        const s = ((await r.json()) as { job: { state: string } }).job.state;
         if (pred(s)) return s;
         if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}; last state=${s}`);
         await delay(500);
       }
     };
 
+    const events = async (jobId: string) => {
+      const r = await fetch(`http://127.0.0.1:${port}/jobs/${jobId}/events`);
+      const body = await r.text();
+      return body
+        .split('\n')
+        .filter((line) => line !== '')
+        .map((line) => JSON.parse(line) as { type: string; text?: string });
+    };
+
+    return { port, dockerHostAddr, postJob, waitFor, events };
+  }
+
+  // AC1: docker-provider job runs gate → fake harness → decision → answer → settle
+  //
+  // The fake harness is delivered as a synced file (.fleet/fake-harness.mjs)
+  // so no shell-quoting of JSON is needed. FLEET_HARNESS_CMD points at it.
+  // FLEET_SYNC_JSON carries the file to the container; materializeWorkspace()
+  // in the runner writes it to /workspace before anything else runs.
+  test('docker-provider job runs gate → fake harness → decision → answer → settle', async (t) => {
+    const manifest: ImageManifest = {
+      harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
+      setup: { image: 'node:22' },
+    };
+    const hash = computeImageHash(manifest);
+    const tag = jobImageTag(hash);
+
+    const loop = await startDockerLoop(t, tag);
+
+    // The fake harness is injected as a synced file; FLEET_HARNESS_CMD points
+    // at it. The runner's materializeWorkspace writes it to the workspace before
+    // running the pickup gate.
+    const jobId = await loop.postJob({
+      workOrder: DOCKER_WORK_ORDER,
+      manifest: DOCKER_TEST_MANIFEST,
+      env: { FLEET_HARNESS_CMD: 'node /workspace/.fleet/fake-harness.mjs' },
+      sync: { '.fleet/fake-harness.mjs': Buffer.from(FAKE_HARNESS_CONTENT).toString('base64') },
+      image: tag,
+    });
+
     // The fake harness writes a decision file → runner posts decision event →
     // daemon transitions to blocked. Fails here if container cannot reach daemon
     // (wrong dockerHostAddr); the error message names the missing env var.
-    await waitFor((s) => s === 'blocked', `blocked (container→${dockerHostAddr}:${port})`);
+    await loop.waitFor(jobId, (s) => s === 'blocked', `blocked (container→${loop.dockerHostAddr}:${loop.port})`);
 
     // Operator answers.
-    const ans = await fetch(`http://127.0.0.1:${port}/jobs/${jobId}/answer`, {
+    const ans = await fetch(`http://127.0.0.1:${loop.port}/jobs/${jobId}/answer`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ option: 'alpha' }),
@@ -571,11 +606,147 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     assert.equal(ans.status, 200);
 
     // Runner delivers the answer file; harness continues; runner settles.
-    await waitFor((s) => s === 'done', 'done');
+    await loop.waitFor(jobId, (s) => s === 'done', 'done');
 
-    const final = await fetch(`http://127.0.0.1:${port}/jobs/${jobId}`);
+    const final = await fetch(`http://127.0.0.1:${loop.port}/jobs/${jobId}`);
     const { job: finalJob } = (await final.json()) as { job: { settle: { rung: string } } };
     assert.equal(finalJob.settle?.rung, 'implemented');
+  });
+
+  // ---------- privilege drop (#196) ----------
+  //
+  // Trust follows authorship: the container starts as root, the
+  // operator-authored setup.script runs with it, and the runner drops to uid
+  // 1000 before the gate/harness/settle. These run one-layer jobs against the
+  // pinned runner base (no baked marker), which is exactly the substrate the
+  // issue names: prerequisites that need apt cannot install as uid 1000.
+
+  // #196 (a)+(b): a setup.script that apt-installs python3 succeeds, python3
+  // works from the harness afterward, setup observed uid 0, and the harness
+  // observes uid 1000. Pre-fix failure: apt-get exits non-zero as uid 1000 →
+  // the job cancels with reason setup-script and never reaches done.
+  test('one-layer setup.script runs as root (apt-get works); the harness runs as uid 1000', async (t) => {
+    const loop = await startDockerLoop(t, BASE_TAG);
+
+    const setupScript = [
+      'id -u > setup-uid.txt',
+      'apt-get update -qq',
+      'apt-get install -y -qq python3',
+    ].join('\n') + '\n';
+
+    // The harness carries the assertions: it exits 3 (job never reaches done)
+    // unless setup ran as root, python3 is installed, and its own uid is 1000.
+    const uidHarness = `
+import { execSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+const out = join(process.cwd(), '.fleet', 'out');
+mkdirSync(out, { recursive: true });
+const setupUid = readFileSync('setup-uid.txt', 'utf8').trim();
+const jobUid = execSync('id -u', { encoding: 'utf8' }).trim();
+const python = execSync('python3 --version', { encoding: 'utf8' }).trim();
+process.stdout.write(JSON.stringify({
+  type: 'assistant',
+  message: { content: [{ type: 'text', text: 'setup-uid=' + setupUid + ' job-uid=' + jobUid + ' python=' + python }] },
+}) + '\\n');
+if (setupUid !== '0' || jobUid !== '1000' || !/^Python 3/.test(python)) process.exit(3);
+writeFileSync(join(out, 'report.json'), JSON.stringify({
+  status: 'READY',
+  next_action: 'reviewed and complete',
+  verification: ['setup-uid=' + setupUid, 'job-uid=' + jobUid, python],
+  not_done: [],
+}));
+process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+`.trim();
+
+    const jobId = await loop.postJob({
+      workOrder: DOCKER_WORK_ORDER,
+      manifest: {
+        ...DOCKER_TEST_MANIFEST,
+        setup: { image: 'node:22', script: '.fleet/setup.sh' },
+        // The gate runs post-drop: uid 1000 or the job never starts.
+        gates: { pickup: 'test "$(id -u)" = "1000"' },
+      },
+      env: { FLEET_HARNESS_CMD: 'node /workspace/.fleet/uid-harness.mjs' },
+      sync: {
+        '.fleet/setup.sh': Buffer.from(setupScript).toString('base64'),
+        '.fleet/uid-harness.mjs': Buffer.from(uidHarness).toString('base64'),
+      },
+      image: BASE_TAG,
+    });
+
+    // apt-get update+install needs a real budget; a failing harness exits 3
+    // and lands on cancelled, so wait for either terminal state.
+    const finalState = await loop.waitFor(
+      jobId,
+      (s) => s === 'done' || s === 'cancelled',
+      'a terminal state (setup installs python3, harness asserts uids)',
+      300_000,
+    );
+    const texts = (await loop.events(jobId))
+      .filter((e) => typeof e.text === 'string')
+      .map((e) => String(e.text));
+    assert.equal(finalState, 'done', `job did not settle clean; events: ${texts.join(' | ')}`);
+
+    // Ordering: setup (root) → drop → gate. Root must end where setup ends.
+    const setupAt = texts.findIndex((x) => /^setup script \.fleet\/setup\.sh ok \(\d+s\)$/.test(x));
+    const dropAt = texts.findIndex((x) => x === 'privileges dropped: job continues as uid 1000');
+    const gateAt = texts.findIndex((x) => x.startsWith('pickup gate:'));
+    assert.ok(setupAt >= 0, `no setup outcome in: ${texts.join(' | ')}`);
+    assert.ok(dropAt > setupAt, 'the drop must come after setup — root belongs to setup');
+    assert.ok(gateAt > dropAt, 'the gate must run only after the drop');
+  });
+
+  // #196 (c): a manifest with no setup.script never runs anything as root
+  // beyond the immediate drop. The gate (the first observable job-side code)
+  // asserts both the uid and that root handed over everything it materialised;
+  // the event log pins the drop as the runner's first act.
+  test('no setup.script → the drop is immediate and nothing else runs as root', async (t) => {
+    const loop = await startDockerLoop(t, BASE_TAG);
+
+    const doneHarness = `
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+const out = join(process.cwd(), '.fleet', 'out');
+mkdirSync(out, { recursive: true });
+writeFileSync(join(out, 'report.json'), JSON.stringify({
+  status: 'READY',
+  next_action: 'reviewed and complete',
+  verification: ['no-setup-drop-test'],
+  not_done: [],
+}));
+process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+`.trim();
+
+    const jobId = await loop.postJob({
+      workOrder: DOCKER_WORK_ORDER,
+      manifest: {
+        ...DOCKER_TEST_MANIFEST,
+        // setup.image only — no script, so no root work is coming at all.
+        // The gate proves the drop already happened AND that the files root
+        // materialised (manifest.json) were handed to the job user.
+        gates: { pickup: 'test "$(id -u)" = "1000" && test "$(stat -c %u .fleet/manifest.json)" = "1000"' },
+      },
+      env: { FLEET_HARNESS_CMD: 'node /workspace/.fleet/done-harness.mjs' },
+      sync: { '.fleet/done-harness.mjs': Buffer.from(doneHarness).toString('base64') },
+      image: BASE_TAG,
+    });
+
+    const finalState = await loop.waitFor(jobId, (s) => s === 'done' || s === 'cancelled', 'a terminal state', 180_000);
+    const texts = (await loop.events(jobId))
+      .filter((e) => typeof e.text === 'string')
+      .map((e) => String(e.text));
+    assert.equal(finalState, 'done', `job did not settle clean; events: ${texts.join(' | ')}`);
+
+    const logs = (await loop.events(jobId))
+      .filter((e) => e.type === 'log')
+      .map((e) => String(e.text));
+    assert.equal(
+      logs[0],
+      'privileges dropped: job continues as uid 1000',
+      `the drop must be the runner's first act when no setup is declared; logs: ${logs.join(' | ')}`,
+    );
+    assert.ok(!logs.some((x) => x.startsWith('setup script:')), 'no setup announce for a script-less manifest');
   });
 
   test('clean up test images after suite', () => {

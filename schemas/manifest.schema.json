@@ -16,7 +16,7 @@
         "devcontainer": { "type": "string", "description": "Path to devcontainer.json (image/build/postCreateCommand subset, built via @devcontainers/cli)." },
         "image": { "type": "string", "description": "Base image (fallback form)." },
         "dockerfile": { "type": "string", "description": "Dockerfile path (fallback form, mutually exclusive with image)." },
-        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run." }
+        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run. Runs as root — it is operator-authored (laptop trust class) and may install system packages; the runner drops to the unprivileged job user before the pickup gate and the harness, so the agent never runs as root." }
       },
       "oneOf": [
         { "required": ["devcontainer"], "not": { "anyOf": [{ "required": ["image"] }, { "required": ["dockerfile"] }] } },
@@ -115,6 +115,7 @@
         "idle": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Liveness check, not a cost bound: no harness output for this long (blocked time excluded) → SIGTERM + grace, partial work pushed, settle with the idle duration, state cancelled reason stall. Supports s/m/h units; zero is not a value — stall detection cannot be switched off, only widened. Must exceed the pickup gate's runtime: the daemon's mirror of this limit measures silence on the event stream, which the gate does not feed. Absent defaults to 20m — the default lives in src/shared/time.ts (idleLimitMs), the one source of truth (#134)." },
         "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "How long a blocked container stays hot before parking (WIP committed, task exits). Absent defaults to 30m — the default lives in src/shared/time.ts (blockHotLimitMs), the one source of truth (#134)." },
         "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered. Absent defaults to 24h — the default lives in src/shared/time.ts (decisionTimeoutMs), the one source of truth (#134)." },
+        "checkpoint": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Cadence of WIP checkpoint pushes to the job branch during the run (#190). On container providers the workspace dies with the task, so without checkpoints the teardown push is the work's only exit. Push failures log and the run continues; a checkpoint of a clean, fully-pushed workspace is a no-op. Zero is not a value — checkpointing cannot be switched off, only widened. Absent defaults to 10m — the default lives in src/shared/time.ts (checkpointLimitMs), the one source of truth (#134)." },
         "model_spend": { "type": "string", "description": "OPEN — not enforced; the structural bounds apply meanwhile (scale to zero, the capacity cap, wall_clock). Per-job metering arrives with fleet-native cost reporting." },
         "egress": {
           "type": "array",
