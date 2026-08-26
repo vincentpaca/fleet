@@ -54,9 +54,9 @@ variable "enable_nat_gateway" {
 # --- Compute ----------------------------------------------------------------
 
 variable "instance_type" {
-  description = "EC2 instance type for the ECS container instances."
+  description = "EC2 instance type for the ECS container instances. Coupled to offered_cpu_units/offered_memory_mib and the runner_cpu/runner_memory task defaults — the five move together (a tier the instance cannot host fails at the runner task definition's precondition). Default is t3.xlarge: 2-vCPU boxes starve suite-heavy harness jobs into their wall-clock budgets (#191), and the Spot price difference is cents per job-hour against a whole re-run when a job times out."
   type        = string
-  default     = "t3.medium"
+  default     = "t3.xlarge"
 }
 
 variable "max_instances" {
@@ -114,9 +114,9 @@ variable "scaling_cooldown_seconds" {
 }
 
 variable "offered_cpu_units" {
-  description = "Maximum CPU (in ECS units, 1024 = 1 vCPU) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default matches a t3.medium (2 vCPU = 2048 units)."
+  description = "Maximum CPU (in ECS units, 1024 = 1 vCPU) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default matches a t3.xlarge (4 vCPU = 4096 units); move it with instance_type."
   type        = number
-  default     = 2048
+  default     = 4096
 
   validation {
     condition     = var.offered_cpu_units > 0
@@ -125,9 +125,9 @@ variable "offered_cpu_units" {
 }
 
 variable "offered_memory_mib" {
-  description = "Maximum memory (in MiB) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default leaves ~512 MiB for the ECS agent and OS on a t3.medium (4096 MiB total)."
+  description = "Maximum memory (in MiB) that a single runner task may request. Encoded in fleet_config so the daemon can reject oversized manifests at dispatch. Default leaves ~1 GiB for the ECS agent and OS on a t3.xlarge (16384 MiB total); move it with instance_type."
   type        = number
-  default     = 3584
+  default     = 15360
 
   validation {
     condition     = var.offered_memory_mib > 0
@@ -184,15 +184,15 @@ variable "daemon_tcp_port" {
 }
 
 variable "runner_cpu" {
-  description = "CPU units reserved for a runner container."
+  description = "CPU units reserved for a runner container when the manifest requests nothing. Defaults to the full offered tier — one job per instance, so a default job gets the performance the tier advertises instead of a 256-unit sliver; manifests wanting denser packing request less via limits.resources. Must not exceed offered_cpu_units (precondition on the runner task definition)."
   type        = number
-  default     = 256
+  default     = 4096
 }
 
 variable "runner_memory" {
-  description = "Hard memory limit (MiB) for a runner container."
+  description = "Hard memory limit (MiB) for a runner container when the manifest requests nothing. Defaults to the full offered tier (see runner_cpu); a 1024 MiB default previously ran whole test suites inside a 1 GiB hard cap. Must not exceed offered_memory_mib (precondition on the runner task definition)."
   type        = number
-  default     = 1024
+  default     = 15360
 }
 
 variable "fleet_home_path" {

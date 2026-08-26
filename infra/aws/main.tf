@@ -690,6 +690,16 @@ resource "aws_cloudwatch_log_group" "runner" {
 # instance level.
 
 resource "aws_ecs_task_definition" "runner" {
+  lifecycle {
+    # The task default must fit the advertised tier: a runner_cpu/runner_memory
+    # above offered_* would dispatch jobs the daemon believes the deployment
+    # cannot host (#191). Plan-time, cross-variable — the tier moves as one.
+    precondition {
+      condition     = var.runner_cpu <= var.offered_cpu_units && var.runner_memory <= var.offered_memory_mib
+      error_message = "runner_cpu/runner_memory must not exceed offered_cpu_units/offered_memory_mib — the five tier variables move together (see variables.tf)."
+    }
+  }
+
   family                   = "${var.name}-runner"
   requires_compatibilities = ["EC2"]
   network_mode             = "bridge"
