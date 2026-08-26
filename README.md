@@ -12,10 +12,11 @@ Everything runs in your account with your credentials. There is no hosted servic
 ## Install
 
 ```sh
-npm install -g github:vincentpaca/fleet
+npm install -g github:vincentpaca/fleet   # always current
+npm install -g ownfleet                   # the npm registry name; may lag main
 ```
 
-That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. One caveat: first-time infrastructure bring-up (`fleet setup infra` and `images/build.sh` in the quick start below) runs from a Fleet checkout, because the Terraform unit and image sources ship by git, not in the npm package.
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs two more tools — Terraform >= 1.7 and Docker — and runs from a Fleet checkout (`fleet setup infra` and `images/build.sh` in the quick start below), because the Terraform unit and image sources ship by git, not in the npm package.
 
 ## What Fleet owns
 
@@ -23,7 +24,7 @@ Fleet is a thin delegation layer. It owns exactly four things:
 
 1. **Dispatch** — package a task and its repo-owned environment contract; refuse work that isn't ready before any model spend.
 2. **Remote execution** — run the repo's existing harness on suitable compute, isolated, with only the credentials the job needs.
-3. **Continuity** — survive the initiating terminal or laptop disappearing; blocked jobs park at zero cost and resume on answer.
+3. **Continuity** — survive the initiating terminal or laptop disappearing; blocked jobs park at zero cost and resume on answer; a harness that crashes mid-run retries once on its own, keeping the failed attempt's branch as evidence.
 4. **The return path** — stream honest progress, route human decisions to wherever the human is, and deliver a branch, PR, or report with evidence.
 
 Everything else belongs to someone else: the harness owns reasoning, tools, and review behavior; the cloud provider owns compute; GitHub owns source control and CI. Fleet connects them. A proposed feature that isn't one of the four is someone else's layer.
@@ -48,10 +49,10 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 ## How it works
 
 1. Your repo describes its environment in `.fleet/manifest.json`: base image or devcontainer, setup script, which gitignored config files to copy in, which env vars and services the job needs, which commands can run, and which agent reviews the work. `fleet setup repo` writes it by interview, with the defaults read out of your checkout.
-2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. `fleet setup infra --destroy` takes it back down.
+2. `fleet setup infra` stands the infrastructure up in your cloud account. It is a wizard, not a flag parade: because Fleet authors the infra shape, it asks only what the contract cannot assume — a name, a region, an optional existing VPC — shows you the plan, and applies on an explicit yes. Underneath is one self-contained Terraform module per cloud under `infra/<cloud>/`, AWS first: an ECS cluster that scales from zero, a small daemon that tracks jobs, no publicly reachable ports. Costs are bounded on both ends: idle workers cost nothing (the fleet floors at zero and runs Spot by default), and every job carries hard wall-clock and idle budgets, so a runaway dispatch dies at its cap instead of billing overnight. `fleet setup infra --destroy` takes it back down.
 3. `fleet delegate 42` builds the sandbox, runs your repo's readiness gate (a script you own; if it fails, the job stops before any model spend), then runs the command headless and streams progress events back. A dispatch is a target and a prompt — nothing to configure: name an issue or a PR and the job delivers a draft PR, or write the ask in prose and it delivers a report and its files instead.
 4. When the agent hits a question it can't answer on its own, the job pauses — hot for a window, then parked at zero cost. You answer with `fleet answer` from any machine, and the job resumes on its existing branch.
-5. The job ends as a draft pull request (or, for a prose dispatch, a report with downloadable artifacts). A human merges it. Fleet never merges and never deploys.
+5. The job ends as a draft pull request (or, for a prose dispatch, a report with artifacts you pull down with `fleet artifacts <job> get <file>`). A human merges it. Fleet never merges and never deploys.
 
 From a machine that has never seen Fleet, that is the whole path:
 
@@ -84,6 +85,8 @@ Claude Code, Codex and OpenCode all discover skills as a `<name>/SKILL.md` direc
 The live end-to-end check — a real session, a real block, a human answering — is [docs/drill.md#the-harness-drill](docs/drill.md#the-harness-drill).
 
 Run `fleet` with no arguments and you get the cockpit: the live board on top with blocked decisions floating up, the selected job's streaming transcript below it, and a command line at the bottom to dispatch from, answer a question, or cancel — one window instead of three. It adopts the daemon tunnel if one is healthy and opens its own if not, so a dead port-forward stops being something you rebuild by hand. Closing it changes nothing about the jobs; watching is a view, never a lifeline.
+
+When something feels off, `fleet doctor` checks the deployment end to end — manifest, gate, credentials, tunnel, and cloud-side leftovers like orphaned tasks — and names the fix for each finding instead of leaving you to guess.
 
 ## Using Fleet vs. building Fleet
 
