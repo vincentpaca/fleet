@@ -24,7 +24,9 @@ permissions:
   contents: write
   id-token: write
 
-# Never cancel a publish mid-flight; a second release waits its turn.
+# Never cancel a publish mid-flight. GitHub still keeps at most one pending
+# run per group, so several release merges in one window can drop a middle
+# run — the registry gate makes re-running any cancelled run a safe recovery.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -43,14 +45,20 @@ jobs:
           cache: npm
 
       # The gate: already on the registry means already released — every later
-      # step is skipped and the run is a green no-op, not a red herring.
+      # step is skipped and the run is a green no-op, not a red herring. Only
+      # E404 means unpublished; a transient registry failure fails the run
+      # rather than proceeding into a doomed publish.
       - id: gate
         run: |
+          NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
-          if npm view "ownfleet@${VERSION}" version >/dev/null 2>&1; then
+          if OUT="$(npm view "${NAME}@${VERSION}" version 2>&1)" && [ -n "$OUT" ]; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ -z "$OUT" ] || grep -q "E404" <<< "$OUT"; then
             echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$OUT" >&2
+            exit 1
           fi
 
       - if: steps.gate.outputs.published == 'false'
@@ -71,6 +79,7 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           awk -v ver="$VERSION" '
+            BEGIN { gsub(/\./, "\\.", ver) }
             $0 ~ ("^## " ver "( |$)") { found = 1; next }
             /^## / && found { exit }
             found { print }

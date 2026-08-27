@@ -14,6 +14,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const playbook = readFileSync(join(root, 'agents/release.md'), 'utf8');
 const changelog = readFileSync(join(root, 'CHANGELOG.md'), 'utf8');
 const workflow = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8');
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+  version: string;
+  repository?: { url?: string };
+};
 
 test('the playbook carries the four changelog sections, the bump, and the draft PR', () => {
   const required = [
@@ -37,7 +41,7 @@ test('the upgrade-note derivation names all three diff shapes', () => {
 
 // The workflow extracts the release body with an awk match on "## <version> ".
 // A changelog heading that stops looking like that ships a release with the
-// wrong (or no) notes, and nothing else would catch it before the publish run.
+// wrong (or no) notes.
 test('every CHANGELOG.md release heading is "## <semver> — <date>"', () => {
   const headings = changelog.match(/^## .*$/gm) ?? [];
   assert.ok(headings.length > 0, 'CHANGELOG.md has no release headings');
@@ -48,6 +52,16 @@ test('every CHANGELOG.md release heading is "## <semver> — <date>"', () => {
       `heading does not match the shape the publish workflow extracts by: ${heading}`,
     );
   }
+});
+
+// This runs in the release PR's own CI: a version bump whose changelog entry
+// is missing or empty goes red before the merge, not in the post-merge
+// publish run with the bump already on main.
+test('CHANGELOG.md carries a non-empty entry for the current package.json version', () => {
+  const entry = changelog.split(/^## /m).slice(1).find((section) => section.startsWith(`${pkg.version} `));
+  assert.ok(entry, `CHANGELOG.md has no entry for ${pkg.version}`);
+  const body = entry.split('\n').slice(1).join('\n').trim();
+  assert.ok(body.length > 0, `the CHANGELOG.md entry for ${pkg.version} is empty`);
 });
 
 test('the publish workflow authenticates by OIDC, never a stored registry token', () => {
@@ -61,9 +75,6 @@ test('the publish workflow authenticates by OIDC, never a stored registry token'
 // package.json needs a repository URL matching this repo or `npm publish
 // --provenance` fails inside the one environment that can run it.
 test('package.json names the repository provenance validates against', () => {
-  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
-    repository?: { url?: string };
-  };
   assert.ok(
     (pkg.repository?.url ?? '').includes('github.com/vincentpaca/fleet'),
     'repository.url missing or wrong',
