@@ -165,6 +165,24 @@ describe('build', () => {
     }
   });
 
+  test('both builds carry the checkout HEAD as the build stamp (#207)', () => {
+    // The stamp is what lets `fleet doctor` name a deployment whose images
+    // predate the CLI (#197 lost a job's work to exactly that). It must be the
+    // CHECKOUT's HEAD even when the operator runs the script from their own
+    // project — the same wrong-repo trap the build-context test pins.
+    const expected = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+    const cwd = makeTempDir('fleet-build-stamp-');
+    execFileSync('git', ['init', '-q'], { cwd });
+    const res = runBuild([], { cwd });
+    assert.equal(res.code, 0, res.stderr);
+    assert.ok(res.stdout.includes(`build stamp: ${expected}`), `stamp not printed: ${res.stdout}`);
+    const builds = find(res.log, 'docker build');
+    assert.equal(builds.length, 2, `expected a runner and a daemon build, got:\n${res.log.join('\n')}`);
+    for (const line of builds) {
+      assert.ok(line.includes(`--build-arg FLEET_BUILD_SHA=${expected} `), `stamp missing from build: ${line}`);
+    }
+  });
+
   test('every build prints the digest its base tag resolved to (#138)', () => {
     // A stub docker that answers `image inspect` the way a real daemon with the
     // base pulled would. The digest is the one thing that distinguishes two

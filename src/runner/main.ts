@@ -37,6 +37,7 @@ import { runSetupScript, dropPrivileges } from './setup.ts';
 import { parseDurationMs, idleLimitMs, blockHotLimitMs, checkpointLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
 import { killTree } from '../shared/process.ts';
+import { buildStamp } from '../shared/build-stamp.ts';
 
 /**
  * Hard cap on one harness stdout line (#139). Readline buffers the whole line
@@ -155,6 +156,16 @@ async function main(): Promise<void> {
     onDepth: () => manageBackpressure?.(),
   });
   await sink.emit({ type: 'state', state: 'running' });
+
+  // Deployment skew (#207): name the build this runner image carries, so a job
+  // run on a stale image is diagnosable from its own log — the #197 incident
+  // was exactly a runner image predating an already-merged fix, with nothing in
+  // the record to say so. Silent when unstamped: an image predating the stamp
+  // has nothing honest to report.
+  const imageStamp = buildStamp();
+  if (imageStamp !== undefined) {
+    await sink.emit({ type: 'log', text: `runner image built at ${imageStamp}`, who: 'runner' });
+  }
 
   let manifest: Record<string, unknown>;
   try {

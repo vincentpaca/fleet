@@ -21,6 +21,7 @@ import { canTransition, isMarkerAllowed, isTerminal } from "./state.ts";
 import type { JobState, Marker } from "./state.ts";
 import { requiresGh, verifyRung, verifyRungGh, REQUIRES_GH_NOTE } from "./verify.ts";
 import type { GhRunnerAsync } from "../shared/git.ts";
+import { buildStamp } from "../shared/build-stamp.ts";
 import type { Provider } from "../providers/provider.ts";
 
 /**
@@ -394,8 +395,21 @@ export class FleetDaemon {
     // Combine path and method into a single key to avoid compound && conditions.
     const key = `${url.pathname}:${method}`;
     if (key === "/reconcile:POST") return this.#reconcileRoute(req, res);
-    if (key === "/health:GET") return sendJson(res, 200, { ok: true });
+    if (key === "/health:GET") return this.#healthRoute(res);
     sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+  }
+
+  /**
+   * /health answers without state, auth, or provider calls — the ECS health
+   * check and the tunnel liveness poll both depend on that staying true. When
+   * this process runs from a stamped image it also names the build it carries
+   * (#207): `fleet doctor` compares that stamp against the operator's CLI to
+   * surface deployment skew, the failure that cost #197 its work. A daemon
+   * running from a checkout has no stamp and the field is simply absent.
+   */
+  #healthRoute(res: ServerResponse): void {
+    const build = buildStamp();
+    sendJson(res, 200, build === undefined ? { ok: true } : { ok: true, build });
   }
 
   /**

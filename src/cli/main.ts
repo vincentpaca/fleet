@@ -41,6 +41,7 @@ import {
   SETUP_STUB,
 } from './setup.ts';
 import { loadDotEnv } from '../shared/dotenv.ts';
+import { appliedUnitPins, skewReport, type DaemonBuild } from './skew.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -1492,6 +1493,46 @@ async function doctorToken(home: string, tokenBefore: string | undefined): Promi
   return { notes: [healthyTokenNote(tokenFile, tokenBefore)], findings: [] };
 }
 
+/**
+ * Deployment skew for doctor (#207): compare the applied unit ref and the
+ * daemon image's build stamp against this CLI's own checkout, and name each
+ * gap with its fix — the #197 incident was a runner image predating an
+ * already-merged fix, and nothing said so until the work was lost. The section
+ * exists only when a deployment root module is captured beside this project:
+ * no deployment, nothing to be skewed against. An unreachable daemon is the
+ * tunnel section's story; here it just means the image goes uncompared.
+ */
+async function doctorSkew(cwd: string): Promise<{ notes: string[]; findings: string[] }> {
+  const pins = appliedUnitPins(cwd);
+  if (pins.length === 0) return { notes: [], findings: [] };
+  const root = installRoot();
+  return skewReport({
+    cliSha: gitValue(['rev-parse', 'HEAD'], root),
+    pins,
+    daemon: await daemonBuild(),
+    resolveRef: (ref) => gitValue(['rev-parse', '--verify', `${ref}^{commit}`], root),
+  });
+}
+
+/**
+ * The build stamp the deployment's daemon reports on /health, if one is
+ * reachable over TCP. A unix-socket daemon is this machine's own process, not
+ * a deployed image — "rebuild the image" would be nonsense advice — so it is
+ * never inspected here, the same scoping the tunnel section applies.
+ */
+async function daemonBuild(): Promise<DaemonBuild> {
+  if (daemonTarget().kind !== 'tcp') return { kind: 'unknown' };
+  let res: DaemonResponse;
+  try {
+    res = await request('GET', '/health');
+  } catch {
+    return { kind: 'unknown' };
+  }
+  if (res.status !== 200) return { kind: 'unknown' };
+  const build = (res.json as { build?: unknown })?.build;
+  return typeof build === 'string' && build !== '' ? { kind: 'stamped', sha: build } : { kind: 'unstamped' };
+}
+
 /** The one healthy-state line doctorToken prints: accepted, fetched, or healed. */
 function healthyTokenNote(tokenFile: string, before: string | undefined): string {
   const after = readTokenFile(tokenFile);
@@ -1639,6 +1680,13 @@ async function cmdDoctor(args: string[]): Promise<number> {
   const token = await doctorToken(fleetHome(), tokenBefore);
   for (const note of token.notes) console.log(note);
   findings.push(...token.findings);
+
+  // 10. Deployment skew (#207): does what is running match what this CLI is?
+  //     A daemon image or applied unit predating the CLI is how #197 lost a
+  //     job's work; name each stale component and its fix here.
+  const skew = await doctorSkew(process.cwd());
+  for (const note of skew.notes) console.log(note);
+  findings.push(...skew.findings);
 
   if (findings.length === 0) {
     console.log('doctor: clean');

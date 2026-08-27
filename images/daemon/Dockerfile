@@ -60,6 +60,15 @@ RUN npm ci --omit=dev
 COPY src/ src/
 COPY schemas/ schemas/
 
+# Build stamp (#207): the git SHA this image was built from, passed by
+# images/build.sh. The daemon reports it on /health so `fleet doctor` can name
+# a deployment whose daemon predates the operator's CLI. Not a secret — a
+# public commit id — so ENV is fine where credentials never are. Declared after
+# the COPY layers: a new SHA on an unchanged tree re-runs nothing above.
+# Empty (a hand build, or a non-git tree) means unstamped, reported as such.
+ARG FLEET_BUILD_SHA=""
+ENV FLEET_BUILD_SHA=${FLEET_BUILD_SHA}
+
 # Default TCP port. When FLEET_PORT is set, the daemon binds on 0.0.0.0 inside
 # the container and discovers its private IP from ECS container metadata to
 # advertise to runner tasks.  Override with -e FLEET_PORT=<port>.
