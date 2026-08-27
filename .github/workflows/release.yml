@@ -1,0 +1,105 @@
+# The deterministic half of the release pipeline (#183). Judgment — what the
+# changelog says, when to cut — lives in agents/release.md and ends as a
+# release PR a human merges. This workflow only ships what that merge decided:
+# suite, tag, GitHub Release from the changelog section, npm publish.
+#
+# Trigger: any push to main that touches package.json. GitHub has no event for
+# "a field inside a file changed", so the paths filter narrows the candidates
+# and the registry check in the gate step makes the actual decision — a push
+# that edits package.json without bumping the version (or a re-delivered run)
+# is a clean no-op. A `v*` tag trigger was rejected in #183: the tag is this
+# workflow's output, not its input, and publish-from-tag leaves package.json
+# lying about its version.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+
+# contents: write — push the release tag and create the GitHub Release.
+# id-token: write — npm Trusted Publishing (OIDC): the registry trusts this
+# repo+workflow directly, so there is no NPM_TOKEN secret to hold or leak.
+permissions:
+  contents: write
+  id-token: write
+
+# Never cancel a publish mid-flight. GitHub still keeps at most one pending
+# run per group, so several release merges in one window can drop a middle
+# run — the registry gate makes re-running any cancelled run a safe recovery.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pinned to commits, moved by dependabot — same policy as tests.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Node 24 bundles npm >= 11.5.1, the floor for Trusted Publishing.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      # The gate: already on the registry means already released — every later
+      # step is skipped and the run is a green no-op, not a red herring. Only
+      # E404 means unpublished; a transient registry failure fails the run
+      # rather than proceeding into a doomed publish.
+      - id: gate
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          if OUT="$(npm view "${NAME}@${VERSION}" version 2>&1)" && [ -n "$OUT" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$OUT" ] || grep -q "E404" <<< "$OUT"; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$OUT" >&2
+            exit 1
+          fi
+
+      - if: steps.gate.outputs.published == 'false'
+        run: npm ci
+      # The e2e tests commit in scratch repos and need a git identity.
+      - if: steps.gate.outputs.published == 'false'
+        run: |
+          git config --global user.name fleet-ci
+          git config --global user.email ci@example.com
+      # A failed suite ships nothing: no tag, no release, no publish.
+      - if: steps.gate.outputs.published == 'false'
+        run: npm test
+
+      # The GitHub Release body is the changelog entry, verbatim. An empty
+      # extraction means the release PR skipped the playbook — fail loudly
+      # rather than ship a release with no notes.
+      - if: steps.gate.outputs.published == 'false'
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          awk -v ver="$VERSION" '
+            BEGIN { gsub(/\./, "\\.", ver) }
+            $0 ~ ("^## " ver "( |$)") { found = 1; next }
+            /^## / && found { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+
+      # gh release create makes the tag and the Release in one step, targeted
+      # at the exact merge commit that triggered this run. Skipped if the
+      # release already exists, so a re-run after a failed publish resumes at
+      # the publish instead of dying here.
+      - if: steps.gate.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          gh release view "v${VERSION}" >/dev/null 2>&1 || gh release create "v${VERSION}" \
+            --target "$GITHUB_SHA" --title "v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      # OIDC mints the credential per-publish; --provenance links the package
+      # to this exact commit and workflow on the registry page.
+      - if: steps.gate.outputs.published == 'false'
+        run: npm publish --provenance --access public

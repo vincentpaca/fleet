@@ -37,6 +37,7 @@ const MUST_SHIP = [
   'integrations/SKILL.md',
   'docs/architecture.md',
   'README.md',
+  'CHANGELOG.md',
 ];
 
 // images/ ships via git source, not npm (docs/architecture.md#two-layer-job-images).

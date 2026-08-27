@@ -16,6 +16,7 @@ import { HARNESS_TARGETS } from '../src/cli/setup-harnesses.ts';
 
 const MIRRORS: Record<string, string> = {
   '.claude/commands/dev.md': 'agents/dev.md',
+  '.claude/commands/release.md': 'agents/release.md',
   '.claude/agents/code-reviewer.md': 'agents/code-reviewer.md',
 };
 
