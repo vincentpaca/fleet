@@ -29,7 +29,11 @@ type SettleOpts = {
   workspace: string;
   rung?: string;
   report?: EventBody;
-  /** PR URL from authority.publish — merged into report.pr (issue #3). */
+  /**
+   * PR URL merged into report.pr (issue #3): the draft PR the runner created
+   * under authority.publish, or the one it detected on the job branch — an
+   * adopted PR (#80) or an agent-opened one (#208).
+   */
   prUrl?: string;
   /**
    * True when work commits landed on the job branch (pushed or delivered by

@@ -102,13 +102,14 @@ Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
                                            placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
-  delegate <target> [--publish] [--finish rung] [--manifest path] [--watch]
+  delegate <target> [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
                                            Defaults follow the target's shape: an issue number
-                                           (or a PR) publishes and aims at merge-ready; a prose
-                                           target is inspected-only and opens no PR. --publish
-                                           grants a prose dispatch push+PR authority.
+                                           (or a PR) publishes and aims at merge-ready; for a
+                                           prose target the runner composes no PR — delivery is
+                                           the prompt's to ask for, and a PR the agent opens
+                                           itself is reported at settle.
                                            A PR target (pr/<n> or a GitHub PR URL) adopts the
                                            PR's head branch, addresses its review comments and
                                            failing checks, and pushes to the same branch so the
@@ -606,8 +607,6 @@ type DelegateRequest = {
   target: string;
   /** Deprecated (#36); mapped onto the shape table for the life of the flag. */
   mode?: string;
-  /** Grant push + PR authority to a dispatch whose shape would not have it. */
-  publish?: boolean;
   finish?: string;
   manifestPath?: string;
   log: (line: string) => void;
@@ -679,9 +678,10 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   }
 
   // Shape decides the defaults (#36). Precedence, tightest first:
-  //   publish: --publish > mapped --mode > shape
+  //   publish: mapped --mode > shape (no flag: prose delivery is prompt-owned,
+  //            #208 — the runner grades an agent-opened PR at settle instead)
   //   finish:  --finish > mapped --mode > manifest.gates.default_finish > shape
-  // The specific flags beat the deprecated bundle; a per-dispatch flag beats the
+  // The specific flag beats the deprecated bundle; a per-dispatch flag beats the
   // repo's manifest default, which in turn beats the shape default — reviving a
   // knob that presets/*.finish had shadowed into dead code since it was added.
   // The repo default applies only where this dispatch could reach it; see
@@ -689,7 +689,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   const shape = dispatchShape(target, continues);
   const shapeDefault = SHAPE_DEFAULTS[shape];
   const mapped = req.mode !== undefined ? resolveModeFlag(req.mode, req.warn) : undefined;
-  const publish = req.publish === true ? true : (mapped?.publish ?? shapeDefault.publish);
+  const publish = mapped?.publish ?? shapeDefault.publish;
   const finish = req.finish
     ?? mapped?.finish
     ?? reachableRepoDefault(manifest.gates?.default_finish, publish)
@@ -825,7 +825,6 @@ async function cmdDelegate(args: string[]): Promise<number> {
     args,
     {
       mode: { type: 'string' },
-      publish: { type: 'boolean' },
       finish: { type: 'string' },
       manifest: { type: 'string' },
       watch: { type: 'boolean' },
@@ -836,7 +835,6 @@ async function cmdDelegate(args: string[]): Promise<number> {
   const created = await dispatchDelegate({
     target: positionals[0],
     mode: typeof values.mode === 'string' ? values.mode : undefined,
-    publish: values.publish === true,
     finish: typeof values.finish === 'string' ? values.finish : undefined,
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,
     log: (line) => console.log(line),

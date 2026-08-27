@@ -404,7 +404,7 @@ const COCKPIT_VERBS = ['delegate', 'answer', 'logs', 'attach', 'cancel', 'help',
 
 /** A submitted line, resolved to an intent. Nothing here talks to the daemon. */
 type CockpitCommand =
-  | { kind: 'delegate'; target: string; mode?: string; publish?: boolean; finish?: string }
+  | { kind: 'delegate'; target: string; mode?: string; finish?: string }
   | { kind: 'answer'; option?: string; text?: string }
   | { kind: 'cancel'; jobId?: string }
   | { kind: 'focus'; jobId?: string }
@@ -424,7 +424,7 @@ const VERB_FOCUS = new Set(['logs', 'attach']);
 const WORDS_RE = /\s+/;
 
 /** Every flag `delegate` understands here; must match `fleet delegate`'s own. */
-const DELEGATE_FLAGS = ['--publish', '--finish', '--mode'];
+const DELEGATE_FLAGS = ['--finish', '--mode'];
 
 /** Of those, the ones that take a following value. `--mode` is deprecated (#36). */
 const DELEGATE_VALUE_FLAGS = new Set(['--mode', '--finish']);
@@ -471,14 +471,13 @@ function parseDelegateCommand(rest: string[]): CockpitCommand {
   if ('error' in split) return { kind: 'error', message: split.error };
   const target = split.args.join(' ');
   if (target === '') {
-    return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--publish] [--finish rung]' };
+    return { kind: 'error', message: 'delegate: needs a target — delegate <target> [--finish rung]' };
   }
   const { flags } = split;
   return {
     kind: 'delegate', target,
     ...(typeof flags['--mode'] === 'string' ? { mode: flags['--mode'] } : {}),
     ...(typeof flags['--finish'] === 'string' ? { finish: flags['--finish'] } : {}),
-    ...(flags['--publish'] === true ? { publish: true } : {}),
   };
 }
 
@@ -692,7 +691,6 @@ type CockpitDeps = {
     target: string;
     /** Deprecated (#36); passed through for the life of the flag. */
     mode?: string;
-    publish?: boolean;
     finish?: string;
     log: (line: string) => void;
     warn: (line: string) => void;
@@ -714,7 +712,7 @@ function errorText(err: unknown): string {
  * `abort()` (wired to the view closing) kills the build's docker child.
  */
 /** The delegate intent, minus its discriminant — what the runner hands on. */
-type DelegateCommand = { target: string; mode?: string; publish?: boolean; finish?: string };
+type DelegateCommand = { target: string; mode?: string; finish?: string };
 
 function delegateRunner(io: {
   delegate: CockpitDeps['delegate'];
@@ -729,7 +727,6 @@ function delegateRunner(io: {
       const created = await io.delegate({
         target: command.target,
         mode: command.mode,
-        publish: command.publish,
         finish: command.finish,
         // Progress holds the footer the way a refusal does: a build is minutes
         // long, and a notice that expired mid-build reads as a dispatch that
@@ -1026,7 +1023,7 @@ export async function runCockpit(deps: CockpitDeps): Promise<number> {
       case 'nothing':
         return;
       case 'help':
-        say('delegate <target> [--publish] [--finish rung] · answer <id> [note] · logs <job> · cancel <job> · quit');
+        say('delegate <target> [--finish rung] · answer <id> [note] · logs <job> · cancel <job> · quit');
         return;
       case 'quit':
         running = false;

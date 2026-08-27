@@ -392,14 +392,15 @@ test('delegate: target, flags, and a missing target', () => {
   assert.deepEqual(parseCockpitInput('delegate 61'), { kind: 'delegate', target: '61' });
   assert.deepEqual(parseCockpitInput('  delegate   61  '), { kind: 'delegate', target: '61' });
   assert.equal(parseCockpitInput('delegate').kind, 'error');
-  // --publish (#36): the cockpit must honour the same flags dispatchDelegate
-  // does, or a prose dispatch typed here can never open a PR.
+  // --publish is gone (#208): prose delivery is prompt-owned, so the word is
+  // target text under the same unknown---word convention pinned below — the
+  // cockpit must not keep honouring a flag `fleet delegate` now refuses.
   assert.deepEqual(parseCockpitInput('delegate --publish draft the note'), {
-    kind: 'delegate', target: 'draft the note', publish: true,
+    kind: 'delegate', target: '--publish draft the note',
   });
   assert.deepEqual(parseCockpitInput('delegate look into the stall backstop'), {
     kind: 'delegate', target: 'look into the stall backstop',
-  }, 'no --publish means the key is absent, not false');
+  });
   assert.deepEqual(parseCockpitInput('delegate 61 --finish pushed'), {
     kind: 'delegate', target: '61', finish: 'pushed',
   });
@@ -714,16 +715,16 @@ test("a flag typed at the input line reaches the order, not just the parser", as
   t.after(() => cockpit.child.kill('SIGKILL'));
   await shows(cockpit, 'no jobs', 'the empty board');
 
-  for (const key of 'delegate --publish --finish pushed look into the stall backstop') cockpit.type(key);
+  for (const key of 'delegate --finish pushed look into the stall backstop') cockpit.type(key);
   cockpit.type('\r');
   await shows(cockpit, 'job-flagged queued', 'the dispatched job');
 
   const posted = daemon.requests.filter((r) => r.method === 'POST' && r.url === '/jobs');
   assert.equal(posted.length, 1);
   const order = JSON.parse(posted[0].body).workOrder;
-  assert.equal(order.target, 'look into the stall backstop', 'the flags are not part of the target');
+  assert.equal(order.target, 'look into the stall backstop', 'the flag is not part of the target');
   assert.equal(order.finish, 'pushed', '--finish reached the order');
-  assert.equal(order.authority.publish, true, '--publish reached the order');
+  assert.equal(order.authority.publish, false, 'prose has no publish default and no flag to change it (#208)');
   assert.equal(await cockpit.quit(), 0);
 });
 

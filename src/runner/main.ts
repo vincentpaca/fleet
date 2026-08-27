@@ -75,6 +75,39 @@ async function dropOrAbort(sink: EventSink, workspace: string): Promise<void> {
   }
 }
 
+/**
+ * Grade a delivered branch against reality: an open PR on it is `pr-open`,
+ * anything else is `pushed`. Shared by the continuation path (#80), where the
+ * adopted branch's PR is detected and never created, and the no-publish path
+ * (#208), where delivery is prompt-owned and an agent-opened PR is what the
+ * settle reports. `missing` is emitted only when the caller expected a PR — a
+ * continuation without one is worth a note, a prose dispatch without one is
+ * the default. A lookup failure degrades to `pushed`, never to a claim.
+ */
+async function gradeBranchPr(opts: {
+  workspace: string;
+  branch: string;
+  sink: EventSink;
+  found: (url: string) => string;
+  missing?: string;
+}): Promise<{ rung: 'pr-open' | 'pushed'; prUrl?: string }> {
+  try {
+    const existingPr = findOpenPr(opts.workspace, opts.branch);
+    if (existingPr !== undefined) {
+      await opts.sink.emit({ type: 'log', text: opts.found(existingPr.url), who: 'runner' });
+      return { rung: 'pr-open', prUrl: existingPr.url };
+    }
+    if (opts.missing !== undefined) {
+      await opts.sink.emit({ type: 'log', text: opts.missing, who: 'runner' });
+    }
+    return { rung: 'pushed' };
+  } catch (err) {
+    const msg = String(err instanceof Error ? err.message : err).split('\n')[0];
+    await opts.sink.emit({ type: 'log', text: `PR lookup failed (proceeding as pushed): ${msg}`, who: 'runner' });
+    return { rung: 'pushed' };
+  }
+}
+
 async function main(): Promise<void> {
   const jobId = requireEnv('FLEET_JOB_ID');
   const daemonUrl = requireEnv('FLEET_DAEMON_URL');
@@ -998,21 +1031,13 @@ async function main(): Promise<void> {
       // Continuation (#80): never create a PR — the adopted branch already has
       // one, and the work just pushed updated it in place. Detect it and report
       // it as this settle's PR; a PR that has since closed degrades to 'pushed'.
-      try {
-        const existingPr = findOpenPr(workspace, branch);
-        if (existingPr !== undefined) {
-          prUrl = existingPr.url;
-          settleRung = 'pr-open';
-          await sink.emit({ type: 'log', text: `continued PR updated: ${prUrl} (head ${getHeadSha(workspace)})`, who: 'runner' });
-        } else {
-          settleRung = 'pushed';
-          await sink.emit({ type: 'log', text: `no open PR found for ${branch} (was #${continues.pr}); work pushed, no PR claimed`, who: 'runner' });
-        }
-      } catch (err) {
-        const msg = String(err instanceof Error ? err.message : err).split('\n')[0];
-        settleRung = 'pushed';
-        await sink.emit({ type: 'log', text: `PR lookup failed (proceeding as pushed): ${msg}`, who: 'runner' });
-      }
+      const graded = await gradeBranchPr({
+        workspace, branch, sink,
+        found: (url) => `continued PR updated: ${url} (head ${getHeadSha(workspace)})`,
+        missing: `no open PR found for ${branch} (was #${continues.pr}); work pushed, no PR claimed`,
+      });
+      prUrl = graded.prUrl;
+      settleRung = graded.rung;
     } else if (gitUrl && branch && base && authorityPublish) {
       try {
         // Compose per the delivery standard: report sections, never raw JSON.
@@ -1033,8 +1058,18 @@ async function main(): Promise<void> {
       }
     } else if (gitUrl && branch) {
       // Git is set up but authority.publish not granted — branch was pushed at
-      // creation and again at pushWork; the runner reached at least 'pushed'.
-      settleRung = 'pushed';
+      // creation and again at pushWork, so at least 'pushed'. Delivery on this
+      // path is prompt-owned (#208, docs/decisions.md#d17): the sandbox has gh
+      // and can open a PR when the prompt asks for one, so the settle grades
+      // what actually happened — an agent-opened PR on the job branch settles
+      // at 'pr-open' (exceeding a prose target, which D6 blesses); none found
+      // stays the honest 'pushed'. Status never lies in either direction.
+      const graded = await gradeBranchPr({
+        workspace, branch, sink,
+        found: (url) => `agent-opened PR detected: ${url} (head ${getHeadSha(workspace)})`,
+      });
+      prUrl = graded.prUrl;
+      settleRung = graded.rung;
     } else {
       settleRung = 'implemented';
     }

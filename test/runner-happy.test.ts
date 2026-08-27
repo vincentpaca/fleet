@@ -314,20 +314,58 @@ test('harness nonzero exit → settle partial + state cancelled reason harness-e
   }
 });
 
-// --- The publish bit is the whole difference between the two shapes (#36) ---
+// --- Prose delivery is prompt-owned; the runner grades reality (#36, #208) ---
 
-/** Stage an order for the same prose target, differing only in authority.publish. */
-function stageProseOrder(workspace: string, publish: boolean): void {
+/** Stage a prose order: no publish authority, no mode — the shape's own row. */
+function stageProseOrder(workspace: string): void {
   writeFileSync(
     join(workspace, '.fleet', 'order.json'),
     JSON.stringify({
       // No mode field: a prose target is the shape, and `publish` is the only
       // authority bit anything reads.
       target: 'why do queued jobs sit behind the capacity cap',
-      finish: publish ? 'pr-open' : 'inspected',
-      authority: { publish, merge: false, deploy: false },
+      finish: 'inspected',
+      authority: { publish: false, merge: false, deploy: false },
     }),
   );
+}
+
+/** Stage an issue-shaped delivery order: publish granted, merge-ready target. */
+function stageIssueOrder(workspace: string): void {
+  writeFileSync(
+    join(workspace, '.fleet', 'order.json'),
+    JSON.stringify({
+      target: '61',
+      finish: 'merge-ready',
+      authority: { publish: true, merge: false, deploy: false },
+    }),
+  );
+}
+
+/**
+ * A stateful fake `gh` for PATH: `pr create` records that a PR now exists and
+ * prints its URL (what the agent's own call sees); `pr list --head <branch>`
+ * answers with that PR when one was created, `[]` otherwise (what the runner's
+ * findOpenPr grading reads at settle). One binary drives both sides so the
+ * test exercises the real settle path, not a canned lookup.
+ */
+function fakeGhPrBin(prUrl: string): { bin: string; calls: () => string[] } {
+  const bin = mkdtempSync(join(tmpdir(), 'fleet-happy-gh-'));
+  const log = join(bin, 'gh-calls.log');
+  const marker = join(bin, 'pr-created');
+  writeFileSync(
+    join(bin, 'gh'),
+    `#!/bin/sh
+echo "$@" >> "${log}"
+case "$1 $2" in
+  "pr create") touch "${marker}"; echo "${prUrl}";;
+  "pr list") if [ -f "${marker}" ]; then echo '[{"url":"${prUrl}","number":99}]'; else echo '[]'; fi;;
+  *) echo '[]';;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return { bin, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []) };
 }
 
 /** A bare remote with a `main` to branch from. */
@@ -347,26 +385,29 @@ function makeFreshRemote(): string {
   return remote;
 }
 
-/** Run one prose dispatch to settle and report what the runner did about a PR. */
-async function proseRun(publish: boolean, jobId: string, token: string): Promise<{
-  rung: unknown; ghCalls: string[]; logs: string[];
-}> {
-  const daemon = await startMockDaemon({ token });
+/** Run one staged order to settle and report what the runner did about a PR. */
+async function settleRun(opts: {
+  jobId: string;
+  token: string;
+  stageOrder: (workspace: string) => void;
+  harnessCmd: string;
+}): Promise<{ rung: unknown; report: Record<string, unknown>; ghCalls: string[]; logs: string[] }> {
+  const daemon = await startMockDaemon({ token: opts.token });
   const remote = makeFreshRemote();
   const workspace = writeWorkspace(`node -e "process.exit(0)"`);
-  stageProseOrder(workspace, publish);
-  const gh = fakeGhBin('https://github.com/acme/example-app/pull/99');
+  opts.stageOrder(workspace);
+  const gh = fakeGhPrBin('https://github.com/acme/example-app/pull/99');
   try {
     const exitCode = await runRunner({
-      FLEET_JOB_ID: jobId,
+      FLEET_JOB_ID: opts.jobId,
       FLEET_DAEMON_URL: daemon.url,
-      FLEET_RUNNER_TOKEN: token,
+      FLEET_RUNNER_TOKEN: opts.token,
       FLEET_WORKSPACE: workspace,
       FLEET_GIT_URL: remote,
       FLEET_GIT_NAME: 'Operator One',
       FLEET_GIT_EMAIL: 'op@example.com',
       PATH: `${gh.bin}:${process.env.PATH ?? ''}`,
-      FLEET_HARNESS_CMD: `node -e "require('node:fs').writeFileSync('notes.md','findings\\n')"`,
+      FLEET_HARNESS_CMD: opts.harnessCmd,
     });
     assert.equal(exitCode, 0);
     assert.deepEqual(daemon.rejected, []);
@@ -374,6 +415,7 @@ async function proseRun(publish: boolean, jobId: string, token: string): Promise
     assert.ok(settle, 'settle event posted');
     return {
       rung: settle.rung,
+      report: (settle.report ?? {}) as Record<string, unknown>,
       ghCalls: gh.calls(),
       logs: daemon.events.filter((e) => e.type === 'log').map((e) => String(e.text)),
     };
@@ -383,28 +425,70 @@ async function proseRun(publish: boolean, jobId: string, token: string): Promise
   }
 }
 
-test('a prose dispatch opens no PR; the same dispatch with publish granted opens a draft PR', async () => {
-  // The #36 acceptance bullet, and the branch that barely ran before it: every
-  // preset except the four read-only ones granted publish, so `publish: false`
-  // with a real git remote was close to untested. Now it is the DEFAULT for any
-  // non-numeric target, so the no-PR path carries the product's promise that an
-  // open-ended prompt cannot quietly become a pull request.
-  const withoutPublish = await proseRun(false, 'job-prose-nopub', 'test-token-prose-1');
+/** Writes a work commit, so the settle has a delivery to grade. */
+const WRITE_NOTES_CMD = `node -e "require('node:fs').writeFileSync('notes.md','findings\\n')"`;
+
+test('prose whose agent opens nothing settles at pushed with no runner-composed PR', async () => {
+  // Half of #208's grading promise, and the product promise it carries over
+  // from #36: an open-ended prompt cannot quietly become a pull request — the
+  // runner composes no PR for a prose dispatch, and the settle claims none.
+  const run = await settleRun({
+    jobId: 'job-prose-nopub',
+    token: 'test-token-prose-1',
+    stageOrder: stageProseOrder,
+    harnessCmd: WRITE_NOTES_CMD,
+  });
   assert.ok(
-    !withoutPublish.ghCalls.some((c) => c.startsWith('pr create')),
-    `no PR may be created without publish authority, saw: ${withoutPublish.ghCalls.join(' | ')}`,
+    !run.ghCalls.some((c) => c.startsWith('pr create')),
+    `no PR may be created without publish authority, saw: ${run.ghCalls.join(' | ')}`,
   );
-  assert.ok(!withoutPublish.logs.some((t) => t.includes('draft PR opened')), 'and it must not claim one');
+  assert.ok(!run.logs.some((t) => t.includes('draft PR opened')), 'and it must not claim one');
+  assert.equal(run.report.pr, undefined, 'no PR in the settle report');
   // The branch is still pushed — evidence has to survive the container — so the
   // rung reached is `pushed`, not `inspected`. That is exactly why a repo's
   // default_finish is skipped only for rungs above this one (D17).
-  assert.equal(withoutPublish.rung, 'pushed');
+  assert.equal(run.rung, 'pushed');
+});
 
-  const withPublish = await proseRun(true, 'job-prose-pub', 'test-token-prose-2');
-  assert.ok(
-    withPublish.ghCalls.some((c) => c.startsWith('pr create')),
-    `--publish must reach pr create, saw: ${withPublish.ghCalls.join(' | ')}`,
+test('prose whose agent opened a PR itself settles at pr-open (#208)', async () => {
+  // The other half: delivery is prompt-owned, so when the prompt asked for a
+  // PR and the agent ran `gh pr create` on the job branch, the settle grades
+  // reality — pr-open, exceeding the prose `inspected` target (D6 blesses
+  // exceeding). The bug this catches: the runner keying the rung on the
+  // publish bit instead of on what actually happened, which would report an
+  // existing, reviewable PR as mere `pushed` and hide it from the board.
+  const run = await settleRun({
+    jobId: 'job-prose-agentpr',
+    token: 'test-token-prose-2',
+    stageOrder: stageProseOrder,
+    harnessCmd:
+      `node -e "require('node:fs').writeFileSync('notes.md','findings\\n');` +
+      `require('node:child_process').execFileSync('gh',['pr','create','--draft','--title','t','--body','b'])"`,
+  });
+  assert.equal(run.rung, 'pr-open');
+  assert.equal(run.report.pr, 'https://github.com/acme/example-app/pull/99', 'the agent-opened PR is the settle PR');
+  assert.ok(run.logs.some((t) => t.includes('agent-opened PR detected')), 'the settle says how the PR got there');
+  assert.equal(
+    run.ghCalls.filter((c) => c.startsWith('pr create')).length,
+    1,
+    `only the agent's own pr create may run — the runner never composes a prose PR, saw: ${run.ghCalls.join(' | ')}`,
   );
-  assert.equal(withPublish.rung, 'pr-open');
-  assert.ok(withPublish.logs.some((t) => t.includes('draft PR opened')), 'and the PR is reported');
+});
+
+test('an issue dispatch still ends in a runner-composed draft PR', async () => {
+  // #208 removes only the prose-side flag: publish stays the issue/adoption
+  // contract, and the runner composing the draft PR from the settle report is
+  // Fleet's return-path job, not a stylistic choice.
+  const run = await settleRun({
+    jobId: 'job-issue-pub',
+    token: 'test-token-issue-1',
+    stageOrder: stageIssueOrder,
+    harnessCmd: WRITE_NOTES_CMD,
+  });
+  assert.ok(
+    run.ghCalls.some((c) => c.startsWith('pr create')),
+    `authority.publish must reach pr create, saw: ${run.ghCalls.join(' | ')}`,
+  );
+  assert.equal(run.rung, 'pr-open');
+  assert.ok(run.logs.some((t) => t.includes('draft PR opened')), 'and the PR is reported');
 });
