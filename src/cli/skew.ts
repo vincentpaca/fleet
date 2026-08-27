@@ -53,7 +53,12 @@ export function appliedUnitPins(cwd: string): UnitPin[] {
     if (!fs.statSync(path.join(infraDir, provider), { throwIfNoEntry: false })?.isDirectory()) continue;
     const source = moduleSourceIn(path.join(infraDir, provider, 'main.tf'));
     if (source === undefined) continue;
-    pins.push({ provider, source, ref: pinnedSource(source)?.ref });
+    // pinnedSource deliberately matches only clonable https git sources (its
+    // other consumer, the CodeBuild image project, must refuse local paths).
+    // Skew has no such constraint: any ?ref= names the commit the operator
+    // applied — a git::file:// dogfood pin compares exactly like a github one.
+    const ref = pinnedSource(source)?.ref ?? source.match(/[?&]ref=([0-9a-f]{7,40})(?:&|$)/)?.[1];
+    pins.push({ provider, source, ref });
   }
   return pins;
 }
