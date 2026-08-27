@@ -31,6 +31,7 @@ import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, parseVersion } from './harness.ts';
+import { authFailureFrom, authFailureIn } from './auth-failure.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { runSetupScript, dropPrivileges } from './setup.ts';
 import { parseDurationMs, idleLimitMs, blockHotLimitMs, checkpointLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
@@ -465,6 +466,11 @@ async function main(): Promise<void> {
     }
     return raw.slice(0, MAX_LINE_CHARS) + LINE_TRUNCATION_MARKER;
   };
+  // Auth-failure evidence (#205): the first harness-authored line naming a
+  // dead credential, kept so a nonzero exit can park behind a decision
+  // instead of riding out as cancelled(harness-exit). Detection alone never
+  // acts — see the exit race below.
+  let authEvidence: string | undefined;
   lines.on('line', (rawLine) => {
     // Any output line is proof of life, translatable or not: the stall clock
     // measures silence on the harness's own stream, not event throughput.
@@ -475,6 +481,7 @@ async function main(): Promise<void> {
       captureStream.write(line + '\n');
     }
     const translated = translateLine(line);
+    authEvidence ??= authFailureFrom(translated);
     // A dropped line is proof of life but not an event: the keepalive timer
     // owns the "harness working" line now (#197), one per window whether the
     // dropped lines arrive in a flood (#50) or stop arriving entirely.
@@ -851,6 +858,27 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // Auth-failure park (#205): a harness that died complaining about its
+  // credential is not a mystery exit. Instead of cancelled(harness-exit),
+  // raise a decision and park — the operator answers it like any other, and
+  // the daemon's existing re-entry machinery relaunches the job. Only a
+  // nonzero exit paired with harness-authored evidence takes this path.
+  if (result.kind === 'exit' && result.code !== 0) {
+    const evidence = authEvidence ?? authFailureIn(stderrTail.join(''));
+    if (evidence !== undefined) {
+      await parkOnAuthFailure({
+        sink,
+        watcher,
+        workspace,
+        evidence,
+        branch: gitUrl ? branch : undefined,
+        pushTimeoutMs: GIT_TIMEOUT_MS,
+        drainOutput,
+        endCapture,
+      });
+    }
+  }
+
   if (result.kind === 'wall-clock' || result.kind === 'stall') {
     // The idle duration is the diagnosis, so it rides both the live log line
     // and the settle report — the transcript must say why the job died.
@@ -1069,6 +1097,82 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'state', state: 'cancelled', reason });
     process.exit(1);
   }
+}
+
+/**
+ * Park a job whose harness exited complaining about its credential (#205).
+ * Same teardown steps as the block_hot park, minus the kill (the harness is
+ * already gone): drain, push WIP, raise the decision, emit blocked/parked,
+ * exit 0. Never returns.
+ *
+ * The decision is honest about the one thing re-entry cannot do: the daemon
+ * relaunches with the env captured at dispatch, so a token refreshed on the
+ * operator's machine does NOT reach this job — Fleet never runs OAuth flows
+ * or refreshes vendor tokens (that boundary moves only via the credential
+ * broker, #10). Retry therefore helps only when the failure was transient or
+ * fixed server-side; a genuinely dead credential means cancel + re-dispatch.
+ */
+async function parkOnAuthFailure(opts: {
+  sink: EventSink;
+  watcher: DecisionWatcher;
+  workspace: string;
+  evidence: string;
+  branch: string | undefined;
+  pushTimeoutMs: number;
+  drainOutput: () => Promise<void>;
+  endCapture: () => Promise<void>;
+}): Promise<never> {
+  const { sink, watcher, branch } = opts;
+  await opts.drainOutput();
+  await sink.flush();
+  await opts.endCapture();
+  await watcher.stop();
+  await sink.emit({ type: 'log', text: `harness auth failure recognized: ${opts.evidence}`, who: 'runner' });
+
+  if (branch !== undefined) {
+    try {
+      const wipOutcome = pushWip(opts.workspace, 'auth failure: parked', opts.pushTimeoutMs);
+      await sink.emit({
+        type: 'log',
+        text: wipOutcome === 'pushed'
+          ? `wip pushed to ${branch} (parked on auth failure)`
+          : `workspace clean at park; no new commit beyond ${branch}`,
+        who: 'runner',
+      });
+    } catch (err) {
+      await sink.emit({
+        type: 'log',
+        text: `wip push failed (parking anyway): ${String(err instanceof Error ? err.message : err).split('\n')[0]}`,
+        who: 'runner',
+      });
+    }
+  }
+
+  await watcher.raise(authParkDecision(opts.evidence));
+  await sink.emit({ type: 'state', state: 'blocked', marker: 'parked' });
+  process.exit(0);
+}
+
+/** The auth-failure park's decision content (#205), decision-file shaped. */
+function authParkDecision(evidence: string): Parameters<DecisionWatcher['raise']>[0] {
+  return {
+    question: 'Harness authentication failed — the credential this job was dispatched with is expired or invalid.',
+    options: [
+      {
+        id: 'retry',
+        label: 'Retry with the stored credential',
+        detail: 'Relaunches with the credential captured at dispatch. Helps when the failure was transient or fixed server-side; a token refreshed on your machine does not reach this job.',
+        recommended: true,
+      },
+      {
+        id: 'abort',
+        label: 'Refresh locally and re-dispatch instead',
+        detail: 'Refresh on your machine (claude setup-token, then fleet setup repo), cancel this job (fleet cancel), reclaim its branch if needed (fleet reclaim), and dispatch fresh. Note: any answer relaunches once; a still-dead credential parks again.',
+      },
+    ],
+    note: `harness reported: ${evidence} — Fleet never refreshes vendor tokens (#10); refresh happens on your machine.`,
+    who: 'runner',
+  };
 }
 
 /** FLEET_RETRY_ATTEMPT as a number, when it names a real retry (#30). */

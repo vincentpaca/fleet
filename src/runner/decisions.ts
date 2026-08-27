@@ -91,6 +91,32 @@ export class DecisionWatcher {
     });
   }
 
+  /**
+   * A decision the RUNNER itself raises (auth-failure park, #205). Same id
+   * sequence as harness-raised decisions — the daemon's answer machinery and
+   * the re-entry seed (#110) key on the ordinals, so a second numbering
+   * convention here would collide with them. No answer poll: the one caller
+   * parks the job immediately after, and the operator's answer arrives via
+   * the daemon's ordinary re-entry relaunch.
+   */
+  async raise(file: {
+    question: string;
+    options: Array<{ id: string; label: string; detail?: string; recommended?: boolean }>;
+    note?: string;
+    who?: string;
+  }): Promise<string> {
+    const id = `d${++this.count}`;
+    await this.sink.emit({
+      type: 'decision',
+      id,
+      question: file.question,
+      options: file.options,
+      ...(file.who !== undefined ? { who: file.who } : {}),
+      ...(file.note !== undefined ? { note: file.note } : {}),
+    });
+    return id;
+  }
+
   /** Stop watching; resolves when the loop has fully wound down.
    *
    *  Aborts any in-flight long-poll fetch so the loop winds down promptly
