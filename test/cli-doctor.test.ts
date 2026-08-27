@@ -170,6 +170,39 @@ test('doctor: reports harness CLI not found when cli_version is set but binary i
   assert.match(lines[0], /claude/);
 });
 
+test('doctor: a missing auth credential names the acquisition path, never a bare var (#205)', async () => {
+  const manifest = { ...BASE_MANIFEST, env: { vars: ['CLAUDE_CODE_OAUTH_TOKEN'] } };
+  const cwd = setupDir(manifest, 'process.exit(0);\n');
+  const res = await runDoctor(['doctor'], { cwd, env: { CLAUDE_CODE_OAUTH_TOKEN: undefined } });
+  assert.equal(res.code, 1, res.stderr);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `expected exactly one finding, got:\n${res.stderr}`);
+  assert.match(lines[0], /unset env var: CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.match(lines[0], /claude setup-token/, 'the finding teaches the recovery command');
+  assert.match(lines[0], /fleet setup repo/, 'and the Fleet side of it');
+});
+
+test('doctor: a missing ANTHROPIC_API_KEY names the seat alternative too (#205)', async () => {
+  const manifest = { ...BASE_MANIFEST, env: { vars: ['ANTHROPIC_API_KEY'] } };
+  const cwd = setupDir(manifest, 'process.exit(0);\n');
+  const res = await runDoctor(['doctor'], { cwd, env: { ANTHROPIC_API_KEY: undefined } });
+  assert.equal(res.code, 1, res.stderr);
+  assert.match(res.stderr, /unset env var: ANTHROPIC_API_KEY/);
+  assert.match(res.stderr, /claude setup-token/, 'a seat user learns their path, not just "set the key"');
+});
+
+test('doctor: a present auth credential is an honest presence-only note, and doctor stays clean (#205)', async () => {
+  const manifest = { ...BASE_MANIFEST, env: { vars: ['CLAUDE_CODE_OAUTH_TOKEN'] } };
+  const cwd = setupDir(manifest, 'process.exit(0);\n');
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-here\n');
+  const res = await runDoctor(['doctor'], { cwd, env: { CLAUDE_CODE_OAUTH_TOKEN: undefined } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /auth: CLAUDE_CODE_OAUTH_TOKEN present in \.fleet\/\.env/);
+  assert.match(res.stdout, /presence only/, 'doctor never claims liveness it cannot inspect');
+  assert.match(res.stdout, /doctor: clean/);
+  assert.equal(res.stderr.trim(), '', 'presence is a note, not a finding');
+});
+
 test('doctor: var in .fleet/.env satisfies the env check (no finding)', async () => {
   const manifest = { ...BASE_MANIFEST, env: { vars: ['FLEET_TEST_DOTENV_VAR_XYZ'] } };
   const cwd = setupDir(manifest, 'process.exit(0);\n');

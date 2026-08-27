@@ -36,9 +36,11 @@ import {
   harnessPrompts,
   flagName,
   writeScaffold,
+  authVarHint,
   SetupError,
   SETUP_STUB,
 } from './setup.ts';
+import { loadDotEnv } from '../shared/dotenv.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -82,6 +84,13 @@ Commands:
                                            exits 1 naming it — it never waits for input.
   setup repo [--yes] [...]                 Write .fleet/manifest.json by interview, with defaults
                                            extracted from this checkout. Same flag-override rules.
+                                           On a machine with a Claude seat login and no API
+                                           credential, walks acquiring one: run \`claude
+                                           setup-token\`, paste the result, and the wizard writes
+                                           .fleet/.env (0600) and the manifest env var itself
+                                           (--claude-oauth-token headless). A Codex login
+                                           (auth.json) can be shipped via workspace.sync
+                                           (--codex-auth yes|no).
   setup harness [--harness ids] [--scope user|project] [--force]
                                            Install the fleet skill where your coding harness
                                            discovers it, so a session can delegate, hold the watch,
@@ -143,9 +152,11 @@ Commands:
                                            /health, and reopen on session death (re-resolving the
                                            daemon task, which changes on every service deployment).
                                            Foreground by default; --detach supervises in background.
-  doctor [--manifest path]                 Check local environment against the manifest, report
-                                           tunnel state, and list workspaces retained after a
-                                           failed push
+  doctor [--manifest path]                 Check local environment against the manifest — including
+                                           auth credential health: a missing one names its recovery
+                                           command, a present one is verified for presence (token
+                                           expiry is not locally inspectable) — report tunnel
+                                           state, and list workspaces retained after a failed push
   version                                  Print version and exit
 
 Flags:
@@ -367,6 +378,7 @@ async function cmdSetupRepo(args: string[]): Promise<number> {
     return await runSetupRepo({
       cwd: process.cwd(),
       env: process.env as Record<string, string | undefined>,
+      home: os.homedir(),
       flags: suppliedFlags(prompts, values),
       yes: values.yes === true,
       interactive: promptable(),
@@ -460,36 +472,9 @@ type Manifest = {
 };
 
 // ---------- .fleet/.env ----------
-
-/**
- * Parse a .fleet/.env file: KEY=VALUE per line.
- * Rules: # starts a comment; blank lines ignored; everything after the first
- * '=' is the value (trimmed); no interpolation; no quoting beyond trim.
- * Empty values (KEY=) are accepted — they satisfy the "var is set" check.
- */
-function parseDotEnv(content: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq < 1) continue; // no key before '='
-    const key = trimmed.slice(0, eq).trim();
-    const value = trimmed.slice(eq + 1).trim();
-    if (key) result[key] = value;
-  }
-  return result;
-}
-
-/** Load .fleet/.env from the given .fleet directory. Returns {} when the file is absent (ENOENT). */
-function loadDotEnv(fleetDir: string): Record<string, string> {
-  try {
-    return parseDotEnv(fs.readFileSync(path.join(fleetDir, '.env'), 'utf8'));
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    throw err;
-  }
-}
+// Parsing/loading lives in src/shared/dotenv.ts: `fleet setup repo`'s
+// credential walk (#205) writes the same file, and two readers with two rule
+// sets is the drift AGENTS.md names a defect.
 
 /**
  * A `presets/modes.json` entry, as far as the deprecated `--mode` flag reads it:
@@ -743,7 +728,16 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   const env: Record<string, string> = {};
   for (const name of manifest.env?.vars ?? []) {
     const value = process.env[name] ?? dotEnv[name];
-    if (value === undefined) fail(`missing env var: ${name} (not in environment or .fleet/.env)`);
+    if (value === undefined) {
+      // A missing auth credential gets its acquisition story (#205): a seat
+      // user has never owned an API key, and a bare variable name teaches
+      // them nothing. Every other var keeps the plain refusal.
+      const hint = authVarHint(name);
+      fail(
+        `missing env var: ${name} (not in environment or .fleet/.env)` +
+          (hint ? `\n  this is the harness credential — ${hint}` : ''),
+      );
+    }
     env[name] = value;
   }
 
@@ -1562,11 +1556,20 @@ async function cmdDoctor(args: string[]): Promise<number> {
     }
   }
 
-  // 3. Env vars — process env first, then .fleet/.env fallback
+  // 3. Env vars — process env first, then .fleet/.env fallback. Auth
+  //    credentials get the acquisition story both ways (#205): absent names
+  //    the recovery command; present is a note that says presence is all
+  //    doctor can verify — the token formats are opaque, so an expiry check
+  //    would be a liveness ping that spends the credential, and doctor never
+  //    spends without asking.
   const dotEnv = loadDotEnv(path.join('.fleet'));
   for (const name of manifest.env?.vars ?? []) {
+    const hint = authVarHint(name);
     if (process.env[name] === undefined && dotEnv[name] === undefined) {
-      findings.push(`unset env var: ${name}`);
+      findings.push(hint === undefined ? `unset env var: ${name}` : `unset env var: ${name} — ${hint}`);
+    } else if (hint !== undefined) {
+      const where = process.env[name] !== undefined ? 'environment' : '.fleet/.env';
+      console.log(`auth: ${name} present in ${where} (presence only — expiry is not locally inspectable; if jobs fail auth, ${hint})`);
     }
   }
 

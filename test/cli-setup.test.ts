@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { validateManifest } from '../src/validate.mjs';
-import { runCli, makeTempDir, fakeCloudBin } from './cli-helpers.ts';
+import { runCli, makeTempDir, fakeCloudBin, startMockDaemon, sendJson } from './cli-helpers.ts';
 import {
   interview,
   renderMainTf,
@@ -875,6 +875,146 @@ test('setup repo: a manifest that is not JSON at all is not silently replaced ei
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /is not valid JSON/);
   assert.equal(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'), '{ "version": 1, }\n');
+});
+
+// ---------- setup repo: subscription-seat auth (#205) ----------
+
+/** A scratch repo with no .env.example: the manifest's env.vars start empty. */
+function seatScratch(): string {
+  const cwd = makeTempDir('fleet-seat-repo-');
+  fs.mkdirSync(path.join(cwd, '.claude', 'commands'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.claude', 'commands', 'dev.md'), '# dev\n');
+  return cwd;
+}
+
+test('setup repo: a seat login and no credential walks the acquisition — one paste writes .fleet/.env and the manifest', async () => {
+  const cwd = scratchRepo();
+  const claudeDir = makeTempDir('fleet-claude-login-'); // the probe is presence of the CLI's config surface
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: {
+      FLEET_FORCE_TTY: '1',
+      CLAUDE_CONFIG_DIR: claudeDir,
+      ANTHROPIC_API_KEY: undefined,
+      CLAUDE_CODE_OAUTH_TOKEN: undefined,
+    },
+    // The eight repo prompts, then the one paste.
+    stdin: `${'\n'.repeat(8)}sk-ant-oat01-pasted\n`,
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /claude setup-token/, 'the walk teaches the vendor command');
+
+  const envPath = path.join(cwd, '.fleet', '.env');
+  assert.match(fs.readFileSync(envPath, 'utf8'), /^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-pasted$/m);
+  assert.equal(fs.statSync(envPath).mode & 0o777, 0o600, 'the credential file is 0600');
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  assert.ok(gitignore.split('\n').includes('.env'), '.fleet/.gitignore covers .env');
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(
+    manifest.env.vars,
+    ['API_TOKEN', 'DB_URL', 'CLAUDE_CODE_OAUTH_TOKEN'],
+    'the interview declares the var itself — the user never learns a variable name',
+  );
+});
+
+test('setup repo headless: --claude-oauth-token writes the credential, and a subsequent delegate dispatches with it', async (t) => {
+  const cwd = seatScratch();
+  const setup = await runCli(
+    ['setup', 'repo', '--repo', 'git@github.com:acme/example-app.git', '--claude-oauth-token', 'sk-ant-oat01-headless'],
+    { cwd, env: { ANTHROPIC_API_KEY: undefined, CLAUDE_CODE_OAUTH_TOKEN: undefined } },
+  );
+  assert.equal(setup.code, 0, setup.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.env.vars, ['CLAUDE_CODE_OAUTH_TOKEN']);
+
+  // The whole point: the very next dispatch works, with the token riding in
+  // from .fleet/.env rather than the shell.
+  const daemon = await startMockDaemon({
+    'POST /jobs': (_req, res) => sendJson(res, 201, { job: { id: 'job-seat', state: 'queued' } }),
+  });
+  t.after(daemon.close);
+  const dispatched = await runCli(['delegate', 'assess the release notes'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, CLAUDE_CODE_OAUTH_TOKEN: undefined },
+  });
+  assert.equal(dispatched.code, 0, dispatched.stderr);
+  const body = JSON.parse(daemon.requests[0].body);
+  assert.equal(body.env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-headless', 'the pasted token ships with the job');
+});
+
+test('setup repo: the token flag replaces a stale value in .fleet/.env and leaves the rest alone', async () => {
+  const cwd = seatScratch();
+  fs.mkdirSync(path.join(cwd, '.fleet'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.fleet', '.env'), 'OTHER_SETTING=kept\nCLAUDE_CODE_OAUTH_TOKEN=stale\n');
+  const res = await runCli(
+    ['setup', 'repo', '--repo', 'origin', '--claude-oauth-token', 'sk-ant-oat01-fresh', '--yes'],
+    { cwd, env: { ANTHROPIC_API_KEY: undefined, CLAUDE_CODE_OAUTH_TOKEN: undefined } },
+  );
+  assert.equal(res.code, 0, res.stderr);
+  const dotEnv = fs.readFileSync(path.join(cwd, '.fleet', '.env'), 'utf8');
+  assert.equal(dotEnv, 'OTHER_SETTING=kept\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-fresh\n');
+  assert.equal(fs.statSync(path.join(cwd, '.fleet', '.env')).mode & 0o777, 0o600, 'an existing .env is tightened');
+});
+
+test('setup repo: a credential already in the environment means no walk — the interview stays eight questions', async () => {
+  const cwd = scratchRepo();
+  const claudeDir = makeTempDir('fleet-claude-login-');
+  // Exactly eight Enters: a ninth prompt would fail on ended stdin.
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1', CLAUDE_CONFIG_DIR: claudeDir, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: '\n'.repeat(8),
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', '.env')), 'nothing to acquire, nothing written');
+});
+
+test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored on yes', async () => {
+  const cwd = seatScratch();
+  const codexHome = makeTempDir('fleet-codex-home-');
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":"codex-login"}\n');
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: `${'\n'.repeat(8)}yes\n`,
+  });
+  assert.equal(res.code, 0, res.stderr);
+
+  const copy = path.join(cwd, '.fleet', 'codex-auth.json');
+  assert.equal(fs.readFileSync(copy, 'utf8'), '{"tokens":"codex-login"}\n');
+  assert.equal(fs.statSync(copy).mode & 0o777, 0o600);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.workspace.sync, ['.fleet/codex-auth.json'], 'the copy rides workspace.sync');
+  const gitignore = fs.readFileSync(path.join(cwd, '.fleet', '.gitignore'), 'utf8');
+  assert.ok(gitignore.split('\n').includes('codex-auth.json'), 'the copy never enters the repo');
+});
+
+test('setup repo: declining the Codex offer copies nothing and syncs nothing', async () => {
+  const cwd = seatScratch();
+  const codexHome = makeTempDir('fleet-codex-home-');
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":"codex-login"}\n');
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    // Enter on the offer takes the default, which is no — protecting the account.
+    stdin: '\n'.repeat(9),
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'codex-auth.json')));
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.workspace.sync, undefined);
+});
+
+test('setup repo: --codex-auth yes with no Codex login here is a refusal, not a broken manifest', async () => {
+  const cwd = seatScratch();
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--codex-auth', 'yes'], {
+    cwd,
+    env: { ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /no Codex login/);
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'manifest.json')), 'nothing written');
 });
 
 // ---------- the unit contract ----------

@@ -55,6 +55,13 @@ export const EVENT_BATTERY = [
 
 export type CliResult = { code: number; stdout: string; stderr: string };
 
+/** A path that exists for nobody: the default "no harness login here" probe target. Lazy — helpers must have no top-level effects. */
+let noHarnessLogin: string | undefined;
+function noLoginPath(): string {
+  noHarnessLogin ??= path.join(makeTempDir('fleet-cli-no-login-'), 'absent');
+  return noHarnessLogin;
+}
+
 export function runCli(
   args: string[],
   opts: { cwd?: string; env?: Record<string, string | undefined>; stdin?: string } = {},
@@ -67,6 +74,12 @@ export function runCli(
     // the caller pins one — same structural isolation as the URL scrub above
     // and the cwd choice below, so no runCli call can ever touch ~/.fleet.
     FLEET_HOME: opts.env?.FLEET_HOME ?? makeTempDir('fleet-cli-home-'),
+    // The seat-auth probes (#205) read the harness CLIs' own config surfaces
+    // (~/.claude, ~/.codex) through these env overrides. Point them somewhere
+    // empty by default so what the suite sees never depends on whether the
+    // machine running it has a Claude or Codex login; a seat test overrides.
+    CLAUDE_CONFIG_DIR: noLoginPath(),
+    CODEX_HOME: noLoginPath(),
     ...opts.env,
   };
   const child = spawn(process.execPath, [CLI, ...args], {
