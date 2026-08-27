@@ -42,6 +42,7 @@ import {
 } from './setup.ts';
 import { loadDotEnv } from '../shared/dotenv.ts';
 import { appliedUnitPins, skewReport, type DaemonBuild } from './skew.ts';
+import { runUpgrade } from './upgrade.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -154,6 +155,14 @@ Commands:
                                            /health, and reopen on session death (re-resolving the
                                            daemon task, which changes on every service deployment).
                                            Foreground by default; --detach supervises in background.
+  upgrade [--yes] [--rebuild-images]       Converge the deployment to this CLI's commit: re-pin the
+                                           generated root module's ?ref= to the CLI's own git SHA,
+                                           init -upgrade, plan, apply on an explicit yes (--yes
+                                           headless), rebuild the images in your account at that
+                                           same ref, re-capture fleet-config.json, and report the
+                                           skew end state. Already converged says so and changes
+                                           nothing; a refused plan restores the ref and mutates
+                                           nothing. --rebuild-images re-runs the image build alone.
   doctor [--manifest path]                 Check local environment against the manifest — including
                                            auth credential health: a missing one names its recovery
                                            command, a present one is verified for presence (token
@@ -414,6 +423,71 @@ async function cmdSetupHarness(args: string[]): Promise<number> {
     if (err instanceof SetupError) fail(`fleet setup harness: ${err.message}`);
     throw err;
   }
+}
+
+// ---------- upgrade (#207) ----------
+
+/**
+ * `fleet upgrade --rebuild-images` is step 4 of the converge alone, and step 4
+ * already exists: it is `fleet setup infra --rebuild-images`, entered through
+ * the same function so the two can never drift. The unit comes from the
+ * deployment this directory describes, not from a flag.
+ */
+async function upgradeRebuildImages(yes: boolean): Promise<number> {
+  const provider = appliedUnitPins(process.cwd())[0]?.provider ?? SETUP_UNITS[0].provider;
+  const unit = unitFor(provider);
+  if (!unit) fail(`fleet upgrade: no unit for provider "${provider}" — this CLI cannot drive that deployment's image build`);
+  return await runSetupInfra({
+    cwd: process.cwd(),
+    env: process.env as Record<string, string | undefined>,
+    root: installRoot(),
+    version: fleetVersion(),
+    unit,
+    flags: {},
+    yes,
+    destroy: false,
+    rebuildImages: true,
+    backendConfig: [],
+    interactive: promptable(),
+    log: (line) => console.log(line),
+  });
+}
+
+/**
+ * `fleet upgrade` (#207): converge the deployment to this CLI's commit through
+ * the setup-infra machinery (src/cli/upgrade.ts), then finish with the same
+ * skew checks doctor runs — the end state is reported, never assumed. A
+ * remaining finding (typically the daemon image until the operator rolls the
+ * service, which no shipped code path may do — docs/decisions.md#d5) is
+ * printed, not an exit-1: the command's own work succeeded, and the finding
+ * names the operator's next act.
+ */
+async function cmdUpgrade(args: string[]): Promise<number> {
+  const { values } = parseCommand(
+    args,
+    { yes: { type: 'boolean' }, 'rebuild-images': { type: 'boolean' } },
+    0,
+    0,
+  );
+  try {
+    if (values['rebuild-images'] === true) return await upgradeRebuildImages(values.yes === true);
+    const code = await runUpgrade({
+      cwd: process.cwd(),
+      env: process.env as Record<string, string | undefined>,
+      root: installRoot(),
+      yes: values.yes === true,
+      interactive: promptable(),
+      log: (line) => console.log(line),
+    });
+    if (code !== EXIT_OK) return code;
+  } catch (err) {
+    if (err instanceof SetupError) fail(`fleet upgrade: ${err.message}`);
+    throw err;
+  }
+  const skew = await doctorSkew(process.cwd());
+  for (const note of skew.notes) console.log(note);
+  for (const finding of skew.findings) console.error(finding);
+  return EXIT_OK;
 }
 
 // ---------- lint ----------
@@ -2172,6 +2246,8 @@ async function main(argv: string[]): Promise<number> {
         return await cmdArtifacts(rest);
       case 'connect':
         return await cmdConnect(rest);
+      case 'upgrade':
+        return await cmdUpgrade(rest);
       case 'doctor':
         return await cmdDoctor(rest);
       default:

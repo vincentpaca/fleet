@@ -12,8 +12,8 @@
 // Until #183 mints release versions that travel together, the honest
 // comparison is git SHAs — imperfect (a tag and the commit it names read
 // differently until git resolves them) but never wrong about a mismatch it
-// reports. `fleet upgrade` will own the fix once #183/#189 land; until then
-// doctor names the component, both SHAs, and the manual remedy.
+// reports. `fleet upgrade` (src/cli/upgrade.ts) owns the fix: doctor names the
+// component, both SHAs, and the command that converges them.
 import fs from 'node:fs';
 import path from 'node:path';
 import { pinnedSource } from './setup.ts';
@@ -85,8 +85,10 @@ export function shortSha(ref: string): string {
  * Do two identifiers name the same commit? Exact match, or one is a hex prefix
  * of the other (a short sha against a full one) — at least 7 characters, so a
  * ref like "v1" can never accidentally "match" a sha starting with v1's hex.
+ * Exported for ./upgrade.ts: "already converged" is the same judgement as
+ * "not skewed", made by the same function.
  */
-function sameCommit(a: string, b: string): boolean {
+export function sameCommit(a: string, b: string): boolean {
   if (a === b) return true;
   const [long, short] = a.length >= b.length ? [a, b] : [b, a];
   return short.length >= 7 && /^[0-9a-f]+$/.test(short) && long.startsWith(short);
@@ -145,7 +147,7 @@ function comparePin(
   const resolved = refSha !== undefined && refSha !== pin.ref ? ` (${shortSha(refSha)})` : '';
   out.findings.push(
     `deployment skew: ${pin.provider} unit is applied at ref ${shortSha(pin.ref)}${resolved}, this CLI is at ${shortSha(cliSha)}` +
-      ' — re-apply the unit at the current ref (fleet setup infra); fleet upgrade will own this once it exists (#207)',
+      " — run fleet upgrade to re-pin and re-apply it at this CLI's commit (#207)",
   );
 }
 
@@ -168,6 +170,6 @@ function compareDaemon(
   }
   out.findings.push(
     `deployment skew: daemon image was built at ${shortSha(daemon.sha)}, this CLI is at ${shortSha(cliSha)}` +
-      ' — rebuild and roll it (images/build.sh --redeploy-daemon); fleet upgrade will own this once it exists (#207)',
+      ' — rebuild it at the applied ref (fleet upgrade --rebuild-images, or images/build.sh --redeploy-daemon from a checkout) and roll the service (#207)',
   );
 }
