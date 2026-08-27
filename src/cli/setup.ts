@@ -21,8 +21,10 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createIfAbsent } from '../shared/fs.ts';
+import { loadDotEnv, upsertDotEnv } from '../shared/dotenv.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
@@ -957,14 +959,153 @@ type RepoManifest = {
   limits: { idle: string; block_hot: string; decision_timeout: string };
 };
 
+// ---------- subscription-seat auth (#205) ----------
+
+/** The credential a seat user ships: minted by `claude setup-token`. */
+const CLAUDE_OAUTH_VAR = 'CLAUDE_CODE_OAUTH_TOKEN';
+/** Where the copied Codex login lands, repo-relative, so sync can carry it. */
+const CODEX_SYNC_PATH = '.fleet/codex-auth.json';
+
+/**
+ * The acquisition story for a harness credential var, or undefined for every
+ * other var. Shared by doctor and the delegate refusal (#205): a seat user
+ * has never owned an API key, so a bare variable name teaches them nothing —
+ * wherever Fleet reports one of these missing, it names the recovery command.
+ */
+export function authVarHint(name: string): string | undefined {
+  if (name === CLAUDE_OAUTH_VAR) {
+    return 'mint a fresh one with `claude setup-token`, then rerun `fleet setup repo` (it writes the token into .fleet/.env), or paste it there yourself';
+  }
+  if (name === 'ANTHROPIC_API_KEY') {
+    return `set your API key — or, on a subscription seat, mint a token with \`claude setup-token\` and rerun \`fleet setup repo\` (it writes ${CLAUDE_OAUTH_VAR} into .fleet/.env)`;
+  }
+  return undefined;
+}
+
+type SeatAuth = {
+  /** Walk the claude token acquisition: a seat login is visible and no credential is. */
+  claudeWalk: boolean;
+  /** The codex CLI's login file, when this machine has one. */
+  codexAuthPath?: string;
+};
+
+/**
+ * The seat situation this machine is in (#205). The claude probe is presence
+ * of the CLI's own config surface — `CLAUDE_CONFIG_DIR`, claude's own
+ * override, else `~/.claude` — and never its contents: the credential proper
+ * lives in the OS keychain on macOS, and reading anyone's credential store is
+ * not Fleet's business. Presence is enough; a false positive costs one
+ * skippable prompt. The codex convention is `$CODEX_HOME/auth.json`, default
+ * `~/.codex/auth.json`. The env indirection is also what keeps the probe
+ * injectable for tests.
+ */
+export function detectSeatAuth(opts: { // contract pin: test-only export, asserted by the suite
+  env: Record<string, string | undefined>;
+  home: string;
+  /** What a dispatch could already see: process env merged over .fleet/.env. */
+  dotEnv: Record<string, string>;
+}): SeatAuth {
+  const hasCredential = ['ANTHROPIC_API_KEY', CLAUDE_OAUTH_VAR].some(
+    (name) => opts.env[name] !== undefined || opts.dotEnv[name] !== undefined,
+  );
+  const claudeDir = opts.env.CLAUDE_CONFIG_DIR ?? path.join(opts.home, '.claude');
+  const codexAuth = path.join(opts.env.CODEX_HOME ?? path.join(opts.home, '.codex'), 'auth.json');
+  return {
+    claudeWalk: !hasCredential && fs.existsSync(claudeDir),
+    ...(fs.existsSync(codexAuth) ? { codexAuthPath: codexAuth } : {}),
+  };
+}
+
+/** What the seat prompts decide; `when` closes over it (flags force a walk on). */
+type SeatWalk = { claudeWalk: boolean; codexOffer: boolean; codexAuthPath?: string };
+
+/** The two acquisition prompts (#205). Always in the list — the prompt list owns the flag surface — and skipped by `when` outside the seat situation. */
+function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
+  return [
+    {
+      key: 'claude_oauth_token',
+      question: 'paste the token from `claude setup-token` (Enter to skip)',
+      hint:
+        'a Claude seat login is here but no credential a job can ship — in another terminal run `claude setup-token`, approve it, and paste the result.\n' +
+        `  It lands in .fleet/.env (mode 0600, gitignored) as ${CLAUDE_OAUTH_VAR}, and the manifest declares the var — you never manage either by hand`,
+      fallback: () => '',
+      when: () => seat?.claudeWalk === true,
+      validate: (value) => (/\s/.test(value) ? 'a token has no whitespace in it — paste it alone' : undefined),
+    },
+    {
+      key: 'codex_auth',
+      question: 'ship your Codex login into job sandboxes? (yes/no)',
+      hint: `found ${seat?.codexAuthPath ?? 'a Codex auth.json'} — yes copies it to ${CODEX_SYNC_PATH} (mode 0600, gitignored) and lists it in workspace.sync`,
+      fallback: () => 'no',
+      when: () => seat?.codexOffer === true,
+      validate: (value) => (value === 'yes' || value === 'no' ? undefined : 'yes or no'),
+    },
+  ];
+}
+
+/** Add `entry` to a comma-separated answer, once. */
+function withEntry(list: string | undefined, entry: string): string {
+  const items = splitList(list ?? '');
+  if (!items.includes(entry)) items.push(entry);
+  return items.join(', ');
+}
+
+/**
+ * Fold the seat answers into the manifest answers and say what has to be
+ * written: the pasted token (destined for .fleet/.env, and its var for
+ * env.vars) and the codex login copy (destined for CODEX_SYNC_PATH, and that
+ * path for workspace.sync). Split from the writing so nothing touches disk
+ * before the manifest passes the schema.
+ */
+function seatWalkOutcome(answers: Answers, codexAuthPath: string | undefined): { token?: string; codexSource?: string } {
+  const outcome: { token?: string; codexSource?: string } = {};
+  const token = answers.claude_oauth_token?.trim();
+  if (token) {
+    outcome.token = token;
+    answers.env_vars = withEntry(answers.env_vars, CLAUDE_OAUTH_VAR);
+  }
+  if (answers.codex_auth === 'yes') {
+    if (codexAuthPath === undefined) {
+      throw new SetupError('--codex-auth yes: no Codex login here (no auth.json under $CODEX_HOME or ~/.codex) — log in with the codex CLI first');
+    }
+    outcome.codexSource = codexAuthPath;
+    answers.sync = withEntry(answers.sync, CODEX_SYNC_PATH);
+  }
+  return outcome;
+}
+
+/** Write what the seat walk acquired. Runs after the scaffold, so .fleet/.gitignore already covers .env. */
+function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: string }): string[] {
+  const lines: string[] = [];
+  if (plan.token !== undefined) {
+    const file = upsertDotEnv(fleetDir, { [CLAUDE_OAUTH_VAR]: plan.token });
+    lines.push(`wrote ${file} (${CLAUDE_OAUTH_VAR}, mode 0600, gitignored) — the manifest declares the var; the token itself never enters the repo`);
+  }
+  if (plan.codexSource !== undefined) {
+    const dest = path.join(fleetDir, 'codex-auth.json');
+    fs.copyFileSync(plan.codexSource, dest);
+    fs.chmodSync(dest, 0o600);
+    ensureFleetGitignore(fleetDir, ['codex-auth.json']);
+    lines.push(`copied ${plan.codexSource} -> ${dest} (mode 0600, gitignored) — ships into each job via workspace.sync`);
+  }
+  return lines;
+}
+
 /**
  * The interview for `.fleet/manifest.json`, with defaults extracted from the
  * repo wherever they can be seen. Everything asked here is repo-specific by
  * definition — this is the file that says what *this* project needs — so the
  * defaults are evidence (a package.json, a .claude/commands file, an
  * .env.example), never a house style guess dressed up as one.
+ *
+ * The trailing seat-auth prompts (#205) are the exception that proves it:
+ * they describe this *machine's* login state, not the repo — but the wall a
+ * seat user hits is `fleet setup repo` writing an env var they cannot supply,
+ * so the interview that creates the requirement is the one that walks the
+ * acquisition. `seat` is computed by the caller (detection plus flags);
+ * absent, the prompts exist only as flag surface and are never asked.
  */
-export function repoPrompts(cwd: string, existing?: RepoManifest): PromptSpec[] {
+export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWalk): PromptSpec[] {
   const ecosystem = ECOSYSTEMS.find((e) => fs.existsSync(path.join(cwd, e.marker)));
   const gate = firstExisting(cwd, ['.fleet/gate.mjs', '.fleet/check-ready.js', '.fleet/check-ready.mjs']);
   const commands = markdownIn(cwd, path.join('.claude', 'commands'));
@@ -1035,6 +1176,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest): PromptSpec[] 
       fallback: kept(existing?.harness.commands[0]?.critic, 'code-reviewer'),
       required: true,
     },
+    ...seatPrompts(seat),
   ];
 }
 
@@ -1072,6 +1214,8 @@ ${command}
 type SetupRepoOptions = {
   cwd: string;
   env: Record<string, string | undefined>;
+  /** The operator's home directory — the seat-auth probes (#205) look under it. */
+  home?: string;
   flags: Record<string, string | undefined>;
   yes: boolean;
   interactive: boolean;
@@ -1137,11 +1281,27 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
     }
   }
 
+  // The seat situation (#205), decided before the interview so the prompts
+  // exist exactly when the walk applies. The manifest this interview writes is
+  // always harness claude-code (the one runner adapter), so that leg of the
+  // condition is met by construction. A flag is an explicit request and
+  // forces its walk on — detection is a default, never a restriction.
+  const detected = detectSeatAuth({
+    env: opts.env,
+    home: opts.home ?? os.homedir(),
+    dotEnv: loadDotEnv(fleetDir),
+  });
+  const seat: SeatWalk = {
+    claudeWalk: detected.claudeWalk || opts.flags.claude_oauth_token !== undefined,
+    codexOffer: detected.codexAuthPath !== undefined || opts.flags.codex_auth !== undefined,
+    ...(detected.codexAuthPath !== undefined ? { codexAuthPath: detected.codexAuthPath } : {}),
+  };
+
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
   let merged: Interview;
   try {
     opts.log('harness: claude-code — the supported runner adapter');
-    merged = await interview(repoPrompts(opts.cwd, existing), {
+    merged = await interview(repoPrompts(opts.cwd, existing, seat), {
       flags: opts.flags,
       env: opts.env,
       ask,
@@ -1164,6 +1324,10 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
     );
   }
 
+  // Fold the seat answers in first (#205): the pasted token adds its var to
+  // env.vars and a shipped codex login adds its copy to sync, and both have to
+  // be in the manifest the schema judges. Disk stays untouched until it passes.
+  const seatPlan = seatWalkOutcome(merged.answers, seat.codexAuthPath);
   const manifest = repoManifest(merged.answers);
   // The schema owns the shape: an interview that can produce a manifest `fleet
   // lint` then rejects is worse than one that refuses to write it.
@@ -1177,6 +1341,10 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
   const setupCommand = merged.answers.setup_command?.trim();
   const scriptExisted = fs.existsSync(path.join(fleetDir, 'setup.sh'));
   for (const line of writeScaffold(fleetDir, manifest, setupCommand ? setupScriptFor(setupCommand) : undefined)) {
+    opts.log(line);
+  }
+  // After the scaffold, whose gitignore write is what makes "gitignored" true.
+  for (const line of applySeatWalk(fleetDir, seatPlan)) {
     opts.log(line);
   }
   if (scriptExisted && setupCommand) {

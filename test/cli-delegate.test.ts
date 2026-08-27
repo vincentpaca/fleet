@@ -289,6 +289,35 @@ test('delegate fails loudly on a missing env var, before any POST', async (t) =>
   assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
+test('delegate: a missing auth credential teaches the seat path; other vars stay generic (#205)', async (t) => {
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  // Both auth vars carry the acquisition story, pre-POST.
+  for (const name of ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) {
+    const cwd = scaffold({ ...MANIFEST, env: { vars: [name] } });
+    const res = await runCli(['delegate', 'APP-123'], {
+      cwd,
+      env: { FLEET_DAEMON_URL: daemon.url, [name]: undefined },
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, new RegExp(`missing env var: ${name}`));
+    assert.match(res.stderr, /claude setup-token/, `${name}: the refusal names the acquisition command`);
+    assert.match(res.stderr, /fleet setup repo/, `${name}: and the interview that writes it`);
+  }
+
+  // A var Fleet has no acquisition story for keeps the plain refusal.
+  const cwd = scaffold();
+  const res = await runCli(['delegate', 'APP-123'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: undefined },
+  });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /missing env var: ACME_API_TOKEN/);
+  assert.doesNotMatch(res.stderr, /setup-token/, 'no invented auth story for an ordinary var');
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
 test('delegate: var present only in .fleet/.env is injected into the job', async (t) => {
   const cwd = scaffold();
   // Write .fleet/.env with the var; remove it from the shell env.
