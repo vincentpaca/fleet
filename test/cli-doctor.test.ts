@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { runCli, makeTempDir, startMockDaemon } from './cli-helpers.ts';
 
 // Minimal valid-for-doctor manifest; sync/env.vars empty so no base findings.
@@ -387,4 +389,131 @@ test('doctor: a daemon that predates the reconcile endpoint stays clean (#147)',
   const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
   assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
   assert.match(res.stdout, /doctor: clean/);
+});
+
+// ── Deployment skew (#207) ───────────────────────────────────────────────────
+// The #197 incident: a runner image predating an already-merged fix cost a job
+// its work, and nothing named the gap. doctor compares the applied unit ref
+// (deployment-local .fleet/infra/<provider>/main.tf) and the daemon image's
+// build stamp (/health `build`, baked by images/build.sh) against this CLI's
+// own checkout — git SHAs until #183 mints release versions.
+
+// The suite runs from a checkout, so HEAD is the CLI's own identity — the same
+// value doctor resolves, read the same way.
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const HEAD_SHA = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+// A well-formed sha that no repository resolves: the "stale deployment" stand-in.
+const STALE_SHA = 'deadbeef'.repeat(5);
+
+/** A deployment root module beside the project, pinned at `ref`. */
+function writeDeployment(cwd: string, ref: string): void {
+  const dir = path.join(cwd, '.fleet', 'infra', 'aws');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'main.tf'),
+    `module "fleet" {\n  source = "git::https://github.com/fleet-test/fleet.git//infra/aws?ref=${ref}"\n\n  aws_region = "us-west-2"\n}\n`,
+  );
+}
+
+/** A mock deployment daemon whose /health carries `build` (omit for unstamped). */
+function healthDaemon(build?: string): ReturnType<typeof startMockDaemon> {
+  return startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(build === undefined ? { ok: true } : { ok: true, build }));
+    },
+  });
+}
+
+test('doctor: a fully-stamped matching deployment gets a version note (#207)', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, HEAD_SHA);
+  const daemon = await healthDaemon(HEAD_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  const short = HEAD_SHA.slice(0, 12);
+  assert.match(res.stdout, new RegExp(`skew: deployment matches this CLI at ${short} \\(unit ref ${short}, daemon image ${short}\\)`));
+  assert.match(res.stdout, /doctor: clean/);
+});
+
+test('doctor: a daemon image behind the CLI is a finding naming both SHAs and the fix (#207)', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, HEAD_SHA);
+  const daemon = await healthDaemon(STALE_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 1, `expected a finding but got: ${res.stdout}`);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `exactly one finding:\n${res.stderr}`);
+  assert.match(lines[0], /deployment skew: daemon image was built at/);
+  assert.ok(lines[0].includes(STALE_SHA.slice(0, 12)), 'names the image sha');
+  assert.ok(lines[0].includes(HEAD_SHA.slice(0, 12)), 'names the CLI sha');
+  assert.match(lines[0], /images\/build\.sh --redeploy-daemon/, 'the fix that exists today');
+  assert.match(lines[0], /fleet upgrade will own this once it exists \(#207\)/);
+});
+
+test('doctor: an applied unit ref behind the CLI is a finding naming both and the fix (#207)', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, STALE_SHA);
+  const daemon = await healthDaemon(HEAD_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 1, `expected a finding but got: ${res.stdout}`);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `exactly one finding:\n${res.stderr}`);
+  assert.match(lines[0], /deployment skew: aws unit is applied at ref/);
+  assert.ok(lines[0].includes(STALE_SHA.slice(0, 12)), 'names the applied ref');
+  assert.ok(lines[0].includes(HEAD_SHA.slice(0, 12)), 'names the CLI sha');
+  assert.match(lines[0], /re-apply the unit at the current ref/);
+});
+
+test('doctor: an unstamped daemon image is the honest finding, not a crash (#207)', async (t) => {
+  // Images built before this stamp existed answer /health without `build`.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, HEAD_SHA);
+  const daemon = await healthDaemon();
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 1, `expected a finding but got: ${res.stdout}`);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `exactly one finding:\n${res.stderr}`);
+  assert.match(lines[0], /daemon image is unstamped/);
+  assert.match(lines[0], /predates skew detection/);
+  assert.match(lines[0], /rebuild/);
+});
+
+test('doctor: no deployment root module means no skew section, even with a daemon up (#207)', async (t) => {
+  // Without .fleet/infra/<provider>/main.tf there is nothing the CLI could be
+  // skewed against — a match note here would be invented.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const daemon = await healthDaemon(STALE_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.ok(!res.stdout.includes('skew'), `no skew section: ${res.stdout}`);
+  assert.ok(!res.stderr.includes('skew'), `no skew finding: ${res.stderr}`);
+});
+
+test('doctor: skew keeps working with no daemon reachable — the unit ref is still compared (#207)', async () => {
+  // Daemon reachability is the tunnel section's story; the image simply goes
+  // uncompared rather than producing a second finding about the same outage.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, STALE_SHA);
+  const probe = await startMockDaemon({});
+  const port = Number(new URL(probe.url).port);
+  await probe.close();
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: `http://127.0.0.1:${port}` } });
+  assert.equal(res.code, 1, res.stdout);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 2, `the dead tunnel and the stale ref, nothing else:\n${res.stderr}`);
+  assert.match(res.stderr, /nothing is listening/);
+  assert.match(res.stderr, /deployment skew: aws unit is applied at ref/);
+  assert.ok(!res.stderr.includes('daemon image'), 'the unreachable image is not a second finding');
 });

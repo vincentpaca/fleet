@@ -252,6 +252,22 @@ fi
 RUNNER_LOCAL_TAG="fleet-runner:${HARNESS_CLI}-${HARNESS_VERSION}"
 DAEMON_LOCAL_TAG="fleet-daemon:local"
 
+# Build stamp (#207): the checkout's HEAD, baked into both images as
+# FLEET_BUILD_SHA (images/*/Dockerfile). The daemon reports it on /health and
+# the runner logs it at job start, so `fleet doctor` can name a deployment
+# whose images predate the operator's CLI — the #197 incident, where a runner
+# image missing an already-merged fix cost a job its work. Resolved against
+# REPO_ROOT, not $PWD: the build context is this checkout even when an
+# operator runs the script from their own project. Best-effort: a tree that is
+# not a git checkout builds an unstamped image, and doctor says so honestly
+# rather than this script inventing an identity.
+FLEET_BUILD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+if [[ -n "$FLEET_BUILD_SHA" ]]; then
+  echo "build stamp: ${FLEET_BUILD_SHA}"
+else
+  echo "warning: ${REPO_ROOT} is not a git checkout — images will carry no build stamp, and fleet doctor cannot check them for skew" >&2
+fi
+
 # The provenance a tag hides (#138): the tag text stays fixed while its content
 # moves — a rebuilt :latest, a republished node:24-slim. Print what this build
 # actually resolved to, so an operator can pin it (--base-image <ref>@sha256:…)
@@ -279,6 +295,7 @@ build_image() { # build_image <local tag> <dockerfile> [build args...]
   docker build \
     --platform "$PLATFORM" \
     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+    --build-arg "FLEET_BUILD_SHA=${FLEET_BUILD_SHA}" \
     ${1+"$@"} \
     -t "$tag" \
     -f "${REPO_ROOT}/${dockerfile}" \

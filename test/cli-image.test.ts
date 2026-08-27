@@ -393,6 +393,37 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     assert.match(sh('aws --version 2>&1'), /aws-cli/, 'EcsProvider shells out to aws as uid 1000');
   });
 
+  // Build stamp (#207): the Dockerfiles must persist FLEET_BUILD_SHA into the
+  // image environment, where the daemon's /health and the runner's job-start
+  // log read it. Asserted on built images, not by grepping the Dockerfiles —
+  // an ARG that is declared but never ENV'd would pass a grep and fail here.
+  // Cheap: every layer below the stamp is already cached by the builds above.
+  test('both images persist the build stamp where the process can read it (#207)', () => {
+    const probe = 'feedfacefeedfacefeedfacefeedfacefeedface';
+    for (const [tag, dockerfile] of [
+      [`${BASE_TAG}-stamped`, join('images', 'runner', 'Dockerfile')],
+      [`${DAEMON_TAG}-stamped`, join('images', 'daemon', 'Dockerfile')],
+    ] as const) {
+      execFileSync(
+        'docker',
+        [
+          'build',
+          '--build-arg', `FLEET_BUILD_SHA=${probe}`,
+          ...(tag.startsWith('fleet-runner') ? ['--build-arg', `HARNESS_CLI=${TEST_CLI}`, '--build-arg', 'HARNESS_VERSION=latest'] : []),
+          '-t', tag, '-f', dockerfile, '.',
+        ],
+        { cwd: repoRoot, stdio: 'inherit' },
+      );
+      cleanup.push(tag);
+      const seen = execFileSync(
+        'docker',
+        ['run', '--rm', '--entrypoint', 'sh', tag, '-c', 'printf %s "$FLEET_BUILD_SHA"'],
+        { encoding: 'utf8' },
+      );
+      assert.equal(seen, probe, `${tag} does not carry the stamp`);
+    }
+  });
+
   // AC3: no secrets baked into any image layer
   test('docker history contains no baked-in secret values', () => {
     const history = execFileSync(

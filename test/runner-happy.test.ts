@@ -135,6 +135,42 @@ test('full happy path: running → gate ok → harness replay → settle → don
   }
 });
 
+test('a stamped runner image names its build at job start (#207)', async () => {
+  // images/build.sh bakes the checkout HEAD into the image as FLEET_BUILD_SHA;
+  // the runner must put it in the job's own log, so a job run on a stale image
+  // (the #197 incident) is diagnosable from its record. Unstamped runs — every
+  // other test in this file — emit nothing, which their pinned event sequences
+  // already prove.
+  const token = 'test-token-stamp';
+  const daemon = await startMockDaemon({ token });
+  const workspace = writeWorkspace(`node -e "process.exit(0)"`);
+  const stamp = 'feedface'.repeat(5);
+  try {
+    const exitCode = await runRunner({
+      FLEET_JOB_ID: 'job-stamp-1',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_HARNESS_CMD: REPLAY_CMD,
+      TEST_FIXTURE: fixturePath,
+      TEST_REPORT: JSON.stringify({ status: 'READY', next_action: 'review it', verification: ['fixture replay completed'] }),
+      FLEET_BUILD_SHA: stamp,
+    });
+    assert.equal(exitCode, 0);
+    assert.deepEqual(daemon.rejected, [], 'the stamp log must pass event validation at intake');
+
+    // Right after `running`, before anything the job itself does: evidence of
+    // which build ran belongs at the top of the record.
+    const [running, stampLog] = daemon.events;
+    assert.equal(running.state, 'running');
+    assert.equal(stampLog.type, 'log');
+    assert.equal(stampLog.text, `runner image built at ${stamp}`);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
 // --- Followthrough continuation (#80): the runner adopts the PR branch end to end ---
 
 /** A bare remote with main plus a delivered job branch (what a settled PR points at). */

@@ -77,6 +77,15 @@ RUN npm ci --omit=dev
 COPY src/ src/
 COPY schemas/ schemas/
 
+# Build stamp (#207): the git SHA this image was built from, passed by
+# images/build.sh. The runner logs it at job start, so a job run on a stale
+# image — the #197 incident — is diagnosable from its own event log. Not a
+# secret (a public commit id), so ENV is fine where credentials never are.
+# Declared after the COPY layers: a new SHA on an unchanged tree re-runs
+# nothing above. Empty means unstamped; the runner then logs nothing.
+ARG FLEET_BUILD_SHA=""
+ENV FLEET_BUILD_SHA=${FLEET_BUILD_SHA}
+
 # Privilege contract (#196): the container starts as root, and root belongs to
 # setup — never to the job. The image carried `USER node` from #155 until the
 # operator-authored manifest setup.script (laptop trust class) proved

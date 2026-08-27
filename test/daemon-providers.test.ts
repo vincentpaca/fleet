@@ -1052,6 +1052,26 @@ test("GET /health returns {ok: true} with status 200", async (t) => {
   const sockResult = await op(sock, "GET", "/health");
   assert.equal(sockResult.status, 200);
   assert.equal((sockResult.json as { ok: boolean }).ok, true);
+
+  // Unstamped process (this suite runs from a checkout, not an image): /health
+  // must not invent a build identity — absence is what doctor reports honestly.
+  assert.ok(!("build" in (sockResult.json as Record<string, unknown>)), "no invented build stamp");
+});
+
+test("GET /health names the build stamp a stamped image carries (#207)", async (t) => {
+  // In a deployment the stamp arrives via the image ENV (images/build.sh bakes
+  // the checkout's HEAD); here it is set on this process the same way. doctor
+  // compares this value against the operator's CLI to surface deployment skew.
+  const stamp = "feedfacefeedfacefeedfacefeedfacefeedface";
+  process.env.FLEET_BUILD_SHA = stamp;
+  t.after(() => { delete process.env.FLEET_BUILD_SHA; });
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new ProcessProvider(), port: 0, longPollMs: 400 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const res = await op(sock, "GET", "/health");
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json, { ok: true, build: stamp });
 });
 
 // ---------- operator access: SSM port-forward primitives (#57) ----------
