@@ -180,18 +180,20 @@ test('window CLI → old gate: --mode assess on an issue still gates strict (D17
   assert.match(out, /lacks the "ready" label/);
 });
 
-test('window CLI → old gate: --publish prose passes report-only and then publishes (D17 risk 1)', async () => {
+test('window CLI → old gate: publish-true prose passes report-only and then publishes (D17 risk 1)', async () => {
   // The compat mapping's other asymmetry, pinned so it is deliberate rather
-  // than discovered: shape decides the compat mode, so a --publish prose
+  // than discovered: shape decides the compat mode, so a publish-true prose
   // dispatch ships as `investigate` and an un-regenerated gate waves it
   // through as report-only — then the job pushes and opens a draft PR, because
   // authority.publish is what the runner reads. Pre-#36 no order could be in
   // this state: publish implied implement/followthrough, which demanded an
   // issue number. There is no better mapping (labelling it `implement` would
   // have the old gate kill it for having no issue number), so D17 records it as
-  // an accepted risk and this is the checkpoint.
+  // an accepted risk and this is the checkpoint. Since #208 removed --publish,
+  // the deprecated `--mode implement` is the one prose route left into this
+  // state, and the risk dies with that flag in the follow-up release.
   const { order, status, out } = await windowOrderAgainstOldGate(
-    ['--publish', 'draft the retry-policy note and open a PR'],
+    ['--mode', 'implement', 'draft the retry-policy note and open a PR'],
     fakeBins(READY_GH),
   );
   assert.equal(order.mode, 'investigate');

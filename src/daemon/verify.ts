@@ -105,8 +105,9 @@ export function verifyRung(
  * exactly verifyRung; for gh-dependent ones it replaces the interim
  * "unverified: requires gh" with a real verdict. Async because gh is a
  * network call — never run this on the event intake path.
- * The PR URL is expected in settle.report.pr (set by the runner after
- * authority.publish PR creation).
+ * The PR URL is expected in settle.report.pr (set by the runner when it
+ * created a draft PR under authority.publish, or detected one on the job
+ * branch — an adopted PR or an agent-opened one).
  */
 export async function verifyRungGh(
   settle: SettleFacts | undefined,
@@ -175,9 +176,10 @@ async function verifyWithGh(
  * report.pr is authored inside the job sandbox — it crosses the same trust
  * boundary the runner token guards, so it must never be able to act as a gh
  * flag under the daemon's GitHub auth (#175). Only the exact shape the runner
- * produces (createDraftPr returns `gh pr create`'s stdout: a full https PR
- * URL) may reach argv; flags, bare numbers, owner/repo#n, and anything else
- * are rejected before argv is built.
+ * produces (a full https PR URL — `gh pr create`'s stdout from createDraftPr,
+ * or the `url` field findOpenPr reads from `gh pr list`) may reach argv;
+ * flags, bare numbers, owner/repo#n, and anything else are rejected before
+ * argv is built.
  */
 const PR_URL_SHAPE = /^https:\/\/[A-Za-z0-9.-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/pull\/[0-9]+$/;
 

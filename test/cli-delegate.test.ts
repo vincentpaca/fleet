@@ -124,16 +124,23 @@ test('delegate: #42 and 42 are the same issue dispatch — normalized at parse',
   assert.equal(order.title, 'Fix the flaky heartbeat', 'the title lookup sees an issue number too');
 });
 
-test('delegate --publish gives a prose dispatch push+PR authority', async (t) => {
-  // No default_finish in this manifest, so the shape default is what shows.
+test('delegate: --publish is gone — refused like any unknown flag (#208)', async (t) => {
+  // Prose delivery is prompt-owned: the flag restated what the prompt already
+  // says, so it no longer exists. The bug this catches: the flag surviving as
+  // an accepted no-op, which would silently dispatch a job the operator
+  // believes carries publish authority.
   const cwd = scaffold({ ...MIN_MANIFEST, gates: { pickup: 'true' } });
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const order = await postedOrder(['--publish', 'draft the retry-policy note and open a PR'], cwd, daemon);
-  assert.equal((order.authority as { publish: boolean }).publish, true);
-  // --publish grants authority; on its own it does not move the finish line.
-  assert.equal(order.finish, 'inspected');
+  const res = await runCli(['delegate', '--publish', 'draft the retry-policy note and open a PR'], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 2, res.stderr);
+  assert.match(res.stderr, /usage error/, 'the unknown-flag convention, not a custom refusal');
+  assert.match(res.stderr, /--publish/, 'the refusal names the flag');
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
 test('delegate: manifest.gates.default_finish beats the shape default and loses to --finish', async (t) => {
@@ -171,9 +178,10 @@ test('delegate: a repo default_finish applies only where the dispatch could reac
   const prose = await postedOrder(['some open question'], unreachable, daemon);
   assert.equal(prose.finish, 'inspected', 'the shape default stands when the repo default needs publishing');
   assert.equal((prose.authority as { publish: boolean }).publish, false);
-  // Say --publish and the repo's delivery rung applies again — one rule, not a
-  // prose-shaped exception.
-  assert.equal((await postedOrder(['--publish', 'some open question'], unreachable, daemon)).finish, 'ci-green');
+  // Grant publish (the one prose route left is the deprecated --mode, #208)
+  // and the repo's delivery rung applies again — one rule, not a prose-shaped
+  // exception.
+  assert.equal((await postedOrder(['--mode', 'implement', 'some open question'], unreachable, daemon)).finish, 'ci-green');
   // An explicit --finish is never second-guessed, publish or not: naming a rung
   // is a decision, not a default.
   assert.equal((await postedOrder(['--finish', 'ci-green', 'some open question'], unreachable, daemon)).finish, 'ci-green');
@@ -259,7 +267,7 @@ test('delegate --mode implement/followthrough grant publish and no more, on any 
   );
 });
 
-test('delegate: the specific flags beat the mapped --mode bundle', async (t) => {
+test('delegate: the specific --finish flag beats the mapped --mode bundle', async (t) => {
   const cwd = scaffold(MIN_MANIFEST);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
@@ -269,9 +277,6 @@ test('delegate: the specific flags beat the mapped --mode bundle', async (t) => 
   const order = await postedOrder(['42', '--mode', 'assess', '--finish', 'merge-ready'], cwd, daemon, env);
   assert.equal(order.finish, 'merge-ready', '--finish beats the mapped bundle');
   assert.equal((order.authority as { publish: boolean }).publish, false, 'and only --finish moved');
-
-  const published = await postedOrder(['42', '--mode', 'assess', '--publish'], cwd, daemon, env);
-  assert.equal((published.authority as { publish: boolean }).publish, true, '--publish beats the mapped bundle');
 });
 
 test('delegate fails loudly on a missing env var, before any POST', async (t) => {

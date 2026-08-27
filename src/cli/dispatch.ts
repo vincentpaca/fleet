@@ -37,10 +37,11 @@ export function dispatchShape(target: string, continues: unknown): DispatchShape
 
 /**
  * Authority and finish line per shape. An issue or an adopted PR is a delivery
- * dispatch: it publishes and aims at merge-ready. Prose is not — it delivers a
- * report artifact and opens nothing, which is what makes an open-ended prompt a
- * legitimate dispatch rather than a defect. `--publish` is how a prose dispatch
- * that should end in a PR says so.
+ * dispatch: it publishes and aims at merge-ready. Prose is not — the runner
+ * composes no PR for it, which is what makes an open-ended prompt a legitimate
+ * dispatch rather than a defect. There is no flag to change that (#208):
+ * prose delivery is prompt-owned — a prompt that asks for a PR gets one from
+ * the agent itself, and the settle grades what actually happened.
  */
 export const SHAPE_DEFAULTS: Record<DispatchShape, { publish: boolean; finish: string }> = {
   adoption: { publish: true, finish: 'merge-ready' },
@@ -121,9 +122,10 @@ function assertLadderFloor(index: number): number {
  * own authority forbids, so each one would report short of its goal on every
  * run. Applied per rung rather than per shape, it keeps working for the rungs
  * that do not need publishing — a repo defaulting to `static-green` gets it on
- * prose too — and a prose dispatch that wants the repo's delivery rung says
- * `--publish` and gets it. An explicit `--finish` is never second-guessed: the
- * operator naming a rung is a decision, not a default.
+ * prose too. An explicit `--finish` is never second-guessed: the operator
+ * naming a rung is a decision, not a default. (With `--publish` gone (#208),
+ * the only prose route to a publish-true order is the deprecated `--mode
+ * implement`, for the life of that flag.)
  */
 export function reachableRepoDefault(
   defaultFinish: string | undefined,
