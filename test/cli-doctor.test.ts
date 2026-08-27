@@ -487,6 +487,28 @@ test('doctor: an unstamped daemon image is the honest finding, not a crash (#207
   assert.match(lines[0], /rebuild/);
 });
 
+test('doctor: a git::file dogfood pin with ?ref= is compared, not shrugged at (#207)', async (t) => {
+  // pinnedSource only matches clonable https sources (the CodeBuild constraint);
+  // skew must still compare a local-clone pin — the dogfood deployment's shape.
+  // The bug this catches: doctor said "no pinned ref to compare" about a source
+  // whose ref was sitting right in the string (2026-08-27, live).
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const dir = path.join(cwd, '.fleet', 'infra', 'aws');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'main.tf'),
+    `module "fleet" {\n  source = "git::file:///somewhere/fleet//infra/aws?ref=${HEAD_SHA}"\n\n  aws_region = "us-west-2"\n}\n`,
+  );
+  const daemon = await healthDaemon(HEAD_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.ok(!res.stdout.includes('no pinned ref to compare'), `file:// pin must be compared: ${res.stdout}`);
+  const short = HEAD_SHA.slice(0, 12);
+  assert.match(res.stdout, new RegExp(`skew: deployment matches this CLI at ${short}`));
+});
+
 test('doctor: no deployment root module means no skew section, even with a daemon up (#207)', async (t) => {
   // Without .fleet/infra/<provider>/main.tf there is nothing the CLI could be
   // skewed against — a match note here would be invented.
