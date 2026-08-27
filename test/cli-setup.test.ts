@@ -24,6 +24,7 @@ import {
   SetupError,
 } from '../src/cli/setup.ts';
 import { SETUP_UNITS, unitFor } from '../src/cli/setup-units.ts';
+import { repinnedMainTf } from '../src/cli/upgrade.ts';
 
 const AWS = unitFor('aws')!;
 
@@ -529,6 +530,194 @@ test('setup infra: a deployment applied from an unpinned source falls back hones
   const rebuild = await runCli(['setup', 'infra', '--rebuild-images'], { cwd: s.cwd, env: s.env });
   assert.equal(rebuild.code, 1, rebuild.stdout);
   assert.match(rebuild.stderr, /unpinned module source/);
+});
+
+// ---------- fleet upgrade (#207) ----------
+// The converge command re-enters the setup-infra machinery against the same
+// fakes: what these tests are about is the re-pin, the explicit-yes contract,
+// the revert on refusal, and the image rebuild (or its honest fallback).
+
+// The suite runs from a checkout, so HEAD is the CLI's own identity — the
+// commit upgrade converges to, read the way doctor's skew section reads it.
+const HEAD_SHA = spawnSync('git', ['rev-parse', 'HEAD'], {
+  cwd: path.join(import.meta.dirname, '..'),
+  encoding: 'utf8',
+}).stdout.trim();
+// A well-formed sha no repository resolves: the "deployment one release behind".
+const STALE_SHA = 'deadbeef'.repeat(5);
+
+/** A deployment applied at STALE_SHA, its logs cleared, ready to upgrade. */
+async function staleDeployment(
+  s: ReturnType<typeof scratch>,
+): Promise<{ mainTf: string; configPath: string }> {
+  const applied = await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(applied.code, 0, applied.stderr);
+  const configPath = path.join(infraDir(s.cwd), 'fleet-config.json');
+  // Point the capture's daemon_url at a port nothing answers on: the finish
+  // report probes /health there, and the default 19000 could be a real tunnel
+  // on the machine running this suite.
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  fs.writeFileSync(configPath, JSON.stringify({ ...config, daemon_url: 'http://127.0.0.1:1', cluster: 'stale-value' }, null, 2));
+  fs.writeFileSync(path.join(s.state, 'calls.log'), '');
+  fs.writeFileSync(path.join(s.state, 'codebuild.log'), '');
+  return { mainTf: path.join(infraDir(s.cwd), 'main.tf'), configPath };
+}
+
+test('upgrade: converges the deployment to the CLI commit on an explicit yes', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}` });
+  const { mainTf, configPath } = await staleDeployment(s);
+
+  const res = await runCli(['upgrade'], {
+    cwd: s.cwd,
+    env: { ...s.env, FLEET_FORCE_TTY: '1' },
+    stdin: 'y\n',
+  });
+  assert.equal(res.code, 0, res.stderr);
+
+  // The re-pin: the one-line ?ref= edit, applied — never left describing a
+  // ref that was not.
+  const text = fs.readFileSync(mainTf, 'utf8');
+  assert.match(text, new RegExp(`\\?ref=${HEAD_SHA}"`), 'the root module is re-pinned to the CLI commit');
+  assert.ok(!text.includes(STALE_SHA), 'the stale ref is gone — from the source AND the source_ref module arg');
+  assert.match(
+    text,
+    new RegExp(`source_ref\\s+= "${HEAD_SHA}"`),
+    '#189: the in-account build clones the re-pinned ref, never the one the apply left behind',
+  );
+  assert.match(res.stdout, /re-pinned .*main\.tf/);
+
+  // The setup-infra drive, plus -upgrade so init cannot serve the cached old ref.
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan', 'apply', 'output']);
+  const init = s.calls().find((line) => line.includes('\tinit'))!;
+  assert.ok(init.includes('-upgrade'), `init must carry -upgrade: ${init}`);
+
+  // The capture is retaken (cluster refreshed) and the operator's port is kept.
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  assert.equal(config.cluster, 'demo', 'fleet-config.json is re-captured from the new apply');
+  assert.equal(config.daemon_url, 'http://127.0.0.1:1', 'the operator-chosen local port survives, as on setup reruns');
+
+  // The rebuild at the same ref: one in-account build, then the roll guidance
+  // (never the roll itself — docs/decisions.md#d5).
+  assert.equal(s.buildCalls().filter((line) => line.startsWith('codebuild start-build')).length, 1);
+  assert.match(res.stdout, /images built and pushed/);
+  assert.match(res.stdout, /service demo-daemon on cluster demo/);
+
+  // The finish is the doctor skew section: the end state is reported, not assumed.
+  assert.match(res.stdout, new RegExp(`skew: deployment matches this CLI at ${HEAD_SHA.slice(0, 12)}`));
+});
+
+test('upgrade: nothing to do says so and changes nothing', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${HEAD_SHA}` });
+  const { mainTf } = await staleDeployment(s); // "stale" only in name: pinned at HEAD already
+  const before = fs.readFileSync(mainTf, 'utf8');
+
+  const res = await runCli(['upgrade'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, new RegExp(`nothing to do: .*\\(${HEAD_SHA.slice(0, 12)}\\)`));
+  assert.deepEqual(s.calls(), [], 'no terraform ran — not even a preflight');
+  assert.deepEqual(s.buildCalls(), [], 'no build was started');
+  assert.equal(fs.readFileSync(mainTf, 'utf8'), before, 'the root module is untouched');
+});
+
+test('upgrade: a refused plan restores the ref and mutates nothing', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}` });
+  const { mainTf, configPath } = await staleDeployment(s);
+  const tfBefore = fs.readFileSync(mainTf, 'utf8');
+  const configBefore = fs.readFileSync(configPath, 'utf8');
+
+  const res = await runCli(['upgrade'], {
+    cwd: s.cwd,
+    env: { ...s.env, FLEET_FORCE_TTY: '1' },
+    stdin: 'n\n',
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan'], 'no apply, no capture');
+  assert.match(res.stdout, /nothing applied/);
+  assert.match(res.stdout, /restored to ref/);
+  assert.equal(fs.readFileSync(mainTf, 'utf8'), tfBefore, 'the ref edit is reverted byte-for-byte');
+  assert.equal(fs.readFileSync(configPath, 'utf8'), configBefore, 'the capture is untouched');
+  assert.deepEqual(s.buildCalls(), [], 'no build was started');
+  assert.ok(
+    !fs.existsSync(path.join(infraDir(s.cwd), 'fleet.tfplan')),
+    'no plan survives for a ref the operator declined',
+  );
+});
+
+test('upgrade headless: no --yes stops at the plan and restores the ref', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}` });
+  const { mainTf } = await staleDeployment(s);
+  const before = fs.readFileSync(mainTf, 'utf8');
+
+  const res = await runCli(['upgrade'], { cwd: s.cwd, env: s.env }); // no stdin: a read would fail, not hang
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan']);
+  assert.match(res.stdout, /Rerun with --yes/);
+  assert.equal(fs.readFileSync(mainTf, 'utf8'), before, 'planned only — the file keeps describing what is deployed');
+});
+
+test('upgrade: a git::file dogfood pin re-applies, and names the image fallback honestly', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::file:///somewhere/fleet//infra/aws?ref=${STALE_SHA}` });
+  // What the real unit outputs for a source CodeBuild cannot clone: no build project.
+  fs.writeFileSync(
+    path.join(s.state, 'fleet-config'),
+    JSON.stringify({ provider: 'ecs', cluster: 'demo', region: 'us-east-1', daemon_port: 9000 }),
+  );
+  const { mainTf } = await staleDeployment(s);
+
+  const res = await runCli(['upgrade', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan', 'apply', 'output'], 'the converge itself still runs');
+  assert.match(fs.readFileSync(mainTf, 'utf8'), new RegExp(`\\?ref=${HEAD_SHA}"`));
+  assert.deepEqual(s.buildCalls(), [], 'no in-account build exists to start');
+  assert.match(res.stdout, /no in-account image build/, 'said plainly, not skipped silently');
+  assert.match(res.stdout, /images\/build\.sh --redeploy-daemon/, 'the developer path is named as the fallback');
+});
+
+test('upgrade --rebuild-images: step 4 alone, through the setup machinery', async () => {
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${HEAD_SHA}` });
+  await staleDeployment(s);
+
+  const res = await runCli(['upgrade', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'preflight only — no plan, no apply, nothing re-pinned');
+  assert.equal(s.buildCalls().filter((line) => line.startsWith('codebuild start-build')).length, 1, 'one fresh build');
+  assert.match(res.stdout, /images built and pushed/);
+  assert.match(res.stdout, /infra\/aws\/README\.md/, 'the roll stays guidance, never a command we run');
+});
+
+test('upgrade: no deployment here is an actionable refusal', async () => {
+  const s = scratch();
+  const res = await runCli(['upgrade', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /no deployment to upgrade/);
+  assert.match(res.stderr, /fleet setup infra/, 'names the command that creates one');
+  assert.deepEqual(s.calls(), [], 'nothing ran');
+});
+
+test('repinnedMainTf edits exactly the ref, and refuses a file that moved under it', () => {
+  const pin = { provider: 'aws', source: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}&depth=1` };
+  const text = [
+    '# operator comment that must survive',
+    'terraform {',
+    '  backend "s3" {}',
+    '}',
+    'module "fleet" {',
+    `  source = "${pin.source}"`,
+    '  name   = "demo"',
+    '}',
+    '',
+  ].join('\n');
+  const repinned = repinnedMainTf(text, pin, HEAD_SHA);
+  assert.ok(repinned.includes(`?ref=${HEAD_SHA}&depth=1`), 'only the ref value changes; trailing params stay');
+  assert.equal(
+    repinned.replace(HEAD_SHA, STALE_SHA),
+    text,
+    'not one other byte moves — comments, backend block and answers all survive',
+  );
+  assert.throws(
+    () => repinnedMainTf('module "fleet" { source = "somewhere-else" }', pin, HEAD_SHA),
+    /no longer contains the module source/,
+  );
 });
 
 // ---------- prompt/flag merging ----------

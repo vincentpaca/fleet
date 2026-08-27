@@ -451,8 +451,8 @@ test('doctor: a daemon image behind the CLI is a finding naming both SHAs and th
   assert.match(lines[0], /deployment skew: daemon image was built at/);
   assert.ok(lines[0].includes(STALE_SHA.slice(0, 12)), 'names the image sha');
   assert.ok(lines[0].includes(HEAD_SHA.slice(0, 12)), 'names the CLI sha');
-  assert.match(lines[0], /images\/build\.sh --redeploy-daemon/, 'the fix that exists today');
-  assert.match(lines[0], /fleet upgrade will own this once it exists \(#207\)/);
+  assert.match(lines[0], /fleet upgrade --rebuild-images/, 'the command that owns the fix');
+  assert.match(lines[0], /images\/build\.sh --redeploy-daemon/, 'the checkout fallback is still named');
 });
 
 test('doctor: an applied unit ref behind the CLI is a finding naming both and the fix (#207)', async (t) => {
@@ -468,7 +468,7 @@ test('doctor: an applied unit ref behind the CLI is a finding naming both and th
   assert.match(lines[0], /deployment skew: aws unit is applied at ref/);
   assert.ok(lines[0].includes(STALE_SHA.slice(0, 12)), 'names the applied ref');
   assert.ok(lines[0].includes(HEAD_SHA.slice(0, 12)), 'names the CLI sha');
-  assert.match(lines[0], /re-apply the unit at the current ref/);
+  assert.match(lines[0], /run fleet upgrade/, 'the command that owns the fix');
 });
 
 test('doctor: an unstamped daemon image is the honest finding, not a crash (#207)', async (t) => {

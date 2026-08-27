@@ -45,7 +45,7 @@ export class SetupError extends Error {}
 // ---------- asking ----------
 
 /** Reads one answer at a time. Injected so the merge logic is testable without a terminal. */
-type Asker = {
+export type Asker = { // exported for ./upgrade.ts, which re-enters this interview machinery
   question: (prompt: string) => Promise<string>;
   close: () => void;
 };
@@ -63,7 +63,7 @@ type Asker = {
  * Input that runs out is an error, never a wait: "never hang waiting for input"
  * has to hold for a stdin that ends mid-interview too, not only for no stdin.
  */
-async function stdinAsker(): Promise<Asker> {
+export async function stdinAsker(): Promise<Asker> { // exported for ./upgrade.ts
   const readline = await import('node:readline/promises'); // lazy: only when there is someone to ask
   // No `output`: the prompt text is written by the caller, so every line the
   // wizard prints goes through one path and tests can read it from stdout.
@@ -195,7 +195,7 @@ export function flagName(key: string): string {
 }
 
 /** A yes/no gate. Anything but an explicit yes is a no — the default protects the account. */
-async function confirm(question: string, ask: Asker): Promise<boolean> {
+export async function confirm(question: string, ask: Asker): Promise<boolean> { // exported for ./upgrade.ts
   const answer = (await ask.question(`${question} [y/N]: `)).trim().toLowerCase();
   return answer === 'y' || answer === 'yes';
 }
@@ -432,10 +432,11 @@ type RunResult = { status: number; stdout: string; stderr: string; missing: bool
  * Run a command for setup. `capture` reads stdout (JSON we parse); without it
  * the child inherits this terminal, because a terraform plan is for the
  * operator to read, and relaying it through us would only make it worse.
+ * Exported (with spawnRunner) for ./upgrade.ts, which drives the same steps.
  */
-type Runner = (argv: string[], opts: { cwd: string; capture?: boolean }) => RunResult;
+export type Runner = (argv: string[], opts: { cwd: string; capture?: boolean }) => RunResult;
 
-const spawnRunner: Runner = (argv, opts) => {
+export const spawnRunner: Runner = (argv, opts) => {
   const res = spawnSync(argv[0], argv.slice(1), {
     cwd: opts.cwd,
     encoding: 'utf8',
@@ -453,7 +454,7 @@ const spawnRunner: Runner = (argv, opts) => {
  * and — worse — an operator who answers "name" three times learns nothing about
  * why nothing is being created.
  */
-function preflight(unit: SetupUnit, cwd: string, run: Runner): void {
+export function preflight(unit: SetupUnit, cwd: string, run: Runner): void { // exported for ./upgrade.ts
   const terraform = run(['terraform', 'version'], { cwd, capture: true });
   if (terraform.missing) {
     throw new SetupError(
@@ -501,7 +502,7 @@ export function terraformTooOld(versionOutput: string): string | undefined { // 
 }
 
 /** Run a terraform step, failing the command when it fails. */
-function terraformStep(run: Runner, dir: string, args: string[], what: string): void {
+export function terraformStep(run: Runner, dir: string, args: string[], what: string): void { // exported for ./upgrade.ts
   const res = run(['terraform', ...args], { cwd: dir });
   if (res.status !== 0) throw new SetupError(`terraform ${what} failed (exit ${res.status}) — the output above says why`);
 }
@@ -663,7 +664,7 @@ async function interviewAndApply(
 }
 
 /** The captured fleet-config.json, for the unit's image-build commands to read. */
-function readCapturedConfig(configPath: string): Record<string, unknown> {
+export function readCapturedConfig(configPath: string): Record<string, unknown> { // exported for ./upgrade.ts
   try {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')) as unknown;
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
@@ -676,14 +677,25 @@ function readCapturedConfig(configPath: string): Record<string, unknown> {
 }
 
 /**
+ * What the image-build driver needs from its caller: `runSetupInfra` passes
+ * its own options; `runUpgrade` (./upgrade.ts) passes the same three fields.
+ */
+export type ImageBuildContext = {
+  cwd: string;
+  env: Record<string, string | undefined>;
+  log: (line: string) => void;
+};
+
+/**
  * Start the deployment's in-account image build and wait it out (#189). False
  * when this deployment has none to start — the caller decides whether that is
  * a note (after an apply that succeeded) or a refusal (--rebuild-images).
  * Everything cloud-specific — the commands, their output shapes, the hints —
- * lives on the unit; this drives and reports.
+ * lives on the unit; this drives and reports. Exported for ./upgrade.ts, whose
+ * post-apply rebuild is this exact step at the freshly re-pinned ref.
  */
-async function produceImages(
-  opts: SetupInfraOptions,
+export async function produceImages(
+  opts: ImageBuildContext,
   run: Runner,
   unit: SetupUnit,
   config: Record<string, unknown>,
@@ -708,7 +720,7 @@ async function produceImages(
 
 /** Poll one build to its end, logging phase changes; a failed build names its log. */
 async function waitForImageBuild(
-  opts: SetupInfraOptions,
+  opts: ImageBuildContext,
   run: Runner,
   unit: SetupUnit,
   config: Record<string, unknown>,
@@ -784,8 +796,11 @@ async function rebuildImagesAlone(opts: SetupInfraOptions, run: Runner, unit: Se
  * tunnel will land on. Fleet created this infrastructure, so leaving the
  * operator to paste that line in by hand — the last manual step of the old
  * bring-up — is exactly the handoff this command exists to close.
+ * Exported for ./upgrade.ts: a converged deployment re-captures through the
+ * same function, so daemon_url survives an upgrade the same way it survives
+ * a setup rerun.
  */
-function captureFleetConfig(dir: string, run: Runner): string {
+export function captureFleetConfig(dir: string, run: Runner): string {
   const configPath = path.join(dir, 'fleet-config.json');
   const res = run(['terraform', 'output', '-json', 'fleet_config'], { cwd: dir, capture: true });
   if (res.status !== 0) {
