@@ -16,6 +16,8 @@ npm install -g github:vincentpaca/fleet   # always current
 npm install -g ownfleet                   # the npm registry name; may lag main
 ```
 
+Releases are operator-cut, not per-merge: the registry copy is the last release ([`CHANGELOG.md`](CHANGELOG.md) says what it contains), while the git install tracks current `main`.
+
 That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs one more tool — Terraform >= 1.7 — and runs from a Fleet checkout (`fleet setup infra` in the quick start below), because the Terraform unit ships by git, not in the npm package. The container images are built inside your own cloud account by the wizard, so Docker on your machine is only needed for the developer path (`images/build.sh`).
 
 ## What Fleet owns

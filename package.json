@@ -4,6 +4,10 @@
   "type": "module",
   "description": "Run your own harness jobs in containers in your own cloud.",
   "license": "PolyForm-Shield-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vincentpaca/fleet.git"
+  },
   "engines": {
     "node": ">=23.6"
   },
@@ -13,7 +17,8 @@
     "presets",
     "examples",
     "integrations",
-    "docs"
+    "docs",
+    "CHANGELOG.md"
   ],
   "bin": {
     "fleet": "src/cli/bin.mjs"

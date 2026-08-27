@@ -1,0 +1,17 @@
+# Label -> section mapping for GitHub's generated release notes. This feeds
+# the release playbook's appendix (agents/release.md step 3) as a grouped
+# starting point; the committed CHANGELOG.md list is the record.
+changelog:
+  exclude:
+    labels: [duplicate, invalid, wontfix]
+  categories:
+    - title: Fixed
+      labels: [bug]
+    - title: Documentation
+      labels: [documentation]
+    - title: Internal
+      labels: [tech-debt, dependencies, github_actions]
+    - title: Features and changes
+      labels: [ready, phase-1, phase-2, enhancement]
+    - title: Everything else
+      labels: ["*"]
