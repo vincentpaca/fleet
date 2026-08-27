@@ -234,8 +234,9 @@ resource "aws_ecr_repository" "runner" {
     encryption_type = "KMS"
   }
 
-  # image_tag_mutability stays MUTABLE. images/build.sh owns the :runner and
-  # :daemon tags that infra/aws/ pins by name and re-pushes them on every build;
+  # image_tag_mutability stays MUTABLE. The :runner and :daemon tags that
+  # infra/aws/ pins by name are re-pushed on every build — by the in-account
+  # CodeBuild project below and by images/build.sh (the developer path) alike;
   # IMMUTABLE makes the second push fail. See docs/decisions.md.
   tags = local.tags
 }
@@ -251,6 +252,165 @@ resource "aws_ecr_repository" "project" {
 
   encryption_configuration {
     encryption_type = "KMS"
+  }
+
+  tags = local.tags
+}
+
+# --- In-account image build (CodeBuild, #189) -----------------------------------
+# `fleet setup infra` owns image production: a one-shot CodeBuild project that
+# clones the PUBLIC Fleet repository at var.source_ref — the same pinned ref the
+# module source names, so images and infra can never skew — builds BOTH images
+# from images/runner and images/daemon, and pushes them to this deployment's ECR
+# as :runner and :daemon. The trust thesis survives intact: you run what your
+# own account built, from a ref you can read. No clone and no local Docker on
+# the operator's machine; images/build.sh stays as the developer/offline path.
+#
+# Created only when source_ref is set. A module applied from a local path (the
+# dogfood shape) has no honest ref to pin, and a build from a floating default
+# would re-shape the images silently — the wizard refuses instead. There is no
+# cost gate: CodeBuild bills per build minute, and an idle project costs $0.
+#
+# Starting a build is the operator's act, not the unit's: `fleet setup infra`
+# calls codebuild:StartBuild with the operator's own credentials (the same
+# admin-ish credentials the apply used), after the apply and on --rebuild-images.
+# No schedule, no webhook, and no Fleet runtime role can reach it.
+
+locals {
+  build_images = var.source_ref != ""
+}
+
+resource "aws_cloudwatch_log_group" "image_build" {
+  count = local.build_images ? 1 : 0
+
+  name              = "/${var.name}/image-build"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = aws_kms_key.fleet.arn
+  tags              = local.tags
+}
+
+data "aws_iam_policy_document" "codebuild_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["codebuild.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "image_build" {
+  count = local.build_images ? 1 : 0
+
+  name               = "${var.name}-image-build"
+  assume_role_policy = data.aws_iam_policy_document.codebuild_assume.json
+  tags               = local.tags
+}
+
+resource "aws_iam_role_policy" "image_build" {
+  count = local.build_images ? 1 : 0
+
+  name = "ecr-push-and-logs"
+  role = aws_iam_role.image_build[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # The login handshake. GetAuthorizationToken is account-scoped by AWS's
+        # own design — it cannot name a repository — and grants nothing beyond
+        # the token; every write below is pinned to the one repository.
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      {
+        # Push to this deployment's runner repository ONLY (the :runner and
+        # :daemon tags both live there). The build must not be able to write
+        # any other repository in the account — including the per-project
+        # repos this same unit creates.
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:CompleteLayerUpload",
+          "ecr:InitiateLayerUpload",
+          "ecr:PutImage",
+          "ecr:UploadLayerPart",
+        ]
+        Resource = aws_ecr_repository.runner.arn
+      },
+      {
+        # Its own log group only.
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.image_build[0].arn}:*"
+      },
+    ]
+  })
+}
+
+resource "aws_codebuild_project" "images" {
+  count = local.build_images ? 1 : 0
+
+  name          = "${var.name}-images"
+  description   = "One-shot Fleet image build: clones the public repo at the pinned ref and pushes :runner and :daemon to this deployment's ECR. Started only by fleet setup infra."
+  service_role  = aws_iam_role.image_build[0].arn
+  build_timeout = 30
+
+  artifacts {
+    type = "NO_ARTIFACTS"
+  }
+
+  # privileged_mode: the buildspec runs `docker build`, and CodeBuild starts a
+  # Docker daemon only in privileged builds. The images come out linux/amd64 —
+  # what the Fargate daemon task and the default t3 instances run — because
+  # that is the build host's own architecture; no emulation, no binfmt.
+  environment {
+    compute_type    = "BUILD_GENERAL1_MEDIUM"
+    image           = "aws/codebuild/standard:7.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = true
+
+    environment_variable {
+      name  = "REPOSITORY_URL"
+      value = aws_ecr_repository.runner.repository_url
+    }
+  }
+
+  source {
+    type            = "GITHUB"
+    location        = var.source_repository
+    git_clone_depth = 1
+
+    # Inline, not a buildspec file in the repo: the pinned ref may predate any
+    # such file, and the build contract belongs beside the role that grants the
+    # push. Build args ride the Dockerfiles' own defaults — the same values
+    # images/build.sh passes explicitly. AWS_REGION is set by CodeBuild itself.
+    buildspec = <<-EOT
+      version: 0.2
+      phases:
+        pre_build:
+          commands:
+            - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$${REPOSITORY_URL%%/*}"
+        build:
+          commands:
+            - docker build -t "$REPOSITORY_URL:runner" -f images/runner/Dockerfile .
+            - docker build -t "$REPOSITORY_URL:daemon" -f images/daemon/Dockerfile .
+        post_build:
+          commands:
+            - docker push "$REPOSITORY_URL:runner"
+            - docker push "$REPOSITORY_URL:daemon"
+    EOT
+  }
+
+  # The version alignment the whole design hangs on: the build checks out
+  # exactly the ref the module source pins.
+  source_version = var.source_ref
+
+  logs_config {
+    cloudwatch_logs {
+      group_name = aws_cloudwatch_log_group.image_build[0].name
+    }
   }
 
   tags = local.tags
@@ -492,9 +652,21 @@ resource "aws_launch_template" "instances" {
     http_put_response_hop_limit = 1
   }
 
+  # The SSM agent line is the break-glass path (#198): the ECS-optimized AL2023
+  # AMI ships amazon-ssm-agent but does not enable it, so an InService worker —
+  # instance role holding AmazonSSMManagedInstanceCore and all — answered
+  # `ssm start-session` with TargetNotConnected during a live rescue, and the
+  # committed work still on its disk was unreachable. `systemctl enable --now`
+  # is AL2023's supported enablement. Network path: registration needs outbound
+  # HTTPS to the ssm/ec2messages/ssmmessages endpoints, which the instances SG's
+  # existing all-outbound egress already serves (the same public-IP or NAT path
+  # ECR pulls take) — no new rule, and still no inbound from anywhere.
+  # Pinned by tests/plan.tftest.hcl; break-glass usage is in the unit README's
+  # operations section.
   user_data = base64encode(<<-EOT
     #!/bin/bash
     echo "ECS_CLUSTER=${aws_ecs_cluster.this.name}" >> /etc/ecs/ecs.config
+    systemctl enable --now amazon-ssm-agent
   EOT
   )
 
@@ -819,8 +991,13 @@ locals {
     daemon_port            = var.daemon_tcp_port
     runner_repository_url  = aws_ecr_repository.runner.repository_url
     runner_task_definition = aws_ecs_task_definition.runner.family
-    runner_container_name  = local.runner_container_name
-    runner_log_group       = aws_cloudwatch_log_group.runner.name
+    # In-account image production (#189): the CodeBuild project `fleet setup
+    # infra` starts after apply and --rebuild-images re-runs. null when the
+    # module was applied from an unpinned source (no source_ref) — the CLI
+    # then refuses to build rather than building from a ref nobody chose.
+    image_build_project   = one(aws_codebuild_project.images[*].name)
+    runner_container_name = local.runner_container_name
+    runner_log_group      = aws_cloudwatch_log_group.runner.name
     # Runner tasks use bridge networking on EC2; ecs run-task must not receive
     # --network-configuration for bridge-mode tasks.
     subnets         = []

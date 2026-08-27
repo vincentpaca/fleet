@@ -37,6 +37,34 @@ export type PromptSpec = {
 /** A `required_providers` entry for the generated root module. */
 type RequiredProvider = { name: string; source: string; version: string };
 
+/** The captured deployment description (fleet-config.json), as a unit reads it. */
+export type CapturedConfig = Record<string, unknown>;
+
+/**
+ * How a unit produces its images inside the operator's account (#189): the
+ * cloud-CLI commands the wizard runs after apply and on --rebuild-images, and
+ * how to read their output. Commands, not code — ./setup.ts drives them
+ * cloud-agnostically, the same split the credential preflight uses. Every
+ * command runs with the operator's own credentials: the same admin-ish
+ * credentials the apply used, never a Fleet runtime role.
+ */
+export type ImageBuild = {
+  /** argv that starts one build, or undefined when the deployment has none to start. */
+  start: (config: CapturedConfig) => string[] | undefined;
+  /** The build id out of start's stdout, or undefined when it is unreadable. */
+  buildId: (stdout: string) => string | undefined;
+  /** argv that reads the build's current phase and status. */
+  poll: (config: CapturedConfig, buildId: string) => string[];
+  /** Parse poll's stdout; undefined when it is unreadable. */
+  progress: (stdout: string) => { done: boolean; ok: boolean; phase: string } | undefined;
+  /** Where the operator reads a failed build's log, as a pasteable command. */
+  failureHint: (config: CapturedConfig, buildId: string) => string;
+  /** After a rebuild: how to roll the daemon service onto the new image. */
+  rollHint: (config: CapturedConfig) => string;
+  /** Why this deployment cannot build in-account, and what to do instead. */
+  unavailable: string;
+};
+
 export type SetupUnit = {
   /** Directory name under `infra/` in this repo and under `.fleet/infra/` in the project. */
   provider: string;
@@ -60,6 +88,8 @@ export type SetupUnit = {
   /** Module block arguments, as already-rendered HCL values. */
   moduleArgs: (answers: Answers) => Array<[string, string]>;
   prompts: PromptSpec[];
+  /** In-account image production (#189). */
+  images: ImageBuild;
 };
 
 // ---------- shared validators ----------
@@ -112,6 +142,12 @@ function validateSubnetIds(value: string): string | undefined {
   return bad === undefined ? undefined : `not a subnet id: ${bad} (expected subnet-…)`;
 }
 
+/** A non-empty string field out of the captured config, or undefined. */
+function configString(config: CapturedConfig, key: string): string | undefined {
+  const value = config[key];
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
 // ---------- the units ----------
 
 const AWS: SetupUnit = {
@@ -133,6 +169,14 @@ const AWS: SetupUnit = {
     if (a.vpc_id) {
       args.push(['vpc_id', hclString(a.vpc_id)]);
       args.push(['subnet_ids', hclStringList(a.subnet_ids)]);
+    }
+    // Not answers: setup.ts derives these from the resolved module source
+    // (#189), so the in-account image build clones exactly the ref the module
+    // itself is pinned to. Absent — a local-path module source — the unit
+    // provisions no build project, deliberately: there is no honest ref.
+    if (a.source_ref) {
+      args.push(['source_repository', hclString(a.source_repository)]);
+      args.push(['source_ref', hclString(a.source_ref)]);
     }
     return args;
   },
@@ -173,6 +217,63 @@ const AWS: SetupUnit = {
       when: (a) => Boolean(a.vpc_id),
     },
   ],
+  // The one-shot CodeBuild project the unit provisions when its module source
+  // is pinned (#189). fleet_config carries the project name (or null), so the
+  // wizard starts only a build the apply actually provisioned.
+  images: {
+    start: (config) => {
+      const project = configString(config, 'image_build_project');
+      const region = configString(config, 'region');
+      if (project === undefined || region === undefined) return undefined;
+      return [
+        'aws', 'codebuild', 'start-build',
+        '--project-name', project,
+        '--region', region,
+        '--query', 'build.id', '--output', 'text',
+      ];
+    },
+    buildId: (stdout) => {
+      const id = stdout.trim();
+      return id === '' || id === 'None' ? undefined : id;
+    },
+    poll: (config, buildId) => [
+      'aws', 'codebuild', 'batch-get-builds',
+      '--ids', buildId,
+      '--region', configString(config, 'region') ?? '',
+      '--query', 'builds[0].{phase:currentPhase,status:buildStatus}', '--output', 'json',
+    ],
+    progress: (stdout) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        return undefined;
+      }
+      if (typeof parsed !== 'object' || parsed === null) return undefined;
+      const { phase, status } = parsed as { phase?: unknown; status?: unknown };
+      const shownPhase = typeof phase === 'string' ? phase : 'UNKNOWN';
+      if (typeof status !== 'string') return undefined;
+      if (status === 'IN_PROGRESS') return { done: false, ok: false, phase: shownPhase };
+      // Terminal: SUCCEEDED, or one of FAILED / FAULT / TIMED_OUT / STOPPED —
+      // the status names the ending better than the phase does.
+      return { done: true, ok: status === 'SUCCEEDED', phase: status };
+    },
+    failureHint: (config, buildId) =>
+      `aws codebuild batch-get-builds --ids ${buildId} --region ${configString(config, 'region') ?? '<region>'} ` +
+      `--query 'builds[0].logs.deepLink' --output text   # the build log names the failing step`,
+    // Guidance, not the deploy command itself: no shipped code path may carry
+    // a service roll, even as a printed string (docs/decisions.md#d5, pinned
+    // by test/images-build.test.ts). The exact one-liner lives in the unit
+    // README's bring-up, where the operator — the only party allowed to
+    // deploy — reads it.
+    rollHint: (config) =>
+      `force a new deployment of service ${configString(config, 'daemon_service') ?? '<service>'} ` +
+      `on cluster ${configString(config, 'cluster') ?? '<cluster>'} ` +
+      `(region ${configString(config, 'region') ?? '<region>'}) — the one-line command is in infra/aws/README.md, bring-up step 2`,
+    unavailable:
+      'this deployment has no in-account image build: its terraform was applied from an unpinned module source (a local path), so there is no honest git ref to build from\n' +
+      '  build and publish from a Fleet checkout instead: images/build.sh --redeploy-daemon',
+  },
 };
 
 /** Every unit this CLI can stand up, in the order they are offered. */

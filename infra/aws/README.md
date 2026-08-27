@@ -51,18 +51,52 @@ terraform -chdir=$PWD output -json fleet_config \
   > <project>/.fleet/infra/aws/fleet-config.json
 ```
 
-**2. Publish both images and start the daemon on them — one command.**
+**2. Images — the wizard already built them.** When the module source is pinned to a
+git ref (which `fleet setup infra` always does), the unit provisions a one-shot
+CodeBuild project (`<name>-images`) that clones the **public** Fleet repository at
+**exactly that ref** (`source_repository` / `source_ref`), builds `images/runner` and
+`images/daemon` inside your account, and pushes them to the deployment's ECR as
+`:runner` and `:daemon` — the tags the task definitions pin. The wizard starts that
+build right after the apply and waits with progress, so images and infrastructure
+can never skew and there is no clone, no local Docker, and no TLS-intercepting proxy
+in the path. Rebuild on upgrade with:
+
+```sh
+fleet setup infra --rebuild-images
+aws ecs update-service --cluster <name> --service <name>-daemon \
+  --force-new-deployment --region <region>    # roll the daemon onto the new :daemon
+```
+
+(The roll stays a command you type: no shipped code path may deploy — not even by
+printing the pasteable line — per `docs/decisions.md#d5`. Freshly built images on a
+*first* bring-up need no roll at all: the daemon service is already retrying its
+image pull and starts as soon as `:daemon` exists.)
+
+The build runs with a role that can push to this deployment's runner repository and
+write its own log group — nothing else; *starting* it uses your own credentials
+(`codebuild:StartBuild`), the same admin-ish credentials the apply used. Build logs
+land in `/<name>/image-build`.
+
+The developer/offline path still exists — build locally and roll the daemon in one
+command from a Fleet checkout:
 
 ```sh
 <fleet-checkout>/images/build.sh --redeploy-daemon
 ```
 
-That builds the runner base and the daemon image for **this deployment's**
-architecture (`linux/amd64`; pass `--platform` to change it), tags them `:runner`
-and `:daemon` — the tags this unit's task definitions pin — pushes both to the ECR
-repository from `fleet_config`, and forces a new deployment of the daemon service so
-it starts from the image just pushed. You never set `DOCKER_DEFAULT_PLATFORM`,
-`docker tag`, or `aws ecs update-service` by hand.
+It targets `linux/amd64` (what this unit runs); on an arm64 workstation that build
+is emulated, which needs binfmt registered — Docker Desktop ships it, a plain arm64
+Linux engine (a Graviton dev box) does not, and without it the first `RUN` fails
+with `exec format error`. Register it once:
+
+```sh
+docker run --privileged --rm tonistiigi/binfmt --install amd64
+```
+
+`daemon_image` is still available if you would rather point the service at an image
+you publish elsewhere. A module applied from a local path (no pinned ref) provisions
+no build project — there is no honest ref to build from — and the wizard says so and
+points at `images/build.sh` instead of building from a floating default.
 
 **3. Open the tunnel.** `fleet setup infra` already wrote `"daemon_url":
 "http://127.0.0.1:19000"` into `fleet-config.json` (any free local port works; `1` +
@@ -78,16 +112,21 @@ It resolves the deployment from `fleet_config`, forwards `daemon_port` to the po
 re-resolving the daemon task, which a `force-new-deployment` replaces. `fleet doctor`
 reports the tunnel's state; `connect_hint` is the same sequence to run by hand.
 
-On an arm64 workstation the build is emulated, which needs binfmt registered.
-Docker Desktop ships it; a plain arm64 Linux engine (a Graviton dev box) does not,
-and without it the first `RUN` fails with `exec format error`. Register it once:
+## Operations
+
+**Break-glass access to a worker instance** (a wedged job, an exited container
+holding unpushed work): every worker runs the SSM agent — user_data enables it,
+the instance role already carries `AmazonSSMManagedInstanceCore`, and no SSH or
+inbound rule exists by design — so a shell on the box is one line:
 
 ```sh
-docker run --privileged --rm tonistiigi/binfmt --install amd64
+aws ssm start-session --target <instance-id> --region <region>
 ```
 
-`daemon_image` is still available if you would rather point the service at an image
-you publish elsewhere.
+Verify registration after a fresh apply: a worker should appear in
+`aws ssm describe-instance-information --region <region>` within a few minutes
+of launching. An instance that never appears there has no rescue path — treat
+that as a deployment bug, not a quirk.
 
 ## Upgrading an existing deployment: the EFS access point moves FLEET_HOME
 
@@ -139,6 +178,8 @@ the right ownership on first mount.
 | `offered_cpu_units` | `number` | `4096` | Largest CPU request (ECS units) a single runner task may make; the daemon rejects bigger manifests at dispatch. Size to `instance_type`. |
 | `offered_memory_mib` | `number` | `15360` | Largest memory request (MiB) a single runner task may make; sized to leave ~1 GiB headroom for the ECS agent on `instance_type`. |
 | `project_repos` | `list(string)` | `[]` | Extra ECR repositories, one per project image. |
+| `source_repository` | `string` | Fleet's canonical repo | Public https git URL the in-account image build clones. `fleet setup infra` sets it from its own module source, so a fork builds its fork. |
+| `source_ref` | `string` | `""` | Git ref the image build checks out — the same pinned ref the module source names. Empty provisions no build project (a local-path module source has no honest ref); `images/build.sh` remains the fallback. |
 | `daemon_image` | `string` | `""` | Daemon container image; empty means `<runner repo>:daemon`. |
 | `daemon_cpu` | `number` | `256` | CPU units for the daemon Fargate task (must be a valid Fargate value: 256/512/1024/2048/4096). |
 | `daemon_memory` | `number` | `512` | Memory (MiB) for the daemon Fargate task (must be valid for the chosen CPU — the unit rejects an invalid pairing at plan). |
@@ -218,7 +259,7 @@ Two interactions to know:
 | `efs_file_system_id` | EFS file system backing `FLEET_HOME`. |
 | `vpc_id` | VPC deployed into (created or reused). |
 | `connect_hint` | The SSM port-forward commands `fleet connect` runs, for when you want the tunnel by hand. |
-| `fleet_config` | The unit's self-description: what the daemon reads at boot, what `images/build.sh` publishes to (`runner_repository_url`, `cluster`, `daemon_service`), and what `fleet connect` tunnels into (`daemon_container_name`, `daemon_port`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
+| `fleet_config` | The unit's self-description: what the daemon reads at boot, what the image build addresses (`image_build_project`, `runner_repository_url`, `cluster`, `daemon_service` — also what `images/build.sh` publishes to), and what `fleet connect` tunnels into (`daemon_container_name`, `daemon_port`). Capture it as `.fleet/infra/aws/fleet-config.json`. |
 
 ## Changing this unit
 

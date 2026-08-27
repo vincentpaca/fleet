@@ -335,6 +335,20 @@ export function resolveModuleSource(opts: { // contract pin: test-only export, a
   );
 }
 
+/**
+ * The repository and ref a git module source pins, when it pins one (#189).
+ * These reach the unit as module arguments so the in-account image build clones
+ * exactly the code the applied module describes — images and infra move as one
+ * ref or not at all. A source that pins nothing (a local path — the dogfood
+ * shape — or a git source with no `?ref=`) returns undefined, and the unit then
+ * provisions no build project rather than building from a ref nobody chose.
+ */
+export function pinnedSource(moduleSource: string): { repository: string; ref: string } | undefined { // contract pin: test-only export, asserted by the suite
+  const found = moduleSource.match(/^git::(https?:\/\/[^?\s]+?)(?:\.git)?\/\/[^?\s]*\?ref=([^&\s]+)$/);
+  if (!found) return undefined;
+  return { repository: `${found[1]}.git`, ref: found[2] };
+}
+
 // ---------- generating the root module ----------
 
 /** Render `key = value` lines with the `=` aligned, the way `terraform fmt` would. */
@@ -510,6 +524,8 @@ type SetupInfraOptions = {
   yes: boolean;
   /** --destroy: tear the named deployment down instead of creating one. */
   destroy: boolean;
+  /** --rebuild-images: re-run the in-account image build alone (the upgrade path, #189). */
+  rebuildImages: boolean;
   /** --backend <type>: write a backend block; local state when absent. */
   backend?: string;
   /** --backend-config: passed through to `terraform init`, repeatable. */
@@ -555,6 +571,10 @@ async function interviewAndApply(
   dir: string,
   ask: Asker | undefined,
 ): Promise<number> {
+  if (opts.rebuildImages) {
+    if (opts.destroy) throw new SetupError('--rebuild-images and --destroy contradict each other — one rebuilds a deployment, the other removes it');
+    return rebuildImagesAlone(opts, run, unit, dir);
+  }
   if (opts.destroy) return await destroyInfra(opts, run, dir, ask);
 
   opts.log(`provider: ${unit.provider} — ${unit.label}`);
@@ -565,13 +585,20 @@ async function interviewAndApply(
         '  supply them as flags (that is what they are for), or run this on a terminal',
     );
   }
-  const answers = merged.answers;
   const moduleSource = resolveModuleSource({
     provider: unit.provider,
     flag: opts.moduleSource,
     env: opts.env,
     root: opts.root,
   });
+  // The pinned repository and ref ride into the unit as pseudo-answers (#189):
+  // derived, never asked — a value the module source already fixes is not an
+  // interview question.
+  const pinned = pinnedSource(moduleSource);
+  const answers: Answers = {
+    ...merged.answers,
+    ...(pinned ? { source_repository: pinned.repository, source_ref: pinned.ref } : {}),
+  };
 
   fs.mkdirSync(dir, { recursive: true });
   ensureFleetGitignore(path.join(opts.cwd, '.fleet'), ['infra/']);
@@ -616,9 +643,136 @@ async function interviewAndApply(
   const configPath = captureFleetConfig(dir, run);
   opts.log('');
   opts.log(`applied. Captured ${path.relative(opts.cwd, configPath)} — every other fleet command reads it.`);
-  opts.log('Next: publish the images and start the daemon on them, then open the tunnel:');
-  opts.log('  <fleet-checkout>/images/build.sh --redeploy-daemon');
+  // Image production is the wizard's job too (#189): the deployment carries a
+  // build project pinned to the module's own ref, so no clone and no local
+  // container tooling stand between the apply and a working daemon.
+  const config = readCapturedConfig(configPath);
+  if (await produceImages(opts, run, unit, config)) {
+    opts.log('Next: open the tunnel:');
+  } else {
+    // Applied from an unpinned source: say so and name the fallback, but the
+    // apply itself succeeded — the deployment is real, only its images are
+    // still the operator's to publish.
+    opts.log(`note: ${unit.images.unavailable}`);
+    opts.log('Then open the tunnel:');
+  }
   opts.log('  fleet connect');
+  return 0;
+}
+
+/** The captured fleet-config.json, for the unit's image-build commands to read. */
+function readCapturedConfig(configPath: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')) as unknown;
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through to the refusal below
+  }
+  throw new SetupError(`cannot read the deployment description at ${configPath} — retake it with a rerun of fleet setup infra`);
+}
+
+/**
+ * Start the deployment's in-account image build and wait it out (#189). False
+ * when this deployment has none to start — the caller decides whether that is
+ * a note (after an apply that succeeded) or a refusal (--rebuild-images).
+ * Everything cloud-specific — the commands, their output shapes, the hints —
+ * lives on the unit; this drives and reports.
+ */
+async function produceImages(
+  opts: SetupInfraOptions,
+  run: Runner,
+  unit: SetupUnit,
+  config: Record<string, unknown>,
+): Promise<boolean> {
+  const start = unit.images.start(config);
+  if (start === undefined) return false;
+
+  opts.log('');
+  opts.log('building the runner and daemon images in your account (one-shot build; takes several minutes) ...');
+  const started = run(start, { cwd: opts.cwd, capture: true });
+  if (started.status !== 0) {
+    throw new SetupError(`starting the image build failed (exit ${started.status})\n${indented(started.stderr)}`);
+  }
+  const buildId = unit.images.buildId(started.stdout);
+  if (buildId === undefined) {
+    throw new SetupError('the image build was requested but no build id came back — check the build in your cloud console');
+  }
+  opts.log(`  build ${buildId}`);
+  await waitForImageBuild(opts, run, unit, config, buildId);
+  return true;
+}
+
+/** Poll one build to its end, logging phase changes; a failed build names its log. */
+async function waitForImageBuild(
+  opts: SetupInfraOptions,
+  run: Runner,
+  unit: SetupUnit,
+  config: Record<string, unknown>,
+  buildId: string,
+): Promise<void> {
+  const interval = imagePollMs(opts.env);
+  let lastPhase = '';
+  for (;;) {
+    const res = run(unit.images.poll(config, buildId), { cwd: opts.cwd, capture: true });
+    if (res.status !== 0) throw new SetupError(`reading the image build's status failed (exit ${res.status})\n${indented(res.stderr)}`);
+    const progress = unit.images.progress(res.stdout);
+    if (progress === undefined) throw new SetupError('the image build reported an unreadable status — check the build in your cloud console');
+    if (progress.phase !== lastPhase) {
+      opts.log(`  images: ${progress.phase}`);
+      lastPhase = progress.phase;
+    }
+    if (progress.done && progress.ok) {
+      opts.log('  images built and pushed.');
+      return;
+    }
+    if (progress.done) {
+      throw new SetupError(
+        `the image build failed (${progress.phase}). Read its log:\n  ${unit.images.failureHint(config, buildId)}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
+
+/**
+ * Poll cadence for the image-build wait. A build is minutes long, so 5s is
+ * plenty; the env override exists for the test suite, which fakes the cloud
+ * CLI and must not spend real seconds between fake polls.
+ */
+function imagePollMs(env: Record<string, string | undefined>): number {
+  const n = Number(env.FLEET_IMAGE_POLL_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 5_000;
+}
+
+/** `fleet setup infra --rebuild-images`: re-run the image build for the deployment already here. */
+async function rebuildImagesAlone(opts: SetupInfraOptions, run: Runner, unit: SetupUnit, dir: string): Promise<number> {
+  // The prompt flags describe a deployment to create; a rebuild creates
+  // nothing. Same rule as --destroy: accepting a value and ignoring it is how
+  // an operator ends up sure they rebuilt something they never named.
+  const contradicting = Object.entries(opts.flags)
+    .filter(([, value]) => value !== undefined)
+    .map(([key]) => `--${flagName(key)}`);
+  if (contradicting.length > 0) {
+    throw new SetupError(
+      `--rebuild-images does not take ${contradicting.join(' ')}: it re-runs the image build for the deployment this directory already describes`,
+    );
+  }
+
+  const configPath = path.join(dir, 'fleet-config.json');
+  if (!fs.existsSync(configPath)) {
+    throw new SetupError(
+      `no deployment to rebuild images for: ${path.relative(opts.cwd, configPath)} does not exist\n` +
+        '  --rebuild-images re-runs the build `fleet setup infra` provisioned; run that first',
+    );
+  }
+  const config = readCapturedConfig(configPath);
+  if (!(await produceImages(opts, run, unit, config))) {
+    throw new SetupError(`--rebuild-images: ${unit.images.unavailable}`);
+  }
+  opts.log('the daemon service starts from the new image on its next deployment — roll it now with:');
+  opts.log(`  ${unit.images.rollHint(config)}`);
   return 0;
 }
 

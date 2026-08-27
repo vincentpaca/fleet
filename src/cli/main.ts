@@ -69,8 +69,12 @@ Commands:
                                            infra contract cannot assume (name, region, optional
                                            existing VPC), shows the plan, and applies on an
                                            explicit yes. Generates .fleet/infra/<provider>/main.tf
-                                           against Fleet's terraform unit at a pinned ref and
-                                           captures fleet-config.json when the apply succeeds.
+                                           against Fleet's terraform unit at a pinned ref,
+                                           captures fleet-config.json when the apply succeeds,
+                                           then builds the runner and daemon images in your
+                                           account from that same pinned ref — no clone, no
+                                           local docker. --rebuild-images re-runs just the
+                                           image build (the upgrade path).
                                            Flags are headless overrides for any prompt
                                            (--name, --region, --vpc-id, --subnet-ids), plus
                                            --provider, --backend, --backend-config (repeatable),
@@ -324,6 +328,7 @@ async function cmdSetupInfra(args: string[]): Promise<number> {
       provider: { type: 'string' },
       yes: { type: 'boolean' },
       destroy: { type: 'boolean' },
+      'rebuild-images': { type: 'boolean' },
       backend: { type: 'string' },
       'backend-config': { type: 'string', multiple: true },
       'module-source': { type: 'string' },
@@ -342,6 +347,7 @@ async function cmdSetupInfra(args: string[]): Promise<number> {
       flags: suppliedFlags(unit.prompts, values),
       yes: values.yes === true,
       destroy: values.destroy === true,
+      rebuildImages: values['rebuild-images'] === true,
       backend: typeof values.backend === 'string' ? values.backend : undefined,
       backendConfig: Array.isArray(values['backend-config']) ? values['backend-config'] : [],
       moduleSource: typeof values['module-source'] === 'string' ? values['module-source'] : undefined,
