@@ -5,7 +5,7 @@
 // emits them: this suite spawns src/daemon/main.ts rather than a stand-in.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -214,4 +214,105 @@ test('boot log precedes a failing provider build, so a stuck boot is diagnosable
     'fleet daemon: provider ecs',
     'fleet daemon: config source ssm:/fleet/test/config',
   ], `boot lines lost on a failing boot:\n${daemon.lines().join('\n')}\nstderr:\n${daemon.stderr()}`);
+});
+
+test('an explicit FLEET_DAEMON_HOST widens the bind past loopback (#185)', async (t) => {
+  // The one real behavior change GCP support makes to the composition root:
+  // the unit's env file sets FLEET_DAEMON_HOST to the reserved internal
+  // address, and a daemon that advertises it while binding 127.0.0.1 is
+  // unreachable by every job and by the IAP tunnel alike. Before #185 only
+  // the ECS-metadata branch widened the bind — this test fails on that code.
+  const home = tempDir(t, 'fleet-boot-widen-home-');
+  const daemon = spawnDaemon(t, {
+    FLEET_HOME: home,
+    FLEET_PORT: '0',
+    FLEET_PROVIDER: 'process',
+    FLEET_DAEMON_HOST: '10.128.0.5',
+  });
+
+  const listening = await daemon.waitFor(/listening on/);
+  assert.match(
+    listening,
+    / and 0\.0\.0\.0:\d+ \(advertising 10\.128\.0\.5\)$/,
+    `an explicit non-loopback FLEET_DAEMON_HOST must bind 0.0.0.0: ${listening}`,
+  );
+  // 0.0.0.0 includes loopback, so the logged port is still reachable locally —
+  // the same proof-by-use the default-bind test above makes.
+  const port = Number(/0\.0\.0\.0:(\d+)/.exec(listening)![1]);
+  const health = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(health.status, 200);
+  await health.json();
+});
+
+test('a loopback FLEET_DAEMON_HOST does not widen the bind (#185)', async (t) => {
+  // Advertising 127.0.0.1 wants no wider listener: widening on any explicit
+  // value would turn every local override into an all-interfaces bind.
+  const home = tempDir(t, 'fleet-boot-loop-home-');
+  const daemon = spawnDaemon(t, {
+    FLEET_HOME: home,
+    FLEET_PORT: '0',
+    FLEET_PROVIDER: 'process',
+    FLEET_DAEMON_HOST: '127.0.0.1',
+  });
+
+  const listening = await daemon.waitFor(/listening on/);
+  assert.match(
+    listening,
+    / and 127\.0\.0\.1:\d+ \(advertising 127\.0\.0\.1\)$/,
+    `a loopback FLEET_DAEMON_HOST must keep the loopback bind: ${listening}`,
+  );
+});
+
+test('a gcp daemon boots from env config, serves, and survives a failed token publish (#185)', async (t) => {
+  // The GCP unit's daemon.env in miniature: provider gcp, config entirely from
+  // FLEET_GCP_* env (config source "env" — there is no SSM-fetch analog), the
+  // widened bind, and a best-effort Secret Manager publish. The fake gcloud
+  // refuses the publish: a daemon that serves but could not publish is
+  // strictly better than one that is down, so the failure is one stderr line
+  // pointing at the IAP fallback, never an exit.
+  const home = tempDir(t, 'fleet-boot-gcp-home-');
+  const binDir = tempDir(t, 'fleet-boot-gcp-bin-');
+  writeFileSync(
+    join(binDir, 'gcloud'),
+    '#!/bin/sh\necho "ERROR: (gcloud.secrets.versions.add) PERMISSION_DENIED" >&2\nexit 1\n',
+    { mode: 0o755 },
+  );
+  const daemon = spawnDaemon(t, {
+    PATH: `${binDir}:${process.env.PATH ?? ''}`,
+    FLEET_HOME: home,
+    FLEET_PORT: '0',
+    FLEET_PROVIDER: 'gcp',
+    FLEET_DAEMON_HOST: '10.128.0.5',
+    FLEET_GCP_PROJECT: 'mock-project',
+    FLEET_GCP_REGION: 'us-central1',
+    FLEET_GCP_JOB: 'fleet-runner',
+    FLEET_GCP_TOKEN_SECRET: 'fleet-operator-token',
+  });
+
+  const listening = await daemon.waitFor(/listening on/);
+  assert.deepEqual(daemon.lines().slice(0, 3), [
+    `fleet daemon: home ${home}`,
+    'fleet daemon: provider gcp',
+    'fleet daemon: config source env',
+  ], `boot lines missing or reordered:\n${daemon.lines().join('\n')}`);
+  assert.match(listening, / and 0\.0\.0\.0:\d+ \(advertising 10\.128\.0\.5\)$/);
+
+  // The publish failed, the daemon did not: /health answers, stderr names the
+  // fallback path, and no token value leaked to either stream.
+  await daemon.waitFor(/listening on/);
+  const port = Number(/0\.0\.0\.0:(\d+)/.exec(listening)![1]);
+  const health = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(health.status, 200);
+  await health.json();
+  // The publish is best-effort but not silent — wait for its stderr line.
+  const deadline = Date.now() + BOOT_TIMEOUT_MS;
+  while (!daemon.stderr().includes('operator token publish failed') && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.match(daemon.stderr(), /operator token publish failed/, daemon.stderr());
+  assert.match(daemon.stderr(), /IAP SSH/, 'the failure must name the by-hand fallback');
+  const token = readFileSync(join(home, 'operator-token'), 'utf8').trim();
+  assert.ok(token.length > 0, 'the daemon minted its token locally regardless');
+  assert.ok(!daemon.lines().join('\n').includes(token), 'boot log must not leak the token');
+  assert.ok(!daemon.stderr().includes(token), 'stderr must not leak the token');
 });

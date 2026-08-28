@@ -17,6 +17,12 @@ import {
   parseSsmParameterValue,
   type FleetConfig,
 } from '../providers/ecs.ts';
+import {
+  buildSecretAccessArgs,
+  gcloudCli,
+  gcpDaemonAccessFromFleetConfig,
+  gcpTunnelOpener,
+} from '../providers/gcp.ts';
 
 /** Re-exported so core can name the type without importing a cloud. */
 export type CloudRunner = CloudCliRunner;
@@ -43,6 +49,10 @@ export function tunnelOpenerFor(deployment: Deployment): { open: TunnelOpener; r
     const access = ecsDaemonAccessFromFleetConfig(deployment.config as FleetConfig);
     return { open: ecsTunnelOpener(access), remotePort: access.port };
   }
+  if (provider === 'gcp') {
+    const access = gcpDaemonAccessFromFleetConfig(deployment.config);
+    return { open: gcpTunnelOpener(access), remotePort: access.port };
+  }
   throw new Error(
     `no tunnel implementation for provider "${provider}" (from ${deployment.source}) — use that unit's connect_hint output by hand`,
   );
@@ -58,6 +68,9 @@ export function refreshDeployment(
   config: Record<string, unknown>,
   run: CloudRunner = awsCli,
 ): Promise<{ source: string; config: Record<string, unknown> }> | undefined {
+  // gcp offers no live source by design: its config is a terraform-rendered
+  // env file on the daemon VM, not a parameter the CLI can re-read. A stale
+  // gcp capture is re-captured from `terraform output -json fleet_config`.
   if (config.provider !== 'ecs') return undefined;
   const ssmPath = config.ssm_config_path;
   if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
@@ -85,8 +98,18 @@ export function refreshDeployment(
  */
 export function fetchDeploymentOperatorToken(
   config: Record<string, unknown>,
-  run: CloudRunner = awsCli,
+  run?: CloudRunner,
 ): Promise<string> | undefined {
+  if (config.provider === 'gcp') {
+    // The GCP daemon publishes a version of the unit-created secret at boot;
+    // `versions access` prints the raw payload. Fetched with the operator's
+    // own gcloud credentials, exactly like the SSM read below uses their AWS
+    // ones.
+    const secret = config.operator_token_secret;
+    const project = config.project;
+    if (typeof secret !== 'string' || secret === '' || typeof project !== 'string' || project === '') return undefined;
+    return (run ?? gcloudCli)(buildSecretAccessArgs(project, secret)).then((stdout) => stdout.trim());
+  }
   if (config.provider !== 'ecs') return undefined;
   const ssmPath = config.ssm_config_path;
   if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
@@ -95,5 +118,5 @@ export function fetchDeploymentOperatorToken(
   // region, not the caller's ambient one (#138).
   const args = ['ssm', 'get-parameter', '--name', operatorTokenSsmPath(ssmPath), '--with-decryption', '--output', 'json'];
   if (typeof config.region === 'string' && config.region !== '') args.push('--region', config.region);
-  return run(args).then((stdout) => parseSsmParameterValue(stdout).trim());
+  return (run ?? awsCli)(args).then((stdout) => parseSsmParameterValue(stdout).trim());
 }

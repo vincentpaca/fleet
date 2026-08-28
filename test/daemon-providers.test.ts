@@ -25,10 +25,24 @@ import {
   ecsTunnelOpener,
   parseFleetTasks,
 } from "../src/providers/ecs.ts";
+import {
+  GCP_TASK_TIMEOUT_MARGIN_S,
+  GCP_TASK_TIMEOUT_MAX_S,
+  GcpProvider,
+  buildIapTunnelArgs,
+  buildSecretAccessArgs,
+  gcpConfigFromEnv,
+  gcpDaemonAccessFromFleetConfig,
+  gcpTunnelOpener,
+  parseExecutionName,
+  parseFleetExecutions,
+  publishOperatorTokenToSecretManager,
+} from "../src/providers/gcp.ts";
+import { fetchDeploymentOperatorToken } from "../src/cli/tunnel-openers.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
-import { writeSecretTempFile } from "../src/providers/provider.ts";
+import { isMissingResourceError, writeSecretTempFile } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until, requestJson } from "./daemon-helpers.ts";
@@ -1056,7 +1070,21 @@ test("GET /health returns {ok: true} with status 200", async (t) => {
   // Unstamped process (this suite runs from a checkout, not an image): /health
   // must not invent a build identity — absence is what doctor reports honestly.
   assert.ok(!("build" in (sockResult.json as Record<string, unknown>)), "no invented build stamp");
+
+  // The daemon's own package version rides every /health (#185): the identity
+  // an npm-installed daemon (the GCP shape) actually has, where a build sha
+  // does not exist. doctor's skew section reads it instead of inventing an
+  // "unstamped image" finding about a deployment with no daemon image.
+  assert.equal(
+    (sockResult.json as { version?: string }).version,
+    PACKAGE_VERSION,
+    "/health must carry the daemon's package.json version",
+  );
 });
+
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8")) as { version: string }
+).version;
 
 test("GET /health names the build stamp a stamped image carries (#207)", async (t) => {
   // In a deployment the stamp arrives via the image ENV (images/build.sh bakes
@@ -1071,7 +1099,7 @@ test("GET /health names the build stamp a stamped image carries (#207)", async (
 
   const res = await op(sock, "GET", "/health");
   assert.equal(res.status, 200);
-  assert.deepEqual(res.json, { ok: true, build: stamp });
+  assert.deepEqual(res.json, { ok: true, version: PACKAGE_VERSION, build: stamp });
 });
 
 // ---------- operator access: SSM port-forward primitives (#57) ----------
@@ -2206,4 +2234,433 @@ test("POST /reconcile requires the operator token; providers without a listing r
   });
   assert.equal(allowed.status, 200, allowed.body);
   assert.deepEqual(allowed.json, { orphans: [] });
+});
+
+// --- GCP provider (#185) --------------------------------------------------------
+// Jobs are Cloud Run Job executions; the unit-tested surface is command
+// construction and response parsing, exercised the same way the ECS block
+// above is: injected runners for argv shape, a fake `gcloud` on PATH (the
+// #122 shim pattern) for the paths that shell out.
+
+const GCP_CONFIG = {
+  project: "mock-project",
+  region: "us-central1",
+  job: "fleet-runner",
+  capacity: { cpu: 4096, memory: 16384 },
+};
+
+function gcpWith(gcloud: CloudCliRunner): GcpProvider {
+  return new GcpProvider(GCP_CONFIG, { gcloud });
+}
+
+test("gcpConfigFromEnv reads FLEET_GCP_* and names missing required vars (#185)", () => {
+  assert.throws(() => gcpConfigFromEnv({}), /FLEET_GCP_PROJECT/);
+  assert.throws(() => gcpConfigFromEnv({ FLEET_GCP_PROJECT: "p" }), /FLEET_GCP_REGION/);
+  const config = gcpConfigFromEnv({
+    FLEET_GCP_PROJECT: "mock-project",
+    FLEET_GCP_REGION: "us-central1",
+    FLEET_GCP_JOB: "fleet-runner",
+    FLEET_GCP_CPU_UNITS: "4096",
+    FLEET_GCP_MEMORY_MIB: "16384",
+  });
+  assert.equal(config.project, "mock-project");
+  assert.equal(config.job, "fleet-runner");
+  assert.deepEqual(config.capacity, { cpu: 4096, memory: 16384 });
+  // No tier published → no dispatch-time check, never a crash.
+  assert.equal(
+    gcpConfigFromEnv({ FLEET_GCP_PROJECT: "p", FLEET_GCP_REGION: "r", FLEET_GCP_JOB: "j" }).capacity,
+    undefined,
+  );
+});
+
+test("GcpProvider builds the execute argv: ^|^ env delimiter, project/region routing, async json (#185)", () => {
+  const provider = new GcpProvider(GCP_CONFIG);
+  const args = provider.buildExecuteArgs(SPEC);
+
+  assert.deepEqual(args.slice(0, 4), ["run", "jobs", "execute", "fleet-runner"]);
+  assert.ok(args.includes("--async"), "launch must be --async: the handle is the execution name, not the outcome");
+  assert.ok(args.includes("--format=json"));
+  assert.equal(args[args.indexOf("--project") + 1], "mock-project");
+  assert.equal(args[args.indexOf("--region") + 1], "us-central1");
+
+  // The whole env rides one --update-env-vars value with the ^|^ delimiter
+  // override: operator values may contain commas, gcloud's default separator.
+  const envArg = args[args.indexOf("--update-env-vars") + 1];
+  assert.ok(envArg.startsWith("^|^"), `env must name its own delimiter: ${envArg.slice(0, 20)}`);
+  const envByName = Object.fromEntries(
+    envArg.slice("^|^".length).split("|").map((pair) => [pair.slice(0, pair.indexOf("=")), pair.slice(pair.indexOf("=") + 1)]),
+  );
+  assert.equal(envByName.FLEET_JOB_ID, SPEC.jobId);
+  assert.equal(envByName.FLEET_RUNNER_TOKEN, SPEC.runnerToken);
+  assert.equal(envByName.FLEET_DAEMON_URL, SPEC.daemonUrl);
+  assert.equal(envByName.FLEET_WORKSPACE, "/workspace");
+  assert.equal(envByName.EXAMPLE_TOKEN, "abc");
+  assert.ok(envByName.FLEET_MANIFEST_JSON);
+  // Provider-complete materialisation: the ECS path once dropped the work
+  // order and the first cloud job died at the pickup gate (#9).
+  assert.ok(envByName.FLEET_WORK_ORDER_JSON, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
+
+  // MANIFEST declares no wall_clock: no --task-timeout, the job resource's
+  // own default timeout is the backstop.
+  assert.ok(!args.includes("--task-timeout"));
+});
+
+test("GcpProvider passes the manifest wall_clock as --task-timeout with the backstop margin (#185)", () => {
+  const provider = new GcpProvider(GCP_CONFIG);
+  const manifest = { ...MANIFEST, limits: { wall_clock: "2h" } };
+  const args = provider.buildExecuteArgs({ ...SPEC, manifest });
+  // 2h = 7200s, plus the margin that keeps the daemon's graceful cancel (WIP
+  // push, settle) ahead of Cloud Run's SIGKILL.
+  assert.equal(args[args.indexOf("--task-timeout") + 1], `${7200 + GCP_TASK_TIMEOUT_MARGIN_S}s`);
+
+  // The 168h API ceiling caps it — a value past it fails the API call.
+  const long = provider.buildExecuteArgs({ ...SPEC, manifest: { ...MANIFEST, limits: { wall_clock: "168h" } } });
+  assert.equal(long[long.indexOf("--task-timeout") + 1], `${GCP_TASK_TIMEOUT_MAX_S}s`);
+});
+
+test("GcpProvider refuses an env value carrying the delimiter, naming the key (#185)", () => {
+  // gcloud has no escape for the chosen delimiter: the value would silently
+  // split into bogus extra env entries. Refuse loudly, by name, at build time.
+  const provider = new GcpProvider(GCP_CONFIG);
+  assert.throws(
+    () => provider.buildExecuteArgs({ ...SPEC, env: { BAD_VALUE: "left|right" } }),
+    /BAD_VALUE.*delimiter/,
+  );
+});
+
+test("parseExecutionName takes metadata.name, reduces a full resource name, and rejects garbage (#185)", () => {
+  assert.equal(parseExecutionName(JSON.stringify({ metadata: { name: "fleet-runner-abc12" } })), "fleet-runner-abc12");
+  assert.equal(
+    parseExecutionName(JSON.stringify({ name: "projects/p/locations/l/jobs/j/executions/fleet-runner-xyz89" })),
+    "fleet-runner-xyz89",
+  );
+  assert.throws(() => parseExecutionName(JSON.stringify({ status: {} })), /no execution name/);
+});
+
+test("GcpProvider cancel argv is scoped and non-interactive (#185)", () => {
+  const provider = new GcpProvider(GCP_CONFIG);
+  const args = provider.buildCancelArgs("fleet-runner-abc12");
+  assert.deepEqual(args.slice(0, 5), ["run", "jobs", "executions", "cancel", "fleet-runner-abc12"]);
+  // --quiet: cancel prompts on a TTY-less stdin it would otherwise wait on
+  // forever — exactly the wedge the kill budget exists for.
+  assert.ok(args.includes("--quiet"), "cancel must be --quiet or it hangs on its own confirmation prompt");
+  assert.equal(args[args.indexOf("--project") + 1], "mock-project");
+  assert.equal(args[args.indexOf("--region") + 1], "us-central1");
+});
+
+test("isMissingResourceError recognises gcloud's not-found spellings (#185)", () => {
+  const gone = new Error("Command failed: gcloud run jobs executions cancel x") as Error & { stderr: string };
+  gone.stderr = "ERROR: (gcloud.run.jobs.executions.cancel) Execution [x] could not be found.";
+  assert.equal(isMissingResourceError(gone), true);
+  assert.equal(isMissingResourceError(new Error("NOT_FOUND: resource vanished")), true);
+  assert.equal(isMissingResourceError(new Error("PERMISSION_DENIED: nope")), false);
+});
+
+test("GcpProvider.terminate treats gcloud not-found as success and bounds its retry (#122/#185)", async () => {
+  // Already gone: idempotent success, exactly one call.
+  let calls = 0;
+  const gone = gcpWith(async () => {
+    calls += 1;
+    const err = new Error("gcloud failed") as Error & { stderr: string };
+    err.stderr = "ERROR: (gcloud.run.jobs.executions.cancel) Execution [fleet-runner-abc12] could not be found.";
+    throw err;
+  });
+  await gone.terminate("fleet-runner-abc12");
+  assert.equal(calls, 1, "not-found is settled on the first answer — no retry against a resource that is gone");
+
+  // Transient failure: one bounded retry, then the error surfaces — a job
+  // must not read cancelled while its execution keeps running.
+  let attempts = 0;
+  const broken = gcpWith(async () => {
+    attempts += 1;
+    throw new Error("DEADLINE_EXCEEDED: try again");
+  });
+  await assert.rejects(() => broken.terminate("fleet-runner-abc12"), /DEADLINE_EXCEEDED/);
+  assert.equal(attempts, 2, "exactly one retry (#122)");
+});
+
+test("parseFleetExecutions keys on FLEET_JOB_ID env and drops completed and foreign executions (#185)", () => {
+  const execution = (name: string, jobId?: string, completed = false) => ({
+    metadata: { name },
+    spec: { template: { spec: { containers: [{ env: jobId === undefined ? [] : [{ name: "FLEET_JOB_ID", value: jobId }] }] } } },
+    status: completed ? { completionTime: "2026-08-29T00:00:00Z" } : {},
+  });
+  const found = parseFleetExecutions(JSON.stringify([
+    execution("fleet-runner-live1", "job-aaa"),
+    // A completed execution is not a live sandbox — cancelling it would be
+    // noise at best; the sweep's contract is what is running and billing.
+    execution("fleet-runner-done1", "job-bbb", true),
+    // An execution with no FLEET_JOB_ID is not fleet's to touch.
+    execution("fleet-runner-alien", undefined),
+    execution("fleet-runner-live2", "job-ccc"),
+  ]));
+  assert.deepEqual(found, [
+    { jobId: "job-aaa", handle: "fleet-runner-live1" },
+    { jobId: "job-ccc", handle: "fleet-runner-live2" },
+  ]);
+});
+
+test("GcpProvider.checkResources translates ECS units against the pinned tier (#185)", () => {
+  const provider = new GcpProvider(GCP_CONFIG);
+  assert.doesNotThrow(() => provider.checkResources({ cpu: 2048, memory: 8192 }));
+  assert.doesNotThrow(() => provider.checkResources({}));
+  let caught: Error | null = null;
+  try {
+    provider.checkResources({ cpu: 8192, memory: 8192 });
+  } catch (error) {
+    caught = error as Error;
+  }
+  assert.ok(caught, "an oversized request must be refused at dispatch — Cloud Run pins resources on the job");
+  // The manifest schema's units are ECS-flavored; the refusal translates.
+  assert.match(caught.message, /cpu=8192 \(8 vCPU\)/);
+  assert.match(caught.message, /cpu=4096 \(4 vCPU\)/);
+  assert.match(caught.message, /job_cpu/);
+  // No tier published (legacy/hand-set env config): no check.
+  assert.doesNotThrow(() =>
+    new GcpProvider({ project: "p", region: "r", job: "j" }).checkResources({ cpu: 999999 }),
+  );
+});
+
+test("GcpProvider refuses a per-job image override with the same honesty as ECS (#49/#185)", () => {
+  const provider = new GcpProvider(GCP_CONFIG);
+  assert.throws(
+    () => provider.checkImageOverride("fleet-job:abc123def4567890"),
+    /Cloud Run job pins its own image[\s\S]*cli_version/,
+  );
+});
+
+// ---------- operator access: IAP tunnel + Secret Manager token (#185) ----------
+
+const GCP_DAEMON_ACCESS_CONFIG = {
+  provider: "gcp",
+  project: "mock-project",
+  region: "us-central1",
+  daemon_instance: "fleet-daemon",
+  daemon_zone: "us-central1-a",
+  daemon_port: 9000,
+  operator_token_secret: "fleet-operator-token",
+};
+
+test("gcpDaemonAccessFromFleetConfig reads the access fields and names a missing one (#185)", () => {
+  const access = gcpDaemonAccessFromFleetConfig(GCP_DAEMON_ACCESS_CONFIG);
+  assert.deepEqual(access, { project: "mock-project", instance: "fleet-daemon", zone: "us-central1-a", port: 9000 });
+  for (const key of ["project", "daemon_instance", "daemon_zone"]) {
+    assert.throws(
+      () => gcpDaemonAccessFromFleetConfig({ ...GCP_DAEMON_ACCESS_CONFIG, [key]: "" }),
+      new RegExp(key),
+    );
+  }
+  assert.throws(() => gcpDaemonAccessFromFleetConfig({ ...GCP_DAEMON_ACCESS_CONFIG, daemon_port: "9000" }), /daemon_port/);
+});
+
+test("the IAP tunnel argv forwards the daemon port and addresses the VM by zone and project (#185)", async () => {
+  const access = gcpDaemonAccessFromFleetConfig(GCP_DAEMON_ACCESS_CONFIG);
+  assert.deepEqual(buildIapTunnelArgs(access, 19000), [
+    "compute",
+    "start-iap-tunnel",
+    "fleet-daemon",
+    "9000",
+    "--local-host-port=localhost:19000",
+    "--zone",
+    "us-central1-a",
+    "--project",
+    "mock-project",
+  ]);
+  const endpoint = await gcpTunnelOpener(access)(19000);
+  assert.equal(endpoint.argv[0], "gcloud");
+  assert.deepEqual(endpoint.argv.slice(1), buildIapTunnelArgs(access, 19000));
+  assert.equal(endpoint.id, "mock-project/us-central1-a/fleet-daemon");
+});
+
+// A fake `gcloud` whose secret store is a file next to it: `secrets versions
+// add` reads --data-file at call time (the temp file must still exist then,
+// and must be gone after), `secrets versions access` prints the stored bytes.
+const FAKE_GCLOUD_SECRETS = `
+import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+const dir = dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+appendFileSync(join(dir, "calls.log"), JSON.stringify(args) + "\\n");
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const cmd = args.slice(0, 3).join(" ");
+if (cmd === "secrets versions add") {
+  const dataFile = args.find((a) => a.startsWith("--data-file="))?.slice("--data-file=".length) ?? opt("--data-file");
+  writeFileSync(join(dir, "secret-store"), readFileSync(dataFile));
+  process.stdout.write(JSON.stringify({ name: "projects/mock-project/secrets/" + args[3] + "/versions/1" }));
+} else if (cmd === "secrets versions access") {
+  process.stdout.write(readFileSync(join(dir, "secret-store"), "utf8"));
+} else {
+  process.stderr.write("fake gcloud: unhandled command: " + cmd + "\\n");
+  process.exit(1);
+}
+`;
+
+/** A fake `gcloud`, first on PATH (the #122 shim pattern); returns its dir. */
+function fakeGcloudOnPath(t: { after: (fn: () => void) => void }, script: string): string {
+  const bin = mkdtempSync(join(tmpdir(), "fleet-fake-gcloud-"));
+  writeFileSync(join(bin, "fake-gcloud.mjs"), script);
+  writeFileSync(
+    join(bin, "gcloud"),
+    `#!/bin/sh\nexec "${process.execPath}" "${join(bin, "fake-gcloud.mjs")}" "$@"\n`,
+    { mode: 0o755 },
+  );
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  t.after(() => {
+    process.env.PATH = previous;
+  });
+  return bin;
+}
+
+test("operator token round-trips through Secret Manager: daemon publish, CLI fetch (#188/#185)", async (t) => {
+  const bin = fakeGcloudOnPath(t, FAKE_GCLOUD_SECRETS);
+  const token = "op-token-0123456789abcdef";
+
+  // Daemon side: the token rides a file into --data-file, never argv (#126).
+  const name = await publishOperatorTokenToSecretManager("mock-project", "fleet-operator-token", token);
+  assert.equal(name, "fleet-operator-token");
+  const calls = readFileSync(join(bin, "calls.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+  assert.deepEqual(calls[0].slice(0, 4), ["secrets", "versions", "add", "fleet-operator-token"]);
+  assert.equal(calls[0][calls[0].indexOf("--project") + 1], "mock-project");
+  assert.ok(!calls[0].some((arg) => arg.includes(token)), "the token must never appear on argv (#126)");
+  assert.equal(readFileSync(join(bin, "secret-store"), "utf8"), token, "the published payload is the token itself");
+
+  // CLI side: the same capture keys the fetch (provider + secret + project).
+  const fetched = fetchDeploymentOperatorToken(GCP_DAEMON_ACCESS_CONFIG);
+  assert.ok(fetched, "a gcp capture naming its secret must offer a token source");
+  assert.equal(await fetched, token);
+  const accessCall = readFileSync(join(bin, "calls.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]).at(-1)!;
+  assert.deepEqual(accessCall.slice(0, 6), ["secrets", "versions", "access", "latest", "--secret", "fleet-operator-token"]);
+
+  // A capture without the secret (or the project) offers no source — the
+  // caller then falls back to the daemon's own 401 story.
+  assert.equal(fetchDeploymentOperatorToken({ provider: "gcp", project: "mock-project" }), undefined);
+  assert.deepEqual(buildSecretAccessArgs("p", "s").slice(0, 4), ["secrets", "versions", "access", "latest"]);
+});
+
+// --- Orphan-execution reconcile, GCP (#147/#185) ---------------------------------
+// The unforgivable-bug test, mirroring the ECS one above: the sweep must stop
+// the execution a wedged launch stranded behind a terminal job — and must
+// never touch a live job's execution or one it cannot account for.
+
+// Fake `gcloud` with an on-disk Cloud Run control plane: executions live in
+// executions.json next to the script; a `wedge-next` flag file makes the next
+// execute record its execution and then die without printing the name — the
+// exact shape of a CLI killed at its budget (#122).
+const FAKE_GCLOUD_RUN = `
+import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+const dir = dirname(fileURLToPath(import.meta.url));
+const file = join(dir, "executions.json");
+const args = process.argv.slice(2);
+appendFileSync(join(dir, "calls.log"), JSON.stringify(args) + "\\n");
+const load = () => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : []);
+const save = (executions) => writeFileSync(file, JSON.stringify(executions, null, 2));
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const cmd = args.slice(0, 3).join(" ");
+if (args[0] === "run" && args[2] === "execute") {
+  const envArg = opt("--update-env-vars");
+  const env = envArg.slice(3).split("|").map((pair) => {
+    const at = pair.indexOf("=");
+    return { name: pair.slice(0, at), value: pair.slice(at + 1) };
+  });
+  const executions = load();
+  const name = "fleet-runner-" + String(executions.length + 1).padStart(4, "0");
+  executions.push({
+    metadata: { name },
+    spec: { template: { spec: { containers: [{ env }] } } },
+    status: {},
+  });
+  save(executions);
+  if (existsSync(join(dir, "wedge-next"))) {
+    unlinkSync(join(dir, "wedge-next"));
+    process.stderr.write("gcloud: killed at budget\\n");
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({ metadata: { name } }));
+} else if (cmd === "run jobs executions" && args[3] === "list") {
+  process.stdout.write(JSON.stringify(load()));
+} else if (cmd === "run jobs executions" && args[3] === "cancel") {
+  const executions = load();
+  const execution = executions.find((e) => e.metadata.name === args[4]);
+  if (!execution) {
+    process.stderr.write("ERROR: (gcloud.run.jobs.executions.cancel) Execution [" + args[4] + "] could not be found.\\n");
+    process.exit(1);
+  }
+  execution.status.completionTime = "2026-08-29T00:00:00Z";
+  save(executions);
+  process.stdout.write(JSON.stringify(execution));
+} else {
+  process.stderr.write("fake gcloud: unhandled command: " + args.slice(0, 4).join(" ") + "\\n");
+  process.exit(1);
+}
+`;
+
+test("reconcile cancels the execution a wedged launch stranded behind a cancelled job — and nothing else (#147/#185)", async (t) => {
+  const bin = fakeGcloudOnPath(t, FAKE_GCLOUD_RUN);
+  const executionsFile = join(bin, "executions.json");
+
+  const daemon = new FleetDaemon({ home: tempHome(), provider: new GcpProvider(GCP_CONFIG) });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  // 1. The bug's exact shape: execute succeeds GCP-side, the CLI dies before
+  //    printing the execution name. The daemon records launch-failed and
+  //    cancels — a terminal job, a live execution, no stored handle.
+  writeFileSync(join(bin, "wedge-next"), "");
+  const wedged = await op(sock, "POST", "/jobs", { manifest: MANIFEST, workOrder: WORK_ORDER });
+  assert.equal(wedged.status, 500, wedged.body);
+  const orphanedJob = jobOf(wedged.json);
+  assert.equal(orphanedJob.state, "cancelled");
+
+  // 2. A healthy dispatch whose job is then running: the one execution the
+  //    sweep must never cancel.
+  const healthy = await op(sock, "POST", "/jobs", { manifest: MANIFEST, workOrder: WORK_ORDER });
+  assert.equal(healthy.status, 201, healthy.body);
+  const liveJob = jobOf(healthy.json);
+  daemon.registry.appendEvent(liveJob.id, { type: "state", state: "running" });
+  daemon.registry.updateJob(liveJob.id, { state: "running" });
+
+  // 3. A FLEET_JOB_ID-stamped execution naming a job this registry has no
+  //    record of: without a record, "terminal" is not a fact the sweep holds.
+  const seeded = JSON.parse(readFileSync(executionsFile, "utf8")) as Array<{ metadata: { name: string } }>;
+  seeded.push({
+    metadata: { name: "fleet-runner-stray" },
+    spec: { template: { spec: { containers: [{ env: [{ name: "FLEET_JOB_ID", value: "job-unknown" }] }] } } },
+    status: {},
+  } as never);
+  writeFileSync(executionsFile, JSON.stringify(seeded));
+
+  const res = await op(sock, "POST", "/reconcile");
+  assert.equal(res.status, 200, res.body);
+  const { orphans } = res.json as { orphans: { job: string; handle: string; stopped: boolean }[] };
+  assert.equal(orphans.length, 1, JSON.stringify(orphans));
+  assert.equal(orphans[0].job, orphanedJob.id);
+  assert.equal(orphans[0].stopped, true);
+
+  // The orphan's execution is cancelled; every other execution survives.
+  const after = Object.fromEntries(
+    (JSON.parse(readFileSync(executionsFile, "utf8")) as Array<{
+      metadata: { name: string };
+      spec: { template: { spec: { containers: Array<{ env: Array<{ name: string; value: string }> }> } } };
+      status: { completionTime?: string };
+    }>).map((execution) => [
+      execution.spec.template.spec.containers[0].env.find((e) => e.name === "FLEET_JOB_ID")?.value,
+      execution.status.completionTime === undefined ? "RUNNING" : "CANCELLED",
+    ]),
+  );
+  assert.equal(after[orphanedJob.id], "CANCELLED", "the orphan must be cancelled");
+  assert.equal(after[liveJob.id], "RUNNING", "a running job's execution must survive the sweep");
+  assert.equal(after["job-unknown"], "RUNNING", "an unaccountable execution is not the sweep's to cancel");
+
+  // cancel went through the real argv builder: scoped and non-interactive.
+  const calls = readFileSync(join(bin, "calls.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+  const cancel = calls.find((call) => call[3] === "cancel");
+  assert.ok(cancel, "cancel was invoked");
+  assert.equal(cancel[4], orphans[0].handle);
+  assert.ok(cancel.includes("--quiet"));
+  assert.equal(cancel[cancel.indexOf("--project") + 1], "mock-project");
+  assert.equal(cancel[cancel.indexOf("--region") + 1], "us-central1");
 });

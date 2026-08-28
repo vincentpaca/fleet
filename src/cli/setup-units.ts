@@ -12,6 +12,7 @@
  * a provider implementation: standing infrastructure up is a terraform
  * conversation, and the runtime provider only exists once the unit is applied.
  */
+import { readFileSync } from 'node:fs';
 
 /** Answers so far, keyed by prompt key. Every value is the operator's raw text. */
 export type Answers = Record<string, string>;
@@ -127,10 +128,6 @@ function validateName(value: string): string | undefined {
   return undefined;
 }
 
-function validateRegion(value: string): string | undefined {
-  return /^[a-z]{2}(-[a-z]+)+-\d$/.test(value) ? undefined : `not an AWS region: ${value}`;
-}
-
 function validateVpcId(value: string): string | undefined {
   return /^vpc-[0-9a-f]+$/.test(value) ? undefined : `not a VPC id: ${value} (expected vpc-…)`;
 }
@@ -148,7 +145,28 @@ function configString(config: CapturedConfig, key: string): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
+/**
+ * The version of the package this CLI runs from — the GCP unit's default for
+ * the daemon version it installs from npm, so a wizard run pins the daemon at
+ * the CLI's own release the way the AWS unit pins images at the module's ref.
+ */
+function ownPackageVersion(): string | undefined {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' && pkg.version !== '' ? pkg.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------- the units ----------
+
+// Regions are per-unit validators, deliberately beside their unit: AWS spells
+// us-east-1 and GCP spells us-central1, and a shared "validateRegion" invited
+// exactly that reuse — each rejects the other cloud's spelling.
+function validateAwsRegion(value: string): string | undefined {
+  return /^[a-z]{2}(-[a-z]+)+-\d$/.test(value) ? undefined : `not an AWS region: ${value}`;
+}
 
 const AWS: SetupUnit = {
   provider: 'aws',
@@ -198,7 +216,7 @@ const AWS: SetupUnit = {
       question: 'region',
       fallback: (env) => env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? 'us-east-1',
       required: true,
-      validate: validateRegion,
+      validate: validateAwsRegion,
     },
     {
       key: 'vpc_id',
@@ -276,8 +294,135 @@ const AWS: SetupUnit = {
   },
 };
 
+// GCP regions spell letters-then-digit with no dash before the digit
+// (us-central1, asia-southeast1) — the inverse of AWS's us-east-1, which this
+// deliberately rejects.
+function validateGcpRegion(value: string): string | undefined {
+  return /^[a-z]+(-[a-z]+)*[a-z][0-9]$/.test(value) ? undefined : `not a GCP region: ${value}`;
+}
+
+function validateGcpProject(value: string): string | undefined {
+  return /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(value)
+    ? undefined
+    : `not a GCP project id: ${value} (6-30 lower-case letters, digits and dashes, starting with a letter)`;
+}
+
+/** GCP resource names (networks, subnetworks): RFC1035 labels. */
+function validateGcpResourceName(value: string): string | undefined {
+  return /^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/.test(value)
+    ? undefined
+    : `not a GCP resource name: ${value} (lower-case letters, digits and dashes, starting with a letter)`;
+}
+
+/**
+ * The GCP deployment name has a tighter cap than AWS's: the unit derives
+ * service-account ids as "<name>-daemon"/"<name>-runner", and account ids max
+ * out at 30 characters.
+ */
+function validateGcpName(value: string): string | undefined {
+  const base = validateName(value);
+  if (base !== undefined) return base;
+  return value.length > 22
+    ? 'a GCP deployment name is at most 22 characters — "-daemon" and "-runner" must fit inside the 30-character service-account id limit'
+    : undefined;
+}
+
+const GCP: SetupUnit = {
+  provider: 'gcp',
+  label: 'GCP — Cloud Run Jobs that scale to zero, the daemon on a micro VM, IAP-only access',
+  credentials: {
+    argv: ['gcloud', 'auth', 'print-access-token'],
+    absent: 'the gcloud CLI is not on PATH — install the Google Cloud CLI and run `gcloud auth login`, then rerun',
+    denied:
+      'gcloud auth print-access-token failed — no usable Google Cloud credentials in this shell (run `gcloud auth login`)',
+  },
+  requiredProviders: [{ name: 'google', source: 'hashicorp/google', version: '~> 6.0' }],
+  providerArgs: (a) => [
+    ['project', hclString(a.project)],
+    ['region', hclString(a.region)],
+  ],
+  moduleArgs: (a) => {
+    const args: Array<[string, string]> = [['name', hclString(a.name)]];
+    // Left out when absent, like the AWS VPC pair: the module's own defaults
+    // (the project's `default` network, the region's same-named subnet) are
+    // the contract.
+    if (a.network) {
+      args.push(['network', hclString(a.network)]);
+      args.push(['subnetwork', hclString(a.subnetwork)]);
+    }
+    // The daemon is installed from npm on the VM, pinned to a version the
+    // operator saw — the GCP analog of the AWS unit's source_ref image pin.
+    if (a.fleet_version) args.push(['fleet_version', hclString(a.fleet_version)]);
+    return args;
+  },
+  prompts: [
+    {
+      key: 'name',
+      question: 'name',
+      hint: 'labels every resource (cost tracking) and names the deployment for teardown',
+      required: true,
+      validate: validateGcpName,
+    },
+    {
+      key: 'project',
+      question: 'project id',
+      fallback: (env) => env.CLOUDSDK_CORE_PROJECT ?? env.GOOGLE_CLOUD_PROJECT,
+      required: true,
+      validate: validateGcpProject,
+    },
+    {
+      key: 'region',
+      question: 'region',
+      fallback: (env) => env.CLOUDSDK_COMPUTE_REGION ?? 'us-central1',
+      required: true,
+      validate: validateGcpRegion,
+    },
+    {
+      key: 'network',
+      question: 'existing VPC network to deploy into',
+      hint: "blank uses the project's default network — what most projects have",
+      fallback: () => '',
+      validate: (v) => (v === '' ? undefined : validateGcpResourceName(v)),
+    },
+    {
+      key: 'subnetwork',
+      question: 'subnetwork in that network (must be in the chosen region)',
+      required: true,
+      validate: validateGcpResourceName,
+      when: (a) => Boolean(a.network),
+    },
+    {
+      key: 'fleet_version',
+      question: 'daemon version (ownfleet on npm)',
+      hint: 'the VM installs this exact version at boot; fleet upgrade moves it later',
+      fallback: () => ownPackageVersion(),
+      required: true,
+      validate: (v) => (/^\d+\.\d+\.\d+/.test(v) ? undefined : `not a version: ${v} (expected an npm version like 0.2.0)`),
+    },
+  ],
+  // No in-account image build wired for GCP: the unit's Cloud Build block is
+  // the #185 follow-up. Until it lands, the runner image is pushed from a
+  // checkout with docker + gcloud; fleet_config names the repository.
+  images: {
+    start: () => undefined,
+    buildId: () => undefined,
+    poll: () => [],
+    progress: () => undefined,
+    failureHint: () => 'no in-account build to inspect on this deployment',
+    // Guidance only, same rule as the AWS entry: no shipped code path carries
+    // a deploy command (docs/decisions.md#d5).
+    rollHint: (config) =>
+      `push a new :runner image to ${configString(config, 'runner_repository_url') ?? '<repository>'} — ` +
+      'on GCP the daemon is not an image; move the daemon itself with fleet upgrade',
+    unavailable:
+      'this deployment has no in-account image build: the GCP Cloud Build path is the #185 follow-up\n' +
+      '  push the runner image from a Fleet checkout instead: gcloud auth configure-docker, then\n' +
+      '  docker build -f images/runner/Dockerfile -t <runner_repository_url>:runner . && docker push <runner_repository_url>:runner',
+  },
+};
+
 /** Every unit this CLI can stand up, in the order they are offered. */
-export const SETUP_UNITS: SetupUnit[] = [AWS];
+export const SETUP_UNITS: SetupUnit[] = [AWS, GCP];
 
 export function unitFor(provider: string): SetupUnit | undefined {
   return SETUP_UNITS.find((unit) => unit.provider === provider);

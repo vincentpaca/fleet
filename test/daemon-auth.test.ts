@@ -159,13 +159,15 @@ test("/health stays open on both listeners without any secret", async (t) => {
   const ctx = await startSecuredDaemon();
   t.after(() => ctx.daemon.stop());
 
+  // ok plus the daemon's package version (#185) — never a token, never state.
   const viaTcp = await tcp(ctx, "GET", "/health");
   assert.equal(viaTcp.status, 200);
-  assert.deepEqual(viaTcp.json, { ok: true });
+  assert.equal((viaTcp.json as { ok: boolean }).ok, true);
 
   const viaSocket = await op(ctx.sock, "GET", "/health");
   assert.equal(viaSocket.status, 200);
-  assert.deepEqual(viaSocket.json, { ok: true });
+  assert.equal((viaSocket.json as { ok: boolean }).ok, true);
+  assert.ok(!JSON.stringify(viaSocket.json).includes(OPERATOR_TOKEN), "health must not leak the operator token");
 });
 
 test("internal token paths unchanged; unknown id and bad token are indistinguishable 401s", async (t) => {

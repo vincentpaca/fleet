@@ -156,14 +156,16 @@ export type CloudCliRunner = (args: string[], timeoutMs?: number) => Promise<str
  * Whether a terminate() failure means the sandbox was already gone (#122).
  * Termination is idempotent by contract, so providers treat these as success:
  * `docker rm -f` names the container on stderr; the ECS API raises
- * TaskNotFoundException or reports the task already stopped. Matches both the
- * error message and any captured stderr, because execFile reports the child's
- * output separately from its message.
+ * TaskNotFoundException or reports the task already stopped; gcloud spells a
+ * missing execution "Execution [x] could not be found" (and the underlying
+ * API status is NOT_FOUND). Matches both the error message and any captured
+ * stderr, because execFile reports the child's output separately from its
+ * message.
  */
 export function isMissingResourceError(error: unknown): boolean {
   const err = error as { message?: unknown; stderr?: unknown };
   const text = `${String(err?.message ?? "")} ${typeof err?.stderr === "string" ? err.stderr : ""}`;
-  return /No such container|TaskNotFoundException|already stopped/i.test(text);
+  return /No such container|TaskNotFoundException|already stopped|could not be found|NOT_FOUND/i.test(text);
 }
 
 /**
