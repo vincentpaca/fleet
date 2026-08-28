@@ -135,21 +135,29 @@ export function parseExecutionName(stdout: string): string { // contract pin: te
  * sandboxes and are dropped too — the sweep's contract is what is running and
  * billing. Pure function — testable without GCP.
  */
+type ListedExecution = {
+  metadata?: { name?: unknown };
+  spec?: { template?: { spec?: { containers?: Array<{ env?: Array<{ name?: unknown; value?: unknown }> }> } } };
+  status?: { completionTime?: unknown };
+};
+
+/** The FLEET_JOB_ID value stamped into an execution's container env, or undefined. */
+function executionJobId(execution: ListedExecution): string | undefined {
+  const env = execution?.spec?.template?.spec?.containers?.flatMap((c) => c.env ?? []) ?? [];
+  const jobId = env.find((entry) => entry?.name === "FLEET_JOB_ID")?.value;
+  return typeof jobId === "string" && jobId !== "" ? jobId : undefined;
+}
+
 export function parseFleetExecutions(listJson: string): JobSandbox[] { // contract pin: test-only export, asserted by the suite
-  const parsed = JSON.parse(listJson) as Array<{
-    metadata?: { name?: unknown };
-    spec?: { template?: { spec?: { containers?: Array<{ env?: Array<{ name?: unknown; value?: unknown }> }> } } };
-    status?: { completionTime?: unknown };
-  }>;
+  const parsed = JSON.parse(listJson) as ListedExecution[];
   if (!Array.isArray(parsed)) return [];
   const found: JobSandbox[] = [];
   for (const execution of parsed) {
     const name = execution?.metadata?.name;
     if (typeof name !== "string" || name === "") continue;
     if (execution?.status?.completionTime) continue; // finished: not a live sandbox
-    const env = execution?.spec?.template?.spec?.containers?.flatMap((c) => c.env ?? []) ?? [];
-    const jobId = env.find((entry) => entry?.name === "FLEET_JOB_ID")?.value;
-    if (typeof jobId !== "string" || jobId === "") continue;
+    const jobId = executionJobId(execution);
+    if (jobId === undefined) continue;
     found.push({ jobId, handle: name });
   }
   return found;

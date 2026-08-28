@@ -100,16 +100,7 @@ export function fetchDeploymentOperatorToken(
   config: Record<string, unknown>,
   run?: CloudRunner,
 ): Promise<string> | undefined {
-  if (config.provider === 'gcp') {
-    // The GCP daemon publishes a version of the unit-created secret at boot;
-    // `versions access` prints the raw payload. Fetched with the operator's
-    // own gcloud credentials, exactly like the SSM read below uses their AWS
-    // ones.
-    const secret = config.operator_token_secret;
-    const project = config.project;
-    if (typeof secret !== 'string' || secret === '' || typeof project !== 'string' || project === '') return undefined;
-    return (run ?? gcloudCli)(buildSecretAccessArgs(project, secret)).then((stdout) => stdout.trim());
-  }
+  if (config.provider === 'gcp') return fetchGcpOperatorToken(config, run);
   if (config.provider !== 'ecs') return undefined;
   const ssmPath = config.ssm_config_path;
   if (typeof ssmPath !== 'string' || ssmPath === '') return undefined;
@@ -119,4 +110,20 @@ export function fetchDeploymentOperatorToken(
   const args = ['ssm', 'get-parameter', '--name', operatorTokenSsmPath(ssmPath), '--with-decryption', '--output', 'json'];
   if (typeof config.region === 'string' && config.region !== '') args.push('--region', config.region);
   return (run ?? awsCli)(args).then((stdout) => parseSsmParameterValue(stdout).trim());
+}
+
+/**
+ * The GCP half of fetchDeploymentOperatorToken: the daemon publishes a version
+ * of the unit-created secret at boot, and `versions access` prints the raw
+ * payload. Fetched with the operator's own gcloud credentials, exactly like
+ * the SSM read uses their AWS ones.
+ */
+function fetchGcpOperatorToken(
+  config: Record<string, unknown>,
+  run?: CloudRunner,
+): Promise<string> | undefined {
+  const secret = config.operator_token_secret;
+  const project = config.project;
+  if (typeof secret !== 'string' || secret === '' || typeof project !== 'string' || project === '') return undefined;
+  return (run ?? gcloudCli)(buildSecretAccessArgs(project, secret)).then((stdout) => stdout.trim());
 }
