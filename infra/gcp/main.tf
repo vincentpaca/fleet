@@ -48,6 +48,7 @@ locals {
 resource "google_project_service" "services" {
   for_each = toset([
     "artifactregistry.googleapis.com",
+    "cloudkms.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
     "iap.googleapis.com",
@@ -58,6 +59,85 @@ resource "google_project_service" "services" {
   project            = local.project
   service            = each.value
   disable_on_destroy = false
+}
+
+# --- KMS (customer-managed key for state at rest) -----------------------------------
+# The GCP twin of infra/aws's aws_kms_key.fleet. The daemon's data disk holds
+# every job's event journal, the boot disk holds the rendered daemon env, and
+# the registry holds the image jobs run as — all encrypted by default with a
+# Google-managed key the operator cannot rotate on their own schedule, audit
+# by policy, or revoke. One CMK covers all three so those things are the
+# operator's to control (Checkov CKV_GCP_37 / CKV_GCP_38 / CKV_GCP_84).
+#
+# Destroy stance, matching the AWS unit's 30-day deletion window: the key ring
+# is permanent by GCP's own design (rings cannot be deleted), and destroying
+# the crypto key only schedules its versions for destruction after
+# var.key_destroy_duration — the key is the only way to read a job's history,
+# and a fat-fingered destroy should be recoverable for longer than a weekend.
+
+resource "google_kms_key_ring" "fleet" {
+  name     = var.name
+  location = local.region
+
+  depends_on = [google_project_service.services]
+}
+
+resource "google_kms_crypto_key" "fleet" {
+  # checkov:skip=CKV_GCP_82: prevent_destroy would wedge `fleet setup infra --destroy`, a supported path — and this lifecycle block lives inside a git-sourced module, so an operator could not override it without forking the unit. What the check guards is already held by construction: a GCP key ring can never be deleted, and destroying this resource only schedules its versions with the destroy_scheduled_duration recovery window below (30 days, the AWS unit's KMS deletion window). Recorded in docs/decisions.md#d18.
+  name     = var.name
+  key_ring = google_kms_key_ring.fleet.id
+  purpose  = "ENCRYPT_DECRYPT"
+  labels   = local.labels
+
+  # Rotation, like the AWS key's enable_key_rotation. Existing data stays
+  # readable under the version that wrote it; new writes take the new one.
+  rotation_period = var.key_rotation_period
+
+  # The recovery window for a destroy: versions sit DESTROY_SCHEDULED for this
+  # long and can be restored.
+  destroy_scheduled_duration = var.key_destroy_duration
+}
+
+# CMEK is two authorizations, and the second is the one that fails a first
+# apply: the *service agent* — not the caller, not the daemon — does the
+# encrypting, and it needs cryptoKeyEncrypterDecrypter on the key.
+#
+# Both agents are addressed by their documented fixed form over the project
+# number. The alternative, google_project_service_identity, would force them
+# into existence rather than assume it — but that resource is beta-only in
+# provider 6.x, and a google-beta provider would need its own configured
+# `provider` block: the wizard's generator emits exactly one
+# (src/cli/setup.ts renderMainTf), so a second one would go unconfigured and
+# silently fall back to the caller's ambient gcloud project — the #138 class
+# of bug, traded for a race. What makes the fixed form safe here is the
+# dependency: an agent is created when its API is enabled, and every
+# reference below waits on google_project_service.services. The residual
+# first-apply race on a brand-new project is the same one the subnetwork data
+# source has, and the README's bring-up notes tell the operator to rerun.
+data "google_project" "current" {
+  project_id = local.project
+
+  depends_on = [google_project_service.services]
+}
+
+locals {
+  compute_agent  = "serviceAccount:service-${data.google_project.current.number}@compute-system.iam.gserviceaccount.com"
+  registry_agent = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-artifactregistry.iam.gserviceaccount.com"
+}
+
+# Both disks are encrypted by the compute agent; the registry by its own.
+# Scoped to this one key — a project-level KMS grant would let either agent
+# use every key in the project.
+resource "google_kms_crypto_key_iam_member" "compute_agent" {
+  crypto_key_id = google_kms_crypto_key.fleet.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = local.compute_agent
+}
+
+resource "google_kms_crypto_key_iam_member" "registry_agent" {
+  crypto_key_id = google_kms_crypto_key.fleet.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = local.registry_agent
 }
 
 # --- Identities -----------------------------------------------------------------
@@ -89,7 +169,15 @@ resource "google_artifact_registry_repository" "runner" {
   description   = "Fleet runner image (:runner tag)"
   labels        = local.labels
 
-  depends_on = [google_project_service.services]
+  # CMEK: the image is what every job executes as, so the operator holds the
+  # key that decrypts it. The grant is a dependency, not a decoration — the
+  # repository create fails outright if the registry agent cannot use the key.
+  kms_key_name = google_kms_crypto_key.fleet.id
+
+  depends_on = [
+    google_project_service.services,
+    google_kms_crypto_key_iam_member.registry_agent,
+  ]
 }
 
 # --- Cloud Run job: the task-definition analog ---------------------------------------
@@ -338,7 +426,17 @@ resource "google_compute_disk" "fleet_home" {
   zone   = local.zone
   labels = local.labels
 
-  depends_on = [google_project_service.services]
+  # CMEK: this disk is every job's event journal — the whole history of what
+  # Fleet did in this account — so it is encrypted under the operator's own
+  # key rather than a Google-managed one they cannot rotate or revoke.
+  disk_encryption_key {
+    kms_key_self_link = google_kms_crypto_key.fleet.id
+  }
+
+  depends_on = [
+    google_project_service.services,
+    google_kms_crypto_key_iam_member.compute_agent,
+  ]
 }
 
 locals {
@@ -420,11 +518,26 @@ resource "google_compute_instance" "daemon" {
 
   # The boot disk is replaceable; state lives on the data disk. cloud-init
   # re-runs on a fresh instance and its format step is guarded by blkid, so a
-  # replacement mounts the existing FLEET_HOME instead of wiping it.
+  # replacement mounts the existing FLEET_HOME instead of wiping it. The image
+  # family is UEFI-enabled, which is what makes the shielded_instance_config
+  # below take effect rather than be silently ignored.
   boot_disk {
+    kms_key_self_link = google_kms_crypto_key.fleet.id
+
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2404-lts-amd64"
     }
+  }
+
+  # Shielded VM (Checkov CKV_GCP_39). The daemon holds the dispatch identity
+  # for the whole deployment, so the one host that must not be silently
+  # tampered with is this one: secure boot refuses unsigned kernel code, the
+  # vTPM anchors the measurements, and integrity monitoring surfaces a boot
+  # sequence that stopped matching its baseline.
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
   }
 
   attached_disk {
@@ -451,11 +564,20 @@ resource "google_compute_instance" "daemon" {
 
   metadata = {
     user-data = local.cloud_init
+    # Project-wide SSH keys would put anyone holding one on this VM
+    # (Checkov CKV_GCP_32), which is the whole IAP-only posture undone by a
+    # setting made elsewhere in the project. Break-glass stays
+    # `gcloud compute ssh --tunnel-through-iap`, which does not depend on it:
+    # it provisions an instance-level key for the caller.
+    block-project-ssh-keys = "TRUE"
   }
 
   allow_stopping_for_update = true
 
-  depends_on = [google_project_service.services]
+  depends_on = [
+    google_project_service.services,
+    google_kms_crypto_key_iam_member.compute_agent,
+  ]
 }
 
 # --- The deployment's self-description --------------------------------------------

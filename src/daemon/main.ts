@@ -25,17 +25,45 @@ import type { Provider } from "../providers/provider.ts";
  * Which provider to build and where its configuration comes from. Decided in
  * one place so the boot log (below) states the same source the provider reads
  * — a boot line derived from a second copy of this branch could lie (#53).
- * `ssmPath` carries the decision; `configSource` is only the log label. It is a
- * parameter *name* or the literal `env`/`none`, never a configuration value:
- * boot evidence must be safe to ship to a log group.
+ * `ssmPath` and `tokenSecret` carry the decision; `configSource` is only the
+ * log label. Every field here is a resource *name* or the literal
+ * `env`/`none`, never a configuration value: boot evidence must be safe to
+ * ship to a log group, and the env is read here — once, validated — rather
+ * than at the sites that log.
  */
-type ProviderChoice = { name: string; configSource: string; ssmPath?: string };
+type ProviderChoice = {
+  name: string;
+  configSource: string;
+  ssmPath?: string;
+  /** GCP project the token publish targets, when the deployment names one. */
+  project?: string;
+  /** Secret Manager secret id the daemon publishes its operator token into. */
+  tokenSecret?: string;
+  /**
+   * Why this configuration cannot be used, when it cannot. Carried rather
+   * than thrown: the three boot lines below are a pinned contract (#53) and
+   * are what tell a stuck boot from a crash-loop, so a bad value is reported
+   * the way an invalid FLEET_PORT is — after the evidence, then exit 1.
+   */
+  configError?: string;
+};
+
+/**
+ * Secret Manager's own id charset (letters, digits, `-` and `_`, up to 255).
+ * A name outside it is rejected at this boundary rather than handed to
+ * `gcloud`: the value arrives from the process environment, the API would
+ * refuse it anyway, and validating here keeps anything env-shaped out of the
+ * argv this daemon builds and the line it logs.
+ */
+const SECRET_ID = /^[A-Za-z0-9_-]{1,255}$/;
 
 function providerChoice(): ProviderChoice {
   const name = process.env.FLEET_PROVIDER ?? "process";
   // gcp config arrives entirely as FLEET_GCP_* env — the unit renders a
   // daemon.env file into the VM's cloud-init, so there is no live-fetch step.
-  if (name === "gcp") return { name, configSource: "env" };
+  // The two values the token publish needs are resolved and checked here, the
+  // same way ecs resolves its ssmPath, so the publish site reads no env.
+  if (name === "gcp") return { name, configSource: "env", ...gcpTokenTarget() };
   // Only ecs reads configuration from outside the process env.
   if (name !== "ecs") return { name, configSource: "none" };
   // FLEET_ECS_CLUSTER being set signals an explicit env override (tests,
@@ -46,6 +74,28 @@ function providerChoice(): ProviderChoice {
     return { name, configSource: `ssm:${ssmPath}`, ssmPath };
   }
   return { name, configSource: "env" };
+}
+
+/**
+ * Where a gcp daemon publishes its operator token (#188), or nothing when the
+ * deployment names no secret — a hand-run gcp daemon simply serves. A secret
+ * id that is not a legal Secret Manager id is a misconfigured deployment, and
+ * it fails the boot loudly here rather than surfacing as an opaque gcloud
+ * error minutes later, after the daemon has already reported itself healthy.
+ */
+function gcpTokenTarget(): { project?: string; tokenSecret?: string; configError?: string } {
+  const tokenSecret = process.env.FLEET_GCP_TOKEN_SECRET;
+  if (!tokenSecret) return {};
+  if (!SECRET_ID.test(tokenSecret)) {
+    // Deliberately does not echo the value: a rejected env value is the one
+    // thing on this path that has never been checked, and boot evidence must
+    // be safe to ship to a log group.
+    return {
+      configError:
+        "invalid FLEET_GCP_TOKEN_SECRET: a Secret Manager id is 1-255 characters of letters, digits, hyphen and underscore",
+    };
+  }
+  return { project: process.env.FLEET_GCP_PROJECT, tokenSecret };
 }
 
 async function buildProvider(choice: ProviderChoice, home: string): Promise<Provider> {
@@ -75,6 +125,15 @@ const choice = providerChoice();
 console.log(`fleet daemon: home ${home}`);
 console.log(`fleet daemon: provider ${choice.name}`);
 console.log(`fleet daemon: config source ${choice.configSource}`);
+
+// A configuration value the deployment got wrong: reported after the boot
+// evidence above and before anything is created, the way an invalid
+// FLEET_PORT is. Failing here beats booting into an opaque cloud-CLI error
+// minutes later, after the daemon has already reported itself healthy.
+if (choice.configError !== undefined) {
+  console.error(choice.configError);
+  process.exit(1);
+}
 
 mkdirSync(home, { recursive: true });
 
@@ -170,13 +229,9 @@ if (choice.name === "ecs" && choice.ssmPath !== undefined) {
 // credentials. Gated on the secret being named — a hand-run gcp daemon
 // without one simply serves. Best-effort and after the listen line, for the
 // same reasons as the SSM publish above.
-if (choice.name === "gcp" && process.env.FLEET_GCP_TOKEN_SECRET) {
+if (choice.name === "gcp" && choice.tokenSecret !== undefined) {
   try {
-    const name = await publishOperatorTokenToSecretManager(
-      process.env.FLEET_GCP_PROJECT ?? "",
-      process.env.FLEET_GCP_TOKEN_SECRET,
-      operatorToken,
-    );
+    const name = await publishOperatorTokenToSecretManager(choice.project ?? "", choice.tokenSecret, operatorToken);
     console.log(`fleet daemon: published operator token to secret-manager:${name}`);
   } catch (error) {
     console.error(`fleet: operator token publish failed: ${String(error)} — the CLI cannot fetch it; read $FLEET_HOME/operator-token over an IAP SSH session instead`);

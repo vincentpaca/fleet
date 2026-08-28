@@ -27,6 +27,20 @@ mock_provider "google" {
     }
   }
 
+  # The project number both CMEK service-agent emails are built from.
+  mock_data "google_project" {
+    defaults = {
+      number     = "111122223333"
+      project_id = "mock-project"
+    }
+  }
+
+  mock_resource "google_kms_crypto_key" {
+    defaults = {
+      id = "projects/mock-project/locations/us-central1/keyRings/fleet/cryptoKeys/fleet"
+    }
+  }
+
   mock_data "google_compute_subnetwork" {
     defaults = {
       name          = "default"
@@ -116,6 +130,29 @@ run "default_shape" {
     error_message = "the daemon VM needs the cloud-platform access scope, or default GCE scopes silently block Secret Manager regardless of IAM"
   }
 
+  # Shielded VM: the daemon holds the deployment's dispatch identity, so the
+  # one host that must not be silently tampered with is this one. All three
+  # settings are schema-valid at false, which is exactly why they are pinned.
+  assert {
+    condition = (
+      google_compute_instance.daemon.shielded_instance_config[0].enable_secure_boot == true &&
+      google_compute_instance.daemon.shielded_instance_config[0].enable_vtpm == true &&
+      google_compute_instance.daemon.shielded_instance_config[0].enable_integrity_monitoring == true
+    )
+    error_message = "the daemon VM must run as a Shielded VM (secure boot, vTPM, integrity monitoring) — it holds the dispatch identity for the whole deployment"
+  }
+
+  # Rotation and the recovery window, in the seconds form the API takes. The
+  # 30-day destroy window matches the AWS unit's KMS deletion window, and for
+  # the same reason: the key is the only way to read a job's history.
+  assert {
+    condition = (
+      google_kms_crypto_key.fleet.rotation_period == "7776000s" &&
+      google_kms_crypto_key.fleet.destroy_scheduled_duration == "2592000s"
+    )
+    error_message = "the KMS key must rotate (90d) and hold destroyed versions recoverable for 30 days — matching the AWS unit's deletion window"
+  }
+
   # The tunnel rule admits exactly Google's published IAP TCP-forwarding range.
   assert {
     condition     = google_compute_firewall.iap_daemon.source_ranges == toset(["35.235.240.0/20"])
@@ -172,6 +209,33 @@ run "cloud_init_carries_the_daemon_contract" {
     error_message = "the daemon VM must take the reserved internal address — an ephemeral IP strands every in-flight job on fleet upgrade"
   }
 
+  # CMEK on all three at-rest stores (the AWS unit's aws_kms_key.fleet twin):
+  # the data disk is every job's event journal, the boot disk holds the
+  # rendered daemon env, and the registry holds the image jobs execute as.
+  # Computed key id, so this lives here rather than in the plan run above.
+  assert {
+    condition = (
+      google_compute_disk.fleet_home.disk_encryption_key[0].kms_key_self_link == google_kms_crypto_key.fleet.id &&
+      google_compute_instance.daemon.boot_disk[0].kms_key_self_link == google_kms_crypto_key.fleet.id &&
+      google_artifact_registry_repository.runner.kms_key_name == google_kms_crypto_key.fleet.id
+    )
+    error_message = "the data disk, the boot disk and the runner registry must all encrypt under the deployment's own KMS key, or the operator cannot rotate, audit or revoke what holds their job history"
+  }
+
+  # CMEK is two authorizations, and this is the one that fails a first apply:
+  # the service agents, not the caller, do the encrypting. Both are built from
+  # the project number, and both are scoped to this one key — a project-level
+  # grant would let either agent use every key in the project.
+  assert {
+    condition = (
+      google_kms_crypto_key_iam_member.compute_agent.member == "serviceAccount:service-111122223333@compute-system.iam.gserviceaccount.com" &&
+      google_kms_crypto_key_iam_member.registry_agent.member == "serviceAccount:service-111122223333@gcp-sa-artifactregistry.iam.gserviceaccount.com" &&
+      google_kms_crypto_key_iam_member.compute_agent.role == "roles/cloudkms.cryptoKeyEncrypterDecrypter" &&
+      google_kms_crypto_key_iam_member.registry_agent.role == "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+    )
+    error_message = "both CMEK service agents must hold cryptoKeyEncrypterDecrypter on this key — without the grant the disks and the repository fail to create at all"
+  }
+
   assert {
     condition = alltrue([
       for needle in [
@@ -210,6 +274,16 @@ run "cloud_init_carries_the_daemon_contract" {
   assert {
     condition     = strcontains(google_compute_instance.daemon.metadata["user-data"], "blkid /dev/disk/by-id/google-fleet-home || mkfs.ext4")
     error_message = "the data-disk format must be blkid-guarded — an unguarded mkfs wipes FLEET_HOME on every VM replacement"
+  }
+
+  # Project-wide SSH keys would put anyone holding one on the daemon VM,
+  # undoing the IAP-only posture through a setting made elsewhere entirely.
+  # It shares the metadata map with the cloud-init above, which is why this
+  # lives here: a rewrite that keeps one key and drops the other fails one of
+  # these two asserts either way.
+  assert {
+    condition     = google_compute_instance.daemon.metadata["block-project-ssh-keys"] == "TRUE"
+    error_message = "the daemon VM must block project-wide SSH keys, or the IAP-only access story is undone by a project-level setting"
   }
 }
 

@@ -113,6 +113,30 @@ variable "fleet_version" {
   }
 }
 
+# --- Encryption -----------------------------------------------------------------
+
+variable "key_rotation_period" {
+  description = "How often the deployment's KMS key rotates, as the seconds duration Cloud KMS itself takes. Default 7776000s is 90 days — the ceiling CIS and Checkov's CKV_GCP_43 hold keys to. Data already written stays readable under the version that wrote it; new writes take the new version. Expressed in the API's own unit rather than days-times-arithmetic so the value is greppable and readable by policy scanners, which cannot evaluate an interpolated product."
+  type        = string
+  default     = "7776000s"
+
+  validation {
+    condition     = can(regex("^[0-9]+s$", var.key_rotation_period)) && tonumber(trimsuffix(var.key_rotation_period, "s")) <= 7776000
+    error_message = "key_rotation_period must be a seconds duration like \"7776000s\", and no longer than 7776000s (90 days) — beyond that the key stops meeting the rotation baseline the unit claims."
+  }
+}
+
+variable "key_destroy_duration" {
+  description = "Recovery window for a destroyed key version: it sits DESTROY_SCHEDULED this long and can be restored. Default 2592000s is 30 days, matching the AWS unit's KMS deletion window and for the same reason — the key is the only way to read a job's history, and a fat-fingered destroy should be recoverable for longer than a weekend."
+  type        = string
+  default     = "2592000s"
+
+  validation {
+    condition     = can(regex("^[0-9]+s$", var.key_destroy_duration)) && tonumber(trimsuffix(var.key_destroy_duration, "s")) >= 86400
+    error_message = "key_destroy_duration must be a seconds duration like \"2592000s\", and at least 86400s (24h) — Cloud KMS's own floor, and anything shorter is not a recovery window."
+  }
+}
+
 # --- Operator access ------------------------------------------------------------
 
 variable "operator_members" {

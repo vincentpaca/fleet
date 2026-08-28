@@ -263,6 +263,42 @@ test('a loopback FLEET_DAEMON_HOST does not widen the bind (#185)', async (t) =>
   );
 });
 
+test('a malformed FLEET_GCP_TOKEN_SECRET fails the boot after the evidence, without echoing it (#185)', async (t) => {
+  // The secret id is a value from the environment that ends up on a gcloud
+  // argv and in a boot log line. It is validated at the one place the env is
+  // read, so a misconfigured deployment dies here rather than booting,
+  // reporting itself healthy, and failing the publish minutes later with an
+  // opaque cloud-CLI error. The three boot lines are a pinned contract and
+  // must still be on stdout — the same ordering an invalid FLEET_PORT gets.
+  const home = tempDir(t, 'fleet-boot-badsecret-home-');
+  const daemon = spawnDaemon(t, {
+    FLEET_HOME: home,
+    FLEET_PORT: '0',
+    FLEET_PROVIDER: 'gcp',
+    FLEET_GCP_PROJECT: 'mock-project',
+    FLEET_GCP_REGION: 'us-central1',
+    FLEET_GCP_JOB: 'fleet-runner',
+    // Slashes and spaces are not Secret Manager id characters; this shape is
+    // also what a path-ish value injected into an argv would look like.
+    FLEET_GCP_TOKEN_SECRET: '../../etc/passwd; rm -rf /',
+  });
+
+  const code = await daemon.exited;
+  assert.notEqual(code, 0, 'a malformed secret id must fail the boot, not reach gcloud');
+  assert.deepEqual(daemon.lines(), [
+    `fleet daemon: home ${home}`,
+    'fleet daemon: provider gcp',
+    'fleet daemon: config source env',
+  ], `boot lines lost on a rejected config value:\n${daemon.lines().join('\n')}\nstderr:\n${daemon.stderr()}`);
+  assert.match(daemon.stderr(), /invalid FLEET_GCP_TOKEN_SECRET/);
+  // The rejected value is the one thing on this path that has never been
+  // checked: naming the variable is the diagnosis, echoing it is a leak.
+  assert.ok(
+    !`${daemon.lines().join('\n')}${daemon.stderr()}`.includes('rm -rf'),
+    'the rejected value must not be echoed into boot evidence',
+  );
+});
+
 test('a gcp daemon boots from env config, serves, and survives a failed token publish (#185)', async (t) => {
   // The GCP unit's daemon.env in miniature: provider gcp, config entirely from
   // FLEET_GCP_* env (config source "env" — there is no SSM-fetch analog), the
