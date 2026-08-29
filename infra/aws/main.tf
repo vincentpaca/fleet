@@ -223,6 +223,13 @@ resource "aws_security_group" "efs" {
 resource "aws_ecr_repository" "runner" {
   name = "${var.name}-runner"
 
+  # A registry holding images refuses to delete, so without this a teardown
+  # fails partway and the operator empties the repository by hand before
+  # retrying (paid for on 2026-08-26). Nothing here is worth that: every image
+  # is rebuilt from a pinned source ref by the CodeBuild project below or by
+  # images/build.sh, and the whole deployment is going away regardless.
+  force_delete = true
+
   image_scanning_configuration {
     scan_on_push = true
   }
@@ -245,6 +252,9 @@ resource "aws_ecr_repository" "project" {
   for_each = toset(var.project_repos)
 
   name = each.value
+
+  # Same reason as the runner repository above.
+  force_delete = true
 
   image_scanning_configuration {
     scan_on_push = true
