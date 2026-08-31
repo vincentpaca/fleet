@@ -61,23 +61,20 @@ export const SIZES: ArtSize[] = [
  * The three colour forms `renderBanner(width, noColor, level)` already asks for.
  *
  * Half blocks only — sextants, octants and braille render as tofu in macOS
- * terminal fonts, which was measured rather than assumed. The plain form is the
- * one that needs more than `--symbols=half`: with no colour there is no
- * background to pair with a half block, so a fully covered cell has no glyph to
- * be and chafa draws the plane as a hollow outline. `space` and `solid` give it
- * the blank and the full block — the same three glyphs the hand-drawn plane
- * used — and `-p off` keeps its 16-colour preprocessing from eating the body.
+ * terminal fonts, which was measured rather than assumed. There is no plain
+ * form: the dart is half blocks paired against a background colour, so with
+ * the colour stripped it reads as a blob, and board.ts shows the wordmark
+ * alone instead (#225).
  *
  * `--polite=on --relative=off` on every form: chafa's default output hides the
  * cursor and positions relative to it. Baked verbatim into a string the CLI
  * prints, that would leave the operator with no cursor.
  */
-export type ArtForm = { key: 'truecolor' | 'c256' | 'plain'; args: string[] };
+export type ArtForm = { key: 'truecolor' | 'c256'; args: string[] };
 
 export const FORMS: ArtForm[] = [
   { key: 'truecolor', args: ['--symbols=half', '-c', 'full'] },
   { key: 'c256', args: ['--symbols=half', '-c', '256'] },
-  { key: 'plain', args: ['--symbols=half+space+solid', '-c', 'none', '-p', 'off'] },
 ];
 
 const COMMON = ['-f', 'symbols', '--polite=on', '--relative=off'];
@@ -135,7 +132,7 @@ const HEADER = `// The paper airplane, baked. GENERATED — do not edit by hand.
 //
 // Half blocks only, and no cursor-hiding or relative-positioning sequences:
 // these strings are printed verbatim by a CLI that must leave the terminal as
-// it found it. The plain form carries no escapes at all — colour here adds
+// it found it. There is no plain form — colour here adds
 // depth to a shape that already reads without it.
 
 /** One size of the art, in the three forms \`renderBanner\` selects between. */
@@ -144,7 +141,6 @@ export type BannerArt = {
   rows: number;
   truecolor: string[];
   c256: string[];
-  plain: string[];
 };
 `;
 

@@ -26,7 +26,7 @@ const BAKED: Array<[string, BannerArt]> = [
   ['DART_HERO', DART_HERO],
 ];
 
-const FORM_KEYS: Array<keyof Pick<BannerArt, 'truecolor' | 'c256' | 'plain'>> = ['truecolor', 'c256', 'plain'];
+const FORM_KEYS: Array<keyof Pick<BannerArt, 'truecolor' | 'c256'>> = ['truecolor', 'c256'];
 
 test('every baked size is one grid in all three colour forms', () => {
   for (const [name, art] of BAKED) {
@@ -40,19 +40,6 @@ test('every baked size is one grid in all three colour forms', () => {
         assert.equal(visualLength(row), art.cols, `${name}.${form} row is not ${art.cols} wide: ${JSON.stringify(row)}`);
       }
     }
-  }
-});
-
-test('the plain form is an unescaped, filled plane — colour carries no meaning', () => {
-  for (const [name, art] of BAKED) {
-    const plain = art.plain.join('\n');
-    assert.doesNotMatch(plain, /\x1b/, `${name}.plain carries an escape sequence`);
-    assert.match(plain.replace(/\n/g, ''), HALF_BLOCKS, `${name}.plain uses a glyph outside the half blocks`);
-    // An outline is what chafa draws when the full block is not in its symbol
-    // set: the plane's body comes out hollow and reads as noise under NO_COLOR.
-    const filled = art.plain.filter((row) => row.includes('█')).length;
-    assert.ok(filled >= art.rows / 2, `${name}.plain is an outline, not a plane (${filled}/${art.rows} filled rows)`);
-    assert.ok(art.plain.some((row) => row.includes('▀')), `${name}.plain has no half-block edge`);
   }
 });
 
@@ -95,5 +82,9 @@ test('the baked art still matches fixtures/dart.png', () => {
   for (const size of SIZES) {
     assert.ok(rebaked.includes(`export const ${size.constant}: BannerArt`), `${size.constant} missing from the bake`);
   }
-  assert.ok(rebaked.includes('█'), 'the bake carries no art');
+  // The coloured forms are half blocks paired against a background, so the
+  // proof of art is a block glyph plus a colour — not the solid █ the deleted
+  // plain form used (#225).
+  assert.match(rebaked, /[▀▄█▌▐]/, 'the bake carries no half-block art');
+  assert.match(rebaked, /38;2;|38;5;/, 'the bake carries no colour');
 });

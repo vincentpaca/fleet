@@ -7,7 +7,7 @@
 //
 // Half blocks only, and no cursor-hiding or relative-positioning sequences:
 // these strings are printed verbatim by a CLI that must leave the terminal as
-// it found it. The plain form carries no escapes at all — colour here adds
+// it found it. There is no plain form — colour here adds
 // depth to a shape that already reads without it.
 
 /** One size of the art, in the three forms `renderBanner` selects between. */
@@ -16,7 +16,6 @@ export type BannerArt = {
   rows: number;
   truecolor: string[];
   c256: string[];
-  plain: string[];
 };
 
 /**
@@ -53,18 +52,6 @@ export const DART_COMPACT: BannerArt = {
     "       \u001b[38;5;247;48;5;188m▄\u001b[38;5;252;48;5;251m▄\u001b[38;5;255;48;5;252m▄\u001b[48;5;255m▄▄▄▄▄▄\u001b[38;5;244m▄\u001b[0m           \u001b[0m",
     "       \u001b[7m\u001b[38;5;246m▌\u001b[0m\u001b[38;5;251;48;5;145m▌\u001b[0m\u001b[7m\u001b[38;5;250m▄\u001b[38;5;254m▄\u001b[0m\u001b[38;5;188;48;5;255m▄\u001b[38;5;255m▄▄▄\u001b[0m\u001b[7m\u001b[38;5;252m▄\u001b[0m            \u001b[0m",
     "            \u001b[7m\u001b[38;5;251m▄\u001b[0m\u001b[38;5;145;48;5;255m▄\u001b[0m\u001b[7m\u001b[38;5;244m▄\u001b[0m             \u001b[0m",
-  ],
-  plain: [
-    "                        ▄▄▄ ",
-    "                   ▄▄▄███▀  ",
-    "               ▄▄███████▀   ",
-    "          ▄▄▄█████████▀     ",
-    "      ▄▄█████████████▀      ",
-    "  ▄▄███████████████▀        ",
-    " ▀▀▀██████████████▀         ",
-    "       ██████████           ",
-    "       ▐█▀▀████▀            ",
-    "            ▀█▀             ",
   ],
 };
 
@@ -103,19 +90,5 @@ export const DART_HERO: BannerArt = { // contract pin: the hero size is #217's t
     "         \u001b[38;5;251;48;5;251m▄\u001b[38;5;250;48;5;252m▄\u001b[38;5;252;48;5;255m▄\u001b[38;5;255m▄▄▄▄▄▄▄\u001b[38;5;244m▄\u001b[0m              \u001b[0m",
     "         \u001b[7m\u001b[38;5;251m▌\u001b[0m\u001b[38;5;249;48;5;102m▌\u001b[0m\u001b[7m\u001b[38;5;246m▄\u001b[0m \u001b[7m\u001b[38;5;254m▄\u001b[0m\u001b[38;5;253;48;5;255m▌\u001b[38;5;255m▄▄▄\u001b[0m\u001b[7m\u001b[38;5;251m▄\u001b[0m               \u001b[0m",
     "               \u001b[7m\u001b[38;5;188m▄\u001b[0m\u001b[38;5;145;48;5;255m▄\u001b[0m\u001b[7m\u001b[38;5;243m▄\u001b[0m                \u001b[0m",
-  ],
-  plain: [
-    "                              ▄▄▄ ",
-    "                         ▄▄▄███▀  ",
-    "                     ▄▄███████▀   ",
-    "                ▄▄██████████▀     ",
-    "           ▄▄▄█████████████       ",
-    "       ▄▄████████████████▀        ",
-    "   ▄▄███████████████████          ",
-    " ▀████████████████████▀           ",
-    "     ▀▀▀█████████████▀            ",
-    "         ██████████▀              ",
-    "         ▐█▀ ▀████▀               ",
-    "               ▀█                 ",
   ],
 };

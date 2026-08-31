@@ -383,30 +383,33 @@ test('invalidateDecision drops exactly one job\'s cached decisions', () => {
 // row at 1 + 17 + 3 + 10. Pinned to the art's real dimensions: the banner is
 // what a short terminal drops first (BANNER_MIN_ROWS), so its footprint is a
 // layout contract, not decoration.
-test('FLEET_BANNER is exactly 10 lines and no wider than 45 chars', () => {
-  // The plane decides the height: at six rows the dart is a blob, so the
-  // banner is the size the artwork needs and the cockpit suppresses it whole
-  // on short windows (BANNER_MIN_ROWS) rather than shrinking it (#225).
+test('FLEET_BANNER is the wordmark alone: no colour means no picture', () => {
+  // Half blocks carry the dart by pairing a foreground against a background
+  // colour. With the colour gone the silhouette reads as a blob, so the
+  // no-colour form keeps the words and drops the plane (#225).
   const lines = FLEET_BANNER.split('\n');
-  assert.equal(lines.length, 10);
+  assert.equal(lines.length, 2);
+  assert.doesNotMatch(FLEET_BANNER, /[▀▄█▌▐]/, 'no half blocks survive without colour to pair them');
+  assert.match(lines[0], /F L E E T/);
   for (const line of lines) assert.ok(line.length <= 45, `banner line too wide (${line.length}): "${line}"`);
 });
 
-test('FLEET_BANNER composes the plane with the wordmark and tagline', () => {
-  const lines = FLEET_BANNER.split('\n');
-  assert.match(lines[2], /^ [ ▀▄█▌▐]+ {3}F L E E T$/, 'wordmark sits beside the plane on row 3');
-  assert.match(lines[3], /^ [ ▀▄█▌▐]+ {3}your cloud$/, 'tagline sits beside the plane on row 4');
-  // Half blocks and nothing else: sextants, octants and braille are tofu in
-  // macOS terminal fonts, so the plain art may only use these glyphs.
-  const plane = lines.map((line) => line.slice(1, 18)).join('');
-  assert.match(plane, /^[ ▀▄█▌▐]+$/, `plain art carries a non-half-block glyph: ${JSON.stringify(plane)}`);
-  assert.ok(plane.includes('█'), 'the plain plane is filled, not an outline');
+test('the coloured banner composes the plane with the wordmark and tagline', () => {
+  // The picture only exists where colour does (#225): half blocks carry the
+  // dart by pairing a foreground against a background, so this pins the
+  // coloured composition — plane on the left, words beside it.
+  const lines = renderBanner(80, false, '24bit').split('\n');
+  assert.equal(lines.length, 10);
+  assert.match(lines[2], /F L E E T/, 'wordmark sits beside the plane');
+  assert.match(lines[3], /your cloud/, 'tagline sits beside the plane');
+  const glyphs = lines.join('').replace(/\x1b\[[0-9;]*m/g, '').replace(/[ FLETyourcld]/g, '');
+  assert.match(glyphs, /^[▀▄█▌▐]+$/, `art carries a non-half-block glyph: ${JSON.stringify(glyphs)}`);
 });
 
 test('renderBanner: noColor is plain, colour is not, both clip to width', () => {
   const plain = renderBanner(80, true);
   assert.doesNotMatch(plain, /\x1b\[/);
-  assert.equal(plain.split('\n').length, 10);
+  assert.equal(plain.split('\n').length, 2, 'the no-colour banner is the wordmark alone');
   assert.match(renderBanner(80, false, '24bit'), /\x1b\[38;2;/, 'truecolor terminals get truecolor');
   assert.match(renderBanner(80, false, '256'), /\x1b\[38;5;/, '256-colour terminals get the cube');
   assert.doesNotMatch(renderBanner(80, false, '256'), /\x1b\[38;2;/, '256 terminals get no truecolor triplet');

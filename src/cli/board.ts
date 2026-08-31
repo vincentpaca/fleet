@@ -95,8 +95,16 @@ function composeBanner(art: BannerArt, level?: ColorLevel): string[] {
   return lines;
 }
 
-/** Small Fleet wordmark, plain form. Shown when the board starts; also `fleet --help`. */
-export const FLEET_BANNER = composeBanner(DART_COMPACT).join('\n'); // contract pin: test-only export, asserted by the suite
+/**
+ * The banner with no colour at all: the wordmark alone.
+ *
+ * The dart is drawn in half blocks paired against a background colour, and
+ * stripping the colour leaves a monochrome silhouette that reads as a blob
+ * rather than a paper airplane — worse than showing nothing. So the no-colour
+ * form keeps the words and drops the picture, which is also the form a pipe,
+ * a log and a screen reader get.
+ */
+export const FLEET_BANNER = ['  F L E E T', '  your cloud'].join('\n'); // contract pin: test-only export, asserted by the suite
 
 // ── Terminal sequences ────────────────────────────────────────────────────────
 
