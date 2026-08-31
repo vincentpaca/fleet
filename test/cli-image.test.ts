@@ -569,6 +569,16 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
       // The provider satisfies the Provider interface structurally.
       provider: provider as unknown as Parameters<typeof FleetDaemon>[0]['provider'],
       port: 0,
+      // 0.0.0.0, not the 127.0.0.1 default: on Linux the container reaches
+      // the host at the docker bridge IP (host-gateway), where a
+      // loopback-bound listener does not exist — every live-loop test here
+      // sat at `queued` on CI while passing on Docker Desktop, whose
+      // host.docker.internal routes into the host's loopback instead.
+      // Ephemeral port, test-lifetime only. tcpHost keeps the ADVERTISED
+      // url at 127.0.0.1 (it defaults to bindHost), because the wrapper
+      // above rewrites exactly that into the container-reachable address.
+      bindHost: '0.0.0.0',
+      tcpHost: '127.0.0.1',
       longPollMs: 15_000,
     });
     const { port } = await daemon.start();
