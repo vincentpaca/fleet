@@ -33,9 +33,10 @@ const FLEET_CONFIG = {
 type Run = { code: number; stdout: string; stderr: string; log: string[] };
 
 /**
- * Recording stubs for docker and aws, prepended to PATH. `docker login` drains
- * stdin: the script pipes the ECR password into it under `set -o pipefail`, so
- * a stub that ignores stdin would fail the run for the wrong reason.
+ * Recording stubs for docker, aws and gcloud, prepended to PATH. `docker login`
+ * drains stdin: the script pipes the ECR password into it under
+ * `set -o pipefail`, so a stub that ignores stdin would fail the run for the
+ * wrong reason.
  */
 function stubBin(dir: string): void {
   fs.writeFileSync(
@@ -48,6 +49,11 @@ function stubBin(dir: string): void {
     '#!/bin/sh\nprintf \'aws %s\\n\' "$*" >> "$FLEET_FAKE_LOG"\ncase "$2" in get-login-password) echo fake-ecr-password ;; esac\nexit 0\n',
     { mode: 0o755 },
   );
+  fs.writeFileSync(
+    path.join(dir, 'gcloud'),
+    '#!/bin/sh\nprintf \'gcloud %s\\n\' "$*" >> "$FLEET_FAKE_LOG"\nexit 0\n',
+    { mode: 0o755 },
+  );
 }
 
 /**
@@ -55,10 +61,13 @@ function stubBin(dir: string): void {
  * .fleet/infra/ — which on an operator's machine points at a live deployment —
  * is never the discovery source under test).
  */
-function runBuild(args: string[], opts: { cwd?: string; config?: unknown; env?: Record<string, string> } = {}): Run {
+function runBuild(
+  args: string[],
+  opts: { cwd?: string; config?: unknown; provider?: string; env?: Record<string, string> } = {},
+): Run {
   const cwd = opts.cwd ?? makeTempDir('fleet-build-cwd-');
   if (opts.config !== undefined) {
-    const infraDir = path.join(cwd, '.fleet', 'infra', 'aws');
+    const infraDir = path.join(cwd, '.fleet', 'infra', opts.provider ?? 'aws');
     fs.mkdirSync(infraDir, { recursive: true });
     fs.writeFileSync(path.join(infraDir, 'fleet-config.json'), JSON.stringify(opts.config));
   }
@@ -288,7 +297,9 @@ describe('push', () => {
   test('--push with no repository anywhere fails before any build', () => {
     const res = runBuild(['--push']);
     assert.equal(res.code, 1);
-    assert.match(res.stderr, /no ECR repository/);
+    // Cloud-neutral, deliberately: with no config and no --repository there is
+    // no way to know which registry the operator meant.
+    assert.match(res.stderr, /no repository to push to/);
     assert.match(res.stderr, /fleet_config/);
     assert.deepEqual(res.log, [], 'must not spend a build it cannot publish');
   });
@@ -388,6 +399,76 @@ describe('--redeploy-daemon', () => {
     const pushed = runBuild(['--platform', 'linux/arm64', '--push'], { config: FLEET_CONFIG });
     assert.equal(pushed.code, 0, pushed.stderr);
     assert.equal(find(pushed.log, 'docker push').length, 2);
+  });
+});
+
+// ---------- gcp: Artifact Registry, one image, no roll (#185) ----------
+
+describe('a gcp deployment', () => {
+  const AR_REPOSITORY = 'us-central1-docker.pkg.dev/demo-project/demo-runner/runner';
+  const AR_HOST = AR_REPOSITORY.split('/')[0];
+  const GCP_CONFIG = {
+    provider: 'gcp',
+    project: 'demo-project',
+    region: 'us-central1',
+    runner_job: 'demo-runner',
+    runner_repository_url: AR_REPOSITORY,
+    daemon_instance: 'demo-daemon',
+    daemon_zone: 'us-central1-a',
+  };
+
+  test('authenticates through gcloud and publishes :runner only', () => {
+    // No --runner flag: the default is "both images", and on this cloud the
+    // second one has nowhere to go — a :daemon tag here is an image nothing
+    // will ever pull.
+    const res = runBuild(['--push'], { config: GCP_CONFIG, provider: 'gcp' });
+    assert.equal(res.code, 0, res.stderr);
+
+    assert.equal(only(res.log, 'configure-docker'), `gcloud auth configure-docker ${AR_HOST} --quiet`);
+    assert.deepEqual(find(res.log, 'docker push'), [`docker push ${AR_REPOSITORY}:runner`]);
+    assert.deepEqual(find(res.log, 'docker tag'), [`docker tag fleet-runner:claude-code-latest ${AR_REPOSITORY}:runner`]);
+    assert.equal(find(res.log, 'docker build').length, 1, 'the daemon image is not built for a cloud that has none');
+    // Nothing AWS is reachable from a GCP deployment, ambient AWS_REGION or not.
+    assert.deepEqual(find(res.log, 'aws '), []);
+    assert.deepEqual(find(res.log, 'docker login'), [], 'the gcloud credential helper replaces the ECR login');
+
+    // The roll step becomes a note: jobs pick the tag up on their next
+    // execution, and the daemon is not an image at all.
+    assert.match(res.stdout, /nothing to roll on GCP/);
+    assert.match(res.stdout, /fleet upgrade/);
+  });
+
+  test('an Artifact Registry --repository is enough — the host names the registry', () => {
+    // No config file anywhere: a deployment described only by its repository
+    // URL must still authenticate the right way, not attempt an ECR login.
+    const res = runBuild(['--push', '--repository', AR_REPOSITORY]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(only(res.log, 'configure-docker'), `gcloud auth configure-docker ${AR_HOST} --quiet`);
+    assert.deepEqual(find(res.log, 'docker push'), [`docker push ${AR_REPOSITORY}:runner`]);
+    assert.deepEqual(find(res.log, 'aws '), []);
+  });
+
+  test('--daemon is refused rather than pushed to a tag nothing reads', () => {
+    const res = runBuild(['--daemon', '--push'], { config: GCP_CONFIG, provider: 'gcp' });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /no :daemon tag on this cloud/);
+    assert.match(res.stderr, /fleet upgrade/, 'names how the daemon actually moves');
+    assert.deepEqual(res.log, [], 'must not spend a build it cannot publish');
+  });
+
+  test('--redeploy-daemon is refused: there is no daemon image to roll', () => {
+    const res = runBuild(['--redeploy-daemon'], { config: GCP_CONFIG, provider: 'gcp' });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /nothing to roll on a gcp deployment/);
+    assert.match(res.stderr, /fleet upgrade/);
+    assert.deepEqual(res.log, [], 'must not build or push a roll it cannot finish');
+  });
+
+  test('a registry host alone is rejected, with this cloud’s shape in the message', () => {
+    const res = runBuild(['--push', '--repository', AR_HOST]);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /full Artifact Registry image path/);
+    assert.deepEqual(res.log, []);
   });
 });
 

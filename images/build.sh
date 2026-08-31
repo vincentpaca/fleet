@@ -10,12 +10,21 @@
 # repository, and forces the daemon service to start from the new image. No
 # DOCKER_DEFAULT_PLATFORM, no docker tag, no aws ecs update-service by hand.
 #
+# On a GCP deployment (fleet_config `provider: gcp`, or an Artifact Registry
+# repository URL) the shape is smaller: docker authenticates through
+# `gcloud auth configure-docker <registry host>`, only :runner is built and
+# pushed, and there is nothing to roll — GCP has no daemon image at all, the
+# daemon is an npm install on a VM that `fleet upgrade` moves. Asking for
+# --daemon or --redeploy-daemon against such a deployment is refused, not
+# silently reinterpreted.
+#
 # Discovery: everything but credentials comes from the deployment's own
 # fleet_config, captured beside the project that dispatches jobs —
 #
 #   .fleet/infra/<provider>/fleet-config.json
-#     runner_repository_url  → push target, ECR host, and region
-#     cluster + daemon_service → the service --redeploy-daemon rolls
+#     provider               → which registry and which roll story
+#     runner_repository_url  → push target, registry host, and (on AWS) region
+#     cluster + daemon_service → the service --redeploy-daemon rolls (AWS only)
 #
 # Capture it once after terraform apply (the same file the CLI reads
 # daemon_url from):
@@ -45,7 +54,8 @@
 # They arrive at task start via -e flags injected by the Fleet daemon; set
 # env.vars in .fleet/manifest.json. Delegated jobs bill via API key;
 # interactive OAuth/subscription login does not transfer to headless
-# containers. ECR push and the service roll use your ambient AWS credentials.
+# containers. ECR push and the service roll use your ambient AWS credentials;
+# an Artifact Registry push uses your ambient gcloud credentials.
 
 set -euo pipefail
 
@@ -61,10 +71,13 @@ usage: images/build.sh [flags]
   --base-image IMAGE     base for both images (default: node:24-slim). Pin a
                          digest for a reproducible build: node:24-slim@sha256:…
                          — every build prints the digest the tag resolved to
-  --push                 push to the deployment's ECR as :runner / :daemon
+  --push                 push to the deployment's registry as :runner / :daemon
+                         (a GCP deployment takes :runner only — it has no daemon image)
   --redeploy-daemon      --push, then force a new deployment of Fleet's daemon service
+                         (AWS only; on GCP the daemon moves with fleet upgrade)
   --config PATH          fleet-config.json to discover from
-  --repository URL       ECR repository URL to push to (skips discovery)
+  --repository URL       repository URL to push to (skips discovery): an ECR
+                         repository, or an Artifact Registry .../<repo>/runner path
   --region REGION        AWS region (default: derived from the repository URL)
   --cluster NAME         ECS cluster holding the daemon service
   --service NAME         daemon service to roll
@@ -130,7 +143,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Neither named: build both. A deployment needs both tags.
+# Which registry this push speaks. Decided during discovery below, from the
+# deployment's own fleet_config (or its repository host); "ecs" is what every
+# path did before GCP existed, so it stays the default.
+TARGET="ecs"
+# Whether the daemon image was ASKED for, before the "neither named" default
+# below fills both in. A GCP deployment has no daemon image: the default drops
+# it silently (there is nothing to push it to), but an explicit --daemon is a
+# request that cannot be honoured and gets said so.
+DAEMON_ASKED=$BUILD_DAEMON
+
+# Neither named: build both. An AWS deployment needs both tags.
 if [[ $BUILD_RUNNER -eq 0 && $BUILD_DAEMON -eq 0 ]]; then
   BUILD_RUNNER=1
   BUILD_DAEMON=1
@@ -180,9 +203,9 @@ find_config() {
 capture_hint() {
   # The terraform unit lives in this checkout; discovery reads the project you
   # ran from. The <> placeholder keeps the two straight.
-  echo "  capture the deployment's own values once after terraform apply:" >&2
-  echo "    mkdir -p .fleet/infra/aws" >&2
-  echo "    terraform -chdir=<fleet-checkout>/infra/aws/examples/basic output -json fleet_config > .fleet/infra/aws/fleet-config.json" >&2
+  echo "  capture the deployment's own values once after terraform apply (<cloud> is aws or gcp):" >&2
+  echo "    mkdir -p .fleet/infra/<cloud>" >&2
+  echo "    terraform -chdir=<fleet-checkout>/infra/<cloud>/examples/basic output -json fleet_config > .fleet/infra/<cloud>/fleet-config.json" >&2
 }
 
 if [[ $PUSH -eq 1 ]]; then
@@ -194,56 +217,91 @@ if [[ $PUSH -eq 1 ]]; then
   fi
   if [[ -n "$CONFIG" ]]; then
     echo "reading deployment from ${CONFIG}"
-    # This script speaks ECR and ECS. A config for another cloud would survive
-    # discovery — its repository URL is non-empty too — and only fail at docker
-    # login, after both images are built.
+    # This script speaks ECR/ECS and Artifact Registry. A config for any other
+    # cloud would survive discovery — its repository URL is non-empty too — and
+    # only fail at docker login, after both images are built.
     CONFIG_PROVIDER="$(config_field "$CONFIG" provider)"
-    if [[ -n "$CONFIG_PROVIDER" && "$CONFIG_PROVIDER" != "ecs" ]]; then
-      echo "error: ${CONFIG} describes a ${CONFIG_PROVIDER} deployment; this script publishes to ECR and rolls an ECS service" >&2
-      echo "  point --config at the ecs deployment, or pass --repository/--cluster/--service yourself" >&2
-      exit 1
-    fi
+    case "$CONFIG_PROVIDER" in
+      ''|ecs) ;;
+      gcp) TARGET="gcp" ;;
+      *)
+        echo "error: ${CONFIG} describes a ${CONFIG_PROVIDER} deployment; this script publishes to ECR (ecs) or Artifact Registry (gcp)" >&2
+        echo "  point --config at one of those, or pass --repository/--cluster/--service yourself" >&2
+        exit 1 ;;
+    esac
     [[ -n "$REPOSITORY" ]] || REPOSITORY="$(config_field "$CONFIG" runner_repository_url)"
     [[ -n "$CLUSTER" ]] || CLUSTER="$(config_field "$CONFIG" cluster)"
     [[ -n "$SERVICE" ]] || SERVICE="$(config_field "$CONFIG" daemon_service)"
   fi
 
   if [[ -z "$REPOSITORY" ]]; then
-    echo "error: no ECR repository to push to — pass --repository <url>, or:" >&2
+    echo "error: no repository to push to — pass --repository <url>, or:" >&2
     capture_hint
     exit 1
   fi
 
-  ECR_HOST="${REPOSITORY%%/*}"
-  if [[ "$ECR_HOST" == "$REPOSITORY" ]]; then
-    echo "error: --repository must be a full ECR repository URL (<host>/<repository>), got: ${REPOSITORY}" >&2
+  REGISTRY_HOST="${REPOSITORY%%/*}"
+
+  # No config, or a config from before the provider key existed: the host names
+  # the registry. Artifact Registry (and the older gcr.io) are the only
+  # non-ECR hosts this script knows how to authenticate to, so an unrecognised
+  # host keeps the ECR path and fails there rather than guessing.
+  if [[ "$TARGET" == "ecs" && "$REGISTRY_HOST" =~ (^|\.)(pkg\.dev|gcr\.io)$ ]]; then
+    TARGET="gcp"
+  fi
+
+  if [[ "$REGISTRY_HOST" == "$REPOSITORY" ]]; then
+    if [[ "$TARGET" == "gcp" ]]; then
+      echo "error: --repository must be a full Artifact Registry image path (<host>/<project>/<repository>/<image>), got: ${REPOSITORY}" >&2
+    else
+      echo "error: --repository must be a full ECR repository URL (<host>/<repository>), got: ${REPOSITORY}" >&2
+    fi
     exit 1
   fi
 
-  # Region, most authoritative first: the flag, then the repository's own host
-  # (a login token is region-scoped, so the URL beats an unrelated AWS_REGION),
-  # then the ambient AWS config.
-  REGION="$REGION_FLAG"
-  if [[ -z "$REGION" && "$ECR_HOST" =~ \.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$ ]]; then
-    REGION="${BASH_REMATCH[1]}"
-  fi
-  if [[ -z "$REGION" ]]; then
-    REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
-  fi
-  if [[ -z "$REGION" ]]; then
-    echo "error: AWS region not set — use --region or set AWS_REGION" >&2
-    exit 1
-  fi
+  if [[ "$TARGET" == "gcp" ]]; then
+    # GCP has no daemon image: the daemon is an npm install on a VM, pinned by
+    # the unit's fleet_version and moved by `fleet upgrade`. Refusing beats
+    # pushing a :daemon tag nothing will ever pull, and beats rolling something
+    # that does not exist.
+    if [[ $REDEPLOY -eq 1 ]]; then
+      echo "error: --redeploy-daemon has nothing to roll on a gcp deployment: the daemon is an npm install on the VM, not an image" >&2
+      echo "  push the runner image (--runner --push), and move the daemon with: fleet upgrade" >&2
+      exit 1
+    fi
+    if [[ $DAEMON_ASKED -eq 1 ]]; then
+      echo "error: --daemon has nowhere to go on a gcp deployment: there is no :daemon tag on this cloud, only :runner" >&2
+      echo "  drop --daemon (or pass --runner), and move the daemon itself with: fleet upgrade" >&2
+      exit 1
+    fi
+    # Default (neither flag named): publish the one image this cloud has.
+    BUILD_DAEMON=0
+  else
+    # Region, most authoritative first: the flag, then the repository's own host
+    # (a login token is region-scoped, so the URL beats an unrelated AWS_REGION),
+    # then the ambient AWS config.
+    REGION="$REGION_FLAG"
+    if [[ -z "$REGION" && "$REGISTRY_HOST" =~ \.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$ ]]; then
+      REGION="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$REGION" ]]; then
+      REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
+    fi
+    if [[ -z "$REGION" ]]; then
+      echo "error: AWS region not set — use --region or set AWS_REGION" >&2
+      exit 1
+    fi
 
-  if [[ $REDEPLOY -eq 1 && -z "$CLUSTER" ]]; then
-    echo "error: --redeploy-daemon needs the ECS cluster — pass --cluster <name>, or take it from fleet_config's cluster field:" >&2
-    capture_hint
-    exit 1
-  fi
-  if [[ $REDEPLOY -eq 1 && -z "$SERVICE" ]]; then
-    echo "error: --redeploy-daemon needs the daemon service — pass --service <name>, or take it from fleet_config's daemon_service field:" >&2
-    capture_hint
-    exit 1
+    if [[ $REDEPLOY -eq 1 && -z "$CLUSTER" ]]; then
+      echo "error: --redeploy-daemon needs the ECS cluster — pass --cluster <name>, or take it from fleet_config's cluster field:" >&2
+      capture_hint
+      exit 1
+    fi
+    if [[ $REDEPLOY -eq 1 && -z "$SERVICE" ]]; then
+      echo "error: --redeploy-daemon needs the daemon service — pass --service <name>, or take it from fleet_config's daemon_service field:" >&2
+      capture_hint
+      exit 1
+    fi
   fi
 fi
 
@@ -316,17 +374,25 @@ fi
 # --- push ---------------------------------------------------------------------
 
 LOGIN_DONE=0
-ecr_login() {
+registry_login() {
   if [[ $LOGIN_DONE -eq 1 ]]; then return 0; fi
-  echo "authenticating to ${ECR_HOST} (${REGION}) ..."
-  aws ecr get-login-password --region "$REGION" \
-    | docker login --username AWS --password-stdin "$ECR_HOST"
+  if [[ "$TARGET" == "gcp" ]]; then
+    # gcloud writes a credential helper into the docker config for this host;
+    # --quiet because it asks to confirm that edit and would otherwise wait
+    # forever on a stdin nobody is typing into.
+    echo "authenticating docker to ${REGISTRY_HOST} through gcloud ..."
+    gcloud auth configure-docker "$REGISTRY_HOST" --quiet
+  else
+    echo "authenticating to ${REGISTRY_HOST} (${REGION}) ..."
+    aws ecr get-login-password --region "$REGION" \
+      | docker login --username AWS --password-stdin "$REGISTRY_HOST"
+  fi
   LOGIN_DONE=1
 }
 
 push_image() { # push_image <local tag> <remote tag>
   local local_tag="$1" remote="${REPOSITORY}:$2"
-  ecr_login
+  registry_login
   docker tag "$local_tag" "$remote"
   docker push "$remote"
   echo "pushed ${remote}"
@@ -340,6 +406,15 @@ if [[ $PUSH -eq 1 ]]; then
 fi
 
 # --- roll the daemon ----------------------------------------------------------
+
+# On GCP there is no roll: the note is the whole step. Jobs read the tag at
+# execution time, so the next dispatched job runs the image just pushed, and the
+# daemon — an npm install on the VM, pinned by the unit's fleet_version — moves
+# only when `fleet upgrade` replaces it.
+if [[ $PUSH -eq 1 && "$TARGET" == "gcp" ]]; then
+  echo "note: nothing to roll on GCP — the next job execution pulls ${REPOSITORY}:runner."
+  echo "  the daemon is not an image on this cloud: move it with \`fleet upgrade\`."
+fi
 
 if [[ $REDEPLOY -eq 1 ]]; then
   echo "forcing a new deployment of ${SERVICE} on ${CLUSTER} ..."

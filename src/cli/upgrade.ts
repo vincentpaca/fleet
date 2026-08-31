@@ -234,9 +234,9 @@ async function upgradeImages(opts: UpgradeOptions, run: Runner, unit: SetupUnit,
   const config = readCapturedConfig(configPath);
   if (await produceImages({ cwd: opts.cwd, env: opts.env, log: opts.log }, run, unit, config)) {
     // Guidance, not the roll itself: no shipped code path may deploy
-    // (docs/decisions.md#d5) — the same boundary --rebuild-images keeps.
-    opts.log('the daemon service starts from the new image on its next deployment — roll it now with:');
-    opts.log(`  ${unit.images.rollHint(config)}`);
+    // (docs/decisions.md#d5) — the same boundary --rebuild-images keeps. The
+    // whole sentence is the unit's: GCP has no daemon image to roll.
+    opts.log(unit.images.rollHint(config));
     return;
   }
   opts.log(`note: ${unit.images.unavailable}`);

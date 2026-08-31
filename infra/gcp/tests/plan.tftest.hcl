@@ -67,6 +67,12 @@ mock_provider "google" {
   }
 }
 
+# The in-account image build's config file is written by terraform (the argv
+# `ImageBuild.start` builds can only point at a path). Mocked here so a test run
+# asserts the bytes without touching the checkout: an unmocked `local` provider
+# would write infra/gcp/fleet-cloudbuild.yaml during the apply runs below.
+mock_provider "local" {}
+
 variables {
   fleet_version = "0.2.0"
 }
@@ -193,6 +199,26 @@ run "default_shape" {
     condition     = strcontains(output.connect_hint, "gcloud compute start-iap-tunnel")
     error_message = "connect_hint must carry the manual IAP tunnel command — the documented fallback when the CLI is not at hand"
   }
+
+  # No source_ref (this file's default): no build exists, and fleet_config says
+  # so in nulls rather than in a path to a file nothing wrote. The CLI reads
+  # exactly this to decide between starting a build and naming images/build.sh.
+  assert {
+    condition = (
+      length(local_file.cloudbuild) == 0 &&
+      length(google_service_account.image_build) == 0 &&
+      output.fleet_config.image_build_config == null &&
+      output.fleet_config.image_build_source == null &&
+      output.fleet_config.image_build_revision == null
+    )
+    error_message = "an unpinned module source must provision no image build and publish null build keys — a path here sends the wizard at a config file that was never written"
+  }
+
+  # An API a deployment never calls is surface nobody asked for.
+  assert {
+    condition     = !contains(keys(google_project_service.services), "cloudbuild.googleapis.com")
+    error_message = "cloudbuild.googleapis.com must be enabled only when this deployment has a build to run"
+  }
 }
 
 # The rendered cloud-init: a mocked apply, because the reserved address only
@@ -284,6 +310,99 @@ run "cloud_init_carries_the_daemon_contract" {
   assert {
     condition     = google_compute_instance.daemon.metadata["block-project-ssh-keys"] == "TRUE"
     error_message = "the daemon VM must block project-wide SSH keys, or the IAP-only access story is undone by a project-level setting"
+  }
+}
+
+# The in-account image build (#189/#185). A mocked apply, not a plan: the build
+# config's bytes interpolate the build service account's computed email, which
+# is unknown until the mock provider has "created" it.
+run "a_pinned_source_builds_one_runner_image_under_its_own_account" {
+  command = apply
+
+  variables {
+    source_repository = "https://github.com/fleet-test/fleet.git"
+    source_ref        = "v9"
+    operator_members  = ["user:operator@fleet-test.invalid"]
+  }
+
+  # The path the wizard's argv points at: absolute (the CLI runs gcloud from the
+  # project root, not from the deployment directory) and beside this root
+  # module, which is where the capture that names it also lands.
+  assert {
+    condition = (
+      output.fleet_config.image_build_config == local_file.cloudbuild[0].filename &&
+      startswith(output.fleet_config.image_build_config, "/") &&
+      endswith(output.fleet_config.image_build_config, "/fleet-cloudbuild.yaml")
+    )
+    error_message = "fleet_config.image_build_config must be the absolute path of the config this apply wrote — a relative path resolves against the operator's cwd, not the deployment directory"
+  }
+
+  # The git source and ref the wizard passes to `gcloud builds submit`: the same
+  # ref the module source pins, so images and infra cannot skew.
+  assert {
+    condition = (
+      output.fleet_config.image_build_source == "https://github.com/fleet-test/fleet.git" &&
+      output.fleet_config.image_build_revision == "v9"
+    )
+    error_message = "fleet_config must republish source_repository/source_ref for the build argv — a build from a floating ref re-shapes the image silently"
+  }
+
+  # ONE image. GCP has no daemon container at all, so a :daemon tag here would
+  # be an image nothing on this cloud ever runs.
+  assert {
+    condition = (
+      strcontains(local_file.cloudbuild[0].content, "images/runner/Dockerfile") &&
+      !strcontains(local_file.cloudbuild[0].content, "images/daemon/Dockerfile") &&
+      !strcontains(local_file.cloudbuild[0].content, ":daemon")
+    )
+    error_message = "the build config must build images/runner and only that — on GCP the daemon is an npm install, so a :daemon tag has no consumer"
+  }
+
+  # It pushes to this deployment's own repository, at the tag the Cloud Run job
+  # pins, stamped with the ref it checked out (#207/#211).
+  assert {
+    condition = alltrue([
+      for needle in [
+        "${local.runner_repository_url}:runner",
+        "FLEET_BUILD_SHA=v9",
+        "CLOUD_LOGGING_ONLY",
+        "1800s",
+        google_service_account.image_build[0].email,
+      ] : strcontains(local_file.cloudbuild[0].content, needle)
+    ])
+    error_message = "the build config must push <runner_repository_url>:runner, carry the build stamp, run as the build service account, and set logging + a timeout Cloud Build's 10-minute default would not survive"
+  }
+
+  # The push grant is repository-scoped: a project-wide artifactregistry.writer
+  # would let the build write every repository in the project.
+  assert {
+    condition = (
+      google_artifact_registry_repository_iam_member.build_pushes_runner[0].role == "roles/artifactregistry.writer" &&
+      google_artifact_registry_repository_iam_member.build_pushes_runner[0].repository == google_artifact_registry_repository.runner.name &&
+      google_artifact_registry_repository_iam_member.build_pushes_runner[0].member == "serviceAccount:${google_service_account.image_build[0].email}"
+    )
+    error_message = "the build service account must hold artifactregistry.writer on this deployment's runner repository and nothing wider"
+  }
+
+  # The operator's StartBuild path: a custom role of exactly the calls the
+  # wizard makes, plus actAs on the build account only — never
+  # roles/cloudbuild.builds.editor (update/cancel/approve over every build in
+  # the project) and never serviceAccountUser at project level, which would
+  # hand the operator the daemon's identity too.
+  assert {
+    condition = (
+      google_project_iam_custom_role.image_build_submit[0].permissions == toset([
+        "cloudbuild.builds.create", "cloudbuild.builds.get", "cloudbuild.builds.list",
+      ]) &&
+      google_project_iam_member.operators_start_builds["user:operator@fleet-test.invalid"].role == google_project_iam_custom_role.image_build_submit[0].id &&
+      google_service_account_iam_member.operators_use_build_sa["user:operator@fleet-test.invalid"].service_account_id == google_service_account.image_build[0].name
+    )
+    error_message = "operator_members must be able to submit and poll the build through the unit's custom role, and act as the build service account — that one account, nothing wider"
+  }
+
+  assert {
+    condition     = contains(keys(google_project_service.services), "cloudbuild.googleapis.com")
+    error_message = "a deployment with an in-account build must enable cloudbuild.googleapis.com, or the first submit fails on a disabled API"
   }
 }
 

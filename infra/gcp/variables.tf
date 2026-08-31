@@ -137,10 +137,40 @@ variable "key_destroy_duration" {
   }
 }
 
+# --- Images (in-account Cloud Build) --------------------------------------------
+
+variable "source_repository" {
+  description = "Public git repository the in-account image build clones to produce the :runner image (#189/#185). Defaults to Fleet's canonical repo; `fleet setup infra` overrides it with the repository its module source names, so a fork builds its own code. There is no :daemon image on GCP — the daemon is an npm install on the VM."
+  type        = string
+  default     = "https://github.com/vincentpaca/fleet.git"
+
+  validation {
+    condition     = can(regex("^https://", var.source_repository))
+    error_message = "source_repository must be an https git URL — `gcloud builds submit` takes a git source as an http(s) URL, and Cloud Build clones a public repository over it anonymously."
+  }
+}
+
+variable "source_ref" {
+  description = "Git ref (tag or commit) of source_repository the image build checks out — the same pinned ref this module was applied from, so images and infra can never skew. `fleet setup infra` supplies it from the generated root module's own module source. Empty (the default) provisions no build at all: a module applied from a local path has no honest ref to pin, and building from a floating default would skew silently. The developer path (images/build.sh --runner --push) still works either way."
+  type        = string
+  default     = ""
+}
+
+variable "image_build_timeout_seconds" {
+  description = "Wall-clock ceiling for one in-account image build, as the seconds duration Cloud Build takes. Default 1800s is 30 minutes, matching the AWS unit's CodeBuild timeout; Cloud Build's own default is 10 minutes, which a cold runner-image build does not reliably finish inside."
+  type        = number
+  default     = 1800
+
+  validation {
+    condition     = var.image_build_timeout_seconds >= 60 && var.image_build_timeout_seconds <= 86400
+    error_message = "image_build_timeout_seconds must be between 60 and 86400 (24h, Cloud Build's own ceiling)."
+  }
+}
+
 # --- Operator access ------------------------------------------------------------
 
 variable "operator_members" {
-  description = "IAM members (user:..., group:...) granted operator access: roles/iap.tunnelResourceAccessor on the daemon VM and read access on the operator-token secret. Empty relies on the applying identity's own project-level grants."
+  description = "IAM members (user:..., group:...) granted operator access: roles/iap.tunnelResourceAccessor on the daemon VM, read access on the operator-token secret, and — when an in-account image build exists — permission to start it (roles/cloudbuild.builds.editor plus actAs on the build service account). Empty relies on the applying identity's own project-level grants."
   type        = list(string)
   default     = []
 }

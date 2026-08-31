@@ -248,14 +248,16 @@ export function fakeAwsBin(stateDir: string): string {
 }
 
 /**
- * A directory holding a `terraform` (and an `aws` for the credential preflight)
- * that route to the fixtures. `fleet setup infra` shells out to both, and a
- * test that let either real binary run would be testing HashiCorp and AWS.
+ * A directory holding a `terraform`, and the cloud CLIs `fleet setup infra`
+ * shells out to for the credential preflight and the in-account image build —
+ * `aws` and `gcloud`, both routed to the fixtures. A test that let any of the
+ * real binaries run would be testing HashiCorp, AWS and Google.
  */
 export function fakeCloudBin(stateDir: string): string {
   const bin = makeTempDir('fleet-fake-cloud-');
   fakeBin(bin, 'terraform', 'fake-terraform.mjs');
   fakeBin(bin, 'aws', 'fake-aws.mjs');
+  fakeBin(bin, 'gcloud', 'fake-gcloud.mjs');
   fs.mkdirSync(stateDir, { recursive: true });
   return bin;
 }
