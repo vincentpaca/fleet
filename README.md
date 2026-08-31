@@ -72,9 +72,9 @@ fleet delegate "why do queued jobs sit behind the capacity cap"   # prose: ends 
 
 ### Setting up headless (agents and CI)
 
-Every step above is a wizard only because there is a terminal to ask on. Point an
-agent — or a CI job — at a fresh checkout with no terminal at all, and the same
-three `setup` commands take every answer as a flag instead:
+Every `setup` step above is a wizard only because there is a terminal to ask on.
+Point an agent — or a CI job — at a fresh checkout with no terminal at all, and
+the same three `setup` commands take every answer as a flag instead:
 
 ```sh
 npm install -g github:vincentpaca/fleet
@@ -90,10 +90,10 @@ fleet setup infra --name my-fleet --region us-east-1 --yes   # plan, apply, buil
 fleet connect --detach                     # tunnel in the background instead of holding the terminal
 fleet setup harness --harness claude-code --scope project
 
-fleet doctor                               # clean means the deployment, manifest and harness skill all agree
+fleet doctor                               # clean means the manifest, gate, credentials and deployment agree
 ```
 
-`--command-path` is the one value setup cannot extract for you — it is your harness's own command file (`.claude/commands/dev.md` for Claude Code; the Codex or OpenCode equivalent otherwise), and it has to exist before the interview accepts it. Everything else above either has a fixed default (`--region`, `--scope`) or is read out of the checkout (`--image`, the pickup gate, `env.vars` from `.env.example`) — pass the matching flag instead wherever your repo's answer differs. A value neither a flag nor the checkout can supply exits 1 naming the flag, never a hang.
+`--command-path` and `--name` are the two values setup cannot extract for you: `--command-path` is your harness's own command file (`.claude/commands/dev.md` for Claude Code; the Codex or OpenCode equivalent otherwise), and it has to exist before the interview accepts it; `--name` names the deployment and has no sensible default to guess. Everything else above either has a fixed default (`--region`, `--scope`) or is read out of the checkout (`--image`, the pickup gate, `env.vars` from `.env.example`) — pass the matching flag instead wherever your repo's answer differs. A value neither a flag nor the checkout can supply exits 1 naming the flag, never a hang.
 
 ## Using Fleet from your coding harness
 

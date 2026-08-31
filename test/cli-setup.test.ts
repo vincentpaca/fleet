@@ -967,18 +967,21 @@ test('setup repo headless: flags supply the answers, and a missing one names its
   assert.ok(!fs.existsSync(path.join(bare, '.fleet', 'manifest.json')), 'nothing written');
 });
 
-// #184: the README's agent-path install sequence is `setup repo` → `setup
-// harness` → `doctor`, every step headless. This chains all three against one
-// checkout with no terminal anywhere, the way a fresh agent actually runs it —
-// each command's own headless test above proves it in isolation, but nothing
-// else proved the handoff between them (a manifest `setup repo` writes that
-// `doctor` then finds a finding in, say) actually lands clean end to end.
+// #184: the repo↔harness↔doctor leg of the README's agent-path sequence
+// (setup infra's own headless behaviour is already covered above against the
+// fake terraform/aws fixtures), run with the exact flags the README tells an
+// agent to paste. Each command's own headless test proves it in isolation, but
+// nothing else proved the handoff between them — a manifest `setup repo`
+// writes that `doctor` then finds a finding in, say — actually lands clean
+// end to end with no terminal anywhere.
 test('#184: the README agent-path sequence — setup repo, setup harness, doctor — headless end to end', async () => {
   const cwd = scratchRepo();
   fs.rmSync(path.join(cwd, '.env.example')); // no env vars declared: nothing for doctor to find unset
-  fs.writeFileSync(path.join(cwd, '.fleet', 'gate.mjs'), 'process.exit(0);\n');
 
-  const repo = await runCli(['setup', 'repo', '--yes'], { cwd });
+  const repo = await runCli(
+    ['setup', 'repo', '--repo', 'origin', '--command-path', '.claude/commands/dev.md', '--critic', 'code-reviewer', '--yes'],
+    { cwd },
+  );
   assert.equal(repo.code, 0, repo.stderr);
 
   const harness = await runCli(['setup', 'harness', '--harness', 'claude-code', '--scope', 'project'], { cwd });
