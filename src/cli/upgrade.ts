@@ -237,6 +237,8 @@ async function upgradeImages(opts: UpgradeOptions, run: Runner, unit: SetupUnit,
     // (docs/decisions.md#d5) — the same boundary --rebuild-images keeps.
     opts.log('the daemon service starts from the new image on its next deployment — roll it now with:');
     opts.log(`  ${unit.images.rollHint(config)}`);
+    // #218 sat latent until a real dispatch found it; the proof is one job.
+    opts.log('then prove the rolled image on a live job: fleet canary');
     return;
   }
   opts.log(`note: ${unit.images.unavailable}`);
