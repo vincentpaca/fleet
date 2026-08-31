@@ -18,6 +18,8 @@
  * pass, when it provably carries no work.
  */
 
+import { jobStates } from '../validate.mjs';
+
 type DelegateFn = (req: {
   target: string;
   log: (line: string) => void;
@@ -30,7 +32,7 @@ type CallFn = (
   body?: unknown,
 ) => Promise<{ status: number; body: string; json: unknown }>;
 
-export type CanaryOptions = {
+export type CanaryOptions = { // contract pin: type imported only by the suite; main.ts consumes runCanary alone
   delegate: DelegateFn;
   call: CallFn;
   /** `git push origin --delete <branch>` in the operator's checkout; true on success. */
@@ -55,6 +57,11 @@ const POLL_MS = 2_000;
 const DEADLINE_MS = 20 * 60_000;
 /** Polls granted after a cancel to let the daemon land the terminal state — never forever. */
 const CANCEL_GRACE_POLLS = 30;
+/** Consecutive failed job GETs tolerated before giving up — one blip mid-run must not fail a healthy canary. */
+const MISS_LIMIT = 5;
+
+/** Terminal states from the schema (src/daemon/state.ts loads the same file) — never hardcoded here. */
+const TERMINAL = new Set(jobStates.terminal as string[]);
 
 type JobView = {
   state: string;
@@ -105,10 +112,22 @@ async function watchToTerminal(
   const deadline = Date.now() + deadlineMs;
   let failure: string | undefined;
   let grace = Infinity;
+  let misses = 0;
   for (;;) {
     const job = await fetchJob(opts, jobId);
-    if (job === undefined) return { job: undefined, failure: failure ?? 'the daemon stopped answering for this job' };
-    if (job.state === 'done' || job.state === 'cancelled') return { job, failure };
+    if (job === undefined) {
+      // One blip 15 minutes in must not fail a healthy canary (daemon roll,
+      // tunnel hiccup) — but a daemon that stays gone ends the watch with an
+      // honest note that the job itself may still be running out there.
+      misses += 1;
+      if (misses >= MISS_LIMIT) {
+        return { job: undefined, failure: failure ?? 'the daemon stopped answering for this job — the job may still be running' };
+      }
+      await sleep(pollMs);
+      continue;
+    }
+    misses = 0;
+    if (TERMINAL.has(job.state)) return { job, failure };
     if (failure === undefined) {
       failure = stallReason(job, deadline, deadlineMs);
       if (failure !== undefined) {
@@ -154,8 +173,9 @@ function handleBranch(opts: CanaryOptions, jobId: string, branch: string): void 
     opts.log(`  remove it with: git push origin --delete ${branch}`);
     return;
   }
-  if (!branch.includes(jobId)) {
-    opts.warn(`canary: not deleting ${branch} — it does not carry job id ${jobId}`);
+  if (!branch.endsWith(`-${jobId}`)) {
+    // Suffix, not substring: job-c1 must not license deleting job-c10's branch.
+    opts.warn(`canary: not deleting ${branch} — it is not this job's claim branch (${jobId})`);
     return;
   }
   if (opts.deleteRemoteBranch(branch)) {
@@ -205,7 +225,12 @@ export async function runCanary(opts: CanaryOptions): Promise<number> {
   const evidence = await jobEvidence(opts, jobId);
   logEvidence(opts, evidence);
 
-  if (passed(outcome.job)) {
+  // A declared failure outranks a clean-looking settle: a cancel can race the
+  // settle (#114) and land done+READY inside the grace window — but this tool
+  // already cancelled that job for cause (it blocked, or it outlived the
+  // deadline), and a canary that asked a decision is a failed canary even
+  // when an operator answered it from another surface.
+  if (outcome.failure === undefined && passed(outcome.job)) {
     opts.log(`canary: PASS — job settled done, report READY${rungNote(outcome.job)}`);
     if (evidence.branch !== undefined) handleBranch(opts, jobId, evidence.branch);
     return 0;

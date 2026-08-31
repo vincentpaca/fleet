@@ -36,6 +36,8 @@ function makeOpts(config: {
   deleteBranch?: boolean;
   deleteOk?: boolean;
   jobStatus?: number;
+  /** The first N job GETs answer 404 before the scripted states begin. */
+  flakyGets?: number;
   deadlineMs?: number;
 }): { opts: CanaryOptions; requests: string[]; lines: string[]; deleted: string[]; targets: string[] } {
   const requests: string[] = [];
@@ -43,6 +45,7 @@ function makeOpts(config: {
   const deleted: string[] = [];
   const targets: string[] = [];
   let index = 0;
+  let flaky = config.flakyGets ?? 0;
   let cancelled = false;
   const opts: CanaryOptions = {
     delegate: async (req) => {
@@ -56,6 +59,10 @@ function makeOpts(config: {
         return { status: 200, body: '', json: {} };
       }
       if (reqPath.endsWith('/events')) return { status: 200, body: config.events ?? eventsBody(), json: undefined };
+      if (flaky > 0) {
+        flaky -= 1;
+        return { status: 404, body: '', json: undefined };
+      }
       if (config.jobStatus !== undefined) return { status: config.jobStatus, body: '', json: undefined };
       const job = cancelled && config.afterCancel !== undefined
         ? config.afterCancel
@@ -102,16 +109,51 @@ test('--delete-branch removes the claim branch, but only after a pass', async ()
   assert.deepEqual(fail.deleted, [], 'a failed canary’s branch is the post-mortem evidence');
 });
 
-test('--delete-branch refuses a branch that does not carry the job id', async () => {
-  const foreign = 'fleet/someone-elses-work-job-zz9';
+test('--delete-branch refuses any branch that is not exactly this job’s claim', async () => {
+  // job-c10 contains job-c1 as a substring — a containment check would delete it.
+  for (const foreign of ['fleet/someone-elses-work-job-zz9', `${BRANCH}0`]) {
+    const { opts, deleted, lines } = makeOpts({
+      states: [DONE_READY],
+      deleteBranch: true,
+      events: eventsBody(foreign),
+    });
+    assert.equal(await runCanary(opts), 0);
+    assert.deepEqual(deleted, [], `only the canary’s own claim branch is deletable (${foreign})`);
+    assert.ok(lines.some((l) => l.includes('not deleting')), lines.join('\n'));
+  }
+});
+
+test('a failure verdict outranks a settle that lands done during the cancel grace window', async () => {
+  // The cancel/settle race (#114): the canary blocked, we cancelled it, an
+  // answer from another surface let it settle done+READY anyway. The tool
+  // already declared this run a failure — it must not flip to PASS, and it
+  // must not delete the branch.
   const { opts, deleted, lines } = makeOpts({
-    states: [DONE_READY],
+    states: [{ state: 'blocked' }],
+    afterCancel: DONE_READY,
     deleteBranch: true,
-    events: eventsBody(foreign),
   });
-  assert.equal(await runCanary(opts), 0);
-  assert.deepEqual(deleted, [], 'only the canary’s own claim branch is deletable');
-  assert.ok(lines.some((l) => l.includes('not deleting')), lines.join('\n'));
+  assert.equal(await runCanary(opts), 1);
+  assert.deepEqual(deleted, []);
+  assert.ok(lines.some((l) => l.startsWith('canary: FAIL') && l.includes('asked for a decision')), lines.join('\n'));
+});
+
+test('a cancel the daemon never lands ends after the grace bound, with exactly one cancel', async () => {
+  // The anti-hang mechanism itself: the job sits blocked forever even after
+  // the cancel. The watch must end (bounded polls), cancel exactly once, and
+  // report failure — not follow a wedged daemon indefinitely.
+  const { opts, requests } = makeOpts({
+    states: [{ state: 'blocked' }],
+    afterCancel: { state: 'blocked' },
+  });
+  assert.equal(await runCanary(opts), 1);
+  assert.equal(requests.filter((r) => r.endsWith('/cancel')).length, 1, requests.join('\n'));
+  assert.ok(requests.length < 50, `watch did not stay bounded: ${requests.length} requests`);
+});
+
+test('transient job-GET failures are tolerated, not treated as a dead daemon', async () => {
+  const { opts } = makeOpts({ states: [DONE_READY], flakyGets: 2 });
+  assert.equal(await runCanary(opts), 0, 'two blips must not fail a healthy canary');
 });
 
 test('a blocked canary is cancelled and fails: it was told not to ask', async () => {
