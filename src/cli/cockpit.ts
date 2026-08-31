@@ -120,6 +120,9 @@ function openOptionIds(m: CockpitModel): string[] {
 export const MIN_COLUMNS = 40; // contract pin: test-only export, asserted by the suite
 
 /** The banner is the product's face, but not at the cost of the panes. */
+// The banner is the artwork's size, not a budget the layout hands it (#225):
+// the dart stops being a paper airplane below ten rows, so the banner is ten
+// rows and a short window drops it whole rather than shrinking it to a blob.
 export const BANNER_MIN_ROWS = 22; // contract pin: test-only export, asserted by the suite
 
 /** Key hints, and the raw keys that must reach a handler for each. Parity is tested. */

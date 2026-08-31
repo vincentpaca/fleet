@@ -8,6 +8,7 @@
 //
 // Zero dependencies: hand-rolled ANSI; erasable TS only.
 import { request } from './client.ts';
+import { DART_COMPACT, type BannerArt } from './banner-art.ts';
 import { artifactTally, formatJobState, formatLogText, renderEvent } from './format.ts';
 import { makeCol, visualClip, visualLength, type ColFn } from './ansi.ts';
 import { optionId, type FleetEvent, type PendingDecision } from '../shared/events.ts';
@@ -54,53 +55,11 @@ export type FrameOpts = {
 };
 
 // ── Visual identity ───────────────────────────────────────────────────────────
-
-/**
- * Paper-airplane pixel art, 16×8. Rendered as half-blocks (two pixel rows per
- * character row) with a blue-chrome gradient; plain blocks under NO_COLOR.
- */
-const PLANE_PX = [
-  '..............##',
-  '..........#####.',
-  '......########..',
-  '..###########...',
-  '############....',
-  '..########......',
-  '....#####.......',
-  '......##........',
-];
-
-/** Under-wing fold: same silhouette, darker shade — the crease that reads "paper". */
-function foldAt(x: number, y: number): boolean {
-  return y >= 4 && x >= 8;
-}
-
-/** Blue-chrome ramp: deep blue → blue → sky → near-white highlight. */
-const RAMP: Array<[number, [number, number, number]]> = [
-  [0.0, [10, 47, 122]],
-  [0.45, [37, 99, 235]],
-  [0.75, [56, 189, 248]],
-  [1.0, [223, 243, 255]],
-];
-
-/** Diagonal gradient position → rgb, lerped across the ramp. */
-function rampAt(t: number): [number, number, number] {
-  for (let i = 1; i < RAMP.length; i++) {
-    const [t0, c0] = RAMP[i - 1];
-    const [t1, c1] = RAMP[i];
-    if (t <= t1) {
-      const f = (t - t0) / (t1 - t0);
-      return [0, 1, 2].map((k) => Math.round(c0[k] + (c1[k] - c0[k]) * f)) as [number, number, number];
-    }
-  }
-  return RAMP[RAMP.length - 1][1];
-}
-
-/** rgb → nearest xterm-256 colour-cube index, for terminals without truecolor. */
-function cube256([r, g, b]: [number, number, number]): number {
-  const q = (v: number) => Math.round((v / 255) * 5);
-  return 16 + 36 * q(r) + 6 * q(g) + q(b);
-}
+//
+// The airplane is baked art, not drawn here: ./banner-art.ts holds chafa's
+// half-block reduction of the real dart in three colour forms, generated from
+// fixtures/dart.png by fixtures/bake-banner-art.ts (#225). This file only
+// picks a form and sets the wordmark beside it.
 
 type ColorLevel = '24bit' | '256';
 
@@ -110,54 +69,42 @@ export function detectColorLevel(env: Record<string, string | undefined>): Color
   return ct.includes('truecolor') || ct.includes('24bit') ? '24bit' : '256';
 }
 
-function pxAt(x: number, y: number): boolean {
-  return PLANE_PX[y]?.[x] === '#';
+/**
+ * Which baked form a colour level gets. Hard-switched, never blended: the art
+ * is chafa's output for that colour depth, and there is no third thing to
+ * derive from it (#225 replaced the hand-rolled gradient rasteriser).
+ */
+function artRows(art: BannerArt, level: ColorLevel | undefined): string[] {
+  if (level === undefined) return art.plain;
+  return level === '24bit' ? art.truecolor : art.c256;
 }
 
-function fg(c: [number, number, number], level: ColorLevel): string {
-  return level === '24bit' ? `\x1b[38;2;${c[0]};${c[1]};${c[2]}m` : `\x1b[38;5;${cube256(c)}m`;
-}
+/** Wordmark and tagline ride these rows of the art, counting from the top. */
+const WORDMARK_ROW = 2;
+const TAGLINE_ROW = 3;
 
-function bg(c: [number, number, number], level: ColorLevel): string {
-  return level === '24bit' ? `\x1b[48;2;${c[0]};${c[1]};${c[2]}m` : `\x1b[48;5;${cube256(c)}m`;
-}
-
-/** Gradient colour of pixel (x, y): diagonal sweep, nose brightest. */
-function planeColor(x: number, y: number): [number, number, number] {
-  const c = rampAt((x + 0.6 * (7 - y)) / (15 + 0.6 * 7));
-  if (!foldAt(x, y)) return c;
-  return c.map((v) => Math.round(v * 0.55)) as [number, number, number];
-}
-
-/** Render one half-block character for a pair of pixel rows at column x. */
-function renderPixelPair(top: boolean, bot: boolean, x: number, row: number, level: ColorLevel | undefined): string {
-  if (!top && !bot) return ' ';
-  if (!level) return top && bot ? '█' : top ? '▀' : '▄';
-  const tc = planeColor(x, row * 2);
-  const bc = planeColor(x, row * 2 + 1);
-  if (top && bot) return fg(tc, level) + bg(bc, level) + '▀\x1b[0m';
-  if (top) return fg(tc, level) + '▀\x1b[0m';
-  return fg(bc, level) + '▄\x1b[0m';
-}
-
-/** Build the 4 banner lines: half-block plane + wordmark. Plain when level omitted. */
-function buildBanner(level?: ColorLevel): string[] {
-  const wide = PLANE_PX[0].length;
-  const lines: string[] = [];
-  for (let row = 0; row < PLANE_PX.length / 2; row++) {
-    let line = ' ';
-    for (let x = 0; x < wide; x++) {
-      line += renderPixelPair(pxAt(x, row * 2), pxAt(x, row * 2 + 1), x, row, level);
-    }
-    lines.push(line);
-  }
-  lines[1] += !level ? '   F L E E T' : '   \x1b[1;38;5;153mF L E E T\x1b[0m';
-  lines[2] += !level ? '   your cloud' : '   \x1b[2myour cloud\x1b[0m';
+/**
+ * The banner: the baked dart, one space in from the left, with the wordmark and
+ * tagline set beside it. Plain when `level` is omitted — the plain art carries
+ * no escapes at all, so the whole block is NO_COLOR-safe by construction.
+ */
+function composeBanner(art: BannerArt, level?: ColorLevel): string[] {
+  const lines = artRows(art, level).map((row) => ' ' + row);
+  lines[WORDMARK_ROW] += !level ? '   F L E E T' : '   \x1b[1;38;5;153mF L E E T\x1b[0m';
+  lines[TAGLINE_ROW] += !level ? '   your cloud' : '   \x1b[2myour cloud\x1b[0m';
   return lines;
 }
 
-/** Small Fleet wordmark, plain form. Shown when the board starts; also `fleet --help`. */
-export const FLEET_BANNER = buildBanner().join('\n'); // contract pin: test-only export, asserted by the suite
+/**
+ * The banner with no colour at all: the wordmark alone.
+ *
+ * The dart is drawn in half blocks paired against a background colour, and
+ * stripping the colour leaves a monochrome silhouette that reads as a blob
+ * rather than a paper airplane — worse than showing nothing. So the no-colour
+ * form keeps the words and drops the picture, which is also the form a pipe,
+ * a log and a screen reader get.
+ */
+export const FLEET_BANNER = ['  F L E E T', '  your cloud'].join('\n'); // contract pin: test-only export, asserted by the suite
 
 // ── Terminal sequences ────────────────────────────────────────────────────────
 
@@ -172,9 +119,9 @@ export const RESTORE_SEQ = '\x1b[?25h\x1b[?1049l';
 
 // ── Pure frame renderers (new) ────────────────────────────────────────────────
 
-/** Render the Fleet banner: gradient plane when colour is on, plain blocks otherwise. */
+/** Render the Fleet banner: the coloured dart when colour is on, the plain one otherwise. */
 export function renderBanner(width: number, noColor: boolean, level: ColorLevel = '256'): string {
-  const lines = noColor ? FLEET_BANNER.split('\n') : buildBanner(level);
+  const lines = noColor ? FLEET_BANNER.split('\n') : composeBanner(DART_COMPACT, level);
   return lines.map((line) => visualClip(line, width)).join('\n');
 }
 

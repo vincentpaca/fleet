@@ -208,8 +208,11 @@ test('the board owns the whole body: many jobs use the rows the tail no longer t
   const lines = frame(model({ jobs }), 80, 30);
   const shown = lines.filter((l) => /job-\d/.test(l)).length;
   // Under the old split layout the board was capped at half the space (~10 rows
-  // at this height). With the tail gone it runs to the footer.
-  assert.ok(shown >= 15, `the board should fill the body, got ${shown} job rows`);
+  // at this height). With the tail gone it runs to the footer. Fourteen rather
+  // than fifteen because the dart banner is ten rows where the hand-drawn plane
+  // was six (#225) — the point is that the board takes whatever chrome does not,
+  // not the exact number.
+  assert.ok(shown >= 14, `the board should fill the body, got ${shown} job rows`);
   assert.equal(lines.length, 30, 'the frame is still exactly the terminal');
 });
 
