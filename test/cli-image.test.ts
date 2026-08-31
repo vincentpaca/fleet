@@ -889,13 +889,18 @@ process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\
         // `git config user.name` with one.
         FLEET_GIT_NAME: 'Operator One',
         FLEET_GIT_EMAIL: 'op@example.com',
-        GIT_CONFIG_COUNT: '1',
-        GIT_CONFIG_KEY_0: 'safe.directory',
-        GIT_CONFIG_VALUE_0: '/remote.git',
+        // The mount is owned by a uid the container never heard of, and git
+        // honors safe.directory only from protected (system/global) config —
+        // GIT_CONFIG_* env and -c are deliberately ignored for it, which CI
+        // proved. GIT_CONFIG_GLOBAL promotes the synced file below to global
+        // scope. It names only the mounted remote: /workspace ownership is
+        // the thing under test and must never be whitelisted here.
+        GIT_CONFIG_GLOBAL: '/workspace/.fleet/test-gitconfig',
       },
       sync: {
         '.fleet/setup.sh': Buffer.from(setupScript).toString('base64'),
         '.fleet/git-harness.mjs': Buffer.from(gitHarness).toString('base64'),
+        '.fleet/test-gitconfig': Buffer.from('[safe]\n\tdirectory = /remote.git\n').toString('base64'),
       },
       image: BASE_TAG,
     });
