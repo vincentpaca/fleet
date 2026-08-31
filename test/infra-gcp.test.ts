@@ -133,6 +133,46 @@ test('the deprecated container-startup path (konlet) never comes back', () => {
   }
 });
 
+test('the image build config declares no source of its own', () => {
+  // API-only in the CLI: `gcloud builds submit` refuses a build config that
+  // carries a `source` unless --no-source is passed, and the refusal arrives
+  // after the apply, when the wizard tries to start the build. The git source
+  // rides the argv (src/cli/setup-units.ts) precisely because of this; a
+  // "tidier" config that inlined the repository would break the whole path.
+  const text = unitText().replace(/^\s*#.*$/gm, '');
+  const start = text.indexOf('resource "local_file" "cloudbuild"');
+  assert.notEqual(start, -1, 'the image build config resource must exist');
+  const body = braceBlock(text, text.indexOf('{', start));
+  assert.doesNotMatch(
+    body,
+    /(^|\n)\s*source\s*=/,
+    'the build config must not declare a source — gcloud rejects that without --no-source, and the git source is passed on the command line',
+  );
+  // It must still be the runner image build, or the assertion above passes
+  // against an empty file.
+  assert.match(body, /images\/runner\/Dockerfile/, 'the scan is looking at the wrong resource');
+});
+
+test('the image-build custom role id is spelled the way the IAM API accepts', () => {
+  // API-only: a custom role_id may hold letters, digits, underscores and dots —
+  // never a dash. var.name is dash-friendly ("fleet-demo"), so the unit
+  // translates, and both `terraform validate` and the mocked plan accept the
+  // untranslated form happily. The apply is where it would fail.
+  const text = unitText();
+  const start = text.indexOf('resource "google_project_iam_custom_role" "image_build_submit"');
+  assert.notEqual(start, -1, 'the operator StartBuild role must exist');
+  const body = braceBlock(text, text.indexOf('{', start));
+  // The whole line, not a quote-delimited capture: the value interpolates a
+  // function call whose own arguments are quoted.
+  const roleId = /^\s*role_id\s*=\s*(.+)$/m.exec(body);
+  assert.ok(roleId, 'the custom role must set role_id');
+  assert.match(
+    roleId[1],
+    /replace\(var\.name, "-", "_"\)/,
+    "role_id must translate var.name's dashes to underscores — the IAM API rejects a dash in a custom role id",
+  );
+});
+
 test('the runner service account is granted logging only', () => {
   // The permission split is the sandbox: a job able to execute or cancel
   // executions, or read the operator-token secret, defeats it the same way an

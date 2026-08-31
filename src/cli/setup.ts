@@ -704,7 +704,9 @@ export async function produceImages(
   if (start === undefined) return false;
 
   opts.log('');
-  opts.log('building the runner and daemon images in your account (one-shot build; takes several minutes) ...');
+  // "images", not "the runner and daemon images": how many a deployment needs
+  // is the unit's business — GCP has no daemon image at all.
+  opts.log("building this deployment's images in your account (one-shot build; takes several minutes) ...");
   const started = run(start, { cwd: opts.cwd, capture: true });
   if (started.status !== 0) {
     throw new SetupError(`starting the image build failed (exit ${started.status})\n${indented(started.stderr)}`);
@@ -785,8 +787,9 @@ async function rebuildImagesAlone(opts: SetupInfraOptions, run: Runner, unit: Se
   if (!(await produceImages(opts, run, unit, config))) {
     throw new SetupError(`--rebuild-images: ${unit.images.unavailable}`);
   }
-  opts.log('the daemon service starts from the new image on its next deployment — roll it now with:');
-  opts.log(`  ${unit.images.rollHint(config)}`);
+  // What happens next is the unit's sentence, not the engine's: on a cloud
+  // whose daemon is not an image there is no roll to announce.
+  opts.log(unit.images.rollHint(config));
   return 0;
 }
 

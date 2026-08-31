@@ -46,15 +46,20 @@ locals {
 # APIs the unit stands on. disable_on_destroy = false: turning a service off
 # on teardown would break whatever else in the project uses it.
 resource "google_project_service" "services" {
-  for_each = toset([
-    "artifactregistry.googleapis.com",
-    "cloudkms.googleapis.com",
-    "compute.googleapis.com",
-    "iam.googleapis.com",
-    "iap.googleapis.com",
-    "run.googleapis.com",
-    "secretmanager.googleapis.com",
-  ])
+  for_each = toset(concat(
+    [
+      "artifactregistry.googleapis.com",
+      "cloudkms.googleapis.com",
+      "compute.googleapis.com",
+      "iam.googleapis.com",
+      "iap.googleapis.com",
+      "run.googleapis.com",
+      "secretmanager.googleapis.com",
+    ],
+    # Only when this deployment actually has an in-account build to run:
+    # enabling an API a deployment never calls is surface nobody asked for.
+    local.build_images ? ["cloudbuild.googleapis.com"] : [],
+  ))
 
   project            = local.project
   service            = each.value
@@ -178,6 +183,160 @@ resource "google_artifact_registry_repository" "runner" {
     google_project_service.services,
     google_kms_crypto_key_iam_member.registry_agent,
   ]
+}
+
+# --- In-account image build (Cloud Build, #189/#185) --------------------------------
+# `fleet setup infra` owns image production: one Cloud Build submission that
+# clones the PUBLIC Fleet repository at var.source_ref — the same pinned ref the
+# module source names, so images and infra can never skew — builds
+# images/runner, and pushes it to this deployment's Artifact Registry as
+# :runner. No clone and no local Docker on the operator's machine;
+# images/build.sh stays the developer/offline path. There is exactly ONE image:
+# GCP has no daemon container at all (cloud-init installs the daemon from npm),
+# so nothing here builds or pushes a :daemon tag.
+#
+# Created only when source_ref is set. A module applied from a local path (the
+# dogfood shape) has no honest ref to pin, and a build from a floating default
+# would re-shape the image silently — the wizard refuses instead and names
+# images/build.sh.
+#
+# Starting a build is the operator's act, not the unit's: `fleet setup infra`
+# runs `gcloud builds submit` with the operator's own credentials (the same
+# admin-ish credentials the apply used), after the apply and on
+# --rebuild-images. No trigger, no webhook, no schedule, and no Fleet runtime
+# identity can reach it.
+
+locals {
+  build_images = var.source_ref != ""
+}
+
+# The build runs as its own service account rather than the legacy Cloud Build
+# one — which new projects no longer get by default, and which carries
+# project-wide powers by design. This one can write to exactly one Artifact
+# Registry repository and write its own logs.
+resource "google_service_account" "image_build" {
+  count = local.build_images ? 1 : 0
+
+  account_id   = "${var.name}-build"
+  display_name = "Fleet image build"
+
+  depends_on = [google_project_service.services]
+}
+
+# Push to THIS deployment's runner repository only, not the project-wide
+# roles/artifactregistry.writer a convenience grant would take: the build must
+# not be able to write any other repository in the project.
+resource "google_artifact_registry_repository_iam_member" "build_pushes_runner" {
+  count = local.build_images ? 1 : 0
+
+  project    = local.project
+  location   = local.region
+  repository = google_artifact_registry_repository.runner.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.image_build[0].email}"
+}
+
+# A user-specified build service account must be able to write its own logs, or
+# the build fails before its first step. This is the only log grant it needs
+# because the config below sets logging = CLOUD_LOGGING_ONLY (no logs bucket).
+resource "google_project_iam_member" "build_logs" {
+  count = local.build_images ? 1 : 0
+
+  project = local.project
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.image_build[0].email}"
+}
+
+# The operator's StartBuild path: submitting a build that runs as the build
+# service account takes both a Cloud Build permission and actAs on that
+# account. Empty operator_members relies on the applying identity's own
+# project-level grants, exactly like the IAP and secret grants above.
+#
+# A custom role of three permissions rather than roles/cloudbuild.builds.editor
+# (Checkov CKV_GCP_49, and the check has a point): builds.editor also carries
+# update, cancel and approve over every build in the project, and Cloud Build's
+# predefined roles are the documented route to impersonating whatever service
+# account a build config names. These are exactly the two calls the wizard
+# makes — submit (create) and poll (get) — plus list, so an operator can find a
+# build whose id they lost. The impersonation half is held on the other side:
+# actAs is granted below on the ONE build account, never
+# roles/iam.serviceAccountUser at project level, which would hand the operator
+# the daemon's identity too. Reading a failed build's log needs a log-viewer
+# role as well — deliberately not granted here (see README.md).
+resource "google_project_iam_custom_role" "image_build_submit" {
+  count = local.build_images ? 1 : 0
+
+  role_id     = "${replace(var.name, "-", "_")}_image_build"
+  title       = "Fleet image build submitter"
+  description = "Submit and read this deployment's one-shot Fleet image build. Least privilege for `fleet setup infra --rebuild-images`."
+  permissions = [
+    "cloudbuild.builds.create",
+    "cloudbuild.builds.get",
+    "cloudbuild.builds.list",
+  ]
+}
+
+resource "google_project_iam_member" "operators_start_builds" {
+  for_each = local.build_images ? toset(var.operator_members) : toset([])
+
+  project = local.project
+  role    = google_project_iam_custom_role.image_build_submit[0].id
+  member  = each.value
+}
+
+resource "google_service_account_iam_member" "operators_use_build_sa" {
+  for_each = local.build_images ? toset(var.operator_members) : toset([])
+
+  service_account_id = google_service_account.image_build[0].name
+  role               = "roles/iam.serviceAccountUser"
+  member             = each.value
+}
+
+# The build config, written to disk beside this deployment's own
+# fleet-config.json and named by fleet_config.image_build_config.
+#
+# A file, and not an argv fragment, because `gcloud builds submit --config`
+# reads the path from the LOCAL filesystem — the git source is fetched
+# server-side into /workspace, and gcloud never looks for the config inside it
+# (verified in the SDK; see README.md#the---config-question). And terraform
+# writes it, not the CLI, because `ImageBuild.start` (src/cli/setup-units.ts)
+# is synchronous and argv-only: there is no seam at which the CLI could
+# generate one. abspath(path.root), not path.cwd: under `terraform -chdir=…`
+# path.cwd is the operator's original directory, which would drop the file
+# somewhere the captured path does not point.
+resource "local_file" "cloudbuild" {
+  count = local.build_images ? 1 : 0
+
+  filename        = "${abspath(path.root)}/${var.name}-cloudbuild.yaml"
+  file_permission = "0644"
+
+  # One step, one image. FLEET_BUILD_SHA is the pinned ref itself (#207/#211):
+  # the runner logs it at job start, and it is the only identity this build
+  # honestly has — Cloud Build's $COMMIT_SHA substitution is not populated for
+  # a manual git-source build. yamlencode, not a heredoc: a build config that
+  # is invalid YAML fails at `gcloud builds submit`, minutes after the apply.
+  content = yamlencode({
+    steps = [{
+      name = "gcr.io/cloud-builders/docker"
+      args = [
+        "build",
+        "--build-arg", "FLEET_BUILD_SHA=${var.source_ref}",
+        "-t", "${local.runner_repository_url}:runner",
+        "-f", "images/runner/Dockerfile",
+        ".",
+      ]
+    }]
+    # `images` is what pushes: Cloud Build publishes these after the steps
+    # succeed, under the service account below.
+    images         = ["${local.runner_repository_url}:runner"]
+    serviceAccount = "projects/${local.project}/serviceAccounts/${google_service_account.image_build[0].email}"
+    timeout        = "${var.image_build_timeout_seconds}s"
+    options = {
+      # Required with a user-specified service account: the default wants a
+      # logs bucket this account has no grant to write.
+      logging = "CLOUD_LOGGING_ONLY"
+    }
+  })
 }
 
 # --- Cloud Run job: the task-definition analog ---------------------------------------
@@ -598,6 +757,14 @@ locals {
     # analog the daemon's launch path names.
     runner_job            = google_cloud_run_v2_job.runner.name
     runner_repository_url = local.runner_repository_url
+    # The in-account image build, as `gcloud builds submit` needs to be told it
+    # (#189's image_build_project, GCP edition): the local config file this
+    # apply wrote, the git source, and the ref. All three are null when the
+    # module was applied from an unpinned source — the CLI then starts no build
+    # and names images/build.sh instead of inventing a ref.
+    image_build_config   = one(local_file.cloudbuild[*].filename)
+    image_build_source   = local.build_images ? var.source_repository : null
+    image_build_revision = local.build_images ? var.source_ref : null
     # Operator access (D12): `fleet connect` opens an IAP tunnel to this VM
     # in this zone, forwarding daemon_port to localhost.
     daemon_instance = google_compute_instance.daemon.name

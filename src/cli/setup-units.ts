@@ -60,7 +60,14 @@ export type ImageBuild = {
   progress: (stdout: string) => { done: boolean; ok: boolean; phase: string } | undefined;
   /** Where the operator reads a failed build's log, as a pasteable command. */
   failureHint: (config: CapturedConfig, buildId: string) => string;
-  /** After a rebuild: how to roll the daemon service onto the new image. */
+  /**
+   * After a rebuild: what the operator must still do to put the new images
+   * into service, in that cloud's own terms — including whether there is
+   * anything to do at all (on GCP there is no daemon image to roll). Guidance,
+   * never the deploy command itself (docs/decisions.md#d5), and the whole
+   * sentence lives here rather than in the driver: an engine that announces a
+   * daemon roll is wrong on a cloud whose daemon is an npm install.
+   */
   rollHint: (config: CapturedConfig) => string;
   /** Why this deployment cannot build in-account, and what to do instead. */
   unavailable: string;
@@ -285,7 +292,8 @@ const AWS: SetupUnit = {
     // README's bring-up, where the operator — the only party allowed to
     // deploy — reads it.
     rollHint: (config) =>
-      `force a new deployment of service ${configString(config, 'daemon_service') ?? '<service>'} ` +
+      'the daemon service starts from the new image on its next deployment — roll it now with:\n' +
+      `  force a new deployment of service ${configString(config, 'daemon_service') ?? '<service>'} ` +
       `on cluster ${configString(config, 'cluster') ?? '<cluster>'} ` +
       `(region ${configString(config, 'region') ?? '<region>'}) — the one-line command is in infra/aws/README.md, bring-up step 2`,
     unavailable:
@@ -353,6 +361,15 @@ const GCP: SetupUnit = {
     // The daemon is installed from npm on the VM, pinned to a version the
     // operator saw — the GCP analog of the AWS unit's source_ref image pin.
     if (a.fleet_version) args.push(['fleet_version', hclString(a.fleet_version)]);
+    // Not answers: setup.ts derives these from the resolved module source
+    // (#189), so the in-account Cloud Build clones exactly the ref the module
+    // itself is pinned to — and `fleet upgrade` re-pins this line with the
+    // module source, so the rebuild follows. Absent (a local-path module
+    // source) the unit provisions no build: there is no honest ref.
+    if (a.source_ref) {
+      args.push(['source_repository', hclString(a.source_repository)]);
+      args.push(['source_ref', hclString(a.source_ref)]);
+    }
     return args;
   },
   prompts: [
@@ -400,26 +417,88 @@ const GCP: SetupUnit = {
       validate: (v) => (/^\d+\.\d+\.\d+/.test(v) ? undefined : `not a version: ${v} (expected an npm version like 0.2.0)`),
     },
   ],
-  // No in-account image build wired for GCP: the unit's Cloud Build block is
-  // the #185 follow-up. Until it lands, the runner image is pushed from a
-  // checkout with docker + gcloud; fleet_config names the repository.
+  // The one-shot Cloud Build the unit provisions when its module source is
+  // pinned (#189/#185). fleet_config carries the three things `gcloud builds
+  // submit` needs — the config file this apply wrote, the git source, and the
+  // ref — or nulls, so the wizard starts only a build the apply provisioned.
+  // Exactly one image: GCP has no daemon container to build.
   images: {
-    start: () => undefined,
-    buildId: () => undefined,
-    poll: () => [],
-    progress: () => undefined,
-    failureHint: () => 'no in-account build to inspect on this deployment',
-    // Guidance only, same rule as the AWS entry: no shipped code path carries
-    // a deploy command (docs/decisions.md#d5).
-    rollHint: (config) =>
-      `push a new :runner image to ${configString(config, 'runner_repository_url') ?? '<repository>'} — ` +
-      'on GCP the daemon is not an image; move the daemon itself with fleet upgrade',
+    start: (config) => {
+      const buildConfig = configString(config, 'image_build_config');
+      const source = configString(config, 'image_build_source');
+      const revision = configString(config, 'image_build_revision');
+      const project = configString(config, 'project');
+      const region = configString(config, 'region');
+      if (
+        buildConfig === undefined || source === undefined || revision === undefined ||
+        project === undefined || region === undefined
+      ) {
+        return undefined;
+      }
+      return [
+        'gcloud', 'builds', 'submit', source,
+        // Cloud Build fetches the source server-side at this ref. --config, by
+        // contrast, is read from the LOCAL filesystem — gcloud loads it before
+        // the API call and never looks inside the git source (verified in the
+        // SDK; infra/gcp/README.md#the---config-question). That is why terraform
+        // writes the file: this argv is all the CLI gets to say.
+        '--git-source-revision', revision,
+        '--config', buildConfig,
+        '--project', project,
+        '--region', region,
+        '--async',
+        '--format=value(id)',
+      ];
+    },
+    // gcloud narrates around its formatted output ("Created [https://…]"), so
+    // the id is picked by shape rather than by taking the last line: polling a
+    // narration line would fail with an error about the wrong thing entirely.
+    buildId: (stdout) => {
+      const ids = stdout.split('\n').map((line) => line.trim()).filter((line) => BUILD_ID_RE.test(line));
+      return ids.length === 0 ? undefined : ids[ids.length - 1];
+    },
+    poll: (config, buildId) => [
+      'gcloud', 'builds', 'describe', buildId,
+      '--project', configString(config, 'project') ?? '',
+      '--region', configString(config, 'region') ?? '',
+      '--format=json',
+    ],
+    progress: (stdout) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stdout);
+      } catch {
+        return undefined;
+      }
+      if (typeof parsed !== 'object' || parsed === null) return undefined;
+      const { status } = parsed as { status?: unknown };
+      if (typeof status !== 'string') return undefined;
+      // Cloud Build has several non-terminal statuses where CodeBuild has one,
+      // so the pending set is named and everything else is terminal: reading an
+      // unrecognised status as terminal would invent a failure, and Cloud Build
+      // reports no phase beside the status, so the status IS the phase.
+      if (BUILD_PENDING.includes(status)) return { done: false, ok: false, phase: status };
+      return { done: true, ok: status === 'SUCCESS', phase: status };
+    },
+    failureHint: (config, buildId) =>
+      `gcloud builds log ${buildId} --region ${configString(config, 'region') ?? '<region>'} ` +
+      `--project ${configString(config, 'project') ?? '<project>'}   # the build log names the failing step`,
+    // Guidance only, same rule as the AWS entry (docs/decisions.md#d5) — and on
+    // this cloud the honest guidance is that there is nothing to deploy.
+    rollHint: () =>
+      'nothing to roll on GCP: a job takes the new :runner image on its next execution, and the daemon is not an image at all — ' +
+      'it is an npm install on the VM, moved by fleet upgrade',
     unavailable:
-      'this deployment has no in-account image build: the GCP Cloud Build path is the #185 follow-up\n' +
-      '  push the runner image from a Fleet checkout instead: gcloud auth configure-docker, then\n' +
-      '  docker build -f images/runner/Dockerfile -t <runner_repository_url>:runner . && docker push <runner_repository_url>:runner',
+      'this deployment has no in-account image build: its terraform was applied from an unpinned module source (a local path), so there is no honest git ref to build from\n' +
+      '  build and publish the runner image from a Fleet checkout instead: images/build.sh --runner --push',
   },
 };
+
+/** A Cloud Build id, the shape `gcloud builds submit --format=value(id)` prints. */
+const BUILD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Cloud Build statuses that are not an ending. Everything else is terminal. */
+const BUILD_PENDING = ['STATUS_UNKNOWN', 'PENDING', 'QUEUED', 'WORKING'];
 
 /** Every unit this CLI can stand up, in the order they are offered. */
 export const SETUP_UNITS: SetupUnit[] = [AWS, GCP];

@@ -36,6 +36,7 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
   state: string;
   calls: () => string[];
   buildCalls: () => string[];
+  gcloudBuildCalls: () => string[];
 } {
   const cwd = makeTempDir('fleet-setup-');
   const state = makeTempDir('fleet-fake-tf-state-');
@@ -47,6 +48,7 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
       PATH: `${bin}${path.delimiter}${process.env.PATH}`,
       FAKE_TF_DIR: state,
       FAKE_AWS_DIR: state,
+      FAKE_GCLOUD_DIR: state,
       // The image-build wait polls the fake cloud CLI; real-cadence polling
       // would spend five wall seconds per fake phase.
       FLEET_IMAGE_POLL_MS: '5',
@@ -64,6 +66,10 @@ function scratch(extraEnv: Record<string, string | undefined> = {}): {
     },
     buildCalls: () => {
       const log = path.join(state, 'codebuild.log');
+      return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
+    },
+    gcloudBuildCalls: () => {
+      const log = path.join(state, 'cloudbuild.log');
       return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : [];
     },
   };
@@ -1286,14 +1292,205 @@ test('the gcp unit pins the daemon version, defaulting to this CLI (#185)', () =
   ]);
 });
 
-test('the gcp unit offers no in-account image build and says so honestly (#185)', () => {
-  // The Cloud Build block is the #185 follow-up; until then start() offering
-  // nothing routes the wizard to the unavailable message, which must name the
-  // by-hand path rather than pretend a build exists.
+// ---------- the gcp in-account image build (#185) ----------
+
+/** A gcp deployment's captured fleet_config, as the unit's output produces it. */
+const GCP_CONFIG = {
+  provider: 'gcp',
+  project: 'demo-project',
+  region: 'us-central1',
+  runner_job: 'demo-runner',
+  runner_repository_url: 'us-central1-docker.pkg.dev/demo-project/demo-runner/runner',
+  daemon_instance: 'demo-daemon',
+  daemon_zone: 'us-central1-a',
+  daemon_port: 9000,
+  operator_token_secret: 'demo-operator-token',
+  // Written by the apply, beside the capture, and absolute: the CLI runs gcloud
+  // from the project root, not from the deployment directory.
+  image_build_config: '/deployments/demo/demo-cloudbuild.yaml',
+  image_build_source: 'https://git.invalid/fleet.git',
+  image_build_revision: 'v9',
+};
+
+test('the gcp unit builds one Cloud Build submission at the pinned ref (#185)', () => {
   const gcp = unitFor('gcp')!;
-  assert.equal(gcp.images.start({ provider: 'gcp', runner_repository_url: 'r' }), undefined);
-  assert.match(gcp.images.unavailable, /docker push/);
-  assert.match(gcp.images.rollHint({ runner_repository_url: 'us-central1-docker.pkg.dev/p/fleet-runner/runner' }), /fleet upgrade/);
+  const argv = gcp.images.start(GCP_CONFIG)!;
+  assert.ok(argv, 'a pinned deployment must have a build to start');
+  assert.deepEqual(argv.slice(0, 4), ['gcloud', 'builds', 'submit', 'https://git.invalid/fleet.git']);
+  // The ref the module source pins — images and infra move as one ref or not
+  // at all. A build from a floating default re-shapes the image silently.
+  assert.equal(argv[argv.indexOf('--git-source-revision') + 1], 'v9');
+  // --config is read from the LOCAL filesystem (gcloud loads it before the API
+  // call), which is the whole reason terraform writes that file; a relative
+  // path would resolve against the operator's cwd instead.
+  assert.equal(argv[argv.indexOf('--config') + 1], '/deployments/demo/demo-cloudbuild.yaml');
+  // #138: every call names its project and region rather than trusting whatever
+  // the operator's gcloud config points at.
+  assert.equal(argv[argv.indexOf('--project') + 1], 'demo-project');
+  assert.equal(argv[argv.indexOf('--region') + 1], 'us-central1');
+  assert.ok(argv.includes('--async'), 'the wizard polls; a synchronous submit would block on gcloud streaming logs');
+
+  // Any missing piece means no build, not a half-formed command: the unit
+  // publishes nulls when it provisioned none.
+  for (const key of ['image_build_config', 'image_build_source', 'image_build_revision', 'project', 'region']) {
+    const { [key]: _dropped, ...without } = GCP_CONFIG as Record<string, unknown>;
+    assert.equal(gcp.images.start(without), undefined, `a config without ${key} must start no build`);
+  }
+});
+
+test('the gcp unit reads a build id by shape and maps Cloud Build statuses (#185)', () => {
+  const gcp = unitFor('gcp')!;
+  // gcloud narrates around its formatted output; taking the last line would
+  // hand the poller a log URL.
+  const narrated =
+    'Created [https://cloudbuild.googleapis.com/v1/projects/p/builds/11111111-2222-3333-4444-555555555555].\n' +
+    '11111111-2222-3333-4444-555555555555\n' +
+    'Logs are available at [https://console.cloud.google.com/cloud-build/builds].\n';
+  assert.equal(gcp.images.buildId(narrated), '11111111-2222-3333-4444-555555555555');
+  assert.equal(gcp.images.buildId('\n'), undefined);
+  assert.equal(gcp.images.buildId('ERROR: nothing here\n'), undefined);
+
+  assert.deepEqual(
+    gcp.images.poll(GCP_CONFIG, 'build-1').slice(0, 4),
+    ['gcloud', 'builds', 'describe', 'build-1'],
+  );
+
+  // Cloud Build has four non-terminal statuses where CodeBuild has one; the
+  // status is also the only phase it reports.
+  for (const status of ['QUEUED', 'WORKING', 'PENDING', 'STATUS_UNKNOWN']) {
+    assert.deepEqual(gcp.images.progress(JSON.stringify({ status })), { done: false, ok: false, phase: status });
+  }
+  assert.deepEqual(gcp.images.progress(JSON.stringify({ status: 'SUCCESS' })), { done: true, ok: true, phase: 'SUCCESS' });
+  for (const status of ['FAILURE', 'TIMEOUT', 'CANCELLED', 'INTERNAL_ERROR', 'EXPIRED']) {
+    assert.deepEqual(gcp.images.progress(JSON.stringify({ status })), { done: true, ok: false, phase: status });
+  }
+  assert.equal(gcp.images.progress('not json'), undefined);
+  assert.equal(gcp.images.progress(JSON.stringify({ id: 'x' })), undefined, 'no status is unreadable, not a success');
+
+  // The log hint names the deployment's own region and project — a `gcloud
+  // builds log` against the ambient ones finds nothing and says so unhelpfully.
+  const hint = gcp.images.failureHint(GCP_CONFIG, 'build-1');
+  assert.match(hint, /gcloud builds log build-1/);
+  assert.match(hint, /--region us-central1/);
+  assert.match(hint, /--project demo-project/);
+});
+
+test('the gcp unit has no daemon image to roll, and says that instead (#185)', () => {
+  // The engine no longer announces a daemon roll: the sentence is the unit's,
+  // because on this cloud the daemon is an npm install and there is nothing to
+  // deploy. Guidance only either way (docs/decisions.md#d5).
+  const roll = unitFor('gcp')!.images.rollHint(GCP_CONFIG);
+  assert.match(roll, /nothing to roll/);
+  assert.match(roll, /fleet upgrade/);
+  assert.doesNotMatch(roll, /roll it now/, 'a GCP rebuild must not be described as a pending deployment');
+
+  // The AWS entry carries its own preamble now, so the driver prints one
+  // sentence and the cloud owns all of it.
+  const awsRoll = AWS.images.rollHint({ daemon_service: 'demo-daemon', cluster: 'demo', region: 'us-east-1' });
+  assert.match(awsRoll, /roll it now/);
+  assert.match(awsRoll, /service demo-daemon on cluster demo \(region us-east-1\)/);
+
+  // An unpinned gcp deployment still names the fallback that exists.
+  assert.match(unitFor('gcp')!.images.unavailable, /unpinned module source/);
+  assert.match(unitFor('gcp')!.images.unavailable, /images\/build\.sh --runner --push/);
+});
+
+/** A scratch project whose fake terraform describes a gcp deployment. */
+function gcpScratch(config: Record<string, unknown> = GCP_CONFIG): ReturnType<typeof scratch> {
+  const s = scratch({ FLEET_MODULE_SOURCE: 'git::https://git.invalid/fleet.git//infra/gcp?ref=v9' });
+  fs.writeFileSync(path.join(s.state, 'fleet-config'), JSON.stringify(config));
+  return s;
+}
+
+const GCP_ANSWERS = [
+  '--provider', 'gcp', '--name', 'demo', '--project', 'demo-project',
+  '--region', 'us-central1', '--fleet-version', '0.2.0',
+];
+
+test('setup infra --provider gcp: the apply is followed by the in-account Cloud Build', async () => {
+  const s = gcpScratch();
+  const res = await runCli(['setup', 'infra', ...GCP_ANSWERS, '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+
+  // The pinned ref reaches the unit, so the build clones exactly what the
+  // module describes — and `fleet upgrade` re-pins this same line.
+  const mainTf = fs.readFileSync(path.join(s.cwd, '.fleet', 'infra', 'gcp', 'main.tf'), 'utf8');
+  assert.match(mainTf, /source_repository\s*=\s*"https:\/\/git\.invalid\/fleet\.git"/);
+  assert.match(mainTf, /source_ref\s*=\s*"v9"/);
+
+  const submits = s.gcloudBuildCalls().filter((line) => line.startsWith('builds submit'));
+  assert.equal(submits.length, 1, `exactly one build after the apply, got:\n${s.gcloudBuildCalls().join('\n')}`);
+  assert.match(submits[0], /builds submit https:\/\/git\.invalid\/fleet\.git/);
+  assert.match(submits[0], /--git-source-revision v9/);
+  assert.match(submits[0], /--config \/deployments\/demo\/demo-cloudbuild\.yaml/);
+  // The id is read by shape out of gcloud's narration, then polled to an end.
+  assert.match(res.stdout, /build 11111111-2222-3333-4444-555555555555/);
+  assert.match(res.stdout, /images: QUEUED/, 'progress is statuses, not silence');
+  assert.match(res.stdout, /images: WORKING/);
+  assert.match(res.stdout, /images built and pushed/);
+  assert.ok(
+    s.gcloudBuildCalls().filter((line) => line.startsWith('builds describe')).length >= 3,
+    'the wait polls until the status is terminal',
+  );
+  // No AWS CLI was involved in a GCP deployment at any point.
+  assert.deepEqual(s.buildCalls(), []);
+});
+
+test('setup infra --provider gcp: a failed build fails the command and names its log', async () => {
+  const s = gcpScratch();
+  fs.writeFileSync(path.join(s.state, 'fail-image-build'), '');
+  const res = await runCli(['setup', 'infra', ...GCP_ANSWERS, '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /image build failed \(FAILURE\)/, 'the terminal status is the headline');
+  assert.match(res.stderr, /gcloud builds log 11111111-2222-3333-4444-555555555555 --region us-central1/);
+  // The apply succeeded and the capture survives: --rebuild-images fixes this.
+  assert.ok(fs.existsSync(path.join(s.cwd, '.fleet', 'infra', 'gcp', 'fleet-config.json')));
+});
+
+test('setup infra --provider gcp: a submit that cannot start surfaces the gcloud error', async () => {
+  const s = gcpScratch();
+  fs.writeFileSync(path.join(s.state, 'fail-start-build'), '');
+  const res = await runCli(['setup', 'infra', ...GCP_ANSWERS, '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /starting the image build failed/);
+  assert.match(res.stderr, /PERMISSION_DENIED/, "gcloud's own reason is not swallowed");
+});
+
+test('setup infra --provider gcp --rebuild-images: rebuilds, then says there is nothing to roll', async () => {
+  const s = gcpScratch();
+  assert.equal((await runCli(['setup', 'infra', ...GCP_ANSWERS, '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  fs.writeFileSync(path.join(s.state, 'calls.log'), '');
+  fs.writeFileSync(path.join(s.state, 'cloudbuild.log'), '');
+  fs.rmSync(path.join(s.state, 'build-polls'), { force: true });
+
+  const res = await runCli(['setup', 'infra', '--provider', 'gcp', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(subcommands(s.calls()), ['version'], 'preflight only — no plan, no apply, nothing regenerated');
+  assert.equal(s.gcloudBuildCalls().filter((line) => line.startsWith('builds submit')).length, 1, 'one fresh build');
+  assert.match(res.stdout, /images built and pushed/);
+  assert.match(res.stdout, /nothing to roll on GCP/);
+  assert.doesNotMatch(res.stdout, /daemon service starts from the new image/, 'GCP has no daemon image to roll');
+});
+
+test('setup infra --provider gcp: an unpinned source refuses honestly and names build.sh', async () => {
+  const { image_build_config: _c, image_build_source: _s, image_build_revision: _r, ...unpinned } = GCP_CONFIG;
+  const s = gcpScratch(unpinned);
+  // A local-path module source pins no ref, so the unit provisions no build.
+  s.env.FLEET_MODULE_SOURCE = '/opt/fleet-checkout/infra/gcp';
+  const applied = await runCli(['setup', 'infra', ...GCP_ANSWERS, '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(applied.code, 0, applied.stderr);
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(s.cwd, '.fleet', 'infra', 'gcp', 'main.tf'), 'utf8'),
+    /source_ref/,
+    'a local path pins no ref, so none is invented',
+  );
+  assert.deepEqual(s.gcloudBuildCalls(), [], 'no build exists to start');
+  assert.match(applied.stdout, /no in-account image build/);
+  assert.match(applied.stdout, /images\/build\.sh --runner --push/);
+
+  const rebuild = await runCli(['setup', 'infra', '--provider', 'gcp', '--rebuild-images'], { cwd: s.cwd, env: s.env });
+  assert.equal(rebuild.code, 1, rebuild.stdout);
+  assert.match(rebuild.stderr, /unpinned module source/);
 });
 
 test('terraformTooOld reads a version rather than trusting the binary exists', () => {
