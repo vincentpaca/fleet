@@ -1,0 +1,60 @@
+# The docker-gated image acceptance: builds the real runner and daemon images
+# and runs live one-layer jobs against them (test/cli-image.test.ts). The
+# suite only runs under FLEET_TEST_DOCKER=1, which nothing guaranteed until
+# #218: the image privilege contract broke, the only tests that could see it
+# never ran, and the first real dispatch was the smoke test. Path-gated to the
+# files that can break the image contract — everything else keeps the fast
+# `tests` workflow only.
+name: docker-images
+
+on:
+  pull_request:
+    paths:
+      - 'images/**'
+      - 'src/runner/**'
+      - 'src/providers/**'
+      - 'src/cli/images.ts'
+      - 'test/cli-image.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docker-images.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'images/**'
+      - 'src/runner/**'
+      - 'src/providers/**'
+      - 'src/cli/images.ts'
+      - 'test/cli-image.test.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docker-images.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    # The runner base build apt-installs git/gh and npm-installs the harness
+    # CLI; the live jobs then apt-install inside containers. Generous bound,
+    # same reasoning as the runner's own timeouts: it exists to break a hang,
+    # not to race a healthy run.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # The git-wired live job seeds a bare remote on the host; Actions
+      # runners ship no git identity.
+      - run: |
+          git config --global user.name fleet-ci
+          git config --global user.email ci@example.com
+      - run: FLEET_TEST_DOCKER=1 node --test test/cli-image.test.ts
