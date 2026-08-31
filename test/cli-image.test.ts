@@ -904,7 +904,10 @@ process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\
     const texts = (await loop.events(jobId))
       .filter((e) => typeof e.text === 'string')
       .map((e) => String(e.text));
-    assert.equal(finalState, 'done', `job did not settle clean; events: ${texts.join(' | ')}`);
+    // The settle report (not the text events) is where a workspace-git failure
+    // names itself — an unstamped local build logs nothing before the clone.
+    const record = await (await fetch(`http://127.0.0.1:${loop.port}/jobs/${jobId}`)).text();
+    assert.equal(finalState, 'done', `job did not settle clean; job: ${record}; events: ${texts.join(' | ')}`);
 
     const branch = `fleet/git-loop-${jobId}`;
     assert.ok(
