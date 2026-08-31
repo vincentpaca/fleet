@@ -1784,7 +1784,12 @@ function loadRetainedWorkspace(home: string, jobId: string): RetainedRecord | un
     console.error('container jobs keep their workspace inside the stopped task, not on this host');
     return undefined;
   }
-  if (!fs.existsSync(record.workspace)) {
+  // Existence is not the question — a git workspace is. A path that survives as
+  // an empty or clobbered directory holds no work, and pushing from it fails
+  // deep inside git ("Command failed: git add -A") while the record stays, so
+  // `fleet doctor` keeps reporting a workspace nobody can ever push. Both
+  // shapes are equally unrecoverable, so both drop the record here.
+  if (!fs.existsSync(path.join(record.workspace, '.git'))) {
     clearRetainedRecord(home, jobId);
     console.error('retained workspace is gone: ' + record.workspace);
     console.error('record dropped; nothing is recoverable from this host');
