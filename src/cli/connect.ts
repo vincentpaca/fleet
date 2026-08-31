@@ -69,14 +69,32 @@ export const FORWARD_SHUTDOWN_MS = 3_000; // contract pin: test-only export, ass
 // ---------- deployment resolution ----------
 
 /**
- * Daemon-access fields every infra unit's fleet_config owes (enforced by
- * test/cloud-agnostic.test.ts). Core reads them; only the provider knows what
- * to do with them.
+ * Daemon-access fields a unit's fleet_config owes, per provider (enforced by
+ * test/cloud-agnostic.test.ts). Every unit publishes daemon_port; the rest is
+ * how that cloud addresses its daemon — an ECS task is found through its
+ * service and container, a GCP VM through its name and zone. Core reads the
+ * keys; only the provider (src/cli/tunnel-openers.ts) knows what to do with
+ * them. This check runs before any opener exists, which is why it is a key
+ * map here rather than a provider method.
  */
+const DAEMON_ACCESS_KEYS: Record<string, string[]> = {
+  ecs: ['daemon_service', 'daemon_container_name'],
+  gcp: ['project', 'daemon_instance', 'daemon_zone'],
+};
+
+/** The string keys a capture must carry to address its daemon; ecs's for unknown providers (the pre-#185 behavior). */
+function daemonAccessKeys(config: Record<string, unknown>): string[] {
+  return DAEMON_ACCESS_KEYS[String(config.provider)] ?? DAEMON_ACCESS_KEYS.ecs;
+}
+
+/** The keys named in "describes no daemon access" errors, so the message matches the provider. */
+function daemonAccessKeyList(config: Record<string, unknown>): string {
+  return [...daemonAccessKeys(config), 'daemon_port'].join(', ');
+}
+
 function hasDaemonAccess(config: Record<string, unknown>): boolean {
   return (
-    typeof config.daemon_service === 'string' &&
-    typeof config.daemon_container_name === 'string' &&
+    daemonAccessKeys(config).every((key) => typeof config[key] === 'string' && config[key] !== '') &&
     typeof config.daemon_port === 'number'
   );
 }
@@ -115,13 +133,13 @@ export async function resolveDeployment(cwd: string, run?: CloudRunner): Promise
   const refreshed = refreshDeployment(found.config, run);
   if (!refreshed) {
     throw new Error(
-      `${found.path} describes no daemon access (daemon_service, daemon_container_name, daemon_port) and names no live source to re-read it from — re-capture it from a current terraform apply`,
+      `${found.path} describes no daemon access (${daemonAccessKeyList(found.config)}) and names no live source to re-read it from — re-capture it from a current terraform apply`,
     );
   }
   const fresh = await refreshed;
   if (!hasDaemonAccess(fresh.config)) {
     throw new Error(
-      `${fresh.source} describes no daemon access either (daemon_service, daemon_container_name, daemon_port) — apply a current version of the infra unit, then re-capture ${found.path}`,
+      `${fresh.source} describes no daemon access either (${daemonAccessKeyList(fresh.config)}) — apply a current version of the infra unit, then re-capture ${found.path}`,
     );
   }
   return { source: `${fresh.source} (via ${found.path})`, config: fresh.config, daemonUrl };

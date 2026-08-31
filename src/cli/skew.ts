@@ -27,11 +27,15 @@ export type UnitPin = {
   ref?: string;
 };
 
-/** What doctor could learn about the daemon image's build. */
+/**
+ * What doctor could learn about the daemon's build. `version` is the daemon's
+ * own package.json version (/health, #185) — carried whenever /health names
+ * one, and the only identity an npm-installed daemon has.
+ */
 export type DaemonBuild =
   | { kind: 'unknown' } // no deployment daemon reachable — the tunnel section owns that story
-  | { kind: 'unstamped' } // /health answered without a stamp: the image predates #207
-  | { kind: 'stamped'; sha: string };
+  | { kind: 'unstamped'; version?: string } // /health answered without a stamp: the image predates #207
+  | { kind: 'stamped'; sha: string; version?: string };
 
 /**
  * Every `.fleet/infra/<provider>/main.tf` under cwd with its module source, in
@@ -99,6 +103,14 @@ export type SkewInput = {
   cliSha: string | undefined;
   pins: UnitPin[];
   daemon: DaemonBuild;
+  /**
+   * Provider of the deployment whose daemon /health was asked (#185) — the
+   * captured fleet-config's `provider`. Decides how the daemon half reads: an
+   * ECS daemon is an image and compares by build sha; a GCP daemon is an npm
+   * install with no sha, so its version is an informational note and the sha
+   * comparison (and its image-rebuild advice) never runs.
+   */
+  daemonProvider?: string;
   /** ref → commit sha in the CLI's checkout, undefined when unresolvable. */
   resolveRef: (ref: string) => string | undefined;
 };
@@ -119,7 +131,7 @@ export function skewReport(input: SkewInput): { notes: string[]; findings: strin
   const notes: string[] = [];
   const matched: string[] = [];
   for (const pin of input.pins) comparePin(pin, cliSha, input.resolveRef, { findings, notes, matched });
-  compareDaemon(input.daemon, cliSha, { findings, matched });
+  compareDaemon(input.daemon, cliSha, input.daemonProvider, { findings, notes, matched });
   if (findings.length === 0 && matched.length > 0) {
     notes.push(`skew: deployment matches this CLI at ${shortSha(cliSha)} (${matched.join(', ')})`);
   }
@@ -155,9 +167,23 @@ function comparePin(
 function compareDaemon(
   daemon: DaemonBuild,
   cliSha: string,
-  out: { findings: string[]; matched: string[] },
+  provider: string | undefined,
+  out: { findings: string[]; notes: string[]; matched: string[] },
 ): void {
   if (daemon.kind === 'unknown') return;
+  if (provider === 'gcp') {
+    // A GCP daemon is installed from npm — it has no build sha, and there is
+    // no daemon image to rebuild, so the unstamped finding below would be a
+    // false alarm with nonsense advice. The version is what it does have:
+    // reported as information until #183 makes versions comparable. The
+    // unit-ref comparison above still holds the terraform half.
+    if (daemon.version) {
+      out.notes.push(
+        `skew: gcp daemon reports ownfleet ${daemon.version} — an npm-installed daemon has no build sha to compare; version-based comparison arrives with #183`,
+      );
+    }
+    return;
+  }
   if (daemon.kind === 'unstamped') {
     out.findings.push(
       'deployment skew: daemon image is unstamped — it predates skew detection; rebuild it (images/build.sh --redeploy-daemon) to enable the check',

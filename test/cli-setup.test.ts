@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { validateManifest } from '../src/validate.mjs';
 import { runCli, makeTempDir, fakeCloudBin, startMockDaemon, sendJson } from './cli-helpers.ts';
 import {
@@ -222,14 +223,15 @@ test('setup infra: a bad flag value is rejected at the flag, not at apply time',
 });
 
 test('setup infra: an unknown provider is refused, in either flag spelling', async () => {
+  // gcp graduated from this test's unknown-provider role to a real unit (#185).
   const s = scratch();
   for (const args of [
-    ['setup', 'infra', '--provider', 'gcp', '--name', 'demo', '--yes'],
-    ['setup', 'infra', '--provider=gcp', '--name', 'demo', '--yes'],
+    ['setup', 'infra', '--provider', 'azure', '--name', 'demo', '--yes'],
+    ['setup', 'infra', '--provider=azure', '--name', 'demo', '--yes'],
   ]) {
     const res = await runCli(args, { cwd: s.cwd, env: s.env });
     assert.equal(res.code, 2, `${args.join(' ')}: ${res.stdout}${res.stderr}`);
-    assert.match(res.stderr, /no unit for provider "gcp"/);
+    assert.match(res.stderr, /no unit for provider "azure"/);
     // The failure that matters: falling through to the first unit would have
     // generated AWS terraform for someone who asked for another cloud.
     assert.deepEqual(s.calls(), [], 'nothing ran');
@@ -1223,6 +1225,75 @@ test('every setup unit asks for the name the rest of setup depends on', () => {
       `unit ${unit.provider}: the name answer must reach the module`,
     );
   }
+});
+
+test('the gcp unit exists with its own region spelling — neither cloud validates the other (#185)', () => {
+  const gcp = unitFor('gcp');
+  assert.ok(gcp, 'the gcp unit must be registered in SETUP_UNITS');
+  const gcpRegion = gcp.prompts.find((p) => p.key === 'region');
+  assert.ok(gcpRegion?.validate, 'gcp must validate its region prompt');
+  // The two clouds spell regions inversely (us-central1 vs us-east-1); a
+  // shared validator was the standing invitation to reuse the AWS regex, and
+  // each accepting the other's spelling is exactly the bug.
+  assert.equal(gcpRegion.validate('us-central1'), undefined);
+  assert.equal(gcpRegion.validate('asia-southeast1'), undefined);
+  assert.match(gcpRegion.validate('us-east-1') ?? '', /not a GCP region/);
+  assert.match(gcpRegion.validate('moon-1') ?? '', /not a GCP region/);
+
+  const awsRegion = unitFor('aws')!.prompts.find((p) => p.key === 'region');
+  assert.equal(awsRegion!.validate!('us-east-1'), undefined);
+  assert.match(awsRegion!.validate!('us-central1') ?? '', /not an AWS region/);
+});
+
+test('the gcp unit caps the name at what service-account ids can carry (#185)', () => {
+  const name = unitFor('gcp')!.prompts.find((p) => p.key === 'name')!;
+  assert.equal(name.validate!('fleet'), undefined);
+  assert.equal(name.validate!('a'.repeat(22)), undefined);
+  assert.match(name.validate!('a'.repeat(23)) ?? '', /22 characters/);
+});
+
+test('the gcp unit pins the daemon version, defaulting to this CLI (#185)', () => {
+  const gcp = unitFor('gcp')!;
+  const version = gcp.prompts.find((p) => p.key === 'fleet_version');
+  assert.ok(version, 'the daemon version must be asked — an unpinned npm install skews silently');
+  assert.equal(version.required, true);
+  const pkg = JSON.parse(
+    fs.readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+  ) as { version: string };
+  assert.equal(version.fallback!({}), pkg.version, "the default is the CLI's own version — the AWS source_ref pin's npm twin");
+  assert.equal(version.validate!('0.2.0'), undefined);
+  assert.match(version.validate!('latest') ?? '', /not a version/);
+
+  // The answer reaches the module; network/subnetwork travel together like
+  // the AWS vpc_id/subnet_ids pair and stay absent when unanswered.
+  const bare = gcp.moduleArgs({ name: 'demo', project: 'demo-project', region: 'us-central1', fleet_version: '0.2.0' });
+  assert.deepEqual(bare, [['name', '"demo"'], ['fleet_version', '"0.2.0"']]);
+  const networked = gcp.moduleArgs({
+    name: 'demo', project: 'demo-project', region: 'us-central1',
+    network: 'shared-vpc', subnetwork: 'shared-subnet', fleet_version: '0.2.0',
+  });
+  assert.deepEqual(networked, [
+    ['name', '"demo"'],
+    ['network', '"shared-vpc"'],
+    ['subnetwork', '"shared-subnet"'],
+    ['fleet_version', '"0.2.0"'],
+  ]);
+  // The provider block carries project and region — where every google
+  // resource resolves them from.
+  assert.deepEqual(gcp.providerArgs({ project: 'demo-project', region: 'us-central1' } as Record<string, string>), [
+    ['project', '"demo-project"'],
+    ['region', '"us-central1"'],
+  ]);
+});
+
+test('the gcp unit offers no in-account image build and says so honestly (#185)', () => {
+  // The Cloud Build block is the #185 follow-up; until then start() offering
+  // nothing routes the wizard to the unavailable message, which must name the
+  // by-hand path rather than pretend a build exists.
+  const gcp = unitFor('gcp')!;
+  assert.equal(gcp.images.start({ provider: 'gcp', runner_repository_url: 'r' }), undefined);
+  assert.match(gcp.images.unavailable, /docker push/);
+  assert.match(gcp.images.rollHint({ runner_repository_url: 'us-central1-docker.pkg.dev/p/fleet-runner/runner' }), /fleet upgrade/);
 });
 
 test('terraformTooOld reads a version rather than trusting the binary exists', () => {

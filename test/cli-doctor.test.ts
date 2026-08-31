@@ -509,6 +509,72 @@ test('doctor: a git::file dogfood pin with ?ref= is compared, not shrugged at (#
   assert.match(res.stdout, new RegExp(`skew: deployment matches this CLI at ${short}`));
 });
 
+test('doctor: a gcp daemon is never an "unstamped image" finding — its version is a note (#185)', async (t) => {
+  // The GCP daemon is an npm install: no build sha exists and there is no
+  // daemon image to rebuild, so the pre-#185 unstamped finding was a false
+  // alarm with nonsense advice. This test fails on that code: same unstamped
+  // /health, but a gcp capture — the verdict must flip from finding to note.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const dir = path.join(cwd, '.fleet', 'infra', 'gcp');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'main.tf'),
+    `module "fleet" {\n  source = "git::https://github.com/fleet-test/fleet.git//infra/gcp?ref=${HEAD_SHA}"\n\n  fleet_version = "0.2.0"\n}\n`,
+  );
+  // The capture that names the provider. Deliberately no operator_token_secret:
+  // doctor's token section must not shell out to a real gcloud from this test.
+  fs.writeFileSync(
+    path.join(dir, 'fleet-config.json'),
+    JSON.stringify({ provider: 'gcp', project: 'mock-project', region: 'us-central1', daemon_port: 9000 }),
+  );
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, version: '9.9.9' }));
+    },
+  });
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 0, `a gcp daemon with no build sha must not be a finding:\n${res.stderr}`);
+  assert.match(res.stdout, /skew: gcp daemon reports ownfleet 9\.9\.9/);
+  assert.match(res.stdout, /#183/, 'the note names where version comparison arrives');
+  // The unit-ref half still works unchanged: the pin matches this checkout.
+  const short = HEAD_SHA.slice(0, 12);
+  assert.match(res.stdout, new RegExp(`skew: deployment matches this CLI at ${short} \\(unit ref ${short}\\)`));
+  assert.ok(!res.stdout.includes('unstamped') && !res.stderr.includes('unstamped'), 'never the image finding');
+  assert.ok(!`${res.stdout}${res.stderr}`.includes('rebuild'), 'never image-rebuild advice on gcp');
+});
+
+test('doctor: a stale gcp unit ref is still a finding — provider awareness only silences the image half (#185)', async (t) => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const dir = path.join(cwd, '.fleet', 'infra', 'gcp');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'main.tf'),
+    `module "fleet" {\n  source = "git::https://github.com/fleet-test/fleet.git//infra/gcp?ref=${STALE_SHA}"\n\n  fleet_version = "0.2.0"\n}\n`,
+  );
+  fs.writeFileSync(
+    path.join(dir, 'fleet-config.json'),
+    JSON.stringify({ provider: 'gcp', project: 'mock-project', region: 'us-central1', daemon_port: 9000 }),
+  );
+  // /health without even a version: an older daemon. Still never a finding.
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    },
+  });
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.equal(res.code, 1, res.stdout);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `the stale unit ref and nothing else:\n${res.stderr}`);
+  assert.match(lines[0], /deployment skew: gcp unit is applied at ref/);
+  assert.ok(!res.stderr.includes('daemon image'), 'the npm daemon is not a second finding');
+});
+
 test('doctor: no deployment root module means no skew section, even with a daemon up (#207)', async (t) => {
   // Without .fleet/infra/<provider>/main.tf there is nothing the CLI could be
   // skewed against — a match note here would be invented.

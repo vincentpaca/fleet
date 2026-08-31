@@ -133,20 +133,20 @@ test('each infra unit self-describes its shape via fleet_config', () => {
     // same-named standalone output (daemon_service_name, runner_repository_url
     // both exist), satisfies it while the map itself has been trimmed — and
     // trimming it silently breaks every consumer.
-    for (const key of [
-      'provider',
-      // region (#138): every aws call the CLI and daemon make appends
-      // --region from fleet_config; a unit that stops publishing it sends
-      // every consumer back to the caller's ambient region.
-      'region',
-      'cluster',
-      'runner_task_definition',
-      'runner_container_name',
-      'runner_repository_url',
-      'daemon_service',
-      'daemon_container_name',
-      'daemon_port',
-    ]) {
+    //
+    // The list splits (#185): CORE_KEYS is what every unit owes core — the
+    // provider dispatch key, the routing region (#138: every cloud-CLI call
+    // names it instead of trusting the caller's ambient config), the tunnel's
+    // far-end port, and where images/build.sh publishes. Everything else is
+    // how THAT cloud addresses its own infrastructure, listed per unit so no
+    // placeholder keys are invented to satisfy a global list. A new unit must
+    // add its entry here — what its tunnel opener and provider actually read.
+    const extras = UNIT_KEYS[unit];
+    assert.ok(
+      extras !== undefined,
+      `infra/${unit} has no per-unit key list in this gate — add its fleet_config extras to UNIT_KEYS (the keys its tunnel opener and provider read)`,
+    );
+    for (const key of [...CORE_KEYS, ...extras]) {
       assert.match(
         blocks[0],
         new RegExp(`^\\s*${key}\\s*=`, 'm'),
@@ -155,6 +155,20 @@ test('each infra unit self-describes its shape via fleet_config', () => {
     }
   }
 });
+
+/** fleet_config keys every unit publishes, whatever the cloud. */
+const CORE_KEYS = ['provider', 'region', 'daemon_port', 'runner_repository_url'];
+
+/** Per-unit fleet_config keys: how that cloud's opener and provider address it. */
+const UNIT_KEYS: Record<string, string[]> = {
+  // ECS: run-task needs the cluster/task-definition/container triple; the SSM
+  // tunnel resolves the daemon task through its service and container name.
+  aws: ['cluster', 'runner_task_definition', 'runner_container_name', 'daemon_service', 'daemon_container_name'],
+  // GCP: execute needs the project and the Cloud Run job; the IAP tunnel
+  // addresses the daemon VM by instance name and zone; the token fetch reads
+  // the Secret Manager secret the daemon publishes into.
+  gcp: ['project', 'runner_job', 'daemon_instance', 'daemon_zone', 'operator_token_secret'],
+};
 
 /** Source with comments removed — what the code actually says, not what it explains. */
 function codeOnly(text: string): string {

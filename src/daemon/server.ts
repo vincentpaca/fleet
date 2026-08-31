@@ -25,6 +25,25 @@ import { buildStamp } from "../shared/build-stamp.ts";
 import type { Provider } from "../providers/provider.ts";
 
 /**
+ * The version of the package this daemon runs from, read once on first use.
+ * /health carries it beside the optional build stamp (#185): the identity an
+ * npm install actually has, where a git sha does not exist. Undefined when
+ * the package.json is unreadable — /health never fails over metadata.
+ */
+let cachedPackageVersion: string | undefined | null = null;
+function daemonPackageVersion(): string | undefined {
+  if (cachedPackageVersion === null) {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version?: unknown };
+      cachedPackageVersion = typeof pkg.version === "string" && pkg.version !== "" ? pkg.version : undefined;
+    } catch {
+      cachedPackageVersion = undefined;
+    }
+  }
+  return cachedPackageVersion;
+}
+
+/**
  * Prefix of the log note the runner posts when a work push failed and the
  * workspace is retained (issue #38). The daemon uses it to suppress the
  * clean-settle container reap: a retained workspace keeps its stopped
@@ -406,10 +425,21 @@ export class FleetDaemon {
    * (#207): `fleet doctor` compares that stamp against the operator's CLI to
    * surface deployment skew, the failure that cost #197 its work. A daemon
    * running from a checkout has no stamp and the field is simply absent.
+   *
+   * `version` is the daemon's own package.json version (#185): an
+   * npm-installed daemon (the GCP shape) has no build sha, and this field is
+   * the data source that lets doctor's skew section say what is running
+   * instead of inventing an "unstamped image" finding about a deployment that
+   * has no daemon image. Version-based comparison arrives with #183.
    */
   #healthRoute(res: ServerResponse): void {
     const build = buildStamp();
-    sendJson(res, 200, build === undefined ? { ok: true } : { ok: true, build });
+    const version = daemonPackageVersion();
+    sendJson(res, 200, {
+      ok: true,
+      ...(version !== undefined ? { version } : {}),
+      ...(build !== undefined ? { build } : {}),
+    });
   }
 
   /**

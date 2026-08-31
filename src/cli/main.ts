@@ -18,7 +18,7 @@ import {
   type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch } from '../runner/git.ts';
-import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, configDaemonUrl, fleetConfigFiles, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
@@ -1555,7 +1555,7 @@ async function doctorOrphans(): Promise<{ notes: string[]; findings: string[] }>
  * (the tunnel section reports that) and on statuses that say nothing about
  * the token — not knowing is not a defect.
  */
-async function doctorToken(home: string, tokenBefore: string | undefined): Promise<{ notes: string[]; findings: string[] }> {
+async function doctorToken(home: string, tokenBefore: string | undefined, provider?: string): Promise<{ notes: string[]; findings: string[] }> {
   const tokenFile = operatorTokenPath(home);
   let res: DaemonResponse;
   try {
@@ -1565,12 +1565,19 @@ async function doctorToken(home: string, tokenBefore: string | undefined): Promi
     return { notes: [], findings: [] };
   }
   if (res.status === 401) {
+    // The hint names where THIS deployment's daemon published the token
+    // (#185): SSM on ECS, Secret Manager on GCP — pointing an operator at the
+    // wrong cloud's store reads as a broken deployment.
+    const published =
+      provider === 'gcp'
+        ? ['a GCP deployment publishes it to Secret Manager (rerun with gcloud credentials to fetch it)', 'a GCP deployment refetches it from Secret Manager automatically']
+        : ['an ECS deployment publishes it to SSM (rerun with AWS credentials to fetch it)', 'an ECS deployment refetches it from SSM automatically'];
     return {
       notes: [],
       findings: [
         tokenBefore === undefined
-          ? `operator token missing: the daemon requires one and ${tokenFile} does not exist — an ECS deployment publishes it to SSM (rerun with AWS credentials to fetch it); otherwise copy $FLEET_HOME/operator-token from the daemon`
-          : `operator token mismatch: the daemon refused ${tokenFile} — an ECS deployment refetches it from SSM automatically; otherwise copy $FLEET_HOME/operator-token from the daemon over it`,
+          ? `operator token missing: the daemon requires one and ${tokenFile} does not exist — ${published[0]}; otherwise copy $FLEET_HOME/operator-token from the daemon`
+          : `operator token mismatch: the daemon refused ${tokenFile} — ${published[1]}; otherwise copy $FLEET_HOME/operator-token from the daemon over it`,
       ],
     };
   }
@@ -1595,8 +1602,23 @@ async function doctorSkew(cwd: string): Promise<{ notes: string[]; findings: str
     cliSha: gitValue(['rev-parse', 'HEAD'], root),
     pins,
     daemon: await daemonBuild(),
+    daemonProvider: capturedDeploymentProvider(cwd),
     resolveRef: (ref) => gitValue(['rev-parse', '--verify', `${ref}^{commit}`], root),
   });
+}
+
+/**
+ * Provider of the deployment the daemon target belongs to: the same first-wins
+ * capture walk resolveDeployment (src/cli/connect.ts) does, preferring the
+ * file whose daemon_url other commands resolve. Undefined when nothing is
+ * captured — provider-specific phrasing then falls back to the default.
+ */
+function capturedDeploymentProvider(cwd: string): string | undefined {
+  const described = [...fleetConfigFiles(cwd)].filter(
+    (file) => typeof file.config.provider === 'string' && file.config.provider !== '',
+  );
+  const found = described.find((file) => configDaemonUrl(file.config) !== undefined) ?? described[0];
+  return found === undefined ? undefined : (found.config.provider as string);
 }
 
 /**
@@ -1614,8 +1636,12 @@ async function daemonBuild(): Promise<DaemonBuild> {
     return { kind: 'unknown' };
   }
   if (res.status !== 200) return { kind: 'unknown' };
-  const build = (res.json as { build?: unknown })?.build;
-  return typeof build === 'string' && build !== '' ? { kind: 'stamped', sha: build } : { kind: 'unstamped' };
+  const body = res.json as { build?: unknown; version?: unknown };
+  const version = typeof body?.version === 'string' && body.version !== '' ? { version: body.version } : {};
+  const build = body?.build;
+  return typeof build === 'string' && build !== ''
+    ? { kind: 'stamped', sha: build, ...version }
+    : { kind: 'unstamped', ...version };
 }
 
 /** The one healthy-state line doctorToken prints: accepted, fetched, or healed. */
@@ -1780,7 +1806,7 @@ async function cmdDoctor(args: string[]): Promise<number> {
   // 9. Operator token (#188): say whether the daemon accepts ours — and when
   //    it does not, name the file and the fix instead of leaving the next
   //    command to print a bare 401.
-  const token = await doctorToken(fleetHome(), tokenBefore);
+  const token = await doctorToken(fleetHome(), tokenBefore, capturedDeploymentProvider(process.cwd()));
   for (const note of token.notes) console.log(note);
   findings.push(...token.findings);
 
