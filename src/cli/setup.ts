@@ -787,6 +787,8 @@ async function rebuildImagesAlone(opts: SetupInfraOptions, run: Runner, unit: Se
   }
   opts.log('the daemon service starts from the new image on its next deployment — roll it now with:');
   opts.log(`  ${unit.images.rollHint(config)}`);
+  // #218 sat latent until a real dispatch found it; the proof is one job.
+  opts.log('then prove the rolled image on a live job: fleet canary');
   return 0;
 }
 

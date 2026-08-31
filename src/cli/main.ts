@@ -43,6 +43,7 @@ import {
 import { loadDotEnv } from '../shared/dotenv.ts';
 import { appliedUnitPins, skewReport, type DaemonBuild } from './skew.ts';
 import { runUpgrade } from './upgrade.ts';
+import { runCanary } from './canary.ts';
 import {
   twoLayerEnabled,
   computeImageHash,
@@ -163,6 +164,16 @@ Commands:
                                            skew end state. Already converged says so and changes
                                            nothing; a refused plan restores the ref and mutates
                                            nothing. --rebuild-images re-runs the image build alone.
+  canary [--delete-branch]                 Prove the deployment on a live job: dispatch a canned
+                                           read-only prose job through the normal path (manifest,
+                                           env, image build, git wiring), follow it to a terminal
+                                           state, and exit 0 only when it settles done with a READY
+                                           report. Prints the runner image build stamp and claim
+                                           branch from the job's own log. A job that blocks on a
+                                           decision or outlives the deadline is cancelled and
+                                           reported as a failure. The claim branch stays on origin
+                                           (evidence convention); --delete-branch removes it after
+                                           a pass. Run it after rolling a new image (fleet upgrade).
   doctor [--manifest path]                 Check local environment against the manifest — including
                                            auth credential health: a missing one names its recovery
                                            command, a present one is verified for presence (token
@@ -1629,6 +1640,24 @@ function readTokenFile(tokenFile: string): string | undefined {
   }
 }
 
+/**
+ * `fleet canary` (#220): one live job as proof the deployment works, through
+ * the same dispatch path as every real job. The verdict machinery lives in
+ * ./canary.ts; this wires in the CLI's own dispatch, daemon client, and git.
+ */
+async function cmdCanary(args: string[]): Promise<number> {
+  const { values } = parseCommand(args, { 'delete-branch': { type: 'boolean' } }, 0, 0);
+  return await runCanary({
+    delegate: (req) => dispatchDelegate({ ...req, buildOutput: (chunk) => process.stdout.write(chunk) }),
+    call: daemonCall,
+    deleteRemoteBranch: (branch) =>
+      spawnSync('git', ['push', 'origin', '--delete', branch], { encoding: 'utf8' }).status === 0,
+    deleteBranch: values['delete-branch'] === true,
+    log: (line) => console.log(line),
+    warn: (line) => console.error(line),
+  });
+}
+
 async function cmdDoctor(args: string[]): Promise<number> {
   const { values } = parseCommand(args, { manifest: { type: 'string' } }, 0, 0);
   const manifestPath =
@@ -1784,7 +1813,12 @@ function loadRetainedWorkspace(home: string, jobId: string): RetainedRecord | un
     console.error('container jobs keep their workspace inside the stopped task, not on this host');
     return undefined;
   }
-  if (!fs.existsSync(record.workspace)) {
+  // Existence is not the question — a git workspace is. A path that survives as
+  // an empty or clobbered directory holds no work, and pushing from it fails
+  // deep inside git ("Command failed: git add -A") while the record stays, so
+  // `fleet doctor` keeps reporting a workspace nobody can ever push. Both
+  // shapes are equally unrecoverable, so both drop the record here.
+  if (!fs.existsSync(path.join(record.workspace, '.git'))) {
     clearRetainedRecord(home, jobId);
     console.error('retained workspace is gone: ' + record.workspace);
     console.error('record dropped; nothing is recoverable from this host');
@@ -2250,6 +2284,8 @@ async function main(argv: string[]): Promise<number> {
         return await cmdUpgrade(rest);
       case 'doctor':
         return await cmdDoctor(rest);
+      case 'canary':
+        return await cmdCanary(rest);
       default:
         console.error(`unknown command: ${command}\n\n${HELP}`);
         return EXIT_USAGE;

@@ -129,6 +129,10 @@ test('resume-push: an incomplete record is refused, never guessed at', async () 
   // could not be parsed: the workspace was kept on purpose, so keep it.
   const home = makeTempDir('fleet-rp-home-');
   const workspace = makeTempDir('fleet-rp-ws-');
+  // A workspace the runner kept is a git workspace — it clones or inits before
+  // anything else runs. The fixture carries .git so this case stays about the
+  // record being incomplete, not about the workspace being unusable.
+  fs.mkdirSync(path.join(workspace, '.git'), { recursive: true });
   writeRetainedRecord(home, {
     jobId: 'job-late-5',
     reason: 'retain request unreadable — the runner asked to keep this workspace',
@@ -160,6 +164,26 @@ test('resume-push: a record whose workspace is gone is dropped, not silently ret
   assert.ok(
     !fs.existsSync(path.join(r.home, 'retained', 'job-late-2.json')),
     'a record pointing nowhere is dropped so doctor stops reporting it',
+  );
+});
+
+test('resume-push: a workspace path that holds no git repo is dropped too', async () => {
+  // The record's path can survive as an empty or clobbered directory — a
+  // partial delete, or something else reusing the name after a cleanup. It
+  // holds no work, so it is exactly as unrecoverable as a missing path. Before
+  // this was checked, resume-push tried to push from it and failed deep in git
+  // ("Command failed: git add -A") while keeping a record nobody could ever
+  // act on; CI hit that shape intermittently.
+  const r = retained({ jobId: 'job-late-6', target: 'APP-126', down: false });
+  fs.rmSync(r.workspace, { recursive: true, force: true });
+  fs.mkdirSync(r.workspace, { recursive: true });
+
+  const res = await runCli(['resume-push', 'job-late-6'], { env: { FLEET_HOME: r.home } });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /retained workspace is gone/);
+  assert.ok(
+    !fs.existsSync(path.join(r.home, 'retained', 'job-late-6.json')),
+    'a record pointing at a workspace with no git repo is dropped like a missing one',
   );
 });
 
