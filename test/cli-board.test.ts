@@ -378,18 +378,35 @@ test('invalidateDecision drops exactly one job\'s cached decisions', () => {
 
 // ── Chrome ────────────────────────────────────────────────────────────────────
 
-test('FLEET_BANNER is exactly 4 lines and under 30 chars wide', () => {
+// The compact dart is 17×6 (fixtures/bake-banner-art.ts), inset one column and
+// carrying the wordmark beside it — so 6 lines, and the widest is the tagline
+// row at 1 + 17 + 3 + 10. Pinned to the art's real dimensions: the banner is
+// what a short terminal drops first (BANNER_MIN_ROWS), so its footprint is a
+// layout contract, not decoration.
+test('FLEET_BANNER is exactly 6 lines and no wider than 31 chars', () => {
   const lines = FLEET_BANNER.split('\n');
-  assert.equal(lines.length, 4);
-  for (const line of lines) assert.ok(line.length <= 30, `banner line too wide (${line.length}): "${line}"`);
+  assert.equal(lines.length, 6);
+  for (const line of lines) assert.ok(line.length <= 31, `banner line too wide (${line.length}): "${line}"`);
+});
+
+test('FLEET_BANNER composes the plane with the wordmark and tagline', () => {
+  const lines = FLEET_BANNER.split('\n');
+  assert.match(lines[2], /^ [ ▀▄█▌▐]+ {3}F L E E T$/, 'wordmark sits beside the plane on row 3');
+  assert.match(lines[3], /^ [ ▀▄█▌▐]+ {3}your cloud$/, 'tagline sits beside the plane on row 4');
+  // Half blocks and nothing else: sextants, octants and braille are tofu in
+  // macOS terminal fonts, so the plain art may only use these glyphs.
+  const plane = lines.map((line) => line.slice(1, 18)).join('');
+  assert.match(plane, /^[ ▀▄█▌▐]+$/, `plain art carries a non-half-block glyph: ${JSON.stringify(plane)}`);
+  assert.ok(plane.includes('█'), 'the plain plane is filled, not an outline');
 });
 
 test('renderBanner: noColor is plain, colour is not, both clip to width', () => {
   const plain = renderBanner(80, true);
   assert.doesNotMatch(plain, /\x1b\[/);
-  assert.equal(plain.split('\n').length, 4);
+  assert.equal(plain.split('\n').length, 6);
   assert.match(renderBanner(80, false, '24bit'), /\x1b\[38;2;/, 'truecolor terminals get truecolor');
   assert.match(renderBanner(80, false, '256'), /\x1b\[38;5;/, '256-colour terminals get the cube');
+  assert.doesNotMatch(renderBanner(80, false, '256'), /\x1b\[38;2;/, '256 terminals get no truecolor triplet');
   for (const line of renderBanner(10, true).split('\n')) assert.ok(line.length <= 10);
 });
 
