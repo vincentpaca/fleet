@@ -15,7 +15,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -329,30 +329,53 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
   // guarantee therefore no longer lives in the image USER — it is pinned on
   // live jobs below ('one-layer setup.script runs as root …' asserts `id -u`
   // from inside the harness). What the image itself must guarantee: the boot
-  // user is root (or one-layer setup cannot install anything) and the dropped
-  // identity can still do the job.
+  // user is root (or one-layer setup cannot install anything), root can do git
+  // work in the workspace it boots with (#218), and the dropped identity can
+  // still do the job after the drop's chown.
   test('the runner image boots as root for setup, and uid 1000 can still do the job', () => {
-    const sh = (script: string, user?: string): string =>
+    const sh = (script: string, opts: { user?: string; env?: Record<string, string> } = {}): string =>
       execFileSync(
         'docker',
-        ['run', '--rm', ...(user !== undefined ? ['--user', user] : []), '--entrypoint', 'sh', BASE_TAG, '-c', script],
+        [
+          'run', '--rm',
+          ...(opts.user !== undefined ? ['--user', opts.user] : []),
+          ...Object.entries(opts.env ?? {}).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
+          '--entrypoint', 'sh', BASE_TAG, '-c', script,
+        ],
         { encoding: 'utf8' },
       ).trim();
 
     assert.equal(sh('id -u'), '0', 'the boot user must be root: one-layer setup.script installs system packages before the drop');
 
-    // The drop is worthless if uid 1000 cannot work. These are the four things
-    // the job does after the drop: write the workspace, clone into it, find
-    // the runner's entrypoint, and write the harness home.
+    // Root phase (#218): with a setup.script declared the runner is still root
+    // through the clone, and git refuses a repository inside a directory
+    // another uid owns (CVE-2022-24765 "dubious ownership"). The pre-#218
+    // image chowned /workspace to node and every git-wired dispatch died at
+    // `git config user.name` — this probe is that dispatch's first two moves.
     assert.equal(
-      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"', '1000'),
+      sh('cd /workspace && git init -q . && git config user.name probe && echo ok'),
       'ok',
-      'the dropped user must be able to write FLEET_WORKSPACE',
+      'root-phase git must work in FLEET_WORKSPACE: the clone precedes the drop when setup.script is declared',
     );
-    assert.equal(sh('git init -q /workspace/repo && echo ok', '1000'), 'ok');
-    assert.equal(sh('[ -w /home/node ] && echo ok', '1000'), 'ok', 'the harness writes config under the dropped user home');
+
+    // Post-drop phase: dropPrivileges chowns -R the workspace to the job user
+    // before uid 1000 runs anything — mirrored here with setpriv, since each
+    // probe is its own container. These are the four things the job does after
+    // the drop: write the workspace, clone into it, find the runner's
+    // entrypoint, and write the harness home.
+    const dropped = (probe: string): string =>
+      sh('chown -R 1000:1000 /workspace && exec setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "$FLEET_TEST_PROBE"', {
+        env: { FLEET_TEST_PROBE: probe },
+      });
     assert.equal(
-      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"', '1000'),
+      dropped('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"'),
+      'ok',
+      'the dropped user must be able to write FLEET_WORKSPACE after the drop chowns it',
+    );
+    assert.equal(dropped('git init -q /workspace/repo && echo ok'), 'ok');
+    assert.equal(sh('[ -w /home/node ] && echo ok', { user: '1000' }), 'ok', 'the harness writes config under the dropped user home');
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"', { user: '1000' }),
       'ok',
     );
   });
@@ -502,7 +525,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
     events(jobId: string): Promise<Array<{ type: string; text?: string }>>;
   };
 
-  async function startDockerLoop(t: { after(fn: () => void): void }, image: string): Promise<LoopHandle> {
+  async function startDockerLoop(t: { after(fn: () => void): void }, image: string, extraRunArgs: string[] = []): Promise<LoopHandle> {
     const { FleetDaemon } = await import('../src/daemon/server.ts');
     const { DockerProvider } = await import('../src/providers/docker.ts');
     const { writeSecretTempFile } = await import('../src/providers/provider.ts');
@@ -529,7 +552,7 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
           const imageRef = (hostSpec as { image?: string }).image ?? image;
           const imageIdx = args.indexOf(imageRef);
           if (imageIdx < 0) throw new Error(`image tag ${imageRef} not found in docker run args`);
-          args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway');
+          args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway', ...extraRunArgs);
           const { stdout } = await runCmd('docker', args);
           const containerId = stdout.trim();
           if (!containerId) throw new Error('docker run returned no container id');
@@ -546,6 +569,16 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
       // The provider satisfies the Provider interface structurally.
       provider: provider as unknown as Parameters<typeof FleetDaemon>[0]['provider'],
       port: 0,
+      // 0.0.0.0, not the 127.0.0.1 default: on Linux the container reaches
+      // the host at the docker bridge IP (host-gateway), where a
+      // loopback-bound listener does not exist — every live-loop test here
+      // sat at `queued` on CI while passing on Docker Desktop, whose
+      // host.docker.internal routes into the host's loopback instead.
+      // Ephemeral port, test-lifetime only. tcpHost keeps the ADVERTISED
+      // url at 127.0.0.1 (it defaults to bindHost), because the wrapper
+      // above rewrites exactly that into the container-reachable address.
+      bindHost: '0.0.0.0',
+      tcpHost: '127.0.0.1',
       longPollMs: 15_000,
     });
     const { port } = await daemon.start();
@@ -778,6 +811,122 @@ process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\
       `the drop must be the runner's first act when no setup is declared; logs: ${logs.join(' | ')}`,
     );
     assert.ok(!logs.some((x) => x.startsWith('setup script:')), 'no setup announce for a script-less manifest');
+  });
+
+  // #218: the whole git lifecycle on a live one-layer job. Every earlier live
+  // job ran with FLEET_GIT_URL unset, which is exactly how the pre-#218 image
+  // shipped broken: no test ever cloned on the real image, and the ownership
+  // bug lived in the clone. This one covers the full sequence the privilege
+  // contract promises: root clones and pushes the claim branch (setup.script
+  // declared), the operator script runs git as root in the clone, the drop
+  // hands the checkout to uid 1000, and the settle commits and pushes as the
+  // job user. The remote is a bare repo on the host, bind-mounted in;
+  // --shared=0666 because two container uids (0, then 1000) write objects
+  // into it, and safe.directory covers only the mount — /workspace itself
+  // stays under test.
+  test('git-wired one-layer job: root clones and pushes, uid 1000 settles and delivers', async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-git-loop-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const bare = join(dir, 'remote.git');
+    const seed = join(dir, 'seed');
+    execFileSync('git', ['init', '-q', '--bare', '--shared=0666', '-b', 'main', bare]);
+    mkdirSync(seed, { recursive: true });
+    writeFileSync(join(seed, 'README.md'), 'seed\n');
+    const g = (args: string[]) =>
+      execFileSync('git', ['-c', 'user.name=Seed', '-c', 'user.email=seed@example.com', ...args], { cwd: seed, encoding: 'utf8' });
+    execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'seed']);
+    g(['push', '-q', bare, 'main']);
+    // The container reads and writes this tree as uids the host never heard
+    // of; the mount does not remap them.
+    execFileSync('chmod', ['-R', 'a+rwX', dir]);
+
+    const loop = await startDockerLoop(t, BASE_TAG, ['-v', `${bare}:/remote.git`]);
+
+    // The operator-authored script does its own git work as root — real setup
+    // scripts do — so root-phase git is pinned beyond the runner's own calls.
+    const setupScript = 'git log -1 --format=%s > setup-git-head.txt\n';
+
+    // The harness carries the in-container assertions: it exits 3 (job never
+    // reaches done) unless the root-phase script saw the seeded history and
+    // the checkout is on the job branch. Then it leaves work for the settle
+    // push to deliver.
+    const gitHarness = `
+import { execSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+const out = join(process.cwd(), '.fleet', 'out');
+mkdirSync(out, { recursive: true });
+const head = readFileSync('setup-git-head.txt', 'utf8').trim();
+const branch = execSync('git branch --show-current', { encoding: 'utf8' }).trim();
+writeFileSync('work.txt', 'delivered by uid ' + execSync('id -u', { encoding: 'utf8' }).trim() + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'assistant',
+  message: { content: [{ type: 'text', text: 'head=' + head + ' branch=' + branch }] },
+}) + '\\n');
+if (head !== 'seed' || !branch.startsWith('fleet/')) process.exit(3);
+writeFileSync(join(out, 'report.json'), JSON.stringify({
+  status: 'READY',
+  next_action: 'reviewed and complete',
+  verification: ['branch=' + branch],
+  not_done: [],
+}));
+process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+`.trim();
+
+    const jobId = await loop.postJob({
+      workOrder: { ...DOCKER_WORK_ORDER, target: 'git-loop' },
+      manifest: {
+        ...DOCKER_TEST_MANIFEST,
+        setup: { image: 'node:22', script: '.fleet/setup.sh' },
+        gates: { pickup: 'test "$(id -u)" = "1000"' },
+      },
+      env: {
+        FLEET_HARNESS_CMD: 'node /workspace/.fleet/git-harness.mjs',
+        FLEET_GIT_URL: 'file:///remote.git',
+        // A name with a space: the #218 dispatches died at exactly
+        // `git config user.name` with one.
+        FLEET_GIT_NAME: 'Operator One',
+        FLEET_GIT_EMAIL: 'op@example.com',
+        // The mount is owned by a uid the container never heard of, and git
+        // honors safe.directory only from protected (system/global) config —
+        // GIT_CONFIG_* env and -c are deliberately ignored for it, which CI
+        // proved. GIT_CONFIG_GLOBAL promotes the synced file below to global
+        // scope. It names only the mounted remote: /workspace ownership is
+        // the thing under test and must never be whitelisted here.
+        GIT_CONFIG_GLOBAL: '/workspace/.fleet/test-gitconfig',
+      },
+      sync: {
+        '.fleet/setup.sh': Buffer.from(setupScript).toString('base64'),
+        '.fleet/git-harness.mjs': Buffer.from(gitHarness).toString('base64'),
+        '.fleet/test-gitconfig': Buffer.from('[safe]\n\tdirectory = /remote.git\n').toString('base64'),
+      },
+      image: BASE_TAG,
+    });
+
+    const finalState = await loop.waitFor(jobId, (s) => s === 'done' || s === 'cancelled', 'a terminal state (clone → setup → drop → settle push)', 180_000);
+    const texts = (await loop.events(jobId))
+      .filter((e) => typeof e.text === 'string')
+      .map((e) => String(e.text));
+    // The settle report (not the text events) is where a workspace-git failure
+    // names itself — an unstamped local build logs nothing before the clone.
+    const record = await (await fetch(`http://127.0.0.1:${loop.port}/jobs/${jobId}`)).text();
+    assert.equal(finalState, 'done', `job did not settle clean; job: ${record}; events: ${texts.join(' | ')}`);
+
+    const branch = `fleet/git-loop-${jobId}`;
+    assert.ok(
+      texts.includes(`workspace on branch ${branch} (pushed)`),
+      `claim branch was not pushed at setup; events: ${texts.join(' | ')}`,
+    );
+
+    // The delivery is judged on the host-side remote, not on job events: the
+    // settle push (uid 1000) must have landed the work commit, authored as
+    // the identity the dispatch carried.
+    const remoteGit = (args: string[]) => execFileSync('git', ['-C', bare, ...args], { encoding: 'utf8' }).trim();
+    assert.equal(remoteGit(['show', `${branch}:work.txt`]), 'delivered by uid 1000');
+    assert.equal(remoteGit(['show', `${branch}:setup-git-head.txt`]), 'seed', 'the root-phase setup script output must be part of the delivered work');
+    assert.equal(remoteGit(['log', '-1', '--format=%an', branch]), 'Operator One');
   });
 
   test('clean up test images after suite', () => {

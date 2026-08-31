@@ -182,6 +182,22 @@ test('getHeadSha returns the current HEAD SHA after a commit', () => {
   assert.equal(sha, remoteHead);
 });
 
+// Settle reports and event log lines keep only err.message's first line, and
+// execFileSync's first line is the argv echoed back — the #218 dispatches all
+// settled with "Command failed: git config user.name …" while git's actual
+// refusal (dubious ownership) sat below the fold. The chokepoint refolds.
+test('a failed git call carries stderr on the first line of err.message', () => {
+  const notARepo = mkdtempSync(join(tmpdir(), 'fleet-ws-'));
+  assert.throws(
+    () => getHeadSha(notARepo),
+    (err: unknown) => {
+      const firstLine = String(err instanceof Error ? err.message : err).split('\n')[0];
+      assert.match(firstLine, /^git rev-parse failed: fatal: not a git repository/);
+      return true;
+    },
+  );
+});
+
 test('createDraftPr calls gh with correct args and returns trimmed URL', () => {
   // Inject a mock ghRun to avoid real GitHub API calls.
   const calls: string[][] = [];

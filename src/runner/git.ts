@@ -126,6 +126,13 @@ function runTool(tool: 'git' | 'gh', workspace: string, args: string[], timeoutM
     if ((err as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
       throw new Error(`${tool} ${args[0]} timed out after ${timeoutMs}ms`);
     }
+    // Callers log err.message's first line, and execFileSync's first line is
+    // the argv echoed back — the diagnosis (the tool's stderr) sat below the
+    // fold and never reached a settle report (#218). Refold to one line naming
+    // the subcommand and the first stderr line.
+    const stderr = (err as { stderr?: unknown }).stderr;
+    const detail = typeof stderr === 'string' ? stderr.trim().split('\n')[0] : '';
+    if (detail !== '') throw new Error(`${tool} ${args[0]} failed: ${detail}`);
     throw err;
   }
 }

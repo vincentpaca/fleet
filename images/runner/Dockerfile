@@ -98,12 +98,18 @@ ENV FLEET_BUILD_SHA=${FLEET_BUILD_SHA}
 # asserted on live jobs in test/cli-image.test.ts (harness `id -u` is 1000),
 # not by grepping this file.
 #
-# /workspace is still created and owned by the job user here: the drop chowns
-# whatever root materialised, but uid 1000 could never mkdir at the filesystem
-# root itself. The container is ephemeral and mounts no volume, so there is no
-# host-side ownership to reconcile — unlike the daemon image, which writes to
-# EFS and keeps uid 1000 via its EFS access point (#156).
-RUN mkdir -p /workspace && chown node:node /workspace
+# /workspace is created here and stays root-owned. It was chowned to the job
+# user until #218: with a setup.script declared the runner is still root when
+# it clones, and git refuses a repository inside a directory another uid owns
+# (CVE-2022-24765 "dubious ownership") — every git-wired dispatch died at
+# `git config`. Ownership follows the worker instead: root owns the workspace
+# exactly as long as root works in it, and dropPrivileges chowns -R to the job
+# user before uid 1000 touches it (src/runner/setup.ts). Both phases are
+# asserted on the built image in test/cli-image.test.ts. The container is
+# ephemeral and mounts no volume, so there is no host-side ownership to
+# reconcile — unlike the daemon image, which writes to EFS and keeps uid 1000
+# via its EFS access point (#156).
+RUN mkdir -p /workspace
 
 # Entrypoint: the runner, deliberately as root until setup settles (see above).
 # API keys arrive via docker run -e, never baked in.
