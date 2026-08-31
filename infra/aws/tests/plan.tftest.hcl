@@ -538,3 +538,25 @@ run "worker_user_data_enables_the_ssm_agent" {
     error_message = "worker user_data must still register the instance with the ECS cluster"
   }
 }
+
+# Teardown must not need hands. A repository holding images refuses to delete,
+# which turns `fleet setup infra --destroy` into a half-destroyed deployment
+# plus a manual batch-delete-image (paid for on 2026-08-26). Images are
+# rebuildable from a pinned ref by definition, so the repositories carry
+# force_delete.
+run "registries_do_not_block_teardown" {
+  command = plan
+
+  variables {
+    project_repos = ["fleet-extra"]
+  }
+
+  assert {
+    condition     = aws_ecr_repository.runner.force_delete == true
+    error_message = "the runner repository must set force_delete or a teardown stalls on its images"
+  }
+  assert {
+    condition     = alltrue([for r in aws_ecr_repository.project : r.force_delete])
+    error_message = "every project repository must set force_delete for the same reason"
+  }
+}
