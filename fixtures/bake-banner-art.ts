@@ -38,11 +38,13 @@ export type ArtSize = { constant: string; box: string; doc: string[] };
 export const SIZES: ArtSize[] = [
   {
     constant: 'DART_COMPACT',
-    box: '30x6',
+    box: '36x10',
     doc: [
-      'The dart, compact: the cockpit header and `fleet --help`. Six rows is what',
-      'the cockpit can pay for a banner — the plane costs roster rows, so it stays',
-      'within two of what the hand-drawn 4-row plane cost (#225).',
+      'The dart, banner size: the cockpit header and `fleet --help`. 30x6 was tried',
+      'first, to keep the banner close to the hand-drawn plane\'s four rows, and it',
+      'is not a paper airplane at that scale — the fold and the wing edge both go.',
+      'The plane decides the size; the cockpit suppresses the whole banner on short',
+      'windows instead (BANNER_MIN_ROWS).',
     ],
   },
   {
