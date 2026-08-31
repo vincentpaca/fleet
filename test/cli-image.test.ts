@@ -329,30 +329,53 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
   // guarantee therefore no longer lives in the image USER — it is pinned on
   // live jobs below ('one-layer setup.script runs as root …' asserts `id -u`
   // from inside the harness). What the image itself must guarantee: the boot
-  // user is root (or one-layer setup cannot install anything) and the dropped
-  // identity can still do the job.
+  // user is root (or one-layer setup cannot install anything), root can do git
+  // work in the workspace it boots with (#218), and the dropped identity can
+  // still do the job after the drop's chown.
   test('the runner image boots as root for setup, and uid 1000 can still do the job', () => {
-    const sh = (script: string, user?: string): string =>
+    const sh = (script: string, opts: { user?: string; env?: Record<string, string> } = {}): string =>
       execFileSync(
         'docker',
-        ['run', '--rm', ...(user !== undefined ? ['--user', user] : []), '--entrypoint', 'sh', BASE_TAG, '-c', script],
+        [
+          'run', '--rm',
+          ...(opts.user !== undefined ? ['--user', opts.user] : []),
+          ...Object.entries(opts.env ?? {}).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
+          '--entrypoint', 'sh', BASE_TAG, '-c', script,
+        ],
         { encoding: 'utf8' },
       ).trim();
 
     assert.equal(sh('id -u'), '0', 'the boot user must be root: one-layer setup.script installs system packages before the drop');
 
-    // The drop is worthless if uid 1000 cannot work. These are the four things
-    // the job does after the drop: write the workspace, clone into it, find
-    // the runner's entrypoint, and write the harness home.
+    // Root phase (#218): with a setup.script declared the runner is still root
+    // through the clone, and git refuses a repository inside a directory
+    // another uid owns (CVE-2022-24765 "dubious ownership"). The pre-#218
+    // image chowned /workspace to node and every git-wired dispatch died at
+    // `git config user.name` — this probe is that dispatch's first two moves.
     assert.equal(
-      sh('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"', '1000'),
+      sh('cd /workspace && git init -q . && git config user.name probe && echo ok'),
       'ok',
-      'the dropped user must be able to write FLEET_WORKSPACE',
+      'root-phase git must work in FLEET_WORKSPACE: the clone precedes the drop when setup.script is declared',
     );
-    assert.equal(sh('git init -q /workspace/repo && echo ok', '1000'), 'ok');
-    assert.equal(sh('[ -w /home/node ] && echo ok', '1000'), 'ok', 'the harness writes config under the dropped user home');
+
+    // Post-drop phase: dropPrivileges chowns -R the workspace to the job user
+    // before uid 1000 runs anything — mirrored here with setpriv, since each
+    // probe is its own container. These are the four things the job does after
+    // the drop: write the workspace, clone into it, find the runner's
+    // entrypoint, and write the harness home.
+    const dropped = (probe: string): string =>
+      sh('chown -R 1000:1000 /workspace && exec setpriv --reuid=1000 --regid=1000 --clear-groups sh -c "$FLEET_TEST_PROBE"', {
+        env: { FLEET_TEST_PROBE: probe },
+      });
     assert.equal(
-      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"', '1000'),
+      dropped('node -e "const f=require(\'node:fs\');f.mkdirSync(\'/workspace/.fleet/out\',{recursive:true});f.writeFileSync(\'/workspace/.fleet/out/probe\',\'ok\');console.log(\'ok\')"'),
+      'ok',
+      'the dropped user must be able to write FLEET_WORKSPACE after the drop chowns it',
+    );
+    assert.equal(dropped('git init -q /workspace/repo && echo ok'), 'ok');
+    assert.equal(sh('[ -w /home/node ] && echo ok', { user: '1000' }), 'ok', 'the harness writes config under the dropped user home');
+    assert.equal(
+      sh('node -e "console.log(require(\'node:fs\').existsSync(\'/opt/fleet/src/runner/main.ts\')?\'ok\':\'missing\')"', { user: '1000' }),
       'ok',
     );
   });
