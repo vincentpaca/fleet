@@ -70,6 +70,31 @@ fleet delegate "why do queued jobs sit behind the capacity cap"   # prose: ends 
 
 `setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. The runner and daemon images are built by the same command, inside your account (a one-shot CodeBuild project the unit provisions), from that same pinned ref — images and infrastructure can never skew, and there is no clone and no local Docker anywhere on this path. `fleet setup infra --rebuild-images` re-runs just the build when you upgrade. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
 
+### Setting up headless (agents and CI)
+
+Every `setup` step above is a wizard only because there is a terminal to ask on.
+Point an agent — or a CI job — at a fresh checkout with no terminal at all, and
+the same three `setup` commands take every answer as a flag instead:
+
+```sh
+npm install -g github:vincentpaca/fleet
+
+fleet setup repo \
+  --repo origin \
+  --command-path .claude/commands/dev.md \
+  --critic code-reviewer \
+  --yes                                    # image, pickup gate, env vars: extracted from the checkout
+
+fleet setup infra --name my-fleet --region us-east-1 --yes   # plan, apply, build images, capture fleet-config.json
+
+fleet connect --detach                     # tunnel in the background instead of holding the terminal
+fleet setup harness --harness claude-code --scope project
+
+fleet doctor                               # clean means the manifest, gate, credentials and deployment agree
+```
+
+`--command-path` and `--name` are the two values setup cannot extract for you: `--command-path` is your harness's own command file (`.claude/commands/dev.md` for Claude Code; the Codex or OpenCode equivalent otherwise), and it has to exist before the interview accepts it; `--name` names the deployment and has no sensible default to guess. Everything else above either has a fixed default (`--region`, `--scope`) or is read out of the checkout (`--image`, the pickup gate, `env.vars` from `.env.example`) — pass the matching flag instead wherever your repo's answer differs. A value neither a flag nor the checkout can supply exits 1 naming the flag, never a hang.
+
 ## Using Fleet from your coding harness
 
 Fleet has no UI of its own — your harness is the UI. The session you already talk to dispatches the job, holds the watch, relays a blocked job's question to you through its own ask mechanism, and reports the settle. That behaviour is one skill file, and `fleet setup harness` installs it where your harness looks for it:
