@@ -53,12 +53,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Harness CLI — one layer; HARNESS_CLI selects the npm package.
 #   claude-code → @anthropic-ai/claude-code
 #   codex       → @openai/codex
-#   opencode    → opencode
+#   opencode    → opencode-ai  (the package is not named for its binary; #228)
 RUN set -eu; \
     case "$HARNESS_CLI" in \
       claude-code) pkg="@anthropic-ai/claude-code" ;; \
       codex)       pkg="@openai/codex" ;; \
-      opencode)    pkg="opencode" ;; \
+      opencode)    pkg="opencode-ai" ;; \
       *) echo "unknown HARNESS_CLI: $HARNESS_CLI" >&2; exit 1 ;; \
     esac; \
     if [ "$HARNESS_VERSION" = "latest" ]; then \
