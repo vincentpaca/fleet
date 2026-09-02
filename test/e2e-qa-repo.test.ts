@@ -32,7 +32,7 @@
 // env var (docs/decisions.md#d10).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -74,6 +74,41 @@ const NEXT_ACTION = 'qa probe complete';
  * until the daemon's 20m idle backstop, which a chatty harness never trips.
  */
 const DEADLINE_MS = 15 * 60 * 1000;
+
+/** How long to wait for container-to-host routing to come good before giving up. */
+const REACHABILITY_WAIT_MS = 3 * 60 * 1000;
+
+/** The command file the target repo's author wrote; `setup repo` points the manifest at it. */
+const COMMAND_PATH = '.claude/commands/task.md';
+
+/**
+ * Every env var name the generated manifest declares. Dispatch resolves each
+ * one and refuses on any that is `undefined` (src/cli/main.ts:806), so a row
+ * supplies '' for the credentials it does not use.
+ */
+const ENV_VARS = [
+  'FLEET_HARNESS_CMD',
+  'GH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CODEX_AUTH_B64',
+  'OPENCODE_AUTH_B64',
+  'NODE_EXTRA_CA_CERTS',
+];
+
+/**
+ * The prompt the non-claude rows carry.
+ *
+ * A `FLEET_HARNESS_CMD` override returns before the runner builds anything
+ * (src/runner/harness.ts:104), which means it suppresses both the derived
+ * `/<command> <target>` prompt AND the injected output contract. So an
+ * override row has to say both itself. It points at the target repo's own
+ * command file rather than restating the task, so all three rows are driven by
+ * one source of truth and a change to the task cannot make the rows disagree.
+ */
+const OVERRIDE_PROMPT =
+  'Read .claude/commands/task.md in this repository and do exactly what it says. '
+  + 'Write every deliverable as a file under .fleet/out/artifacts/ — files anywhere else are not collected. '
+  + 'Do not ask questions; there is nobody to answer them.';
 
 type HarnessRow = {
   id: string;
@@ -121,24 +156,42 @@ const ROWS: HarnessRow[] = [
   {
     id: 'codex',
     image: 'fleet-runner:codex-latest',
-    // Provisional: `codex exec --full-auto "<prompt>"`, where the prompt has to
-    // restate the output contract because an override suppresses the injected
-    // one. Left unpinned until it is confirmed against the installed CLI.
-    command: undefined,
-    // src/cli/setup.ts copies the operator's auth.json to
-    // .fleet/codex-auth.json and gitignores it, but nothing in src/runner/ or
-    // images/ points CODEX_HOME at it. That is a product gap, not a test gap.
-    missingCredentials: () => ['no CODEX_HOME wiring reaches the sandbox (auth.json is copied but never pointed at)'],
+    // `exec` is codex's non-interactive mode. The sandbox flag is not
+    // recklessness: the container IS the sandbox, and codex's own confinement
+    // on top of it only blocks the writes the job exists to make — the same
+    // reasoning behind claude-code's --allowedTools in the derived command.
+    // --skip-git-repo-check because the workspace is a fresh clone whose
+    // provenance codex has no way to recognise.
+    command: `codex exec --sandbox danger-full-access --skip-git-repo-check ${JSON.stringify(OVERRIDE_PROMPT)}`,
+    // The credential is the operator's own ~/.codex/auth.json, handed over
+    // base64 and placed by the target repo's setup.sh. It cannot ride
+    // workspace.sync: a declared-but-missing sync file fails EVERY dispatch,
+    // including the rows that do not need it.
+    //
+    // KNOWN FAILURE on an org-managed Codex account. Enterprise requirements
+    // can pin `approval_policy` to UnlessTrusted and restrict `sandbox_mode`
+    // to [ReadOnly, WorkspaceWrite], overriding whatever this command asks
+    // for. `codex exec` cannot answer an approval prompt ("file change
+    // approval is not supported in exec mode"), so every write is declined and
+    // the job settles having produced nothing. Verified against all three
+    // sandbox modes and with the workspace marked trusted; none get through.
+    // That is a property of the account, not of Fleet — the row stays live
+    // because it passes on an unmanaged one, and a red result here is the
+    // honest report of what that account can do.
+    missingCredentials: () =>
+      process.env.CODEX_AUTH_B64
+        ? []
+        : ['CODEX_AUTH_B64 unset — export it with: export CODEX_AUTH_B64=$(base64 < ~/.codex/auth.json)'],
     translated: false,
   },
   {
     id: 'opencode',
     image: 'fleet-runner:opencode-latest',
-    command: undefined,
-    // A binary/PATH entry exists (src/cli/setup-harnesses.ts:69-75); a
-    // credential convention does not. Resolves by investigation, or the row
-    // skips indefinitely — which is an honest state, not a bug.
-    missingCredentials: () => ['no opencode credential convention exists'],
+    command: `opencode run ${JSON.stringify(OVERRIDE_PROMPT)}`,
+    missingCredentials: () =>
+      process.env.OPENCODE_AUTH_B64
+        ? []
+        : ['OPENCODE_AUTH_B64 unset — export it with: export OPENCODE_AUTH_B64=$(base64 < ~/.local/share/opencode/auth.json)'],
     translated: false,
   },
 ];
@@ -255,9 +308,9 @@ function unmetPrerequisites(row: HarnessRow): string[] {
  * sentinel resolve (src/cli/main.ts:824-825), so the QA repo's own committed
  * manifest is the artifact under test.
  */
-function cloneQaRepo(): string {
+async function cloneQaRepo(): Promise<string> {
   const project = mkdtempSync(join(tmpdir(), 'fleet-qa-proj-'));
-  execFileSync('git', ['clone', '--quiet', qaRepo(), project], { env: gitEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+  await run('git', ['clone', '--quiet', qaRepo(), project], { env: gitEnv() });
   return project;
 }
 
@@ -389,35 +442,109 @@ async function assertDelivery(
  * host, and a VPN or TLS-inspecting proxy can take it away without warning.
  */
 async function assertDaemonReachable(hostAddr: string, port: number, extraRunArgs: string[]): Promise<void> {
-  const probe = spawnSync(
-    'docker',
-    [
-      'run', '--rm', '--add-host', 'host.docker.internal:host-gateway', ...extraRunArgs,
-      '--entrypoint', 'sh', 'fleet-runner:claude-code-latest', '-c',
-      `node -e "const c=new AbortController();setTimeout(()=>c.abort(),10000);`
-        + `fetch('http://${hostAddr}:${port}/health',{signal:c.signal})`
-        + `.then(r=>r.text()).then(t=>{process.stdout.write(t);process.exit(0)})`
-        + `.catch(e=>{process.stdout.write('unreachable: '+e.name);process.exit(1)})"`,
-    ],
-    { encoding: 'utf8', timeout: 90_000 },
+  const probeOnce = async (): Promise<boolean> => {
+    try {
+      await run(
+      'docker',
+      [
+        'run', '--rm', '--add-host', 'host.docker.internal:host-gateway', ...extraRunArgs,
+        '--entrypoint', 'sh', 'fleet-runner:claude-code-latest', '-c',
+        `node -e "const c=new AbortController();setTimeout(()=>c.abort(),8000);`
+          + `fetch('http://${hostAddr}:${port}/health',{signal:c.signal})`
+          + `.then(r=>r.text()).then(()=>process.exit(0)).catch(()=>process.exit(1))"`,
+      ],
+      { encoding: 'utf8', timeout: 60_000 },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Retried, not one-shot. Container-to-host routing is not reliably steady on
+  // every machine — on at least one it drops out for a minute at a time and
+  // comes back on its own, with nothing in Docker or the host to show for it.
+  // A one-shot probe turns that into a coin flip on a test that costs real
+  // model tokens to run, so wait for the window rather than fail into it. The
+  // bound still exists: an outage longer than this is a real problem and the
+  // message says what to do about it.
+  const deadline = Date.now() + REACHABILITY_WAIT_MS;
+  let attempts = 0;
+  for (;;) {
+    attempts += 1;
+    if (await probeOnce()) return;
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+  assert.fail(
+    `a container could not reach the test daemon at ${hostAddr}:${port} in ${attempts} attempts over `
+      + `${Math.round(REACHABILITY_WAIT_MS / 1000)}s, so no job could ever report in. `
+      + 'On Linux set FLEET_DOCKER_HOST_ADDR=172.17.0.1; on macOS this usually means Docker Desktop '
+      + 'or a VPN has taken the host-gateway route away — restarting Docker Desktop clears it.',
   );
-  assert.equal(
-    probe.status,
-    0,
-    `a container cannot reach the test daemon at ${hostAddr}:${port}, so no job could ever report in. `
-      + `Probe said: ${(probe.stdout ?? '').trim() || '(no output)'}. `
-      + 'On Linux set FLEET_DOCKER_HOST_ADDR=172.17.0.1; on macOS this usually means Docker Desktop or a VPN has taken the host-gateway route away.',
-  );
+}
+
+/**
+ * What a user types before their first dispatch. The manifest is generated
+ * here rather than committed to the target repo, because generating it is part
+ * of what an end-to-end run has to prove: a repository that already carries a
+ * manifest is one somebody set up by hand, and testing against that skips the
+ * step every real adopter performs.
+ *
+ * Every prompt gets a flag, so the interview never blocks on a terminal. Async
+ * for the same reason everything else on this path is: a synchronous child
+ * would freeze the daemon's event loop, and the daemon has to keep answering
+ * while containers are alive.
+ */
+async function setupRepo(project: string, image: string, env: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
+  const args = [
+    'setup', 'repo', '--yes',
+    '--repo', 'origin',
+    // The daemon launches manifest.setup.image when no per-job override exists
+    // (src/daemon/server.ts:628), so under the docker provider this IS the job
+    // container. A bare node image would start without the runner in it.
+    '--image', image,
+    '--setup-command', 'npm install --no-fund --no-audit',
+    '--sync', '',
+    '--env-vars', ENV_VARS.join(', '),
+    '--pickup', 'npm test',
+    '--command-path', COMMAND_PATH,
+    '--critic', 'code-reviewer',
+  ];
+  try {
+    const res = await run('node', [cli, ...args], { cwd: project, env });
+    return { code: 0, out: `${res.stdout}${res.stderr}` };
+  } catch (err) {
+    const e = err as { code?: number; stdout?: string; stderr?: string };
+    return { code: e.code ?? -1, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
 }
 
 async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Promise<void> {
   const loop = await startDockerLoop(t, row.image, caMountArgs());
   await assertDaemonReachable(loop.dockerHostAddr, loop.port, caMountArgs());
-  const project = cloneQaRepo();
+  const project = await cloneQaRepo();
   const env = dispatchEnv(row, loop.port);
-  const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
 
-  // No --mode, no --finish: the prose shape's defaults are what is under test.
+  // Step one of the journey, and a real assertion: a failure here means an
+  // adopter cannot onboard their repo at all.
+  const setup = await setupRepo(project, row.image, env);
+  assert.equal(setup.code, 0, `fleet setup repo failed on a fresh checkout:\n${setup.out.slice(-2000)}`);
+  assert.ok(existsSync(join(project, '.fleet', 'manifest.json')), 'setup repo reported success but wrote no manifest');
+
+  // The journey does not end at generating .fleet/ — a job clones the REMOTE,
+  // so anything setup repo wrote is invisible to it until it is committed.
+  // That is what an adopter does next, and skipping it is how the codex row
+  // silently lost its setup script (and with it, its credential).
+  await run('git', ['add', '.fleet'], { cwd: project, env: gitEnv() });
+  const staged = await run('git', ['diff', '--cached', '--name-only'], { cwd: project, env: gitEnv() });
+  if (staged.stdout.trim() !== '') {
+    await run('git', ['-c', 'user.name=fleet-e2e', '-c', 'user.email=fleet-e2e@example.com',
+      'commit', '-q', '-m', 'Add the Fleet manifest generated by fleet setup repo'], { cwd: project, env: gitEnv() });
+    await run('git', ['push', '--quiet', 'origin', 'HEAD:main'], { cwd: project, env: gitEnv() });
+  }
+
+  const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
   const delegated = await fleet(['delegate', TARGET]);
   const jobId = delegated.stdout.trim().split(/\s+/).find((word) => word.startsWith('job-'));
   assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
@@ -427,7 +554,7 @@ async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Pr
   const state = await loop.waitFor(
     jobId,
     (s) => s === 'done' || s === 'cancelled',
-    `a terminal state for ${jobId} (clone → gate → ${row.id} → settle)`,
+    `a terminal state for ${jobId} (setup → clone → gate → ${row.id} → settle)`,
     DEADLINE_MS,
   );
   const events = await loop.events(jobId);
@@ -436,10 +563,6 @@ async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Pr
   await assertDelivery(jobId, events, fleet);
 
   if (row.translated) {
-    // src/runner/translate.ts:173 emits this prefix only for a real tool call.
-    // A `think` assertion is deliberately absent: :205-209 maps plain assistant
-    // text to `think` as well as thinking blocks, so it would be a liveness
-    // check dressed up as a reasoning check.
     assert.ok(
       events.some((e) => e.type === 'log' && typeof e.text === 'string' && e.text.startsWith('tool_use ')),
       `no tool_use log event — the translator saw no tool calls; events: ${digest(events)}`,

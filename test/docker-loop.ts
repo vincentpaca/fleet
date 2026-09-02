@@ -79,6 +79,13 @@ export async function startDockerLoop(t: { after(fn: () => void): void }, image:
         const imageIdx = args.indexOf(imageRef);
         if (imageIdx < 0) throw new Error(`image tag ${imageRef} not found in docker run args`);
         args.splice(imageIdx, 0, '--add-host', 'host.docker.internal:host-gateway', ...extraRunArgs);
+        // The real DockerProvider.launch clears a stale container first, and
+        // this wrapper has to do the same: the auto-retry (#30) relaunches
+        // under the SAME job id, so the dead attempt still owns the name
+        // `fleet-<jobId>` and `docker run --name` fails outright on it. Without
+        // this, every retry dies on the collision instead of on whatever it
+        // was retrying, and the real cause never surfaces.
+        await runCmd('docker', ['rm', '-f', `fleet-${hostSpec.jobId}`]).catch(() => undefined);
         const { stdout } = await runCmd('docker', args);
         const containerId = stdout.trim();
         if (!containerId) throw new Error('docker run returned no container id');
