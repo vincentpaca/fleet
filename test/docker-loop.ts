@@ -103,7 +103,17 @@ export async function startDockerLoop(t: { after(fn: () => void): void }, image:
     // Ephemeral port, test-lifetime only. tcpHost keeps the ADVERTISED
     // url at 127.0.0.1 (it defaults to bindHost), because the wrapper
     // above rewrites exactly that into the container-reachable address.
-    bindHost: '0.0.0.0',
+    // '::' rather than '0.0.0.0': dual-stack, so the listener answers on IPv6
+    // as well. `--add-host host.docker.internal:host-gateway` writes BOTH an
+    // A and an AAAA record into the container's /etc/hosts (192.168.65.254 and
+    // fdc4:f303:9324::254 on Docker Desktop), so whichever address the
+    // container's resolver hands its client is the one that must answer. An
+    // IPv4-only listener leaves the AAAA half of that pair connecting to
+    // nothing, which presents as an intermittent hang rather than a refusal —
+    // and a hang here means the job never reports in and sits at `queued`.
+    // Node treats '::' as dual-stack unless ipv6Only is set, so this is
+    // strictly more permissive than '0.0.0.0'.
+    bindHost: '::',
     tcpHost: '127.0.0.1',
     longPollMs: 15_000,
   });
