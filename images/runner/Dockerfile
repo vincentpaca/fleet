@@ -58,7 +58,7 @@ RUN set -eu; \
     case "$HARNESS_CLI" in \
       claude-code) pkg="@anthropic-ai/claude-code" ;; \
       codex)       pkg="@openai/codex" ;; \
-      opencode)    pkg="opencode" ;; \
+      opencode)    pkg="opencode-ai" ;; \
       *) echo "unknown HARNESS_CLI: $HARNESS_CLI" >&2; exit 1 ;; \
     esac; \
     if [ "$HARNESS_VERSION" = "latest" ]; then \
