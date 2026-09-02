@@ -32,8 +32,8 @@
 // env var (docs/decisions.md#d10).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -142,6 +142,31 @@ const ROWS: HarnessRow[] = [
     translated: false,
   },
 ];
+
+/**
+ * Where a mounted extra CA lands inside the container. Only used when the host
+ * has one.
+ */
+const CONTAINER_CA = '/etc/fleet-extra-ca.pem';
+
+/** The host's extra CA bundle, when it has one and the file is really there. */
+function hostCaFile(): string | undefined {
+  const path = process.env.NODE_EXTRA_CA_CERTS;
+  return path && existsSync(path) ? path : undefined;
+}
+
+/**
+ * A TLS-inspecting proxy (corporate networks routinely run one) reissues
+ * certificates under a private root. The host trusts it — that is what
+ * NODE_EXTRA_CA_CERTS on the host means — but a container is a fresh trust
+ * store, so the harness's calls to its own model API fail to verify and the
+ * job dies for a reason that looks nothing like a proxy. When the host has
+ * such a CA, hand the container the same one; when it does not, add nothing.
+ */
+function caMountArgs(): string[] {
+  const ca = hostCaFile();
+  return ca === undefined ? [] : ['-v', `${ca}:${CONTAINER_CA}:ro`];
+}
 
 /** The QA repo pointer. Only called once the skip line has proved it is set. */
 function qaRepo(): string {
@@ -291,6 +316,9 @@ function dispatchEnv(row: HarnessRow, port: number): NodeJS.ProcessEnv {
     CODEX_AUTH_B64: process.env.CODEX_AUTH_B64 ?? '',
     OPENCODE_AUTH_B64: process.env.OPENCODE_AUTH_B64 ?? '',
     GH_TOKEN: process.env.GH_TOKEN ?? '',
+    // Points at the mount, not at the host path: the container's filesystem is
+    // its own. Empty when the host has no extra CA, which is the normal case.
+    NODE_EXTRA_CA_CERTS: hostCaFile() === undefined ? '' : CONTAINER_CA,
   };
 }
 
@@ -348,8 +376,43 @@ async function assertDelivery(
 }
 
 /** Dispatch one row against the QA repo and hold it to the contract. */
+/**
+ * Prove a container can reach this daemon before spending a job on it.
+ *
+ * Without this the failure is a fifteen-minute timeout on a job stuck at
+ * `queued`, with an empty container log and nothing naming the cause — the
+ * runner posts `state: running` as its first act, so an unreachable daemon and
+ * a container that never started look identical from the outside. The probe
+ * costs one container start and turns that into an immediate, specific
+ * message. Reachability is not a given even on a working machine: Docker
+ * Desktop's host-gateway alias is the only route from a container back to the
+ * host, and a VPN or TLS-inspecting proxy can take it away without warning.
+ */
+async function assertDaemonReachable(hostAddr: string, port: number, extraRunArgs: string[]): Promise<void> {
+  const probe = spawnSync(
+    'docker',
+    [
+      'run', '--rm', '--add-host', 'host.docker.internal:host-gateway', ...extraRunArgs,
+      '--entrypoint', 'sh', 'fleet-runner:claude-code-latest', '-c',
+      `node -e "const c=new AbortController();setTimeout(()=>c.abort(),10000);`
+        + `fetch('http://${hostAddr}:${port}/health',{signal:c.signal})`
+        + `.then(r=>r.text()).then(t=>{process.stdout.write(t);process.exit(0)})`
+        + `.catch(e=>{process.stdout.write('unreachable: '+e.name);process.exit(1)})"`,
+    ],
+    { encoding: 'utf8', timeout: 90_000 },
+  );
+  assert.equal(
+    probe.status,
+    0,
+    `a container cannot reach the test daemon at ${hostAddr}:${port}, so no job could ever report in. `
+      + `Probe said: ${(probe.stdout ?? '').trim() || '(no output)'}. `
+      + 'On Linux set FLEET_DOCKER_HOST_ADDR=172.17.0.1; on macOS this usually means Docker Desktop or a VPN has taken the host-gateway route away.',
+  );
+}
+
 async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Promise<void> {
-  const loop = await startDockerLoop(t, row.image);
+  const loop = await startDockerLoop(t, row.image, caMountArgs());
+  await assertDaemonReachable(loop.dockerHostAddr, loop.port, caMountArgs());
   const project = cloneQaRepo();
   const env = dispatchEnv(row, loop.port);
   const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
