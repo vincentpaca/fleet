@@ -168,23 +168,26 @@ const ROWS: HarnessRow[] = [
     // workspace.sync: a declared-but-missing sync file fails EVERY dispatch,
     // including the rows that do not need it.
     //
-    // KNOWN FAILURE, and the cause is the entry point rather than the account.
-    // An org-managed Codex profile can pin the filesystem to read-only with no
-    // writable entries, leaving approval escalation as the only route to a
-    // write — that is why the same command succeeds on the operator's own
-    // machine, where the escalation is answered, and fails here. `codex exec`
-    // states the limit itself: "file change approval is not supported in exec
-    // mode", so under such a profile it can never write, whatever flags it is
-    // given. Verified against danger-full-access, workspace-write, a trusted
-    // project entry, a TTY, bubblewrap with relaxed seccomp, and
-    // --dangerously-bypass-approvals-and-sandbox.
+    // KNOWN FAILURE on an org-managed account, and NOT the wrong entry point:
+    // `codex exec` is OpenAI's documented headless/CI mode, which normally
+    // runs with no approval prompt at all under whatever sandbox it is given.
     //
-    // The real integration is `codex mcp-server` / `app-server`, where an
-    // approval request has somewhere to go — which is a genuine adapter, not a
-    // command string, and exactly what harness.ts:113 defers until an adopter
-    // needs it. Fleet already owns a decision mechanism such an adapter could
-    // answer with. The row stays live because exec mode does work on an
-    // unmanaged account.
+    // What breaks it here is admin-enforced `requirements.toml`, delivered on
+    // ChatGPT business sign-in and attached to the ACCOUNT rather than the
+    // machine — which is why it applies inside the container although only
+    // auth.json was copied in. It pins the filesystem read-only and forces an
+    // approval policy, and exec mode has no way to answer an approval ("file
+    // change approval is not supported in exec mode"), so every write is
+    // declined. The same command succeeds on the operator's own machine, where
+    // the escalation is answered. Verified against danger-full-access,
+    // workspace-write, a trusted project entry, a TTY, bubblewrap with relaxed
+    // seccomp, and --dangerously-bypass-approvals-and-sandbox.
+    //
+    // Fixable only outside Fleet: an admin can allow non-interactive use via a
+    // granular approval policy, or the job can authenticate with
+    // OPENAI_API_KEY, which is not a workspace sign-in and so carries no
+    // managed requirements. The row stays live because it passes on an
+    // account without them.
     translated: false,
   },
   {
