@@ -168,20 +168,23 @@ const ROWS: HarnessRow[] = [
     // workspace.sync: a declared-but-missing sync file fails EVERY dispatch,
     // including the rows that do not need it.
     //
-    // KNOWN FAILURE on an org-managed Codex account. Enterprise requirements
-    // can pin `approval_policy` to UnlessTrusted and restrict `sandbox_mode`
-    // to [ReadOnly, WorkspaceWrite], overriding whatever this command asks
-    // for. `codex exec` cannot answer an approval prompt ("file change
-    // approval is not supported in exec mode"), so every write is declined and
-    // the job settles having produced nothing. Verified against all three
-    // sandbox modes and with the workspace marked trusted; none get through.
-    // That is a property of the account, not of Fleet — the row stays live
-    // because it passes on an unmanaged one, and a red result here is the
-    // honest report of what that account can do.
-    missingCredentials: () =>
-      process.env.CODEX_AUTH_B64
-        ? []
-        : ['CODEX_AUTH_B64 unset — export it with: export CODEX_AUTH_B64=$(base64 < ~/.codex/auth.json)'],
+    // KNOWN FAILURE, and the cause is the entry point rather than the account.
+    // An org-managed Codex profile can pin the filesystem to read-only with no
+    // writable entries, leaving approval escalation as the only route to a
+    // write — that is why the same command succeeds on the operator's own
+    // machine, where the escalation is answered, and fails here. `codex exec`
+    // states the limit itself: "file change approval is not supported in exec
+    // mode", so under such a profile it can never write, whatever flags it is
+    // given. Verified against danger-full-access, workspace-write, a trusted
+    // project entry, a TTY, bubblewrap with relaxed seccomp, and
+    // --dangerously-bypass-approvals-and-sandbox.
+    //
+    // The real integration is `codex mcp-server` / `app-server`, where an
+    // approval request has somewhere to go — which is a genuine adapter, not a
+    // command string, and exactly what harness.ts:113 defers until an adopter
+    // needs it. Fleet already owns a decision mechanism such an adapter could
+    // answer with. The row stays live because exec mode does work on an
+    // unmanaged account.
     translated: false,
   },
   {
