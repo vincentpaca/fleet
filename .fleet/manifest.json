@@ -11,7 +11,7 @@
   },
   "env": {
     "vars": [
-      "ANTHROPIC_API_KEY",
+      "CLAUDE_CODE_OAUTH_TOKEN",
       "GH_TOKEN"
     ]
   },

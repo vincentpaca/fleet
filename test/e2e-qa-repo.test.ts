@@ -225,6 +225,28 @@ const ROWS: HarnessRow[] = [
       process.env.OPENAI_API_KEY ? [] : ['OPENAI_API_KEY unset — omp reads provider keys from the environment'],
     translated: false,
   },
+  {
+    // A harness that is not a model at all: a shell one-liner writing exactly
+    // what the probe task asks for. It proves the delivery path — setup repo,
+    // clone, gate, harness spawn, report read, artifact collection, settle —
+    // without a provider account, a token, or a cent of spend, which is what
+    // makes it the row CI can run on every pull request. The four real rows
+    // cover "does this CLI work"; this one covers "does Fleet work", and only
+    // the second needs to gate a merge.
+    id: 'stub',
+    image: 'fleet-runner:claude-code-latest',
+    command:
+      `sh -c 'mkdir -p .fleet/out/artifacts && `
+      + `printf "%s\\n" ${JSON.stringify(ARTIFACT_CONTENT)} > .fleet/out/artifacts/${ARTIFACT} && `
+      + `printf "%s" ${JSON.stringify(JSON.stringify({
+          status: 'READY',
+          verification: [`wrote artifacts/${ARTIFACT}`],
+          not_done: [],
+          next_action: NEXT_ACTION,
+        }))} > .fleet/out/report.json'`,
+    missingCredentials: () => [],
+    translated: false,
+  },
 ];
 
 /**

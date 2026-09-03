@@ -146,8 +146,29 @@ function localImageId(tag: string): string | undefined {
   const result = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], {
     stdio: ["ignore", "pipe", "ignore"],
   });
-  if (result.status !== 0) return undefined;
-  const id = result.stdout?.toString().trim();
+  if (result.status === 0) {
+    const id = result.stdout?.toString().trim();
+    if (id) return id;
+  }
+  return listedImageId(tag);
+}
+
+/**
+ * Second opinion for `localImageId`, and not defensive decoration: on the
+ * containerd image store `docker image inspect <tag>` intermittently answers
+ * "No such image" for an image that is listed and runs, while `docker images
+ * -q <tag>` keeps reporting it. A false "absent" is expensive rather than
+ * harmless — it is read as a cache miss, so `fleet delegate` rebuilds a job
+ * image it already has, and any caller gating on the image skips work that
+ * would have succeeded. Only consulted after inspect declines, so the happy
+ * path costs nothing.
+ */
+function listedImageId(tag: string): string | undefined {
+  const listed = spawnSync("docker", ["images", "--quiet", tag], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (listed.status !== 0) return undefined;
+  const id = listed.stdout?.toString().trim().split("\n")[0];
   return id ? id : undefined;
 }
 
@@ -168,9 +189,10 @@ export async function localImageIdAsync(tag: string, signal?: AbortSignal): Prom
     const id = result.stdout.trim();
     return id ? id : undefined;
   } catch {
-    // Nonzero exit (no such tag), no docker at all, or an abort: all read as
-    // "no local image", same as the sync form.
-    return undefined;
+    // Nonzero exit (no such tag), no docker at all, or an abort. Ask the
+    // listing before concluding absence, for the containerd-store reason in
+    // listedImageId — an abort will simply fail there too.
+    return listedImageId(tag);
   }
 }
 

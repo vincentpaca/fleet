@@ -66,6 +66,49 @@ Layer 2 — per-repo job image (per-repo CI or `fleet image build`)
 
 Two rules make the contracts real rather than decorative: the daemon validates **every** event at intake and rejects rather than coerces, and the CLI validates manifests and work orders **before** any request is sent (`fleet lint` runs with no daemon at all, so target repos can gate their own CI on it).
 
+## Harnesses
+
+`harness.cli` selects the coding CLI a job runs. One value, `claude-code`, is
+supported end to end: the runner derives the command from
+`harness.commands[0].path`, injects the output contract, and `src/runner/translate.ts`
+turns its stream into Fleet events, so the transcript renders.
+
+Every other CLI runs through **`FLEET_HARNESS_CMD`**, an environment variable
+naming the exact command to spawn. It is read *before* the `harness.cli` check
+(`src/runner/harness.ts`), so it works for any CLI without a schema entry, a
+code change, or a Fleet release — declare it in `env.vars` and export it at
+dispatch:
+
+```json
+"env": { "vars": ["FLEET_HARNESS_CMD", "OPENAI_API_KEY"] }
+```
+
+```
+FLEET_HARNESS_CMD='codex exec --dangerously-bypass-approvals-and-sandbox "<prompt>"' fleet delegate <target>
+```
+
+What you give up: the override short-circuits the derived prompt **and** the
+output contract, so the command's own prompt must tell the agent where
+deliverables go — artifacts under `.fleet/out/artifacts/`, the report at
+`.fleet/out/report.json`. Transcripts also degrade, because the translator
+speaks claude-code's dialect alone; the job still delivers, because the settle
+reads the report off disk rather than out of the stream. **Delivery is
+harness-agnostic; observability is not.**
+
+Four harnesses are exercised against a real external repository in
+`test/e2e-qa-repo.test.ts`. What each needed, since none of it is guessable:
+
+| CLI | Invocation | Notes |
+| --- | --- | --- |
+| claude-code | derived; no override needed | the only one with an adapter |
+| codex | `codex exec --dangerously-bypass-approvals-and-sandbox` | needs `OPENAI_API_KEY`; a ChatGPT sign-in carries admin requirements that decline every write in exec mode |
+| opencode | `opencode run --model <model>` | name the model — its default may be one the key cannot reach |
+| omp | `omp -p --auto-approve --model <model>` | `@oh-my-pi/pi-coding-agent`; a bun script, so its image installs bun |
+
+Bypassing a CLI's own sandbox is deliberate where it appears above: the
+container is already the sandbox, and a second one nested inside it can only
+subtract.
+
 ## Job lifecycle
 
 States: `queued → running → blocked ⇄ running → done`, plus `cancelled` from anywhere non-terminal. Provisioning and container start happen under `queued`.
