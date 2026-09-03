@@ -130,9 +130,12 @@ test('resume-push: an incomplete record is refused, never guessed at', async () 
   const home = makeTempDir('fleet-rp-home-');
   const workspace = makeTempDir('fleet-rp-ws-');
   // A workspace the runner kept is a git workspace — it clones or inits before
-  // anything else runs. The fixture carries .git so this case stays about the
-  // record being incomplete, not about the workspace being unusable.
-  fs.mkdirSync(path.join(workspace, '.git'), { recursive: true });
+  // anything else runs, so this fixture inits one and the case stays about the
+  // record being incomplete rather than the workspace being unusable. A bare
+  // mkdir of .git was enough while the guard only checked that the path
+  // existed; it is not a repository, which is exactly what the neighbouring
+  // test proves is unrecoverable.
+  execFileSync('git', ['init', '-q', workspace]);
   writeRetainedRecord(home, {
     jobId: 'job-late-5',
     reason: 'retain request unreadable — the runner asked to keep this workspace',

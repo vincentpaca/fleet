@@ -235,6 +235,10 @@ test('doctor: lists a workspace retained after a failed push, with the recovery 
   const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
   const home = makeTempDir('fleet-doctor-retained-');
   const workspace = makeTempDir('fleet-doctor-kept-ws-');
+  // A retained workspace is a git workspace — the runner clones before
+  // anything else runs. Without this the fixture describes a healthy record
+  // while carrying the one shape resume-push discards.
+  execFileSync('git', ['init', '-q', workspace]);
   fs.mkdirSync(path.join(home, 'retained'), { recursive: true });
   fs.writeFileSync(
     path.join(home, 'retained', 'job-kept-1.json'),
@@ -258,6 +262,41 @@ test('doctor: lists a workspace retained after a failed push, with the recovery 
   assert.ok(lines[0].includes(workspace), 'the finding must name the kept path');
   assert.match(lines[0], /fleet resume-push job-kept-1/);
   assert.doesNotMatch(lines[0], /directory missing/);
+  assert.doesNotMatch(lines[0], /no git repo/);
+});
+
+test('doctor: a retained workspace that holds no repo says so, rather than reading as healthy', async () => {
+  // doctor and resume-push have to agree about what a usable workspace is. A
+  // path that survived a partial delete keeps its name and loses its
+  // repository, and resume-push drops the record for exactly that — so doctor
+  // recommending resume-push without a word would be recommending the command
+  // that discards the thing it just reported.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const home = makeTempDir('fleet-doctor-retained-');
+  const workspace = makeTempDir('fleet-doctor-norepo-ws-');
+  // Present, named in the record, and not a repository: an empty .git is what
+  // a partial delete leaves, and it satisfies a bare existence check.
+  fs.mkdirSync(path.join(workspace, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(home, 'retained'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, 'retained', 'job-kept-2.json'),
+    JSON.stringify({
+      jobId: 'job-kept-2',
+      target: 'APP-124',
+      branch: 'fleet/APP-124-job-kept-2',
+      base: 'main',
+      ok: true,
+      reason: 'fatal: could not read from remote repository',
+      at: '2026-08-17T10:00:00.000Z',
+      workspace,
+    }),
+  );
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_HOME: home } });
+  assert.equal(res.code, 1, res.stdout);
+  const lines = stderrLines(res.stderr);
+  assert.match(lines[0], /no git repo/);
+  assert.doesNotMatch(lines[0], /directory missing/, 'the path is there; only the repository is not');
 });
 
 test('doctor: a retained record whose directory is gone says so', async () => {
