@@ -106,6 +106,7 @@ const ENV_VARS = [
  * one source of truth and a change to the task cannot make the rows disagree.
  */
 /** Overridable so a machine with different provider access can still run the row. */
+const OMP_MODEL = process.env.FLEET_OMP_MODEL ?? 'gpt-5';
 const OPENCODE_MODEL = process.env.FLEET_OPENCODE_MODEL ?? 'openai/gpt-5';
 
 const OVERRIDE_PROMPT =
@@ -208,6 +209,20 @@ const ROWS: HarnessRow[] = [
       process.env.OPENCODE_AUTH_B64
         ? []
         : ['OPENCODE_AUTH_B64 unset — export it with: export OPENCODE_AUTH_B64=$(base64 < ~/.local/share/opencode/auth.json)'],
+    translated: false,
+  },
+  {
+    // "oh my pi" — @oh-my-pi/pi-coding-agent, binary `omp`. Added because the
+    // escape hatch is the point: nothing in src/ knows this harness exists, and
+    // it still runs. `-p` is its non-interactive mode and `--auto-approve`
+    // skips the tool prompts no one is there to answer; the model is named for
+    // the same reason opencode's is, so the row depends on a credential the
+    // operator demonstrably has rather than on a default that may drift.
+    id: 'omp',
+    image: 'fleet-runner:omp-latest',
+    command: `omp -p --auto-approve --model ${OMP_MODEL} ${JSON.stringify(OVERRIDE_PROMPT)}`,
+    missingCredentials: () =>
+      process.env.OPENAI_API_KEY ? [] : ['OPENAI_API_KEY unset — omp reads provider keys from the environment'],
     translated: false,
   },
 ];
