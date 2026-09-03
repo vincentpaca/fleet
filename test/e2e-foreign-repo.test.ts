@@ -78,6 +78,23 @@ const DEADLINE_MS = 15 * 60 * 1000;
 /** How long to wait for container-to-host routing to come good before giving up. */
 const REACHABILITY_WAIT_MS = 3 * 60 * 1000;
 
+/**
+ * A git config shipped into the sandbox, and the reason it has to exist.
+ *
+ * When the target is a bare repo on this machine it is mounted into the
+ * container, where it belongs to a uid the container has never heard of. Git
+ * then refuses it as "dubious ownership" (CVE-2022-24765) and the job dies at
+ * the clone. Docker Desktop hides this by presenting mounts as owned by the
+ * accessing user, so it reproduces only on Linux — which is to say, only in CI.
+ *
+ * safe.directory is honoured from protected scopes alone: GIT_CONFIG_COUNT and
+ * `-c` are deliberately ignored for it, so the value has to arrive as a file
+ * that GIT_CONFIG_GLOBAL points at. It rides workspace.sync because sync files
+ * are materialised before the clone and preserveDispatchFiles only reads them,
+ * so the file is on disk exactly when git looks.
+ */
+const GITCONFIG_PATH = '.fleet/e2e-gitconfig';
+
 /** The command file the target repo's author wrote; `setup repo` points the manifest at it. */
 const COMMAND_PATH = '.claude/commands/task.md';
 
@@ -93,6 +110,7 @@ const ENV_VARS = [
   'OPENAI_API_KEY',
   'OPENCODE_AUTH_B64',
   'NODE_EXTRA_CA_CERTS',
+  'GIT_CONFIG_GLOBAL',
 ];
 
 /**
@@ -514,6 +532,18 @@ function dispatchEnv(row: HarnessRow, port: number): NodeJS.ProcessEnv {
     // Points at the mount, not at the host path: the container's filesystem is
     // its own. Empty when the host has no extra CA, which is the normal case.
     NODE_EXTRA_CA_CERTS: hostCaFile() === undefined ? '' : CONTAINER_CA,
+    // A container path, and this env is also the CLI child's, so it replaces
+    // the HOST's global config too — which is where the operator's git
+    // identity lives, and dispatch refuses without one. The identity is
+    // therefore supplied at command scope, which git honours for user.* (only
+    // safe.directory is restricted to protected scopes, which is the whole
+    // reason the file has to travel).
+    GIT_CONFIG_GLOBAL: `/workspace/${GITCONFIG_PATH}`,
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'fleet-e2e',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'fleet-e2e@example.com',
   };
 }
 
@@ -647,7 +677,7 @@ async function setupRepo(project: string, image: string, env: NodeJS.ProcessEnv)
     // container. A bare node image would start without the runner in it.
     '--image', image,
     '--setup-command', 'npm install --no-fund --no-audit',
-    '--sync', '',
+    '--sync', GITCONFIG_PATH,
     '--env-vars', ENV_VARS.join(', '),
     '--pickup', 'npm test',
     '--command-path', COMMAND_PATH,
@@ -668,6 +698,11 @@ async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Pr
   await assertDaemonReachable(loop.dockerHostAddr, loop.port, caMountArgs());
   const project = await cloneTargetRepo();
   const env = dispatchEnv(row, loop.port);
+
+  // Before setup repo, not after: the interview refuses a --sync path that is
+  // not already in the checkout, and .fleet/ does not exist in a fresh clone.
+  mkdirSync(join(project, '.fleet'), { recursive: true });
+  writeFileSync(join(project, GITCONFIG_PATH), '[safe]\n\tdirectory = *\n');
 
   // Step one of the journey, and a real assertion: a failure here means an
   // adopter cannot onboard their repo at all.
