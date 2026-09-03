@@ -21,15 +21,12 @@
 #   FLEET_QA_TOKEN  a token that can clone it and push branches to it
 name: e2e-foreign-repo
 
+# Every pull request, not a path subset. The delivery path runs through the
+# CLI, the daemon, the provider, the runner and the schemas at once, so almost
+# any change can break it, and the ones that did were not in files anybody
+# would have listed here.
 on:
   pull_request:
-    paths:
-      - 'src/**'
-      - 'images/**'
-      - 'schemas/**'
-      - 'test/e2e-qa-repo.test.ts'
-      - 'test/docker-loop.ts'
-      - '.github/workflows/e2e-foreign-repo.yml'
   push:
     branches: [main]
   workflow_dispatch:
