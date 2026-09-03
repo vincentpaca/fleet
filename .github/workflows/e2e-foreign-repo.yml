@@ -17,8 +17,8 @@
 # It needs two secrets and skips cleanly without them, because a fork pull
 # request never receives them and a check that fails for a missing secret is a
 # check people learn to ignore:
-#   FLEET_QA_REPO   https URL of the target repository
-#   FLEET_QA_TOKEN  a token that can clone it and push branches to it
+#   FLEET_TARGET_REPO_URL   https URL of the target repository
+#   FLEET_TARGET_REPO_TOKEN  a token that can clone it and push branches to it
 name: e2e-foreign-repo
 
 # Every pull request, not a path subset. The delivery path runs through the
@@ -45,7 +45,7 @@ jobs:
     env:
       # Read at job level so a step-level `if` can test it: a secret cannot be
       # referenced in one directly.
-      HAS_QA_REPO: ${{ secrets.FLEET_QA_REPO }}
+      HAS_QA_REPO: ${{ secrets.FLEET_TARGET_REPO_URL }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -55,7 +55,7 @@ jobs:
       - run: npm ci
 
       - if: env.HAS_QA_REPO == ''
-        run: echo "::notice title=Skipped::FLEET_QA_REPO is not set (expected on forks); the foreign-repo end-to-end did not run."
+        run: echo "::notice title=Skipped::FLEET_TARGET_REPO_URL is not set (expected on forks); the foreign-repo end-to-end did not run."
 
       # The job dispatches through the CLI, which refuses without an identity
       # because job commits are authored as the operator.
@@ -76,10 +76,10 @@ jobs:
 
       - if: env.HAS_QA_REPO != ''
         env:
-          FLEET_QA_REPO: ${{ secrets.FLEET_QA_REPO }}
-          GH_TOKEN: ${{ secrets.FLEET_QA_TOKEN }}
+          FLEET_TARGET_REPO_URL: ${{ secrets.FLEET_TARGET_REPO_URL }}
+          GH_TOKEN: ${{ secrets.FLEET_TARGET_REPO_TOKEN }}
           # Linux has no host.docker.internal: containers reach the host on the
           # docker0 bridge instead, and without this every job would sit at
           # `queued` until the deadline with nothing to say why.
           FLEET_DOCKER_HOST_ADDR: 172.17.0.1
-        run: node --test --test-name-pattern "stub" test/e2e-qa-repo.test.ts
+        run: node --test --test-name-pattern "stub" test/e2e-foreign-repo.test.ts

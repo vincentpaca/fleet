@@ -15,7 +15,7 @@
 // is a drill with an assertion harness around it, and it is gated twice:
 //
 //   FLEET_E2E_CLOUD=1 \
-//   FLEET_QA_REPO=https://github.com/<owner>/<repo>.git \
+//   FLEET_TARGET_REPO_URL=https://github.com/<owner>/<repo>.git \
 //   FLEET_E2E_MODULE_SOURCE='git::https://github.com/<owner>/fleet.git//infra/aws?ref=<sha>' \
 //   node --test test/e2e-cloud-lifecycle.test.ts
 //
@@ -117,7 +117,7 @@ async function jobEvents(jobId: string): Promise<Array<Record<string, unknown>>>
 test('a deployment stands up, runs a real job for a foreign repo, and tears down', { timeout: APPLY_MS + JOB_MS + DESTROY_MS }, async (t) => {
   // Two gates, deliberately. Credentials alone must never be enough.
   if (process.env.FLEET_E2E_CLOUD !== '1') return t.skip('FLEET_E2E_CLOUD=1 not set (this drill applies real infrastructure and costs money)');
-  if (!process.env.FLEET_QA_REPO) return t.skip('FLEET_QA_REPO not set');
+  if (!process.env.FLEET_TARGET_REPO_URL) return t.skip('FLEET_TARGET_REPO_URL not set');
   const moduleSource = process.env.FLEET_E2E_MODULE_SOURCE;
   if (!moduleSource) {
     // A local module path provisions no in-account build (src/cli/setup.ts
@@ -126,7 +126,7 @@ test('a deployment stands up, runs a real job for a foreign repo, and tears down
     // pinned source — which also means the commit under test must be pushed.
     return t.skip('FLEET_E2E_MODULE_SOURCE not set (needs a clonable git:: source so the in-account image build exists)');
   }
-  const qaRepo = requireEnv('FLEET_QA_REPO');
+  const targetRepo = requireEnv('FLEET_TARGET_REPO_URL');
   const region = process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? 'ap-southeast-1';
   const name = deploymentName();
 
@@ -134,7 +134,7 @@ test('a deployment stands up, runs a real job for a foreign repo, and tears down
   // the generated .fleet/infra (where to run it). The CLI resolves both from
   // its cwd, so they have to be the same cwd.
   const project = mkdtempSync(join(tmpdir(), 'fleet-e2e-cloud-'));
-  execFileSync('git', ['clone', '--quiet', qaRepo, project], {
+  execFileSync('git', ['clone', '--quiet', targetRepo, project], {
     env: { ...process.env, ...gitCredentialEnv(process.env) },
   });
 

@@ -5,7 +5,7 @@
 // foreign repo, and that any other harness CLI can satisfy the job contract.
 // This file is the axis both of those live on — one test per harness, all
 // three dispatching against the *same* committed `cli: "claude-code"` manifest
-// in the QA repo, because an override short-circuits above the cli guard
+// in the target repo, because an override short-circuits above the cli guard
 // (src/runner/harness.ts:104 returns before the `cli !== 'claude-code'` refusal
 // at :113).
 //
@@ -23,10 +23,10 @@
 // serves exactly one harness CLI). Docker is the only substrate that gives
 // each row its own image, which is what makes the multi-harness axis buildable.
 //
-//   FLEET_QA_REPO=https://github.com/<owner>/<repo>.git \
-//   GH_TOKEN=... CLAUDE_CODE_OAUTH_TOKEN=... node --test test/e2e-qa-repo.test.ts
+//   FLEET_TARGET_REPO_URL=https://github.com/<owner>/<repo>.git \
+//   GH_TOKEN=... CLAUDE_CODE_OAUTH_TOKEN=... node --test test/e2e-foreign-repo.test.ts
 //
-// The QA repo carries the scaffold (`.fleet/manifest.json`,
+// The target repo carries the scaffold (`.fleet/manifest.json`,
 // `.claude/commands/qa.md`, `README.md`); see the issue. Nothing about it —
 // name, owner or URL — belongs in this tree, which is why the pointer is an
 // env var (docs/decisions.md#d10).
@@ -48,13 +48,13 @@ const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli', 'm
 /**
  * The dispatch target. A single prose token, so `dispatchShape` gives
  * `publish:false` and `finish:'inspected'`: no draft PR, and a branch name with
- * no sanitisation surprises. The QA repo's manifest must carry no
+ * no sanitisation surprises. The target repo's manifest must carry no
  * `gates.default_finish` or `reachableRepoDefault` (src/cli/dispatch.ts:130)
  * would override `inspected` with the repo default.
  */
 const TARGET = 'qa-probe';
 
-/** What the QA repo's committed `/qa` command writes, and the content it must carry. */
+/** What the target repo's committed `/qa` command writes, and the content it must carry. */
 const ARTIFACT = 'qa-probe.txt';
 const ARTIFACT_CONTENT = 'qa-probe ok';
 
@@ -274,9 +274,9 @@ function caMountArgs(): string[] {
   return ca === undefined ? [] : ['-v', `${ca}:${CONTAINER_CA}:ro`];
 }
 
-/** The QA repo pointer. Only called once the skip line has proved it is set. */
-function qaRepo(): string {
-  return process.env.FLEET_QA_REPO as string;
+/** The target repo pointer. Only called once the skip line has proved it is set. */
+function targetRepoUrl(): string {
+  return process.env.FLEET_TARGET_REPO_URL as string;
 }
 
 /**
@@ -289,7 +289,7 @@ function gitEnv(): NodeJS.ProcessEnv {
   // The empty `credential.helper` first is not decoration: an operator machine
   // usually has an OS-keychain helper in ~/.gitconfig, and git asks helpers in
   // order and takes the first answer. With two GitHub accounts on the machine
-  // that answer is the wrong one, and a private QA repo then reports
+  // that answer is the wrong one, and a private target repo then reports
   // "Repository not found" — an auth failure wearing a 404's clothes. An empty
   // value resets the list, so gh's helper is the only one asked. The runner
   // never needs this: its container has no helper to displace.
@@ -354,22 +354,22 @@ function unmetPrerequisites(row: HarnessRow): string[] {
 }
 
 /**
- * A fresh checkout of the QA repo, which the CLI child gets as its cwd.
+ * A fresh checkout of the target repo, which the CLI child gets as its cwd.
  * Never `process.chdir`: nothing in src/ or test/ does, and a foreign checkout
  * inside the repo tree would land in the scanners' path. Dispatching from the
  * checkout is also what makes the manifest's `workspace.repo: "origin"`
- * sentinel resolve (src/cli/main.ts:824-825), so the QA repo's own committed
+ * sentinel resolve (src/cli/main.ts:824-825), so the target repo's own committed
  * manifest is the artifact under test.
  */
-async function cloneQaRepo(): Promise<string> {
-  const project = mkdtempSync(join(tmpdir(), 'fleet-qa-proj-'));
-  await run('git', ['clone', '--quiet', qaRepo(), project], { env: gitEnv() });
+async function cloneTargetRepo(): Promise<string> {
+  const project = mkdtempSync(join(tmpdir(), 'fleet-target-proj-'));
+  await run('git', ['clone', '--quiet', targetRepoUrl(), project], { env: gitEnv() });
   return project;
 }
 
-/** Every branch on the QA remote, as full ref names. */
+/** Every branch on the target remote, as full ref names. */
 function remoteHeads(): string[] {
-  const listed = execFileSync('git', ['ls-remote', '--heads', qaRepo()], { env: gitEnv(), encoding: 'utf8' });
+  const listed = execFileSync('git', ['ls-remote', '--heads', targetRepoUrl()], { env: gitEnv(), encoding: 'utf8' });
   return listed
     .split('\n')
     .map((line) => line.split('\t')[1])
@@ -388,14 +388,14 @@ function deleteJobRefs(jobId: string): void {
   try {
     const mine = remoteHeads().filter((ref) => ref.startsWith(prefix));
     if (mine.length === 0) return;
-    execFileSync('git', ['push', '--quiet', qaRepo(), ...mine.map((ref) => `:${ref}`)], {
+    execFileSync('git', ['push', '--quiet', targetRepoUrl(), ...mine.map((ref) => `:${ref}`)], {
       env: gitEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (err) {
     // Best effort: a cleanup failure must not mask the assertion that failed
     // first, but it must not pass silently either.
-    console.error(`e2e-qa-repo: could not delete ${prefix}* from the QA remote: ${String(err)}`);
+    console.error(`e2e-foreign-repo: could not delete ${prefix}* from the target remote: ${String(err)}`);
   }
 }
 
@@ -456,7 +456,7 @@ async function assertDelivery(
   const branch = jobBranch(TARGET, jobId);
   assert.ok(
     remoteHeads().includes(`refs/heads/${branch}`),
-    `claim branch ${branch} is not on the QA remote; events: ${digest(events)}`,
+    `claim branch ${branch} is not on the target remote; events: ${digest(events)}`,
   );
 
   const settle = events.find((e) => e.type === 'settle');
@@ -481,7 +481,7 @@ async function assertDelivery(
   assert.equal(stdout.trim(), ARTIFACT_CONTENT, `${ARTIFACT} did not round-trip through the artifact lane`);
 }
 
-/** Dispatch one row against the QA repo and hold it to the contract. */
+/** Dispatch one row against the target repo and hold it to the contract. */
 /**
  * Prove a container can reach this daemon before spending a job on it.
  *
@@ -576,7 +576,7 @@ async function setupRepo(project: string, image: string, env: NodeJS.ProcessEnv)
 async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Promise<void> {
   const loop = await startDockerLoop(t, row.image, caMountArgs());
   await assertDaemonReachable(loop.dockerHostAddr, loop.port, caMountArgs());
-  const project = await cloneQaRepo();
+  const project = await cloneTargetRepo();
   const env = dispatchEnv(row, loop.port);
 
   // Step one of the journey, and a real assertion: a failure here means an
@@ -628,7 +628,7 @@ for (const row of ROWS) {
     // The `return` is load-bearing: a bare t.skip() marks the test skipped and
     // then keeps running the body. No existsSync clause either — the other
     // env-pointer gates in this suite point at files, this one is a URL.
-    if (!process.env.FLEET_QA_REPO) return t.skip('FLEET_QA_REPO not set');
+    if (!process.env.FLEET_TARGET_REPO_URL) return t.skip('FLEET_TARGET_REPO_URL not set');
     const missing = unmetPrerequisites(row);
     if (missing.length > 0) return t.skip(`${row.id} row not runnable: ${missing.join('; ')}`);
     await runProbe(t, row);

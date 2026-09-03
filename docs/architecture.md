@@ -96,7 +96,7 @@ reads the report off disk rather than out of the stream. **Delivery is
 harness-agnostic; observability is not.**
 
 Four harnesses are exercised against a real external repository in
-`test/e2e-qa-repo.test.ts`. What each needed, since none of it is guessable:
+`test/e2e-foreign-repo.test.ts`. What each needed, since none of it is guessable:
 
 | CLI | Invocation | Notes |
 | --- | --- | --- |

@@ -13,8 +13,8 @@
 # "go look at that harness", not "the branch is broken".
 #
 # Secrets, all four required; the job skips cleanly without them:
-#   FLEET_QA_REPO             https URL of the target repository
-#   FLEET_QA_TOKEN            token that can clone it and push branches
+#   FLEET_TARGET_REPO_URL             https URL of the target repository
+#   FLEET_TARGET_REPO_TOKEN            token that can clone it and push branches
 #   CLAUDE_CODE_OAUTH_TOKEN   claude-code credential
 #   OPENAI_API_KEY            codex, opencode and omp all read this
 name: harness-drift
@@ -36,7 +36,7 @@ jobs:
     # healthy run would make the report useless.
     timeout-minutes: 90
     env:
-      HAS_SECRETS: ${{ secrets.FLEET_QA_REPO }}${{ secrets.OPENAI_API_KEY }}
+      HAS_SECRETS: ${{ secrets.FLEET_TARGET_REPO_URL }}${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -72,14 +72,14 @@ jobs:
       # before reading four harness failures.
       - if: env.HAS_SECRETS != ''
         env:
-          FLEET_QA_REPO: ${{ secrets.FLEET_QA_REPO }}
-          GH_TOKEN: ${{ secrets.FLEET_QA_TOKEN }}
+          FLEET_TARGET_REPO_URL: ${{ secrets.FLEET_TARGET_REPO_URL }}
+          GH_TOKEN: ${{ secrets.FLEET_TARGET_REPO_TOKEN }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Linux has no host.docker.internal; without this every job sits at
           # `queued` until the deadline with nothing to say why.
           FLEET_DOCKER_HOST_ADDR: 172.17.0.1
-        run: node --test test/e2e-qa-repo.test.ts
+        run: node --test test/e2e-foreign-repo.test.ts
 
       - if: failure() && env.HAS_SECRETS != ''
         run: |
