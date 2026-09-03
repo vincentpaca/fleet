@@ -1,0 +1,73 @@
+# The foreign-repo end-to-end, stubbed (#224).
+#
+# Every other job Fleet runs in CI targets this repository. This one targets a
+# real repository that is not Fleet, and drives the whole operator journey
+# through it: `fleet setup repo` onboards a fresh checkout, the generated
+# manifest is committed as an adopter would commit it, a container clones it,
+# the target's own test suite gates the pickup, a harness runs, and the report
+# and artifact come back.
+#
+# The harness here is a shell one-liner, not a model. That is deliberate: the
+# question this job answers is "does Fleet still deliver a job", which needs no
+# provider account, no token, and no spend, and gives the same answer every
+# time. The real-CLI rows in the same file (claude-code, codex, opencode, omp)
+# answer a different question — "does this CLI still work" — which costs money
+# and cannot gate a merge. Run those by hand or on a schedule.
+#
+# It needs no secrets and no network target: absent FLEET_TARGET_REPO_URL the
+# test seeds a bare repository in tmp and mounts it into the container. A gate
+# that first requires provisioning a personal access token is a gate that runs
+# nowhere.
+name: e2e-foreign-repo
+
+# Every pull request, not a path subset. The delivery path runs through the
+# CLI, the daemon, the provider, the runner and the schemas at once, so almost
+# any change can break it, and the ones that did were not in files anybody
+# would have listed here.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stubbed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+
+      # The job dispatches through the CLI, which refuses without an identity
+      # because job commits are authored as the operator.
+      - run: |
+          git config --global user.name fleet-ci
+          git config --global user.email ci@example.com
+
+      # Only the base image the stub row names. The real-CLI rows skip on a
+      # missing image, so there is nothing to gain from building theirs here.
+      - run: |
+          docker build \
+            --build-arg HARNESS_CLI=claude-code \
+            --build-arg HARNESS_VERSION=latest \
+            -t fleet-runner:claude-code-latest \
+            -f images/runner/Dockerfile .
+
+      - env:
+          # Linux has no host.docker.internal: containers reach the host on the
+          # docker0 bridge instead, and without this every job would sit at
+          # `queued` until the deadline with nothing to say why.
+          FLEET_DOCKER_HOST_ADDR: 172.17.0.1
+        run: node --test --test-name-pattern "stub" test/e2e-foreign-repo.test.ts

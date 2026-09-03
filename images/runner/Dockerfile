@@ -58,9 +58,17 @@ RUN set -eu; \
     case "$HARNESS_CLI" in \
       claude-code) pkg="@anthropic-ai/claude-code" ;; \
       codex)       pkg="@openai/codex" ;; \
-      opencode)    pkg="opencode" ;; \
+      opencode)    pkg="opencode-ai" ;; \
+      omp)         pkg="@oh-my-pi/pi-coding-agent" ;; \
       *) echo "unknown HARNESS_CLI: $HARNESS_CLI" >&2; exit 1 ;; \
     esac; \
+    if [ "$HARNESS_CLI" = "omp" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends unzip \
+        && rm -rf /var/lib/apt/lists/*; \
+      BUN_INSTALL=/usr/local/bun curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local/bun bash; \
+      ln -s /usr/local/bun/bin/bun /usr/local/bin/bun; \
+      chmod -R a+rX /usr/local/bun; \
+    fi; \
     if [ "$HARNESS_VERSION" = "latest" ]; then \
       npm install -g "$pkg"; \
     else \
