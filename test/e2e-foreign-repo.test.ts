@@ -33,7 +33,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -106,6 +106,22 @@ const ENV_VARS = [
  * one source of truth and a change to the task cannot make the rows disagree.
  */
 /** Overridable so a machine with different provider access can still run the row. */
+/** The command file body, mirroring what a hosted target repo commits. */
+const TASK_BODY = [
+  'Do exactly these two things and nothing else.',
+  '',
+  '1. Write `.fleet/out/artifacts/qa-probe.txt` whose entire content is the single line:',
+  '',
+  '   qa-probe ok',
+  '',
+  '2. Write `.fleet/out/report.json` with exactly this content:',
+  '',
+  '   {"status":"READY","verification":["wrote artifacts/qa-probe.txt"],"not_done":[],"next_action":"qa probe complete"}',
+  '',
+  'Do not add any other key to the report. Then stop.',
+  '',
+].join('\n');
+
 const OMP_MODEL = process.env.FLEET_OMP_MODEL ?? 'gpt-5';
 const OPENCODE_MODEL = process.env.FLEET_OPENCODE_MODEL ?? 'openai/gpt-5';
 
@@ -274,9 +290,82 @@ function caMountArgs(): string[] {
   return ca === undefined ? [] : ['-v', `${ca}:${CONTAINER_CA}:ro`];
 }
 
-/** The target repo pointer. Only called once the skip line has proved it is set. */
+/**
+ * When the target is a bare repo on this machine, the container has to be able
+ * to reach it — its filesystem is its own, so a host path resolves to nothing
+ * and the job dies at the clone having logged almost nothing. Mounted at the
+ * SAME absolute path it has on the host, because the URL the runner receives
+ * is whatever `git remote get-url origin` reported at dispatch, and rewriting
+ * that would mean teaching the CLI about this test. Read-write: the job pushes
+ * its claim branch there, which is the whole point of a foreign remote.
+ *
+ * Empty for a hosted target, which the container reaches over the network like
+ * any other.
+ */
+function targetMountArgs(): string[] {
+  if (process.env.FLEET_TARGET_REPO_URL) return [];
+  const bare = targetRepoUrl();
+  return ['-v', `${bare}:${bare}`];
+}
+
+/**
+ * A foreign repository, without needing GitHub.
+ *
+ * `FLEET_TARGET_REPO_URL` points at a real remote when someone wants the live
+ * article — network clone, gh lookups, a token. Absent, this seeds a bare repo
+ * in tmp with the same shape: a small project, its own test suite, and the
+ * command file describing the task. It is every bit as foreign as a hosted one
+ * — what the test cares about is that the repository is not Fleet — and it
+ * needs no secret, no token and no write access to anything, so the stub row
+ * runs on any checkout and in CI with nothing configured.
+ *
+ * A regression gate that requires provisioning a personal access token is a
+ * gate that runs nowhere.
+ */
+let seededRemote: string | undefined;
+
 function targetRepoUrl(): string {
-  return process.env.FLEET_TARGET_REPO_URL as string;
+  const configured = process.env.FLEET_TARGET_REPO_URL;
+  if (configured) return configured;
+  if (seededRemote !== undefined) return seededRemote;
+
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-target-remote-'));
+  const bare = join(dir, 'target.git');
+  const seed = join(dir, 'seed');
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  mkdirSync(join(seed, 'src'), { recursive: true });
+  mkdirSync(join(seed, 'test'), { recursive: true });
+  mkdirSync(join(seed, '.claude', 'commands'), { recursive: true });
+
+  writeFileSync(join(seed, 'package.json'), JSON.stringify({
+    name: 'slugmaker', version: '0.3.1', type: 'module',
+    scripts: { test: 'node --test test/*.test.js' },
+  }, null, 2) + '\n');
+  writeFileSync(join(seed, 'src', 'slug.js'),
+    'export function slugify(text) {\n'
+    + "  if (typeof text !== 'string') throw new TypeError('slugify expects a string');\n"
+    + "  return text.toLowerCase().replace(/[\\s_]+/g, '-').replace(/[^a-z0-9-]+/g, '')\n"
+    + "    .replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');\n"
+    + '}\n');
+  writeFileSync(join(seed, 'test', 'slug.test.js'),
+    "import { test } from 'node:test';\n"
+    + "import assert from 'node:assert/strict';\n"
+    + "import { slugify } from '../src/slug.js';\n"
+    + "test('lowercases and hyphenates', () => { assert.equal(slugify('Hello World'), 'hello-world'); });\n"
+    + "test('drops unsafe characters', () => { assert.equal(slugify('Wow!!! Really???'), 'wow-really'); });\n"
+    + "test('rejects non-strings', () => { assert.throws(() => slugify(null), TypeError); });\n");
+  writeFileSync(join(seed, COMMAND_PATH), TASK_BODY);
+
+  const git = (args: string[]) => execFileSync('git', [
+    '-c', 'user.name=fleet-e2e', '-c', 'user.email=fleet-e2e@example.com', ...args,
+  ], { cwd: seed, stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+  git(['add', '-A']);
+  git(['commit', '-q', '-m', 'slugmaker']);
+  git(['push', '-q', bare, 'main']);
+
+  seededRemote = bare;
+  return bare;
 }
 
 /**
@@ -574,7 +663,8 @@ async function setupRepo(project: string, image: string, env: NodeJS.ProcessEnv)
 }
 
 async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Promise<void> {
-  const loop = await startDockerLoop(t, row.image, caMountArgs());
+  const runArgs = [...caMountArgs(), ...targetMountArgs()];
+  const loop = await startDockerLoop(t, row.image, runArgs);
   await assertDaemonReachable(loop.dockerHostAddr, loop.port, caMountArgs());
   const project = await cloneTargetRepo();
   const env = dispatchEnv(row, loop.port);
@@ -625,10 +715,9 @@ async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Pr
 
 for (const row of ROWS) {
   test(`${row.id}: a real job against a foreign repo delivers the artifact and the report`, async (t) => {
-    // The `return` is load-bearing: a bare t.skip() marks the test skipped and
-    // then keeps running the body. No existsSync clause either — the other
-    // env-pointer gates in this suite point at files, this one is a URL.
-    if (!process.env.FLEET_TARGET_REPO_URL) return t.skip('FLEET_TARGET_REPO_URL not set');
+    // No pointer gate: without FLEET_TARGET_REPO_URL the target is a bare repo
+    // seeded in tmp, so the stub row runs anywhere. Only rows needing a model
+    // credential skip, and they say which one is missing.
     const missing = unmetPrerequisites(row);
     if (missing.length > 0) return t.skip(`${row.id} row not runnable: ${missing.join('; ')}`);
     await runProbe(t, row);
