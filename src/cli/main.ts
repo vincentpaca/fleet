@@ -1641,6 +1641,24 @@ function readTokenFile(tokenFile: string): string | undefined {
 }
 
 /**
+ * Does this path hold a git repository, rather than merely a `.git` entry?
+ *
+ * A bare existence check is not enough, and the gap is the exact shape this
+ * guard exists for: a partial delete can leave `.git` behind as an empty
+ * directory, which satisfies existsSync and still makes every git command fail
+ * with "not a git repository". CI hit that and the record survived, which is
+ * the outcome the check was added to prevent. HEAD is the cheapest artefact
+ * every real repository has; a `.git` file rather than a directory is the
+ * worktree/submodule form and is left to git to resolve.
+ */
+function holdsGitRepo(workspace: string): boolean {
+  const dotGit = path.join(workspace, '.git');
+  if (!fs.existsSync(dotGit)) return false;
+  if (fs.statSync(dotGit).isFile()) return true;
+  return fs.existsSync(path.join(dotGit, 'HEAD'));
+}
+
+/**
  * `fleet canary` (#220): one live job as proof the deployment works, through
  * the same dispatch path as every real job. The verdict machinery lives in
  * ./canary.ts; this wires in the CLI's own dispatch, daemon client, and git.
@@ -1764,7 +1782,13 @@ async function cmdDoctor(args: string[]): Promise<number> {
   //    holds the only copy of that job's work. It is a finding until recovered —
   //    silence here is exactly how hours of agent time disappear.
   for (const record of listRetainedRecords(fleetHome())) {
-    const missing = fs.existsSync(record.workspace) ? '' : ' (directory missing)';
+    // The same predicate resume-push uses, not a bare existence check: a
+    // clobbered workspace that kept its path would otherwise read as healthy
+    // here and be dropped there, so doctor would keep recommending a command
+    // that discards the record it just reported.
+    const missing = holdsGitRepo(record.workspace)
+      ? ''
+      : (fs.existsSync(record.workspace) ? ' (no git repo — resume-push will drop it)' : ' (directory missing)');
     findings.push(
       `retained workspace: ${record.workspace}${missing} (job ${record.jobId}, push failed ${record.at}) — retry with: fleet resume-push ${record.jobId}`,
     );
@@ -1806,24 +1830,6 @@ async function cmdDoctor(args: string[]): Promise<number> {
  * exist. Prints the appropriate error and returns undefined on any problem so
  * cmdResumePush can exit without duplicating the checks.
  */
-/**
- * Does this path hold a git repository, rather than merely a `.git` entry?
- *
- * A bare existence check is not enough, and the gap is the exact shape this
- * guard exists for: a partial delete can leave `.git` behind as an empty
- * directory, which satisfies existsSync and still makes every git command fail
- * with "not a git repository". CI hit that and the record survived, which is
- * the outcome the check was added to prevent. HEAD is the cheapest artefact
- * every real repository has; a `.git` file rather than a directory is the
- * worktree/submodule form and is left to git to resolve.
- */
-function holdsGitRepo(workspace: string): boolean {
-  const dotGit = path.join(workspace, '.git');
-  if (!fs.existsSync(dotGit)) return false;
-  if (fs.statSync(dotGit).isFile()) return true;
-  return fs.existsSync(path.join(dotGit, 'HEAD'));
-}
-
 function loadRetainedWorkspace(home: string, jobId: string): RetainedRecord | undefined {
   const record = readRetainedRecord(home, jobId);
   if (record === undefined) {
