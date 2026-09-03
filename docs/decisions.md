@@ -140,3 +140,30 @@ Shape decides two things. In the CLI, the defaults: issue and adoption publish a
 **The deprecated `--mode` flag maps onto what its preset used to mean**, for the life of the flag, so an invocation that worked before #36 still does. The read-only names (`assess`/`investigate`/`review`/`compare`) ask for a read-only `inspected` job, and both halves outrank the repo's `default_finish` because both are the operator's explicit request. `implement`/`followthrough` asked to deliver and nothing more specific, so they grant publish and express no opinion on the rung — which is what makes `--mode implement 42` identical to a bare `42` on every manifest, instead of having a deprecated no-op flag quietly override a repo's configured finish line.
 
 **Amended 2026-08-27 by #208 — `--publish` is removed; prose delivery is prompt-owned.** The flag restated intent the prompt already carries: the sandbox has `gh` and a token that can open PRs, so an agent told "create a PR" in prose just creates one — the flag never gated capability, it only toggled whether the runner auto-composed a draft PR at settle, which for a prose dispatch is the same configuration written twice. Prose dispatches now carry no publish default and no flag (read `--publish` in the paragraphs above as historical; the finish precedence is `--finish` > mapped `--mode` > `manifest.gates.default_finish` > shape default). The runner instead grades reality at settle: a prose job whose agent opened a PR on the job branch settles at `pr-open` — exceeding its `inspected` target, which D6 blesses — and one whose agent did not settles with report and artifacts as before. The stated consequence, recorded rather than hidden: a prose prompt requesting a PR whose agent fails to open one settles at `pushed`/`inspected` with the gap visible in the report — the prompt was an instruction, not a contract, consistent with the prose lane's whole design. Issue and adoption dispatches are untouched: PR delivery is their contract, and the runner keeps composing their draft PR from the settle report — that is Fleet's return-path job, not a stylistic choice. `authority.publish` stays in the work order as the field the shape defaults set (issue/adoption true); whether the field itself can shrink is the follow-up schema release's call. Risk 1 above narrows accordingly: for the life of the window its route is only the deprecated `--mode implement` on a prose target (still pinned in `test/gate-window-compat.test.ts`), and it dies with that flag in the follow-up release.
+
+## D18 — Files crossing the HTTP boundary is the product, not a finding
+
+CodeQL's `js/file-access-to-http` and `js/http-to-file-access` fire on Fleet's
+central dataflow and always will. A job's artifacts are read off disk and
+POSTed to the daemon (`src/runner/artifacts.ts`), an operator's answer arrives
+over HTTP and is written into the sandbox as `answer-d<n>.json`
+(`src/runner/decisions.ts`), and `src/shared/http.ts` is the transport both
+use. Removing the flow would remove artifact delivery and the decision loop —
+the two things the design exists for.
+
+What makes it safe is not the absence of the flow but its shape, and each part
+is enforced elsewhere: every payload is schema-validated at the daemon's intake
+and rejected rather than coerced (D4); the runner token authorises only
+`/internal/*` for its own job, so a job cannot read another's files or answer
+its own question; artifact paths are stored relative to the artifacts directory
+and never interpolated from a request; and the answer filename is built from
+the runner's own decision ordinal, never from anything the response carries.
+
+So these alerts are dismissed against this entry rather than fixed or excluded.
+A future one is only the same finding if it is also schema-validated,
+token-scoped, and free of request-derived paths — if it is not, it is a real
+bug wearing a familiar name.
+
+`js/stack-trace-exposure` on `sendJson` is a separate matter and is fixed in
+code: the daemon no longer echoes an error's text to a client.
+

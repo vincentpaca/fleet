@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fakeAwsBin, makeTempDir, runCli, sendJson, startMockDaemon, type MockDaemon } from './cli-helpers.ts';
+import { loadOrCreateOperatorToken } from '../src/daemon/server.ts';
+import { operatorTokenPath } from '../src/shared/home.ts';
 
 const TOKEN = 'live-operator-token-188';
 const TOKEN_PARAM = '/fleet/operator-token';
@@ -184,4 +186,29 @@ test('doctor: a mismatch with nowhere to refetch from is a finding naming the fi
   assert.match(res.stderr, /operator token mismatch: the daemon refused/);
   assert.match(res.stderr, /operator-token/);
   assert.doesNotMatch(res.stderr, /daemon returned 401/);
+});
+
+
+test('operator token: a concurrent create keeps one token, never clobbers the winner', () => {
+  // The daemon claims its home before this runs, so two daemons should not
+  // race here — but the check-then-write shape meant that if they ever did,
+  // the loser silently overwrote a token the winner had already handed to a
+  // cockpit or a tunnel, and that client is then refused with nothing to
+  // explain it. Exclusive create makes the filesystem pick the winner.
+  const home = makeTempDir('fleet-token-race-');
+  const first = loadOrCreateOperatorToken(home);
+  const second = loadOrCreateOperatorToken(home);
+  assert.equal(second, first, 'a second call must adopt the existing token, not mint a new one');
+  assert.equal(fs.readFileSync(operatorTokenPath(home), 'utf8').trim(), first);
+});
+
+test('operator token: an empty file left by a dead run is claimed, not returned', () => {
+  // Present but empty is what a process killed between create and write
+  // leaves. Nobody can be holding it, so claiming it is safe — returning ''
+  // would authorise every request.
+  const home = makeTempDir('fleet-token-empty-');
+  fs.writeFileSync(operatorTokenPath(home), '');
+  const token = loadOrCreateOperatorToken(home);
+  assert.notEqual(token, '', 'an empty token file must never become the token');
+  assert.equal(loadOrCreateOperatorToken(home), token, 'and the claim must stick');
 });

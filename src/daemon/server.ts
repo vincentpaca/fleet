@@ -253,13 +253,38 @@ function targetRung(workOrder: unknown): string {
  */
 export function loadOrCreateOperatorToken(home: string): string {
   const path = operatorTokenPath(home);
-  if (existsSync(path)) {
-    const existing = readFileSync(path, "utf8").trim();
-    if (existing !== "") return existing;
-  }
+  const existing = readTokenFile(path);
+  if (existing !== undefined) return existing;
+
+  // Created exclusively rather than checked-then-written. Between an
+  // existsSync and a writeFileSync another process can create the file, and
+  // the loser silently overwrites a token the winner has already handed to a
+  // cockpit or a tunnel — which presents as a working client being refused for
+  // no visible reason. `wx` makes the create the decision: whoever wins keeps
+  // its token, and the loser re-reads the winner's rather than clobbering it.
   const token = randomBytes(32).toString("base64url");
-  writeFileSync(path, `${token}\n`, { mode: 0o600 });
-  return token;
+  try {
+    writeFileSync(path, `${token}\n`, { mode: 0o600, flag: "wx" });
+    return token;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const winner = readTokenFile(path);
+    if (winner !== undefined) return winner;
+    // Present but empty: a previous run died between create and write. Nobody
+    // can be holding it, so it is safe to claim.
+    writeFileSync(path, `${token}\n`, { mode: 0o600 });
+    return token;
+  }
+}
+
+/** The token already on disk, or undefined when the file is absent or empty. */
+function readTokenFile(path: string): string | undefined {
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    return existing === "" ? undefined : existing;
+  } catch {
+    return undefined;
+  }
 }
 
 export class FleetDaemon {
@@ -331,7 +356,12 @@ export class FleetDaemon {
     if (existsSync(this.#sockPath)) unlinkSync(this.#sockPath);
     const handler = (req: IncomingMessage, res: ServerResponse) => {
       this.#route(req, res).catch((error: unknown) => {
-        if (!res.headersSent) sendJson(res, 500, { error: String(error) });
+        // Logged here, not returned: an error's text carries absolute paths
+        // and internal state, and the client that reads it may be a job's
+        // runner rather than the operator. The status is the whole answer a
+        // caller needs; the detail belongs in the daemon's log (D18).
+        console.error(`fleet: request failed: ${String(error)}`);
+        if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
         else res.end();
       });
     };
