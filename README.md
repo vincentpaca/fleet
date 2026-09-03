@@ -33,7 +33,7 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 
 ## What Fleet refuses to become
 
-- **Not a coding agent.** Fleet never has its own agent loop. The harness you already trust — Claude Code, Codex, OpenCode — is the agent; Fleet is the pipe. If Fleet ever competes with your harness, it has failed.
+- **Not a coding agent.** Fleet never has its own agent loop. The harness you already trust — Claude Code, Codex, OpenCode, omp, or whatever you run next — is the agent; Fleet is the pipe. If Fleet ever competes with your harness, it has failed.
 - **Not a hosted platform.** No vendor control plane, no relay that sees your code, no account with us. Regulated and paranoid environments are first-class citizens.
 - **Not a workspace product or dashboard.** No cloud IDE, no workflow editor, no model picker. The CLI flow must be reliable before any UI exists, and any UI consumes the same event stream the CLI does.
 - **Not a merger or deployer.** No code path can merge a PR or deploy. Humans own merges. This is schema-enforced, not a policy.
@@ -45,7 +45,7 @@ Everything else belongs to someone else: the harness owns reasoning, tools, and 
 - **Truth before action.** A job that can't prove readiness doesn't start; a claim that wasn't verified doesn't ship. Reports say `PARTIAL` honestly instead of `READY` optimistically, and the daemon verifies claimed rungs mechanically where it can.
 - **Prompt-level permission is not enforcement.** Every rule worth having gets a checkpoint — a schema, a gate, or a test. Until a credential broker exists, Fleet says plainly: sandboxes carry operator credentials; single-operator use only.
 - **Humans are load-bearing, not decorative.** The pickup gate before model spend, the decision protocol mid-run, the merge at the end. Agents cannot answer their own questions — the answer API is unreachable with a job's credentials, by construction.
-- **One vertical path before breadth.** One harness (Claude Code), one cloud unit proven end to end, then adapters and substrates from demand — never speculatively.
+- **One vertical path before breadth.** One harness *adapter* (Claude Code) and one cloud unit proven end to end, then more from demand — never speculatively. Other harnesses do not wait on an adapter: `FLEET_HARNESS_CMD` names the command to run, and four are exercised against a real external repository in CI.
 - **Fleet builds Fleet.** This repo's own issues are dispatched through Fleet and come back as reviewed PRs.
 
 ## How it works
@@ -88,6 +88,31 @@ The live end-to-end check — a real session, a real block, a human answering �
 Run `fleet` with no arguments and you get the cockpit: the live board on top with blocked decisions floating up, the selected job's streaming transcript below it, and a command line at the bottom to dispatch from, answer a question, or cancel — one window instead of three. It adopts the daemon tunnel if one is healthy and opens its own if not, so a dead port-forward stops being something you rebuild by hand. Closing it changes nothing about the jobs; watching is a view, never a lifeline.
 
 When something feels off, `fleet doctor` checks the deployment end to end — manifest, gate, credentials, tunnel, and cloud-side leftovers like orphaned tasks — and names the fix for each finding instead of leaving you to guess.
+
+## Running a different harness
+
+Claude Code is the one harness with an adapter: Fleet derives its command from
+the manifest and renders its transcript as events. Anything else runs by naming
+the command, which needs no schema entry and no release:
+
+```json
+"env": { "vars": ["FLEET_HARNESS_CMD", "OPENAI_API_KEY"] }
+```
+
+```
+FLEET_HARNESS_CMD='codex exec --dangerously-bypass-approvals-and-sandbox "<prompt>"' fleet delegate <target>
+```
+
+The override replaces the derived prompt *and* the injected output contract, so
+the command's own prompt has to say where deliverables go — artifacts under
+`.fleet/out/artifacts/`, the report at `.fleet/out/report.json`. Transcripts
+degrade too, because the translator speaks one dialect. Delivery does not: the
+settle reads the report off disk, so the job still lands.
+
+`docs/architecture.md#harnesses` has the working invocation for each of the four
+Fleet tests — Claude Code, Codex, OpenCode and omp — including the parts that
+are not guessable, like which of them needs an API key rather than a
+subscription sign-in.
 
 ## Using Fleet vs. building Fleet
 
