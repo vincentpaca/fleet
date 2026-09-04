@@ -419,6 +419,54 @@ test('delegate: target, flags, and a missing target', () => {
   assert.equal(parseCockpitInput('delegate 61 --mode').kind, 'error');
 });
 
+test('delegate --prompt: the cockpit honours it, and it takes the rest of the line', () => {
+  // The dispatch inversion an unlisted flag causes. A `--word` the cockpit does
+  // not know is target text, not a refusal (the trade splitDelegateFlags
+  // documents) — so a missing `--prompt` would silently turn an issue dispatch
+  // into a prose one targeting the whole string: no issue strictness, no
+  // publish, no readiness gate, and a branch named after a sentence.
+  assert.deepEqual(parseCockpitInput('delegate 61 --prompt /dev-work #61'), {
+    kind: 'delegate', target: '61', prompt: '/dev-work #61',
+  });
+  // Rest of the line, not the next word. A one-token read would keep `fix` and
+  // push `the flaky heartbeat` into the target — wrong in both slots at once,
+  // and on the board it reads like a typo nobody made.
+  assert.deepEqual(parseCockpitInput('delegate 61 --prompt fix the flaky heartbeat'), {
+    kind: 'delegate', target: '61', prompt: 'fix the flaky heartbeat',
+  });
+  // The price of greedy, asserted rather than left to be discovered: flags go
+  // before `--prompt`, and anything after it is prompt text.
+  assert.deepEqual(parseCockpitInput('delegate 61 --finish pushed --prompt fix it --mode assess'), {
+    kind: 'delegate', target: '61', finish: 'pushed', prompt: 'fix it --mode assess',
+  });
+  const empty = parseCockpitInput('delegate 61 --prompt');
+  assert.equal(empty.kind, 'error');
+  assert.match(empty.kind === 'error' ? empty.message : '', /rest of the line/);
+});
+
+test('the cockpit honours every delegate flag `fleet delegate` advertises', async () => {
+  // A checkpoint under the prose invariant on DELEGATE_FLAGS ("must match
+  // `fleet delegate`'s own"), because that list is hand-maintained and had
+  // already drifted once — and drift here is silent by construction: the
+  // unknown flag is absorbed into the target instead of refused.
+  const help = await runCli(['help']);
+  const usage = help.stdout.split('\n').find((line) => line.includes('delegate <target>'));
+  assert.ok(usage, `no delegate usage line in \`fleet help\`:\n${help.stdout}`);
+  const advertised = [...usage.matchAll(/--[a-z-]+/g)].map((m) => m[0]);
+  assert.ok(advertised.length > 0, `no flags parsed out of: ${usage}`);
+  // The two that are the shell's business, not the resident view's: the cockpit
+  // dispatches from its own cwd and already follows every job it starts.
+  const cliOnly = new Set(['--manifest', '--watch']);
+  for (const flag of advertised.filter((f) => !cliOnly.has(f))) {
+    const parsed = parseCockpitInput(`delegate 61 ${flag} something`);
+    assert.equal(
+      parsed.kind === 'delegate' ? parsed.target : `(${parsed.kind})`,
+      '61',
+      `${flag} is advertised by \`fleet delegate\` but unknown to the cockpit, so it lands in the target`,
+    );
+  }
+});
+
 test('a line that is not a verb is a delegate payload — a target or a symptom statement', () => {
   assert.deepEqual(parseCockpitInput('APP-123'), { kind: 'delegate', target: 'APP-123' });
   assert.deepEqual(parseCockpitInput('login redirects to /null on Safari'), {

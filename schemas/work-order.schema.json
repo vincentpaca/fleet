@@ -16,12 +16,12 @@
     "target": {
       "type": "string",
       "minLength": 1,
-      "description": "Ticket key, PR reference, branch pair, or symptom statement. An identity, not an instruction: the job branch `fleet/<target>-<jobId>`, the pickup gate's claim guard, `Closes #n`, the board's lineage column and the dispatch shape all read it. Say what you want done in `prompt`."
+      "description": "Ticket key, PR reference, branch pair, or symptom statement. An identity, not an instruction: the job branch `fleet/<target>-<jobId>`, the pickup gate's claim guard, `Closes #n`, the board's lineage column and the dispatch shape all read it. `prompt` is where what-to-do will live once a runner reads it."
     },
     "prompt": {
       "type": "string",
       "minLength": 1,
-      "description": "What the harness is asked to do, passed through verbatim (#240). Optional, and absent means exactly what this order meant before the field existed — the runner composes the launch line from `harness.commands[0]`. It stays optional and unwritten-by-default because a deployed daemon validates orders against the schema baked into its own image, so a field the CLI always wrote would 422 every dispatch at an un-upgraded deployment. It never decides the shape: strictness, publish and finish come from `target` and `continues` alone (docs/decisions.md#d17), so a prompt naming an issue does not buy a prose dispatch the issue readiness check, and a prompt on an issue target does not escape it. Fleet appends only what it owns — the output contract, and the adoption continuation clause."
+      "description": "What the operator wants done, carried on the order (#240). No runner consumes it yet: src/runner/harness.ts still composes every launch line from `harness.commands[0]` and the target, prompted or not, so today this field is cargo and a dispatch behaves identically with or without it. The carrier lands first on purpose — a deployed daemon validates orders against the schema baked into its own image, so the field has to be accepted by deployments before a runner can be allowed to depend on it, and it stays optional and unwritten-by-default so that a field the CLI always wrote does not 422 every dispatch at an un-upgraded deployment in the meantime. It never decides the shape: strictness, publish and finish come from `target` and `continues` alone (docs/decisions.md#d17), so a prompt naming an issue does not buy a prose dispatch the issue readiness check, and a prompt on an issue target does not escape it."
     },
     "truth": {
       "type": "array",

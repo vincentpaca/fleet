@@ -229,9 +229,10 @@ test('delegate: an un-prompted dispatch writes no prompt at all', async (t) => {
   // validates orders against the schema baked into its own image, so a `prompt`
   // written unconditionally — even the shape's own default — would 422 every
   // dispatch until the deployment caught up. The assertion is the WHOLE order,
-  // not a `'prompt' in order` check: a defaulted prompt and a reordered or
-  // added field both fail here, which is what "identical to the release before
-  // it" actually means.
+  // not a `'prompt' in order` check: a defaulted prompt and any other field
+  // this release started writing both fail here, which is what "the same order
+  // the release before it posted" actually means. (Key ORDER is not asserted —
+  // deepEqual ignores it, and JSON object order is not part of the contract.)
   const cwd = scaffold(MIN_MANIFEST);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
@@ -254,11 +255,12 @@ test('delegate: an un-prompted dispatch writes no prompt at all', async (t) => {
   });
 });
 
-test('delegate --prompt: the operator says what they want, verbatim', async (t) => {
+test('delegate --prompt: what the operator typed reaches the order verbatim', async (t) => {
   // What the field exists for: before it, the operator's own workflow could
-  // only arrive as an argument to Fleet's. The characters are chosen: backticks
-  // around an identifier and a `$` are idiomatic in a prompt, and both survive
-  // JSON round-trips that a naive shell-quoting fix would eat.
+  // only arrive as an argument to Fleet's. Verbatim ON THE ORDER is all that is
+  // claimed here — no runner reads the field yet. The characters are chosen:
+  // backticks around an identifier and a `$` are idiomatic in a prompt, and
+  // both survive JSON round-trips that a naive shell-quoting fix would eat.
   const cwd = scaffold(MIN_MANIFEST);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
