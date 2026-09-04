@@ -309,3 +309,147 @@ test('the runner spawns the derived harness as argv — no shell at the spawn si
     await daemon.close();
   }
 });
+
+// --- The operator's prompt (#240) ---
+// Fleet used to compose `/<command> <target>` for every job, so the operator's
+// own workflow became an argument to Fleet's. A work order may now carry the
+// instruction itself; Fleet appends only what it owns.
+
+test('an order prompt replaces the composed slash command and is used verbatim (#240)', () => {
+  const plan = buildHarnessCommand({
+    manifest,
+    target: 'APP-14',
+    prompt: '/dev-work #14 - land the parser, no refactors',
+    actualVersion: '2.1.220',
+  });
+  assert.ok(plan);
+  assert.deepStrictEqual(plan.args, [
+    '-p', `/dev-work #14 - land the parser, no refactors\n\n${OUTPUT_CONTRACT}`,
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--allowedTools', 'Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'Task', 'TodoWrite', 'WebSearch', 'WebFetch',
+  ]);
+  // The bug this catches: composing around the prompt instead of replacing the
+  // composition — `/dev /dev-work #14 ...`, which is exactly #240's complaint.
+  assert.equal(plan.args[1].includes('/dev /dev-work'), false, `the prompt became an argument to Fleet's command: ${plan.args[1]}`);
+  assert.equal(plan.args[1].startsWith('/dev-work'), true, `something was prepended to the operator's prompt: ${plan.args[1]}`);
+});
+
+test('a prompted job derives even when the manifest declares no commands (#240)', () => {
+  // harness.commands is the default prompt template and nothing else once an
+  // order carries its own; failing the job over a field the launch line no
+  // longer reads would be a manifest requirement with no consumer.
+  const plan = buildHarnessCommand({
+    manifest: { harness: { cli: 'claude-code' } },
+    target: 'APP-14',
+    prompt: 'read src/runner/harness.ts and write what it does to answer.md',
+  });
+  assert.ok(plan);
+  assert.equal(plan.args[1], `read src/runner/harness.ts and write what it does to answer.md\n\n${OUTPUT_CONTRACT}`);
+});
+
+test('without a prompt the launch line is byte-identical to before #240', () => {
+  // The compatibility contract: every manifest and every dispatch that predates
+  // the field must be unaffected. Pinned against the literal, not against
+  // another call to the same builder, so a builder that mangles both ways still
+  // fails here.
+  const expected = `/dev APP-14\n\n${OUTPUT_CONTRACT}`;
+  assert.equal(buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' })?.args[1], expected);
+  assert.equal(
+    buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220', prompt: undefined })?.args[1],
+    expected,
+    'an explicitly absent prompt took a different path from an omitted one',
+  );
+  assert.equal(
+    buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220', prompt: '' })?.args[1],
+    expected,
+    'an empty prompt is not an instruction — it must fall back, not launch a bare contract',
+  );
+});
+
+test('a prompt does not change the dispatch shape: an adoption keeps its continuation clause (#240)', () => {
+  // The shape comes from `target` and `continues`, never from the prompt. This
+  // is the runner end of that invariant: an adopted job told what to do still
+  // gets the clause that makes it push to the adopted branch instead of opening
+  // a second PR.
+  const plan = buildHarnessCommand({
+    manifest,
+    target: '77',
+    prompt: '/dev-work #77',
+    actualVersion: '2.1.220',
+    continues: { pr: 41, branch: 'fleet/77-job-old' },
+  });
+  assert.ok(plan);
+  const prompt = plan.args[1];
+  assert.ok(prompt.startsWith('/dev-work #77 -- continuing PR #41 (branch fleet/77-job-old)'), `prompt or clause lost its place: ${prompt}`);
+  assert.match(prompt, /gh pr checks 41/);
+  assert.match(prompt, /never open a new PR/);
+  assert.ok(prompt.endsWith(`\n\n${OUTPUT_CONTRACT}`), 'the output contract stopped riding on a prompted adoption');
+});
+
+test('an order prompt with shell metacharacters reaches the harness literally (#240 on #241)', async () => {
+  // The prompt is the most operator-authored string in the whole order, and
+  // backticks around identifiers and `$HOME` in a path are idiomatic prose. It
+  // runs the real runner with no FLEET_HARNESS_CMD — the derived path — so it
+  // also pins that src/runner/main.ts reads `prompt` off the order at all.
+  const token = 'test-token-prompt-240';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-prompt-ws-'));
+  const loot = mkdtempSync(join(tmpdir(), 'fleet-prompt-loot-'));
+  const fromSubst = join(loot, 'from-subst');
+  const fromBacktick = join(loot, 'from-backtick');
+  const argvOut = join(loot, 'argv.rs');
+  const bin = stubClaudeOnPath();
+  const prompt = `/spec write a spec for \`parseVersion\` and $HOME handling $(touch ${fromSubst}) \`touch ${fromBacktick}\``;
+  try {
+    mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
+    writeFileSync(
+      join(workspace, '.fleet', 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        setup: { image: 'node:22', script: '.fleet/setup.sh' },
+        workspace: { repo: 'git@github.com:acme/example.git', strategy: 'branch-per-job' },
+        harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev.md' }] },
+        gates: { pickup: `node -e "process.exit(0)"` },
+      }),
+    );
+    writeFileSync(
+      join(workspace, '.fleet', 'order.json'),
+      JSON.stringify({ target: '77', prompt, finish: 'inspected' }),
+    );
+
+    const { FLEET_GIT_URL: _u, FLEET_GIT_NAME: _n, FLEET_GIT_EMAIL: _e, ...parentEnv } = process.env;
+    const child = spawn(process.execPath, [runnerMain], {
+      env: {
+        ...parentEnv,
+        FLEET_JOB_ID: 'job-prompt-240',
+        FLEET_DAEMON_URL: daemon.url,
+        FLEET_RUNNER_TOKEN: token,
+        FLEET_WORKSPACE: workspace,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HARNESS_ARGV_OUT: argvOut,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const exited = Promise.withResolvers<number>();
+    child.on('close', (code) => exited.resolve(code ?? -1));
+    const exitCode = await exited.promise;
+
+    assert.ok(existsSync(argvOut), 'the harness never received the argv the runner built');
+    const argv = readFileSync(argvOut, 'utf8').split('\x1e').slice(0, -1);
+    assert.equal(argv[0], '-p', `first arg is not the prompt flag: ${JSON.stringify(argv)}`);
+    // The operator's prompt, character for character, at the head of the launch:
+    // not composed into `/dev 77`, and not touched by a shell.
+    assert.equal(argv[1], `${prompt}\n\n${OUTPUT_CONTRACT}`, `the order's prompt did not reach the harness intact:\n${argv[1]}`);
+    for (const marker of [fromSubst, fromBacktick]) {
+      assert.equal(existsSync(marker), false, `a command in the prompt ran inside the job container: ${marker}`);
+    }
+    assert.equal(exitCode, 0);
+    assert.deepEqual(daemon.rejected, []);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(loot, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+    await daemon.close();
+  }
+});

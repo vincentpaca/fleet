@@ -193,6 +193,10 @@ async function main(): Promise<void> {
 
   // Work-order target: names the job branch and rides into the harness prompt.
   let target = 'work';
+  // What the operator asked for (#240), when they said so. Absent, the harness
+  // builder composes the launch line from the manifest as it always has; the
+  // target keeps naming the branch and the shape either way.
+  let orderPrompt: string | undefined;
   let orderTitle: string | undefined;
   let authorityPublish = false;
   // Continuation (#80): an order carrying `continues` adopts the named PR
@@ -206,6 +210,7 @@ async function main(): Promise<void> {
   try {
     const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8'));
     if (typeof order.target === 'string' && order.target !== '') target = order.target;
+    if (typeof order.prompt === 'string' && order.prompt !== '') orderPrompt = order.prompt;
     orderLimits = order.limits;
     if (typeof order.title === 'string' && order.title) orderTitle = order.title;
     authorityPublish = order?.authority?.publish === true;
@@ -374,6 +379,7 @@ async function main(): Promise<void> {
     override: process.env.FLEET_HARNESS_CMD,
     actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
     continues,
+    prompt: orderPrompt,
   });
   if (!plan) {
     await settleBlocked(sink, `no harness command derivable for cli "${cli}" — set harness.commands or FLEET_HARNESS_CMD`);
