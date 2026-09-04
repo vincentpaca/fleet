@@ -3,11 +3,13 @@
 // requirements are checked, never guessed.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT } from '../src/runner/harness.ts';
+import { startMockDaemon } from './runner-mock-daemon.ts';
 
 const manifest = {
   harness: {
@@ -193,4 +195,117 @@ test('the launch line an operator reads survives argv (display only)', () => {
 test('parseVersion pulls the semver out of CLI banners', () => {
   assert.equal(parseVersion('2.1.220 (Claude Code)'), '2.1.220');
   assert.equal(parseVersion('no version here'), undefined);
+});
+
+// --- The derived path where the runner actually spawns it (#241) ---
+// The plan-level tests above spawn the plan themselves, so they re-state
+// src/runner/main.ts's spawn options rather than exercising them, and every
+// other runner and e2e test sets FLEET_HARNESS_CMD — the override branch, which
+// still takes a shell on purpose. Nothing ran `spawn(plan.file, plan.args,
+// { shell: plan.shell })` on the derived path, which is the line the fix lives
+// on. This runs the real runner with no override.
+
+const runnerMain = fileURLToPath(new URL('../src/runner/main.ts', import.meta.url));
+
+/**
+ * A `claude` for PATH that answers the runner's `--version` probe and dumps the
+ * argv of the real launch, entries separated by RS (0x1e) so a prompt's own
+ * newlines stay inside their entry. Its output path arrives in a non-FLEET_ env
+ * var: the runner strips every FLEET_* from the harness child's environment.
+ */
+function stubClaudeOnPath(): string {
+  const bin = mkdtempSync(join(tmpdir(), 'fleet-derived-bin-'));
+  writeFileSync(
+    join(bin, 'claude'),
+    `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi
+: > "$HARNESS_ARGV_OUT"
+for a in "$@"; do printf '%s\\036' "$a" >> "$HARNESS_ARGV_OUT"; done
+`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test('the runner spawns the derived harness as argv — no shell at the spawn site (#241)', async () => {
+  const token = 'test-token-derived-241';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-derived-ws-'));
+  // Landing zone for the payload, outside the workspace the runner wipes.
+  const loot = mkdtempSync(join(tmpdir(), 'fleet-derived-loot-'));
+  const fromTarget = join(loot, 'from-target');
+  const fromBacktick = join(loot, 'from-backtick');
+  const fromBranch = join(loot, 'from-branch');
+  const argvOut = join(loot, 'argv.rs');
+  const bin = stubClaudeOnPath();
+  try {
+    mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
+    writeFileSync(
+      join(workspace, '.fleet', 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        setup: { image: 'node:22', script: '.fleet/setup.sh' },
+        workspace: { repo: 'git@github.com:acme/example.git', strategy: 'branch-per-job' },
+        harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev.md' }] },
+        gates: { pickup: `node -e "process.exit(0)"` },
+      }),
+    );
+    // Both untrusted inputs at once: the dispatch target, and the branch name of
+    // an adopted PR, which is chosen by whoever pushed the branch.
+    writeFileSync(
+      join(workspace, '.fleet', 'order.json'),
+      JSON.stringify({
+        target: 'audit why $HOME is wrong, `touch ' + fromBacktick + '` and $(touch ' + fromTarget + ')',
+        finish: 'inspected',
+        continues: { pr: 7, branch: `feat/$(touch ${fromBranch})` },
+      }),
+    );
+
+    const { FLEET_GIT_URL: _u, FLEET_GIT_NAME: _n, FLEET_GIT_EMAIL: _e, ...parentEnv } = process.env;
+    const child = spawn(process.execPath, [runnerMain], {
+      env: {
+        ...parentEnv,
+        FLEET_JOB_ID: 'job-derived-241',
+        FLEET_DAEMON_URL: daemon.url,
+        FLEET_RUNNER_TOKEN: token,
+        FLEET_WORKSPACE: workspace,
+        // No FLEET_HARNESS_CMD: this is what makes it the derived path.
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HARNESS_ARGV_OUT: argvOut,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const exited = Promise.withResolvers<number>();
+    child.on('close', (code) => exited.resolve(code ?? -1));
+    const exitCode = await exited.promise;
+
+    assert.ok(existsSync(argvOut), 'the harness never received the argv the runner built');
+    const argv = readFileSync(argvOut, 'utf8').split('\x1e').slice(0, -1);
+    assert.equal(argv[0], '-p', `first arg is not the prompt flag: ${JSON.stringify(argv)}`);
+    const prompt = argv[1];
+
+    // Literal, character for character: nothing between buildHarnessCommand and
+    // the harness process may interpret these.
+    assert.ok(prompt.includes('$HOME'), `$HOME was expanded en route:\n${prompt}`);
+    assert.ok(prompt.includes('`touch ' + fromBacktick + '`'), `backticks were consumed:\n${prompt}`);
+    assert.ok(prompt.includes('$(touch ' + fromTarget + ')'), `target substitution was consumed:\n${prompt}`);
+    assert.ok(prompt.includes(`branch feat/$(touch ${fromBranch})`), `branch substitution was consumed:\n${prompt}`);
+
+    // And the payload itself, because a shell that mangles the argv may still
+    // hand the harness a plausible-looking prompt.
+    for (const marker of [fromTarget, fromBacktick, fromBranch]) {
+      assert.equal(existsSync(marker), false, `a command ran inside the job container: ${marker}`);
+    }
+
+    // The rest of the launch arrived as its own argv entries, not as one string
+    // something downstream would have to split.
+    assert.ok(argv.includes('stream-json'), `launch argv did not survive intact: ${JSON.stringify(argv)}`);
+    assert.equal(exitCode, 0);
+    assert.deepEqual(daemon.rejected, []);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(loot, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+    await daemon.close();
+  }
 });
