@@ -594,27 +594,31 @@ test('delegate refuses a non-open PR before any POST', async (t) => {
   assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
-test('delegate refuses a PR whose head branch is not a valid git ref, naming it', async (t) => {
-  // headRefName is chosen by whoever opened the PR and flows into the runner's
-  // git argv. A branch starting with '-' is read as an option there, so the
-  // shape is checked at the boundary the value enters on — before any POST.
-  const cwd = scaffold();
-  const gh = fakeGhBin(JSON.stringify({
-    number: 41, state: 'OPEN', headRefName: '--upload-pack=touch /tmp/pwned', title: 'x',
-    closingIssuesReferences: [{ number: 9 }],
-  }));
-  const daemon = await startMockDaemon(jobsRoute());
-  t.after(daemon.close);
+// headRefName is chosen by whoever opened the PR and flows into the harness
+// prompt and the runner's git argv. The second of these is a name git itself
+// accepts as a ref — the vet is a whitelist for exactly that reason.
+const HOSTILE_HEADS = ['--upload-pack=touch /tmp/pwned', 'fix/$(id)'];
 
-  const res = await runCli(['delegate', 'pr/41'], {
-    cwd,
-    env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+for (const headRefName of HOSTILE_HEADS) {
+  test(`delegate refuses PR head branch ${headRefName}, naming it, before any POST`, async (t) => {
+    const cwd = scaffold();
+    const gh = fakeGhBin(JSON.stringify({
+      number: 41, state: 'OPEN', headRefName, title: 'x',
+      closingIssuesReferences: [{ number: 9 }],
+    }));
+    const daemon = await startMockDaemon(jobsRoute());
+    t.after(daemon.close);
+
+    const res = await runCli(['delegate', 'pr/41'], {
+      cwd,
+      env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /refusing head branch/);
+    assert.ok(res.stderr.includes(headRefName), 'the refusal names the value it rejected');
+    assert.equal(daemon.requests.length, 0, 'nothing posted');
   });
-  assert.equal(res.code, 1);
-  assert.match(res.stderr, /refusing head branch/);
-  assert.match(res.stderr, /--upload-pack=touch \/tmp\/pwned/, 'the refusal names the value it rejected');
-  assert.equal(daemon.requests.length, 0, 'nothing posted');
-});
+}
 
 test('delegate refuses a gh resolution failure before any POST', async (t) => {
   const cwd = scaffold();

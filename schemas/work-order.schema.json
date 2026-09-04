@@ -53,7 +53,7 @@
       "description": "Post-settle feedback re-entry (#80): this dispatch adopts an existing open PR's head branch instead of creating a fresh job branch. The runner fetches and checks out `branch`, pushes work to it (the PR updates in place), and never opens a new PR. Its presence IS the adoption declaration (#36) — the repo's pickup gate subjects every continues-carrying order to the adopted PR's checks (open, head matches) plus the claim guard, which is where the guard against adoption-by-accident now lives.",
       "properties": {
         "pr": { "type": "integer", "minimum": 1, "description": "The open PR being continued." },
-        "branch": { "type": "string", "minLength": 1, "description": "The PR's head branch, resolved by the CLI at dispatch." }
+        "branch": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+$", "description": "The PR's head branch, resolved by the CLI at dispatch. Whoever opened the PR chose this name, and the runner interpolates it into the harness prompt and into git argv — so the shape is a whitelist, not git's own ref rules, which permit `$`, backtick, parentheses, `|` and braces. Narrower than what GitHub allows as a branch name, deliberately: a PR whose head is outside this set cannot be adopted. The CLI refuses the same shape at dispatch (validBranchName, src/runner/git.ts); this is the enforcing half, since the daemon validates every work order at intake." }
       }
     },
     "limits": {

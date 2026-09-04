@@ -650,17 +650,19 @@ async function ghPrViewJson(target: string, ref: string, signal?: AbortSignal): 
 }
 
 /**
- * The head branch gh reported, admitted only if git would accept it as a ref.
- * That name is chosen by whoever opened the PR, and from here it travels in the
- * work order into the runner's git argv — so git's own rules are the admission
- * test, applied at the boundary the value enters on, and a refusal names it.
+ * The head branch gh reported, admitted only against validBranchName's
+ * whitelist. That name is chosen by whoever opened the PR, and from here it
+ * travels in the work order into the harness prompt and the runner's git argv,
+ * so the admission test is applied at the boundary the value enters on and a
+ * refusal names the value. The daemon re-applies the same shape from the work
+ * order schema at intake; this is the earlier, louder half of that pair.
  */
 function prHeadBranch(target: string, headRefName: unknown): string {
   if (typeof headRefName !== 'string' || headRefName === '') {
     fail(`cannot resolve PR target ${target}: gh reported no head branch`);
   }
   if (!validBranchName(headRefName)) {
-    fail(`cannot resolve PR target ${target}: refusing head branch ${JSON.stringify(headRefName)} — not a valid git branch name`);
+    fail(`cannot resolve PR target ${target}: refusing head branch ${JSON.stringify(headRefName)} — only [A-Za-z0-9._/-] in a name git can use as a ref`);
   }
   return headRefName;
 }

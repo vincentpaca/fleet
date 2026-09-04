@@ -26,6 +26,7 @@
  * (the dispatched manifest wins over the cloned one, but is never pushed).
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 // The gh-executor seam (inject in tests; defaults to the real gh CLI) is
@@ -157,7 +158,8 @@ const REF_COMPONENT_MAX = 250;
 
 /**
  * Held back from a branch's last component for the `-<jobId>` that makes two
- * jobs on one target distinct (21 characters from newId, with slack) plus the
+ * jobs on one target distinct (21 characters from newId, with slack), the
+ * `-<digest>` a cut target carries (9), plus the
  * `-attempt<n>` a claim release appends to the whole name (releaseRetryClaim,
  * `fleet reclaim`) — a job branch that cannot be released is the same dead end
  * as one that cannot be created. Fixed rather than measured off the actual id:
@@ -167,18 +169,38 @@ const REF_COMPONENT_MAX = 250;
  */
 const BRANCH_SUFFIX_RESERVE = 50;
 
+/** Width of the digest that keeps two cut-to-the-same-prefix targets apart. */
+const TARGET_DIGEST_LEN = 8;
+
 /**
  * fleet/<target>-<jobId>, target sanitized to git-ref-safe characters and cut
  * to what git can lock. Prose targets are whole prompts (the canary's is 223
  * characters after sanitizing), and an over-long name failed as a dead job at
  * setupWorkspace. The jobId is appended after the cut, never inside it.
+ *
+ * Cutting alone would collapse two long targets that agree on their first
+ * `width` sanitized characters into one claim namespace, and `fleet reclaim
+ * <target>` releases by that namespace — reclaiming one would rename the
+ * other's live claim. So a cut name carries a digest of the WHOLE target.
+ * Derived from the target and not the job id on purpose: jobBranch(target, '')
+ * must stay a prefix of jobBranch(target, jobId) for reclaim to match at all.
  */
 export function jobBranch(target: string, jobId: string): string { // contract pin: test-only export, asserted by the suite
-  const safe = target.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  const safe = target
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    // '.' survives the class above, so a target with an ellipsis in it reaches
+    // git as '..' — which git rejects anywhere in a ref, killing the job at
+    // setupWorkspace exactly as an over-long name did.
+    .replace(/\.{2,}/g, '.')
+    .replace(/^[-.]+|[-.]+$/g, '');
   // Re-trim after the cut: it can land mid-separator, and git rejects a
   // component ending in '.'.
-  const cut = safe.slice(0, REF_COMPONENT_MAX - BRANCH_SUFFIX_RESERVE).replace(/[-.]+$/, '') || 'work';
-  return `fleet/${cut}-${jobId}`;
+  const width = REF_COMPONENT_MAX - BRANCH_SUFFIX_RESERVE;
+  const cut = safe.slice(0, width).replace(/[-.]+$/, '') || 'work';
+  const digest = safe.length > width
+    ? `-${createHash('sha256').update(target).digest('hex').slice(0, TARGET_DIGEST_LEN)}`
+    : '';
+  return `fleet/${cut}${digest}-${jobId}`;
 }
 
 /** Sequences git's ref rules forbid anywhere in a name (git-check-ref-format(1)). */
@@ -194,16 +216,36 @@ function validRefComponent(part: string): boolean {
 }
 
 /**
+ * The only characters an externally-chosen branch name may contain.
+ *
+ * git's own rules are the wrong shape for this boundary. git-check-ref-format(1)
+ * happily permits `$`, backtick, `(`, `)`, `|`, `{`, `}` and every other byte it
+ * has no use for — they are meaningless to git, so it does not care. But the
+ * consumer downstream is not git: the name is interpolated verbatim into the
+ * harness prompt (continuationClause, src/runner/harness.ts) and into a command
+ * line. The threat is a name read as something other than a name — an
+ * instruction to the agent, or a substitution to a shell — not a ref git would
+ * refuse. A rules-check can only subtract what git happens to dislike; a
+ * whitelist admits only what a branch name plausibly needs, so a character
+ * nobody thought about is refused by default rather than admitted by default.
+ * Mirrored as `pattern` on continues.branch in schemas/work-order.schema.json,
+ * which is where the daemon enforces the same shape at intake.
+ */
+const BRANCH_NAME_ALLOWED = /^[A-Za-z0-9._/-]+$/;
+
+/**
  * git-check-ref-format(1)'s rules for `refs/heads/<name>`, applied without
- * spawning git, for names chosen outside this system — a PR's headRefName is
- * whatever the person who opened it typed, and it travels from there into git
- * argv here. Three rules are tighter than a bare refname check, deliberately:
+ * spawning git, AND THEN narrowed to BRANCH_NAME_ALLOWED, for names chosen
+ * outside this system — a PR's headRefName is whatever the person who opened it
+ * typed, and it travels from there into a prompt and into git argv here. Three
+ * of git's own rules are also applied more tightly than a bare refname check:
  * a leading '-' (git reads it as an option), a bare '@' (git's own shorthand
  * for HEAD), and REF_COMPONENT_MAX (a legal refname git still cannot lock).
  */
 export function validBranchName(name: string): boolean {
   if (name === '' || name.startsWith('-') || name === '@') return false;
   if (REF_FORBIDDEN.test(name)) return false;
+  if (!BRANCH_NAME_ALLOWED.test(name)) return false;
   return name.split('/').every(validRefComponent);
 }
 
