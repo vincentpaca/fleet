@@ -105,9 +105,15 @@ Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
                                            placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
-  delegate <target> [--finish rung] [--manifest path] [--watch]
+  delegate <target> [--prompt text] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
+                                           --prompt is what you want done, handed to your harness
+                                           verbatim; without it the job runs your first
+                                           harness.commands entry against the target, as before.
+                                           The target still decides everything else, so a prompt
+                                           on an issue number keeps issue strictness, publish and
+                                           the readiness gate — and one on prose buys none of them.
                                            Defaults follow the target's shape: an issue number
                                            (or a PR) publishes and aims at merge-ready; for a
                                            prose target the runner composes no PR — delivery is
@@ -691,6 +697,12 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
 /** A dispatch as asked for, with somewhere to put its progress. */
 type DelegateRequest = {
   target: string;
+  /**
+   * What the harness is asked to do (#240), passed to the runner verbatim.
+   * Absent leaves the runner composing its own launch line, which is what makes
+   * an un-prompted dispatch identical to the one this release replaces.
+   */
+  prompt?: string;
   /** Deprecated (#36); mapped onto the shape table for the life of the flag. */
   mode?: string;
   finish?: string;
@@ -767,6 +779,7 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   //   publish: mapped --mode > shape (no flag: prose delivery is prompt-owned,
   //            #208 — the runner grades an agent-opened PR at settle instead)
   //   finish:  --finish > mapped --mode > manifest.gates.default_finish > shape
+  //   prompt:  --prompt > shape (no shape sets one: the runner composes, #240)
   // The specific flag beats the deprecated bundle; a per-dispatch flag beats the
   // repo's manifest default, which in turn beats the shape default — reviving a
   // knob that presets/*.finish had shadowed into dead code since it was added.
@@ -780,6 +793,10 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     ?? mapped?.finish
     ?? reachableRepoDefault(manifest.gates?.default_finish, publish)
     ?? shapeDefault.finish;
+  // Read after `shape`, and read nowhere else: the prompt is cargo. Deriving
+  // the target back out of it — scanning for a `#69` — would make gate
+  // strictness depend on parsing English (D17).
+  const prompt = req.prompt ?? shapeDefault.prompt;
 
   // Resolve issue title at dispatch (best-effort; absent degrades gracefully).
   // A PR target already resolved its title from the PR — one gh call, one truth.
@@ -797,6 +814,11 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     finish,
     authority: shapeAuthority(publish),
   };
+  // Written only when there is one, so an un-prompted order is byte-identical
+  // to what the previous release posted — a deployed daemon validates against
+  // the schema baked into its own image, and a field written unconditionally
+  // would 422 every dispatch until the deployment caught up (fleet upgrade).
+  if (prompt !== undefined) workOrder.prompt = prompt;
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);
@@ -910,6 +932,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   const { values, positionals } = parseCommand(
     args,
     {
+      prompt: { type: 'string' },
       mode: { type: 'string' },
       finish: { type: 'string' },
       manifest: { type: 'string' },
@@ -920,6 +943,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   );
   const created = await dispatchDelegate({
     target: positionals[0],
+    prompt: typeof values.prompt === 'string' ? values.prompt : undefined,
     mode: typeof values.mode === 'string' ? values.mode : undefined,
     finish: typeof values.finish === 'string' ? values.finish : undefined,
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,

@@ -42,8 +42,18 @@ export function dispatchShape(target: string, continues: unknown): DispatchShape
  * dispatch rather than a defect. There is no flag to change that (#208):
  * prose delivery is prompt-owned — a prompt that asks for a PR gets one from
  * the agent itself, and the settle grades what actually happened.
+ *
+ * `prompt` (#240) defaults here too, and no shape carries one: absent means the
+ * runner composes the launch line from `harness.commands[0]` exactly as it
+ * always has. That is what keeps `fleet delegate 69` byte-identical to the
+ * release before it, and keeps every order this CLI writes without `--prompt`
+ * acceptable to a deployed daemon validating against an older baked-in schema.
+ * The current line is deliberately not written out as a string here: the runner
+ * must keep composing it for every order that predates the field, and a second
+ * copy of that rule in the CLI would be the drift AGENTS.md forbids. A shape
+ * that wants its own default line sets it here and nothing else moves.
  */
-export const SHAPE_DEFAULTS: Record<DispatchShape, { publish: boolean; finish: string }> = {
+export const SHAPE_DEFAULTS: Record<DispatchShape, { publish: boolean; finish: string; prompt?: string }> = {
   adoption: { publish: true, finish: 'merge-ready' },
   issue: { publish: true, finish: 'merge-ready' },
   prose: { publish: false, finish: 'inspected' },
