@@ -95,6 +95,10 @@ speaks claude-code's dialect alone; the job still delivers, because the settle
 reads the report off disk rather than out of the stream. **Delivery is
 harness-agnostic; observability is not.**
 
+The override is also the only launch path that still runs through a shell: it is
+spawned as `/bin/sh -c '<your string>'`, so its content is trusted operator
+input, while the derived path is spawned as argv and never sees a shell (#241).
+
 Four harnesses are exercised against a real external repository in
 `test/e2e-foreign-repo.test.ts`. What each needed, since none of it is guessable:
 

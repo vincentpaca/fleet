@@ -94,7 +94,18 @@ function checkVersionNotes(actualVersion: string | undefined, required: string |
   if (satisfied === undefined) notes.push(`cannot evaluate cli_version requirement "${required}" against ${actualVersion}`);
 }
 
-/** Build the adopted-PR continuation clause, or empty string. */
+/**
+ * Build the adopted-PR continuation clause, or empty string.
+ *
+ * `continues.branch` is a headRefName the CLI read from `gh pr view`, so its
+ * text is chosen by whoever pushed the branch, not by the operator dispatching
+ * the job — which is why it must never reach a shell (#241). A fork's PR is NOT
+ * the reach, contrary to what 1c9f6ad's commit body says: src/runner/main.ts
+ * runs setupWorkspace before it builds this prompt, and adoption checks the
+ * branch out with `git fetch origin <branch>`, which fails for a branch that is
+ * not on origin, so the job dies before the clause exists. The reach is a branch
+ * pushed to origin (anyone with push access) plus targets an operator types.
+ */
 function continuationClause(continues: { pr: number; branch: string } | undefined): string {
   if (!continues) return '';
   return (
