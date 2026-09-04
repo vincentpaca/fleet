@@ -30,7 +30,7 @@ import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
-import { buildHarnessCommand, parseVersion } from './harness.ts';
+import { buildHarnessCommand, describeHarnessPlan, parseVersion } from './harness.ts';
 import { authFailureFrom, authFailureIn } from './auth-failure.ts';
 import { materializeWorkspace } from './workspace.ts';
 import { runSetupScript, dropPrivileges } from './setup.ts';
@@ -383,7 +383,7 @@ async function main(): Promise<void> {
   for (const note of plan.notes) {
     await sink.emit({ type: 'log', text: note, who: 'runner' });
   }
-  const cmd = plan.cmd;
+  const cmd = describeHarnessPlan(plan);
   // Last event before the harness owns the stream: it dates the silence the
   // stall detectors measure, and it is the line an operator reads to see which
   // command the job actually launched.
@@ -429,13 +429,19 @@ async function main(): Promise<void> {
       Object.entries(process.env).filter(([key]) => !key.startsWith('FLEET_')),
     ),
   };
-  const child = spawn(cmd, {
-    shell: true,
+  // argv, not a shell string, on the derived path: the prompt carries a target
+  // and (on an adoption) a PR branch name nobody here chose, and a shell would
+  // expand `$(...)` in either before claude ever saw it (#241). Only the
+  // operator-authored FLEET_HARNESS_CMD asks for a shell, and buildHarnessCommand
+  // is where that asymmetry is decided.
+  const child = spawn(plan.file, plan.args, {
+    shell: plan.shell,
     cwd: workspace,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     // Own process group, so a timeout can take the whole harness tree down —
-    // see killTree: signalling the shell alone is not enough.
+    // see killTree: the harness forks (its own Bash tool, an override's shell)
+    // and signalling the child alone leaves those running.
     detached: true,
   });
 
@@ -631,18 +637,18 @@ async function main(): Promise<void> {
    *
    * Two traps live here, both of which cost a job. `child.killed` only records
    * that a signal was *sent*, so guarding the escalation on it (as this code
-   * once did) means SIGKILL never arrives. And `shell: true` makes the child a
-   * shell that may fork rather than exec, so signalling its pid alone leaves the
-   * real harness alive holding the stdout pipe — 'close' never fires and the
-   * runner waits forever instead of settling. A stalled harness is precisely the
-   * process that will not exit on its own (#39), so the kill, not the harness,
-   * has to be what ends the run.
+   * once did) means SIGKILL never arrives. And the child forks — the harness
+   * runs its own tools, and an override runs under a shell — so signalling its
+   * pid alone leaves a descendant alive holding the stdout pipe: 'close' never
+   * fires and the runner waits forever instead of settling. A stalled harness
+   * is precisely the process that will not exit on its own (#39), so the kill,
+   * not the harness, has to be what ends the run.
    */
   const endHarness = async (grace = graceMs): Promise<void> => {
     killTree(child, 'SIGTERM');
     await Promise.race([exit.promise, delay(grace)]);
-    // Escalate unless 'close' already fired. Not `child.exitCode` — the shell can
-    // be dead while the harness it forked lives on holding the pipe, which is
+    // Escalate unless 'close' already fired. Not `child.exitCode` — the child can
+    // be dead while a process it forked lives on holding the pipe, which is
     // the case this escalation exists for. 'close' is the honest signal that
     // nothing is left to kill, and skipping the signal then also avoids aiming
     // -pid at a group id the kernel may since have recycled.

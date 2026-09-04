@@ -1,11 +1,16 @@
 /**
  * Harness command construction (issue #4): derive the exact headless launch
- * line from the manifest and the work order. FLEET_HARNESS_CMD (tests, exotic
+ * plan from the manifest and the work order. FLEET_HARNESS_CMD (tests, exotic
  * setups) overrides everything and is used verbatim.
  */
 
 type HarnessPlan = {
-  cmd: string;
+  /** The executable on the derived path; the whole operator command line on the override path. */
+  file: string;
+  /** argv after `file`. Empty on the override path, which carries its arguments inside `file`. */
+  args: string[];
+  /** Whether `file` must go through `/bin/sh -c` — true only for the override (see buildHarnessCommand). */
+  shell: boolean;
   /** Non-fatal findings to surface as log events (version drift, fallbacks). */
   notes: string[];
   /** Harness-dialect env defaults; the job's real env always wins on conflict. */
@@ -99,9 +104,15 @@ function continuationClause(continues: { pr: number; branch: string } | undefine
   );
 }
 
-/** Build the launch line, or undefined when no command can be derived. */
+/** Build the launch plan, or undefined when no command can be derived. */
 export function buildHarnessCommand({ manifest, target, override, actualVersion, continues }: HarnessInputs): HarnessPlan | undefined {
-  if (override) return { cmd: override, notes: [] };
+  // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
+  // line an operator wrote — pipes, redirects and `node -e "..."` are the point
+  // of it — so it stays a shell string and runs verbatim. The derived plan
+  // below is argv and never sees a shell: its target comes from a work order
+  // and, on an adoption, its branch name comes from whoever opened the PR, so a
+  // `$(...)` in either used to execute inside the job container (#241).
+  if (override) return { file: override, args: [], shell: true, notes: [] };
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
@@ -123,14 +134,27 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   // The output contract (#81) rides on every prompt, continuation included: a
   // continuation that produces a report instead of commits still owes its
   // deliverables to the artifact lane.
-  const prompt = JSON.stringify(`/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`);
-  const tools = CLAUDE_ALLOWED_TOOLS.map((tool) => JSON.stringify(tool)).join(' ');
+  const prompt = `/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
   return {
-    cmd: `claude -p ${prompt} --output-format stream-json --verbose --allowedTools ${tools}`,
+    file: 'claude',
+    args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--allowedTools', ...CLAUDE_ALLOWED_TOOLS],
+    shell: false,
     notes,
     // claude-code caps a single response at 32k output tokens by default; a
     // whole-file Write can exceed it and kill the job (observed on #28).
     // Dialect knob, so it lives here — never in the manifest.
     env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
   };
+}
+
+/**
+ * The launch plan as an operator reads it in the log. Display only: the derived
+ * plan is spawned as argv, so anything that parsed this string back into a
+ * command would reintroduce the shell the argv exists to avoid. Arguments are
+ * JSON-quoted so a prompt's newlines stay on one line and an argument boundary
+ * is visible.
+ */
+export function describeHarnessPlan(plan: HarnessPlan): string {
+  if (plan.shell) return plan.file;
+  return [plan.file, ...plan.args.map((arg) => JSON.stringify(arg))].join(' ');
 }
