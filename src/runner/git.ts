@@ -146,10 +146,65 @@ function defaultGhRun(workspace: string): GhRunner {
   return (args: string[]) => runTool('gh', workspace, args, GH_TIMEOUT_MS);
 }
 
-/** fleet/<target>-<jobId>, target sanitized to git-ref-safe characters. */
+/**
+ * Longest a single path component of a ref may be. A loose ref is a file and
+ * git locks it by creating `<name>.lock` beside it, so the ceiling is the
+ * filesystem's NAME_MAX (255 on ext4 and APFS) less those five characters.
+ * Measured, not assumed: a 250-character component is created, 251 fails with
+ * `cannot lock ref ...: File name too long`.
+ */
+const REF_COMPONENT_MAX = 250;
+
+/**
+ * Held back from a branch's last component for the `-<jobId>` that makes two
+ * jobs on one target distinct (21 characters from newId, with slack) plus the
+ * `-attempt<n>` a claim release appends to the whole name (releaseRetryClaim,
+ * `fleet reclaim`) — a job branch that cannot be released is the same dead end
+ * as one that cannot be created. Fixed rather than measured off the actual id:
+ * `fleet reclaim` matches claims by jobBranch(target, ''), which only stays a
+ * prefix of jobBranch(target, jobId) if the target is cut to the same width
+ * either way.
+ */
+const BRANCH_SUFFIX_RESERVE = 50;
+
+/**
+ * fleet/<target>-<jobId>, target sanitized to git-ref-safe characters and cut
+ * to what git can lock. Prose targets are whole prompts (the canary's is 223
+ * characters after sanitizing), and an over-long name failed as a dead job at
+ * setupWorkspace. The jobId is appended after the cut, never inside it.
+ */
 export function jobBranch(target: string, jobId: string): string { // contract pin: test-only export, asserted by the suite
-  const safe = target.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '') || 'work';
-  return `fleet/${safe}-${jobId}`;
+  const safe = target.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  // Re-trim after the cut: it can land mid-separator, and git rejects a
+  // component ending in '.'.
+  const cut = safe.slice(0, REF_COMPONENT_MAX - BRANCH_SUFFIX_RESERVE).replace(/[-.]+$/, '') || 'work';
+  return `fleet/${cut}-${jobId}`;
+}
+
+/** Sequences git's ref rules forbid anywhere in a name (git-check-ref-format(1)). */
+const REF_FORBIDDEN = /[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{/;
+
+/** A slash-separated part of a ref: non-empty, lockable, not a .lock or dot-file name. */
+function validRefComponent(part: string): boolean {
+  return part !== ''
+    && part.length <= REF_COMPONENT_MAX
+    && !part.startsWith('.')
+    && !part.endsWith('.')
+    && !part.endsWith('.lock');
+}
+
+/**
+ * git-check-ref-format(1)'s rules for `refs/heads/<name>`, applied without
+ * spawning git, for names chosen outside this system — a PR's headRefName is
+ * whatever the person who opened it typed, and it travels from there into git
+ * argv here. Three rules are tighter than a bare refname check, deliberately:
+ * a leading '-' (git reads it as an option), a bare '@' (git's own shorthand
+ * for HEAD), and REF_COMPONENT_MAX (a legal refname git still cannot lock).
+ */
+export function validBranchName(name: string): boolean {
+  if (name === '' || name.startsWith('-') || name === '@') return false;
+  if (REF_FORBIDDEN.test(name)) return false;
+  return name.split('/').every(validRefComponent);
 }
 
 /** Sync paths from the staged manifest, so they can be preserved + excluded. */

@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, renameRemoteBranch, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, validBranchName, getHeadSha, remoteHasHead, remoteMovedBeyond, renameRemoteBranch, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -101,6 +101,50 @@ test('partial work is pushed with a partial marker — evidence over tidiness', 
 test('jobBranch sanitizes hostile targets', () => {
   assert.equal(jobBranch('QA symptom: 403 on upload!', 'j9'), 'fleet/QA-symptom-403-on-upload-j9');
   assert.equal(jobBranch('...', 'j9'), 'fleet/work-j9');
+});
+
+/** A prose target the length of a whole prompt — the canary's shape, longer. */
+const LONG_TARGET = 'Canary: prove this deployment can run a job. '.repeat(9);
+
+test('jobBranch caps the name at what git can lock, keeping the job id whole', () => {
+  const jobId = 'job-mfk2z8x1-9a3c7e02';
+  const branch = jobBranch(LONG_TARGET, jobId);
+  const component = branch.slice('fleet/'.length);
+  // The measured ceiling: git locks a loose ref by creating <name>.lock, so a
+  // component may be NAME_MAX (255) minus five. 251 fails "File name too long".
+  assert.ok(component.length <= 250, `component is ${component.length} characters`);
+  // Truncation must eat the target, never the suffix that distinguishes jobs.
+  assert.ok(branch.endsWith(`-${jobId}`), branch);
+  assert.notEqual(branch, jobBranch(LONG_TARGET, 'job-mfk2z8x1-9a3c7e03'));
+  // fleet reclaim lists claims by jobBranch(target, ''); a cut whose width
+  // depends on the job id would leave it matching nothing.
+  assert.ok(branch.startsWith(jobBranch(LONG_TARGET, '')), 'the claim prefix must still prefix the branch');
+});
+
+test('a prose target long enough to break git still creates and pushes its branch', () => {
+  // The failure this replaces: an uncapped name reached setupWorkspace and the
+  // job died there on "cannot lock ref ... File name too long".
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const { branch } = setupWorkspace(workspace, { ...opts(remote), target: LONG_TARGET, jobId: 'job-mfk2z8x1-9a3c7e02' });
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote, branch], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${branch}`), `branch ${branch} never reached the remote`);
+  // And the claim it creates can still be released — the rename appends more.
+  assert.equal(renameRemoteBranch(workspace, branch, `${branch}-attempt1`), 'renamed');
+});
+
+test('validBranchName applies git ref rules to a name chosen elsewhere', () => {
+  for (const ok of ['fleet/9-job-old', 'feature/a.b', 'v2', 'a'.repeat(250)]) {
+    assert.equal(validBranchName(ok), true, ok);
+  }
+  const refused = [
+    '', '@', '-oops', '--upload-pack=touch /tmp/pwn', 'a b', 'a..b', 'a~1', 'a^', 'a:b', 'a?b',
+    'a*b', 'a[b', 'a\\b', 'a@{b', 'a/', '/a', 'a//b', 'a.', '.a', 'a/.b', 'a.lock', 'a/b.lock',
+    'a\nb', 'a\x7fb', 'a'.repeat(251),
+  ];
+  for (const bad of refused) {
+    assert.equal(validBranchName(bad), false, JSON.stringify(bad));
+  }
 });
 
 test('gitCredentialEnv wires gh as the github.com helper only when a token exists', () => {

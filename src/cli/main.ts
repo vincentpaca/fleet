@@ -17,7 +17,7 @@ import {
   retainedDir,
   type RetainedRecord,
 } from '../shared/retained.ts';
-import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch } from '../runner/git.ts';
+import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch, validBranchName } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
@@ -650,6 +650,22 @@ async function ghPrViewJson(target: string, ref: string, signal?: AbortSignal): 
 }
 
 /**
+ * The head branch gh reported, admitted only if git would accept it as a ref.
+ * That name is chosen by whoever opened the PR, and from here it travels in the
+ * work order into the runner's git argv — so git's own rules are the admission
+ * test, applied at the boundary the value enters on, and a refusal names it.
+ */
+function prHeadBranch(target: string, headRefName: unknown): string {
+  if (typeof headRefName !== 'string' || headRefName === '') {
+    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  }
+  if (!validBranchName(headRefName)) {
+    fail(`cannot resolve PR target ${target}: refusing head branch ${JSON.stringify(headRefName)} — not a valid git branch name`);
+  }
+  return headRefName;
+}
+
+/**
  * Resolve a PR target via gh at dispatch (#80): the head branch the job will
  * adopt, the PR title, and the linked issue when exactly one is derivable.
  * Refuses non-open PRs — a merged or closed PR has no branch to continue, and
@@ -671,8 +687,9 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
   } catch {
     fail(`cannot resolve PR target ${target}: gh returned unparseable JSON`);
   }
-  if (typeof pr.number !== 'number' || typeof pr.headRefName !== 'string' || pr.headRefName === '') {
-    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  const branch = prHeadBranch(target, pr.headRefName);
+  if (typeof pr.number !== 'number') {
+    fail(`cannot resolve PR target ${target}: gh reported no PR number`);
   }
   if (pr.state !== 'OPEN') {
     fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — only an open PR can be continued`);
@@ -682,7 +699,7 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
     : undefined;
   return {
     number: pr.number,
-    branch: pr.headRefName,
+    branch,
     ...(typeof pr.title === 'string' && pr.title !== '' ? { title: pr.title } : {}),
     ...(typeof linked === 'number' ? { issue: linked } : {}),
   };
