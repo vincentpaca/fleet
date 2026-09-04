@@ -5,6 +5,96 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.2.1 — 2026-09-05
+
+A fix release that turned into the week Fleet stopped being a one-harness tool.
+The headline is small and urgent — every git-wired dispatch was dying before the
+harness started — but the same investigation produced an end-to-end test that
+now runs four different coding CLIs against a repository that is not this one.
+
+### What's new for you
+
+- **Your dispatches work again.** Any job whose manifest declared a
+  `setup.script` died at `git config user.name` with a message naming the
+  command and not the cause. The runner stays root through the clone so an
+  operator-written setup script can install packages, but the image had handed
+  `/workspace` to the job user, and git refuses a repository owned by somebody
+  else. If jobs have been failing since late August with a git error that made
+  no sense, this is why. **Rebuild your runner image** — the fix is in the
+  image, not the CLI.
+- **Git failures say what git said.** The settle report kept only the first
+  line of an error, and for a spawned command that line is the arguments echoed
+  back. It now carries the tool's own first line of stderr, which is the
+  difference between "Command failed: git config user.name Vincent Paca" and
+  "dubious ownership in repository at '/workspace'".
+- **`fleet canary`** dispatches a small read-only job through the normal path
+  and tells you whether the deployment can actually run one. Point it at a
+  freshly rolled image before you trust it: the git bug above sat undetected
+  for three days because nothing exercised a real job after a rebuild.
+- **Run a harness Fleet has never heard of.** `FLEET_HARNESS_CMD` names the
+  command to spawn and is read before the `harness.cli` check, so any CLI runs
+  without a schema entry, an adapter, or a release. Claude Code, Codex,
+  OpenCode and omp each now complete a real job against an external repository
+  in Fleet's own CI. What you give up is the transcript — the translator speaks
+  claude-code's dialect — and the injected output contract, so an override's
+  prompt has to say where deliverables go. Delivery itself is unaffected: the
+  settle reads the report off disk. See `docs/architecture.md#harnesses` for
+  each CLI's working invocation, including which need an API key rather than a
+  subscription sign-in.
+- **`--destroy` finishes.** Tearing a deployment down stalled on a non-empty
+  ECR repository and left half a deployment plus a manual batch-delete before
+  you could retry.
+- **`fleet doctor` and `fleet resume-push` agree.** Doctor called a retained
+  workspace healthy whenever its directory existed, while resume-push discarded
+  the record unless a git repository was really there — so doctor recommended
+  the command that would throw away the record it had just reported. Both now
+  check for a repository, and doctor distinguishes a path that is gone from one
+  that is present without a repository in it.
+- **The operator token survives a race.** It was written check-then-create, so
+  two processes starting together could each mint one and the loser would
+  overwrite a token already handed to a cockpit or a tunnel — a working client
+  refused with nothing to explain it. It is created exclusively now, and an
+  empty token file left by a killed run is claimed rather than returned as the
+  token.
+- **The daemon stops echoing error text.** A 500 carried the error's message,
+  which holds absolute paths and internal state, to a client that may be a
+  job's runner rather than you. It is logged instead.
+- **The paper airplane in the banner is the real asset**, not a hand-drawn
+  pixel grid.
+
+### Upgrade notes
+
+- **Rebuild your runner images.** `images/runner/Dockerfile` changed and the
+  `/workspace` ownership fix lives there — a CLI upgrade alone leaves every
+  git-wired dispatch broken. `fleet upgrade --rebuild-images`, or
+  `images/build.sh --redeploy-daemon` from a checkout.
+- **Re-run `terraform apply`.** `infra/aws/main.tf` changed: ECR repositories
+  are created with `force_delete` so a teardown is not blocked by pushed
+  images. Note the consequence — a change that replaces a repository now
+  deletes the images inside it rather than failing loudly. They are rebuildable
+  from a pinned ref, which is the standing assumption (D16).
+- **Then run `fleet canary`.** It exists because a rolled image that cannot run
+  a job is invisible until a real dispatch fails on it.
+- No schema changes: existing manifests and stored jobs need nothing.
+
+### Breaking changes
+
+None.
+
+### All merged PRs
+
+- #216: Registries no longer block a teardown
+- #219: #218: Runner image chowns /workspace to the job user; root-phase git dies on dubious ownership
+- #221: #220: fleet canary: prove the deployment on a live job after an image roll
+- #222: Fix the intermittent resume-push failures: workspace validity and temp isolation
+- #226: #225: One paper airplane everywhere: the real dart art in the dashboard and help
+- #229: #224: End-to-end against a foreign repo, one row per harness
+- #231: ci: bump fast-uri from 3.1.5 to 3.1.7 in the npm_and_yarn group across 1 directory
+- #232: Cloud lifecycle drill: apply, delegate, destroy
+- #233: Check a retained workspace holds a repository, not just a .git entry
+- #234: Resolve the open code-scanning alerts
+- #235: README: say that a harness without an adapter still runs
+
 ## 0.2.0 — 2026-08-27
 
 The first release cut by the release pipeline. It spans everything merged since
