@@ -1523,9 +1523,36 @@ async function mayOverwrite(
   return confirm(`overwrite ${path.relative(opts.cwd, situation.manifestPath)}?`, ask);
 }
 
+/** Frames the dart flies through, and how long each one holds. */
+const FLIGHT_OFFSETS = [14, 10, 7, 4, 2, 0];
+const FLIGHT_MS = 55;
+
+/**
+ * Fly the dart in from the left, once, on a real terminal.
+ *
+ * Redraws the same block in place — cursor up, clear line, print at a smaller
+ * left offset — so it lands exactly where the static banner would have been and
+ * everything after it is unaffected. Skipped whenever the output is not a
+ * terminal a human is watching (a pipe, a log, CI, NO_COLOR): the escape codes
+ * would be garbage in a file, and the suite captures stdout, so an animation
+ * that ignored this would be asserted against as literal control characters.
+ */
+async function flyIn(banner: string, out: NodeJS.WriteStream): Promise<void> {
+  const lines = banner.split('\n');
+  for (const [frame, offset] of FLIGHT_OFFSETS.entries()) {
+    if (frame > 0) out.write(`\x1b[${lines.length}A`);
+    for (const line of lines) out.write(`\x1b[2K${' '.repeat(offset)}${line}\n`);
+    if (offset > 0) await new Promise((resolve) => setTimeout(resolve, FLIGHT_MS));
+  }
+}
+
 /** The face of the product, and where it is about to work (#217). */
-function printHeader(opts: SetupRepoOptions): void {
-  opts.log(renderBanner(80, 'NO_COLOR' in opts.env, detectColorLevel(opts.env)));
+async function printHeader(opts: SetupRepoOptions): Promise<void> {
+  const banner = renderBanner(80, 'NO_COLOR' in opts.env, detectColorLevel(opts.env));
+  const out = process.stdout;
+  const watched = out.isTTY === true && !('NO_COLOR' in opts.env) && opts.env.CI === undefined;
+  if (watched) await flyIn(banner, out);
+  else opts.log(banner);
   opts.log('');
   opts.log(`  Setting up ${opts.cwd}`);
   opts.log('');
@@ -1542,7 +1569,7 @@ async function askForAnswers(
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
   const prompts = repoPrompts(opts.cwd, situation.existing, situation.seat);
   try {
-    if (ask) printHeader(opts);
+    if (ask) await printHeader(opts);
     const shortcut = situation.manifestExists ? undefined : await offerDetectedPlan(prompts, opts, ask);
     const merged = await interview(prompts, {
       flags: shortcut ? { ...shortcut, ...opts.flags } : opts.flags,

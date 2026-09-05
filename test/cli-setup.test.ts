@@ -963,6 +963,22 @@ test('setup repo: no gate in the repo means a gate that passes, never a missing 
   assert.equal(gate.status, 0, 'the gate a fresh repo gets must actually pass');
 });
 
+test('the banner animation never reaches anything but a terminal (#217)', async () => {
+  // The dart flies in on a real TTY by redrawing itself in place. Those cursor
+  // codes are garbage in a file, and this suite captures stdout — so a version
+  // that animated regardless would put literal escape sequences into every
+  // assertion here, and into every operator's CI log. FLEET_FORCE_TTY makes the
+  // interview interactive without making stdout a terminal, which is exactly
+  // the case that must stay clean.
+  const cwd = scratchRepo();
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(4) });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stdout.includes('\u001b[2K'), false, 'a clear-line code reached a pipe');
+  assert.equal(/\u001b\[\d+A/.test(res.stdout), false, 'a cursor-up code reached a pipe');
+  // The banner itself still arrives — the fallback is the static one, not none.
+  assert.match(res.stdout, /F L E E T/);
+});
+
 test('setup repo shows what it found and takes one Enter for all of it (#217)', async () => {
   // #217's third principle: ask nothing by default. Six questions a first-time
   // operator cannot answer become one block they can read and one Enter. The
