@@ -34,9 +34,12 @@ const preWindowSchemaPath = fileURLToPath(new URL('../fixtures/work-order-pre-wi
  * Every work order this file's dispatches posted. Node runs the tests in one
  * file sequentially, so by the time the last test reads this the dispatches
  * above have all happened — which is what lets the pre-window-schema test
- * assert against the real thing rather than a hand-written imitation.
+ * assert against the real thing rather than a hand-written imitation. The
+ * dispatch's argv rides along: since #240 what an order may legally contain
+ * depends on what the operator asked for, and the args are the only record of
+ * that.
  */
-const ORDERS_SEEN: Record<string, unknown>[] = [];
+const ORDERS_SEEN: { args: string[]; order: Record<string, unknown> }[] = [];
 
 const MANIFEST = {
   version: 1,
@@ -117,7 +120,7 @@ async function windowOrderAgainstOldGate(
     });
     assert.equal(res.code, 0, res.stderr);
     order = JSON.parse(daemon.requests[0].body).workOrder;
-    ORDERS_SEEN.push(order);
+    ORDERS_SEEN.push({ args, order });
   } finally {
     await daemon.close();
   }
@@ -176,6 +179,24 @@ test('window CLI → old gate: --mode assess on an issue still gates strict (D17
   const { order, status, out } = await windowOrderAgainstOldGate(['--mode', 'assess', '42'], fakeBins(UNREADY_GH));
   assert.equal(order.mode, 'implement', 'a read-only --mode must not soften the compat mode');
   assert.equal((order.authority as { publish: boolean }).publish, false, 'it does move the dispatch defaults');
+  assert.equal(status, 1, out);
+  assert.match(out, /lacks the "ready" label/);
+});
+
+test('window CLI → old gate: an operator prompt on an issue still gates strict (#240)', async () => {
+  // The invariant #240 could most easily have broken, checked on the gate an
+  // operator actually has rather than on this repo's regenerated one: the
+  // prompt says what the agent does, never what the dispatch is, so "/dev-work
+  // #42" against an unready issue must still die at pickup. A CLI that read the
+  // prompt as the job — or
+  // that let a prompt-carrying order fall through to the prose row — would pass
+  // this issue through with no readiness check and no `Closes #n`.
+  const { order, status, out } = await windowOrderAgainstOldGate(
+    ['42', '--prompt', '/dev-work #42'],
+    fakeBins(UNREADY_GH),
+  );
+  assert.equal(order.prompt, '/dev-work #42', 'carried verbatim');
+  assert.equal(order.mode, 'implement', 'the old gate keys on this, and the prompt must not have moved it');
   assert.equal(status, 1, out);
   assert.match(out, /lacks the "ready" label/);
 });
@@ -240,7 +261,9 @@ test('both pre-window fixtures are byte-identical to the originals', () => {
 test('every order the window CLI writes validates against the frozen pre-window schema', () => {
   // The compatibility claim the whole window rests on, checked rather than
   // asserted: a new CLI dispatching at an operator's un-upgraded daemon must
-  // not 422. It is also what licenses NOT writing `report` or the dead
+  // not 422 — for every dispatch that asks for nothing the old schema lacks,
+  // which since #240 is every dispatch without `--prompt`. It is also what
+  // licenses NOT writing `report` or the dead
   // authority subfields — the pre-window schema required only mode/target/
   // finish and nothing inside `authority`, so writing them would be dead weight
   // justified by a compatibility need that does not exist.
@@ -279,20 +302,45 @@ test('every order the window CLI writes validates against the frozen pre-window 
   for (const order of orders) {
     assert.ok(validate(order), `${order.mode}: ${JSON.stringify(validate.errors)}`);
   }
+  // `prompt` (#240) is the one field a pre-window daemon cannot take, and the
+  // cost is bounded by the CLI writing it only when the operator asked for one:
+  // every default dispatch above still validates, and `--prompt` against an
+  // un-upgraded deployment is a 422 the operator provoked and `fleet upgrade`
+  // resolves. Pinned as a failure rather than left unsaid, because the bug is
+  // making the field unconditional — that would move every order into this
+  // branch, and the loop below is what would say so.
+  const prompted = { ...orders[0], prompt: '/dev-work #42' };
+  assert.equal(validate(prompted), false, 'the frozen schema is additionalProperties:false — this must not silently pass');
+  assert.ok(
+    validate.errors?.some((e) => e.params?.additionalProperty === 'prompt'),
+    `the refusal must be about prompt: ${JSON.stringify(validate.errors)}`,
+  );
+
   assert.ok(ORDERS_SEEN.length > 0, 'no dispatch was recorded — the pin has nothing to compare');
   const keys = (o: Record<string, unknown>): string => JSON.stringify(Object.keys(o).sort());
+  const pinned = [...orders, prompted];
+  const strip = ({ order }: { order: Record<string, unknown> }): Record<string, unknown> => {
+    const { title: _title, ...rest } = order;
+    return rest;
+  };
   for (const seen of ORDERS_SEEN) {
-    const { title: _title, ...rest } = seen;
-    assert.ok(validate(rest), `a posted order failed the pre-window schema: ${JSON.stringify(validate.errors)}`);
+    const rest = strip(seen);
+    const asked = seen.args.includes('--prompt');
+    assert.equal('prompt' in rest, asked, `only an operator asking for a prompt may put one on the wire: ${seen.args.join(' ')}`);
+    assert.equal(
+      validate(rest),
+      !asked,
+      `a posted order disagreed with the pre-window schema: ${keys(rest)} ${JSON.stringify(validate.errors)}`,
+    );
     assert.ok(
-      orders.some((o) => keys(o) === keys(rest)),
+      pinned.some((o) => keys(o) === keys(rest)),
       `a posted order has fields none of the pinned shapes do: ${keys(rest)}`,
     );
   }
   // Every pinned shape must actually have been dispatched, or the list is
   // documenting an order the CLI no longer writes.
-  const seenKeys = new Set(ORDERS_SEEN.map(({ title: _t, ...rest }) => keys(rest)));
-  for (const order of orders) {
+  const seenKeys = new Set(ORDERS_SEEN.map(strip).map(keys));
+  for (const order of pinned) {
     assert.ok(seenKeys.has(keys(order)), `no dispatch in this file produced the pinned shape ${keys(order)}`);
   }
 });

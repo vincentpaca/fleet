@@ -222,6 +222,99 @@ test('delegate: the window release writes a compat mode computed from shape', as
   assert.equal(mapped.mode, 'implement', 'the compat mode is keyed on shape, never on the flag');
 });
 
+// --- The operator's prompt (#240): instruction beside identity ---
+
+test('delegate: an un-prompted dispatch writes no prompt at all', async (t) => {
+  // The compatibility claim the whole field rests on. A deployed daemon
+  // validates orders against the schema baked into its own image, so a `prompt`
+  // written unconditionally — even the shape's own default — would 422 every
+  // dispatch until the deployment caught up. The assertion is the WHOLE order,
+  // not a `'prompt' in order` check: a defaulted prompt and any other field
+  // this release started writing both fail here, which is what "the same order
+  // the release before it posted" actually means. (Key ORDER is not asserted —
+  // deepEqual ignores it, and JSON object order is not part of the contract.)
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const issue = await postedOrder(['42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.deepEqual(issue, {
+    mode: 'implement',
+    target: '42',
+    finish: 'merge-ready',
+    authority: { publish: true, merge: false, deploy: false },
+    title: 'Fix the flaky heartbeat',
+  });
+  const prose = await postedOrder(['why do queued jobs sit behind the capacity cap'], cwd, daemon);
+  assert.deepEqual(prose, {
+    mode: 'investigate',
+    target: 'why do queued jobs sit behind the capacity cap',
+    finish: 'inspected',
+    authority: { publish: false, merge: false, deploy: false },
+  });
+});
+
+test('delegate --prompt: what the operator typed reaches the order verbatim', async (t) => {
+  // What the field exists for: before it, the operator's own workflow could
+  // only arrive as an argument to Fleet's. This covers the dispatch leg only —
+  // that the runner then launches the harness with these same bytes is pinned
+  // separately in test/runner-harness.test.ts. The characters are chosen:
+  // backticks around an identifier and a `$` are idiomatic in a prompt, and
+  // both survive JSON round-trips that a naive shell-quoting fix would eat.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const prompt = '/dev-work #42 — keep `parseVersion` reading $HOME, and say "why" in the body';
+
+  const order = await postedOrder(['42', '--prompt', prompt], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(order.prompt, prompt, 'byte-for-byte, nothing prepended and nothing escaped');
+  assert.equal(order.target, '42', 'and the target is still the identity every consumer reads');
+});
+
+test('delegate --prompt: the shape still comes from the target alone (D17)', async (t) => {
+  // The inversion this field could have introduced, and the reason the prompt
+  // is never parsed for an issue reference. Two bugs it catches: a prompt
+  // naming an issue promoting a prose dispatch to issue strictness and publish
+  // authority, and — the direction that costs a readiness check — a prompt on
+  // an issue target demoting it to prose because the CLI decided the operator
+  // asking for something specific means the number is no longer the job.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const onIssue = await postedOrder(['42', '--prompt', '/dev-work #42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(onIssue.target, '42', 'the branch, the claim guard and Closes #n all read this');
+  assert.equal(onIssue.finish, 'merge-ready');
+  assert.deepEqual(onIssue.authority, { publish: true, merge: false, deploy: false });
+  assert.equal(onIssue.mode, 'implement', 'so an un-regenerated repo gate still runs the readiness check');
+
+  const onProse = await postedOrder(['compare the two retry approaches', '--prompt', '/dev-work #42'], cwd, daemon);
+  assert.equal(onProse.target, 'compare the two retry approaches', 'never derived back out of the prompt');
+  assert.equal(onProse.finish, 'inspected');
+  assert.equal((onProse.authority as { publish: boolean }).publish, false, 'a prompt grants no authority');
+  assert.equal(onProse.mode, 'investigate');
+});
+
+test('delegate --prompt: an empty prompt is refused by the schema, before any POST', async (t) => {
+  // `--prompt ""` is a typo, not a request to run with no instruction, and the
+  // schema is where that is decided (minLength 1) rather than in a hand-rolled
+  // check beside it.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'some open question', '--prompt', ''], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 1, res.stderr);
+  assert.match(res.stderr, /prompt/);
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
+});
+
 // --- The deprecated --mode flag, for the life of the window ---
 
 test('delegate --mode: read-only names ask for read-only and inspected, and it warns', async (t) => {
