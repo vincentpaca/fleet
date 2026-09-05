@@ -84,6 +84,15 @@ type HarnessInputs = {
    * gh itself — no runner-side feedback plumbing exists on purpose.
    */
   continues?: { pr: number; branch: string };
+  /**
+   * The work order's `prompt` (#240): what the operator wants done, used
+   * verbatim in place of the `/<command> <target>` line Fleet composes when it
+   * is absent. Fleet still appends what it owns — the continuation clause and
+   * the output contract — because those are guarantees of the pipe, not of the
+   * instruction. It is operator text, so it must reach the harness as literal
+   * characters; the derived plan is argv and never sees a shell (#241).
+   */
+  prompt?: string;
 };
 
 /** Append version-drift notes when an actual version is measurable and required. */
@@ -115,15 +124,43 @@ function continuationClause(continues: { pr: number; branch: string } | undefine
   );
 }
 
+/**
+ * Fleet's own instruction line for an order that carries no prompt: the
+ * manifest's first slash command applied to the target. This is Fleet choosing
+ * the verb, which #240 exists to stop doing — it survives only as the default
+ * for orders dispatched without a prompt. Undefined when no command is
+ * declared, which is what makes such a setup underivable.
+ */
+function composeSlashCommand(harness: Record<string, unknown>, target: string): string | undefined {
+  const commands = Array.isArray(harness.commands) ? harness.commands : [];
+  const first = commands[0] as { path?: string } | undefined;
+  if (!first?.path) return undefined;
+  // .claude/commands/dev.md -> /dev — the repo's own slash command, which the
+  // CLI discovers from the cloned workspace.
+  const name = first.path.split('/').pop()?.replace(/\.md$/, '');
+  if (!name) return undefined;
+  return `/${name} ${target}`;
+}
+
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, target, override, actualVersion, continues }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, target, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
   // below is argv and never sees a shell: its target comes from a work order
   // and, on an adoption, its branch name comes from whoever opened the PR, so a
   // `$(...)` in either used to execute inside the job container (#241).
-  if (override) return { file: override, args: [], shell: true, notes: [] };
+  if (override) {
+    // An override is the entire launch line, so a work-order prompt has nowhere
+    // to go: splicing it in would put operator text back inside a shell string,
+    // which is the hole #241 closed. Dropping it is the right call and a silent
+    // drop is not — the operator typed the prompt and would otherwise spend the
+    // job wondering why it had no effect.
+    const notes = prompt
+      ? ['FLEET_HARNESS_CMD is set, so it is the whole launch line and the work order prompt was not used']
+      : [];
+    return { file: override, args: [], shell: true, notes };
+  }
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
@@ -134,21 +171,23 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
 
   if (cli !== 'claude-code') return undefined; // adapters for other CLIs arrive with demand
 
-  const commands = Array.isArray(harness.commands) ? harness.commands : [];
-  const first = commands[0] as { path?: string } | undefined;
-  if (!first?.path) return undefined;
-  // .claude/commands/dev.md -> /dev — the repo's own slash command, which the
-  // CLI discovers from the cloned workspace.
-  const name = first.path.split('/').pop()?.replace(/\.md$/, '');
-  if (!name) return undefined;
+  // An operator-supplied prompt (#240) replaces the whole composed line, so the
+  // manifest's commands are not consulted at all: requiring them would make a
+  // prompted job die on a field the launch no longer reads. Without one, Fleet
+  // still composes `/<command> <target>` — byte-identical to before #240, which
+  // is what keeps every existing manifest and every un-prompted dispatch
+  // behaving exactly as it did.
+  const instruction = prompt !== undefined && prompt !== '' ? prompt : composeSlashCommand(harness, target);
+  if (instruction === undefined) return undefined;
 
-  // The output contract (#81) rides on every prompt, continuation included: a
-  // continuation that produces a report instead of commits still owes its
-  // deliverables to the artifact lane.
-  const prompt = `/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
+  // The output contract (#81) and the continuation clause ride on every prompt,
+  // operator-written included: a continuation that produces a report instead of
+  // commits still owes its deliverables to the artifact lane, and an adoption is
+  // still an adoption whoever wrote the instruction.
+  const promptText = `${instruction}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
   return {
     file: 'claude',
-    args: ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--allowedTools', ...CLAUDE_ALLOWED_TOOLS],
+    args: ['-p', promptText, '--output-format', 'stream-json', '--verbose', '--allowedTools', ...CLAUDE_ALLOWED_TOOLS],
     shell: false,
     notes,
     // claude-code caps a single response at 32k output tokens by default; a

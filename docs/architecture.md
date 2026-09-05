@@ -69,9 +69,10 @@ Two rules make the contracts real rather than decorative: the daemon validates *
 ## Harnesses
 
 `harness.cli` selects the coding CLI a job runs. One value, `claude-code`, is
-supported end to end: the runner derives the command from
-`harness.commands[0].path`, injects the output contract, and `src/runner/translate.ts`
-turns its stream into Fleet events, so the transcript renders.
+supported end to end: the runner takes the work order's `prompt` when it carries
+one and otherwise composes `/<harness.commands[0]> <target>`, injects the output
+contract, and `src/runner/translate.ts` turns its stream into Fleet events, so
+the transcript renders.
 
 Every other CLI runs through **`FLEET_HARNESS_CMD`**, an environment variable
 naming the exact command to spawn. It is read *before* the `harness.cli` check
