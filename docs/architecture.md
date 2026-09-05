@@ -74,14 +74,17 @@ that sentence. Fleet does not choose the verb (D8) — it carries the instructio
 and appends only what it owns: the output contract, and an adoption's
 continuation clause.
 
-The one exception is a target that is an *identity* rather than an instruction.
-`fleet delegate 69` names issue 69 — the pickup gate, the claim guard and
-`Closes #n` all read that number — so there is nothing in it to run, and the
-runner composes `/<harness.commands[0]> 69` from the manifest as it always has.
-That is the only surviving use of `harness.commands`, which is why the field is
-now optional: a repo whose jobs are all prompts declares none. To run your own
-workflow *with* issue strictness, name both:
-`fleet delegate 69 --prompt "/dev-work #69"`.
+A bare issue number is not an instruction — it names *which* work, not what to
+do about it. `fleet delegate 69` is therefore an error, and it says what to type
+instead: `fleet delegate 69 --prompt "/dev-work #69"`, which runs your workflow
+while `69` stays the identity the pickup gate, the claim guard and `Closes #69`
+all read.
+
+Fleet used to fill that gap from `harness.commands[0]`. Nothing reads that field
+any more — it survives in the schema as a deprecated tombstone only because
+`harness` is `additionalProperties: false` and removing the property would fail
+every existing manifest. Delete it from yours. `fleet setup repo` no longer asks
+for one, which is also why a bare checkout can now be onboarded.
 
 `harness.cli` selects which coding CLI executes it. `claude-code`, `codex`,
 `opencode` and `omp` each have a headless invocation in
