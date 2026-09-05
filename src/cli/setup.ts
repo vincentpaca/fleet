@@ -971,7 +971,7 @@ type RepoManifest = {
   setup: { image: string; script: string };
   workspace: { repo: string; strategy: 'branch-per-job'; sync?: string[] };
   env?: { vars: string[] };
-  harness: { cli: string; commands: Array<{ path: string; critic: string }> };
+  harness: { cli: string };
   gates: { pickup: string; default_finish: string };
   limits: { idle: string; block_hot: string; decision_timeout: string };
 };
@@ -1125,7 +1125,6 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
 export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWalk): PromptSpec[] {
   const ecosystem = ECOSYSTEMS.find((e) => fs.existsSync(path.join(cwd, e.marker)));
   const gate = firstExisting(cwd, ['.fleet/gate.mjs', '.fleet/check-ready.js', '.fleet/check-ready.mjs']);
-  const commands = markdownIn(cwd, path.join('.claude', 'commands'));
   const envKeys = [...envKeysFrom(cwd, '.env.example'), ...envKeysFrom(cwd, path.join('.fleet', '.env.example'))];
   const kept = (value: string | undefined, detected: string | undefined): (() => string | undefined) =>
     () => value ?? detected;
@@ -1176,23 +1175,6 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
       fallback: kept(existing?.gates.pickup, gate ? `node ${gate}` : 'node .fleet/check-ready.js'),
       required: true,
     },
-    {
-      key: 'command_path',
-      question: 'harness command to run',
-      fallback: kept(existing?.harness.commands[0]?.path, commands[0] ?? '.claude/commands/dev.md'),
-      required: true,
-      validate: (value) =>
-        fs.existsSync(path.join(cwd, value))
-          ? undefined
-          : `not in this checkout: ${value} (create it before dispatching, or name one that exists)`,
-    },
-    {
-      key: 'critic',
-      question: 'critic agent that reviews the work',
-      hint: 'no command runs without one — the manifest lint enforces it',
-      fallback: kept(existing?.harness.commands[0]?.critic, 'code-reviewer'),
-      required: true,
-    },
     ...seatPrompts(seat),
   ];
 }
@@ -1206,7 +1188,9 @@ export function repoManifest(answers: Answers): RepoManifest { // contract pin: 
     setup: { image: answers.image, script: '.fleet/setup.sh' },
     workspace: { repo: answers.repo, strategy: 'branch-per-job' },
     // One runner adapter exists, so the CLI is shown rather than asked.
-    harness: { cli: 'claude-code', commands: [{ path: answers.command_path, critic: answers.critic }] },
+    // No command list (#240): the operator says what to run at dispatch, so
+    // there is nothing here for Fleet to pick from.
+    harness: { cli: 'claude-code' },
     gates: { pickup: answers.pickup, default_finish: 'merge-ready' },
     // Not interviewed: these are the documented defaults (src/shared/time.ts),
     // written out so the manifest shows the cost model instead of hiding it.

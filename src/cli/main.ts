@@ -111,13 +111,11 @@ Commands:
                                            What you type is what the agent runs:
                                              fleet delegate "/dev-sprint"
                                              fleet delegate "use the feature-spec skill for X"
-                                           A bare issue number is the exception — it is an
-                                           identity, not an instruction, so delegate 69 runs
-                                           your first harness.commands entry against issue 69 and
-                                           keeps the readiness gate, publish and Closes #69.
-                                           --prompt names both, so
+                                           An issue number says which work, not what to do
+                                           about it, so it needs --prompt as well:
                                              fleet delegate 69 --prompt "/dev-work #69"
-                                           runs your workflow with issue strictness.
+                                           That keeps the readiness gate, publish and Closes #69
+                                           while still running your workflow, not Fleet's.
                                            A deployment older than #240 rejects a prompt-carrying
                                            order outright — fleet upgrade first.
                                            The target decides everything else either way, so a
@@ -851,7 +849,18 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // is one, so an issue dispatch posts the same bytes it always has and keeps
   // working against a daemon whose baked-in schema predates the field.
   const prompt = req.prompt ?? defaultPrompt(shape, target);
-  if (prompt !== undefined) workOrder.prompt = prompt;
+  if (prompt === undefined) {
+    // An identity target says which issue, never what to do about it, and Fleet
+    // no longer invents the verb from the manifest (#240). Refused here rather
+    // than in the runner: this costs nothing, and the alternative is finding out
+    // after a container has booted and cloned.
+    fail(
+      `nothing to run: "${target}" names the work but does not say what to do with it.\n` +
+        `  fleet delegate ${target} --prompt "/your-command #${target}"\n` +
+        '  (or dispatch the instruction on its own: fleet delegate "/your-command")',
+    );
+  }
+  workOrder.prompt = prompt;
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);

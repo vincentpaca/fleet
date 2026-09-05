@@ -382,7 +382,7 @@ async function main(): Promise<void> {
     prompt: orderPrompt,
   });
   if (!plan) {
-    await settleBlocked(sink, `no harness command derivable for cli "${cli}" — set harness.commands or FLEET_HARNESS_CMD`);
+    await settleBlocked(sink, `nothing to run: the work order carries no prompt and cli "${cli}" has no launch plan without one. Dispatch with an instruction (fleet delegate "/your-command"), or set FLEET_HARNESS_CMD.`);
     await sink.emit({ type: 'state', state: 'cancelled', reason: 'harness-cmd' });
     process.exit(1);
   }

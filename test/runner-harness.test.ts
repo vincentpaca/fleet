@@ -11,16 +11,13 @@ import { fileURLToPath } from 'node:url';
 import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT } from '../src/runner/harness.ts';
 import { startMockDaemon } from './runner-mock-daemon.ts';
 
-const manifest = {
-  harness: {
-    cli: 'claude-code',
-    cli_version: '>=2.1.0',
-    commands: [{ path: '.claude/commands/dev.md', critic: 'code-reviewer' }],
-  },
-};
+const manifest = { harness: { cli: 'claude-code', cli_version: '>=2.1.0' } };
+
+/** What a dispatch of `APP-14` now carries: the operator's own instruction. */
+const PROMPT = '/dev APP-14';
 
 test('derives the claude-code launch argv from the first command and the target', () => {
-  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.1.220' });
   assert.ok(plan);
   assert.equal(plan.file, 'claude');
   assert.equal(plan.shell, false, 'the derived plan is argv; a shell here re-opens #241');
@@ -41,7 +38,7 @@ test('the output contract is injected into every derived prompt, verbatim (#81)'
     OUTPUT_CONTRACT,
     'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.',
   );
-  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.1.220' });
   assert.ok(plan);
   // The contract rides inside the -p prompt argument, so it reaches the agent
   // on repos with no fleet playbook at all.
@@ -60,7 +57,7 @@ test('override wins verbatim, no notes, no derivation', () => {
 });
 
 test('claude-code adapter ships its dialect env default; overrides carry none', () => {
-  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.1.220' });
   assert.equal(plan?.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '64000');
   const override = buildHarnessCommand({ manifest, target: 'APP-14', override: 'node fake.mjs' });
   assert.equal(override?.env, undefined);
@@ -70,6 +67,7 @@ test('continues (#80) rides into the prompt: PR, branch, gh feedback instruction
   const plan = buildHarnessCommand({
     manifest,
     target: '77',
+    prompt: '/dev 77',
     actualVersion: '2.1.220',
     continues: { pr: 41, branch: 'fleet/77-job-old' },
   });
@@ -81,20 +79,22 @@ test('continues (#80) rides into the prompt: PR, branch, gh feedback instruction
   assert.match(prompt, /never open a new PR/);
   // The bug this catches: continuation text leaking into ordinary dispatches,
   // which would send every implement job hunting for a PR that does not exist.
-  const plain = buildHarnessCommand({ manifest, target: '77', actualVersion: '2.1.220' });
+  const plain = buildHarnessCommand({ manifest, target: '77', prompt: '/dev 77', actualVersion: '2.1.220' });
   assert.ok(plain);
   assert.doesNotMatch(plain.args[1], /continuing PR/);
 });
 
 test('version violations become notes, not failures', () => {
-  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.0.9' });
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.0.9' });
   assert.ok(plan);
   assert.match(plan.notes[0], /2\.0\.9 violates .*>=2\.1\.0/);
 });
 
 test('underivable setups return undefined (unknown cli, missing commands)', () => {
-  assert.equal(buildHarnessCommand({ manifest: { harness: { cli: 'codex' } }, target: 'X' }), undefined);
-  assert.equal(buildHarnessCommand({ manifest: { harness: { cli: 'claude-code', commands: [] } }, target: 'X' }), undefined);
+  // Underivable now means "no instruction", not "no command list": Fleet has
+  // nothing of its own to fall back on (#240).
+  assert.equal(buildHarnessCommand({ manifest, target: 'X' }), undefined, 'an order with no prompt has nothing to run');
+  assert.equal(buildHarnessCommand({ manifest, target: 'X', prompt: '' }), undefined, 'an empty prompt is not an instruction');
 });
 
 test('versionSatisfies: >= comparisons and exact-prefix pins', () => {
@@ -137,18 +137,19 @@ function runPlan(plan: { file: string; args: string[]; shell: boolean }): { argv
   return { argv: readFileSync(argvFile, 'utf8'), cwd };
 }
 
-test('a target with shell metacharacters reaches the harness literally (#241)', () => {
-  const plan = buildHarnessCommand({
-    manifest,
-    target: 'audit why $HOME is wrong, `id -u` and $(touch pwned-target) matter',
-    actualVersion: '2.1.220',
-  });
+test('the target is not on the launch line at all any more (#240 closing #241 by construction)', () => {
+  // #241's original vector was the target being interpolated into a shell
+  // string. Since #240 the target is not interpolated into anything — the
+  // instruction is the prompt, and the identity stays an identity. Asserted
+  // rather than assumed, because reintroducing the target here would quietly
+  // reopen the hole for every operator who types a `$` in one.
+  const hostile = 'audit why $HOME is wrong, `id -u` and $(touch pwned-target) matter';
+  const plan = buildHarnessCommand({ manifest, target: hostile, prompt: '/dev-audit', actualVersion: '2.1.220' });
   assert.ok(plan);
+  assert.equal(plan.args.some((a) => a.includes(hostile)), false, `the target reached the launch line: ${JSON.stringify(plan.args)}`);
   const { argv, cwd } = runPlan(plan);
-  assert.ok(argv.includes('$HOME'), `$HOME was expanded before the harness saw it:\n${argv}`);
-  assert.ok(argv.includes('`id -u`'), `backticks were consumed by a shell:\n${argv}`);
-  assert.ok(argv.includes('$(touch pwned-target)'), `command substitution was consumed by a shell:\n${argv}`);
   assert.equal(existsSync(join(cwd, 'pwned-target')), false, 'the target executed a command');
+  assert.equal(argv.includes('pwned-target'), false, `the target reached the harness: ${argv}`);
 });
 
 test('an adopted PR branch with a command substitution reaches the harness literally (#241)', () => {
@@ -157,6 +158,7 @@ test('an adopted PR branch with a command substitution reaches the harness liter
   const plan = buildHarnessCommand({
     manifest,
     target: '77',
+    prompt: '/dev 77',
     actualVersion: '2.1.220',
     continues: { pr: 7, branch: 'feat/$(touch pwned-branch)' },
   });
@@ -251,7 +253,7 @@ test('harness.model reaches the clis that need one, and is absent when unset (#2
 });
 
 test('the launch line an operator reads survives argv (display only)', () => {
-  const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
+  const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.1.220' });
   assert.ok(plan);
   const line = describeHarnessPlan(plan);
   assert.ok(line.startsWith('claude "-p" '), line);
@@ -321,12 +323,15 @@ test('the runner spawns the derived harness as argv — no shell at the spawn si
         gates: { pickup: `node -e "process.exit(0)"` },
       }),
     );
-    // Both untrusted inputs at once: the dispatch target, and the branch name of
-    // an adopted PR, which is chosen by whoever pushed the branch.
+    // Both untrusted inputs at once, at the real spawn site: the operator's
+    // prompt — which since #240 is the launch line itself, so it is the widest
+    // this input has ever been — and the branch name of an adopted PR, chosen
+    // by whoever pushed the branch.
     writeFileSync(
       join(workspace, '.fleet', 'order.json'),
       JSON.stringify({
-        target: 'audit why $HOME is wrong, `touch ' + fromBacktick + '` and $(touch ' + fromTarget + ')',
+        target: '77',
+        prompt: 'audit why $HOME is wrong, `touch ' + fromBacktick + '` and $(touch ' + fromTarget + ')',
         finish: 'inspected',
         continues: { pr: 7, branch: `feat/$(touch ${fromBranch})` },
       }),
@@ -419,23 +424,24 @@ test('a prompted job derives even when the manifest declares no commands (#240)'
   assert.equal(plan.args[1], `read src/runner/harness.ts and write what it does to answer.md\n\n${OUTPUT_CONTRACT}`);
 });
 
-test('without a prompt the launch line is byte-identical to before #240', () => {
-  // The compatibility contract: every manifest and every dispatch that predates
-  // the field must be unaffected. Pinned against the literal, not against
-  // another call to the same builder, so a builder that mangles both ways still
-  // fails here.
-  const expected = `/dev APP-14\n\n${OUTPUT_CONTRACT}`;
-  assert.equal(buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' })?.args[1], expected);
-  assert.equal(
-    buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220', prompt: undefined })?.args[1],
-    expected,
-    'an explicitly absent prompt took a different path from an omitted one',
-  );
-  assert.equal(
-    buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220', prompt: '' })?.args[1],
-    expected,
-    'an empty prompt is not an instruction — it must fall back, not launch a bare contract',
-  );
+test('no prompt means no launch plan — there is nothing left to fall back to (#240)', () => {
+  // What replaced the fallback. Fleet used to answer "no instruction" by
+  // composing `/<harness.commands[0]> <target>`, which is how a repo with four
+  // workflows only ever reached the first one. Now the absence is fatal, and
+  // the CLI refuses the dispatch before a container boots. The three spellings
+  // of absent must agree: a builder that treats one of them as an instruction
+  // would launch a bare output contract with no job in it.
+  for (const prompt of [undefined, '']) {
+    assert.equal(
+      buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220', prompt }),
+      undefined,
+      `prompt ${JSON.stringify(prompt)} produced a launch plan out of nothing`,
+    );
+  }
+  assert.equal(buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' }), undefined);
+  // And a manifest still carrying the deprecated command list buys it nothing.
+  const legacy = { harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev.md' }] } };
+  assert.equal(buildHarnessCommand({ manifest: legacy, target: 'APP-14' }), undefined, 'harness.commands came back to life');
 });
 
 test('a prompt does not change the dispatch shape: an adoption keeps its continuation clause (#240)', () => {

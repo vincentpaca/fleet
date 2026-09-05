@@ -63,20 +63,20 @@ export const SHAPE_DEFAULTS: Record<DispatchShape, { publish: boolean; finish: s
  * first".
  */
 /**
- * The launch instruction for a shape, or undefined to leave it to the runner.
+ * The launch instruction for a shape, or undefined when the operator has not
+ * given one.
  *
  * This is the whole of #240. A prose target has never been an identity — no
  * `Closes #n`, no readiness check, nothing reads it but the branch name — so it
- * is the operator saying what they want run, and it now runs as typed:
- * `fleet delegate "/dev-sprint"` launches `/dev-sprint`, not `/dev /dev-sprint`.
+ * is the operator saying what they want run, and it runs as typed:
+ * `fleet delegate "/dev-sprint"` launches `/dev-sprint`.
  *
- * An issue or an adoption returns undefined and the runner composes
- * `/<harness.commands[0]> <target>` exactly as it always has, because there the
- * target IS an identity — a number the gate, the claim guard and `Closes #n`
- * all read — and `fleet delegate 69` must not change. The composition stays in
- * the runner rather than moving here because only the runner has the cloned
- * workspace's manifest; duplicating it in the CLI is the drift AGENTS.md
- * forbids.
+ * An issue or an adoption returns undefined, because a number says which work,
+ * never what to do about it. Fleet used to fill that gap from
+ * `harness.commands[0]`, which is how a repo with four workflows could only
+ * ever reach the first one and how Fleet ended up choosing the verb (D8). It
+ * does not any more: the caller refuses the dispatch and tells the operator to
+ * say what to run. `fleet delegate 69 --prompt "/dev-work #69"` names both.
  */
 export function defaultPrompt(shape: DispatchShape, target: string): string | undefined {
   return shape === 'prose' ? target : undefined;

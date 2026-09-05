@@ -224,11 +224,11 @@
               },
               "critic": {
                 "type": "string",
-                "description": "Deprecated (#240), unused. Nothing in src/ reads it: agents/dev.md hardcodes its reviewer, so a manifest naming another critic still runs that one. The property survives one train so existing manifests keep validating."
+                "description": "Deprecated and unread (#240). It never had a reader: agents/dev.md hardcodes its reviewer, so naming another critic here has never had any effect."
               }
             }
           },
-          "description": "Optional (#240). The repo's slash commands. Only the first is used, and only as the default instruction for an issue or adoption dispatch, where the target is an identity rather than something to run. A prose dispatch runs what the operator typed, so a repo whose jobs are all prompts needs no commands at all. Kept as a property because harness is additionalProperties:false and deployed daemons validate with their own baked-in schema, so removals ship daemon-first."
+          "description": "Deprecated and unread (#240). Fleet composes no instruction of its own any more \u2014 you say what to run at dispatch \u2014 so nothing in src/ looks at this. The property survives one train because harness is additionalProperties:false and every existing manifest declares it; removing it now would fail them all at validation. Delete it from yours."
         },
         "model": {
           "type": "string",

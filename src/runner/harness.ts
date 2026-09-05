@@ -73,7 +73,8 @@ export function versionSatisfies(actual: string, requirement: string): boolean |
 
 type HarnessInputs = {
   manifest: Record<string, unknown>;
-  target: string;
+  /** The job's identity. Not part of the launch line any more (#240) — kept for callers' shape. */
+  target?: string;
   /** FLEET_HARNESS_CMD, when set. */
   override?: string;
   /** Actual CLI version when measurable (runner probes `claude --version`). */
@@ -86,11 +87,12 @@ type HarnessInputs = {
   continues?: { pr: number; branch: string };
   /**
    * The work order's `prompt` (#240): what the operator wants done, used
-   * verbatim in place of the `/<command> <target>` line Fleet composes when it
-   * is absent. Fleet still appends what it owns — the continuation clause and
-   * the output contract — because those are guarantees of the pipe, not of the
-   * instruction. It is operator text, so it must reach the harness as literal
-   * characters; the derived plan is argv and never sees a shell (#241).
+   * verbatim as the launch line. Required: Fleet composes no instruction of its
+   * own any more, so an order without one has no job to run. Fleet still
+   * appends what it owns — the continuation clause and the output contract —
+   * because those are guarantees of the pipe, not of the instruction. It is
+   * operator text, so it must reach the harness as literal characters; the
+   * derived plan is argv and never sees a shell (#241).
    */
   prompt?: string;
 };
@@ -122,24 +124,6 @@ function continuationClause(continues: { pr: number; branch: string } | undefine
     ` read that PR's review comments and failing checks with gh (gh pr view ${continues.pr} --comments; gh pr checks ${continues.pr})` +
     ` and address them. Push fixes to the same branch so the PR updates in place; never open a new PR.`
   );
-}
-
-/**
- * Fleet's own instruction line for an order that carries no prompt: the
- * manifest's first slash command applied to the target. This is Fleet choosing
- * the verb, which #240 exists to stop doing — it survives only as the default
- * for orders dispatched without a prompt. Undefined when no command is
- * declared, which is what makes such a setup underivable.
- */
-function composeSlashCommand(harness: Record<string, unknown>, target: string): string | undefined {
-  const commands = Array.isArray(harness.commands) ? harness.commands : [];
-  const first = commands[0] as { path?: string } | undefined;
-  if (!first?.path) return undefined;
-  // .claude/commands/dev.md -> /dev — the repo's own slash command, which the
-  // CLI discovers from the cloned workspace.
-  const name = first.path.split('/').pop()?.replace(/\.md$/, '');
-  if (!name) return undefined;
-  return `/${name} ${target}`;
 }
 
 /**
@@ -191,7 +175,7 @@ function overridePlan(override: string, prompt: string | undefined): HarnessPlan
 }
 
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, target, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
@@ -210,20 +194,19 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   const dialect = DIALECTS[cli];
   if (!dialect) return undefined; // an unknown cli has no headless invocation to guess at
 
-  // An operator-supplied prompt (#240) replaces the whole composed line, so the
-  // manifest's commands are not consulted at all: requiring them would make a
-  // prompted job die on a field the launch no longer reads. Without one, Fleet
-  // still composes `/<command> <target>` — byte-identical to before #240, which
-  // is what keeps every existing manifest and every un-prompted dispatch
-  // behaving exactly as it did.
-  const instruction = prompt !== undefined && prompt !== '' ? prompt : composeSlashCommand(harness, target);
-  if (instruction === undefined) return undefined;
+  // The instruction is the operator's, always (#240). Fleet used to compose
+  // `/<harness.commands[0]> <target>` when the order carried no prompt, which
+  // is how a repo with four workflows could only ever reach the first one, and
+  // how Fleet ended up choosing the verb — the harness's job, not the pipe's
+  // (D8). There is no fallback now: an order with no prompt is underivable, and
+  // the CLI refuses to build one, so this is a guard rather than a path.
+  if (prompt === undefined || prompt === '') return undefined;
 
   // The output contract (#81) and the continuation clause ride on every prompt,
   // operator-written included: a continuation that produces a report instead of
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
-  const promptText = `${instruction}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
+  const promptText = `${prompt}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
   const model = typeof harness.model === 'string' ? harness.model : undefined;
   if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
   return { ...dialect(promptText, model), shell: false, notes };

@@ -918,7 +918,7 @@ function scratchRepo(): string {
 test('setup repo: an all-Enter interview extracts a valid manifest from the checkout', async () => {
   const cwd = scratchRepo();
   // repo, image, setup command, sync, env vars, pickup, command, critic.
-  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) });
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) });
   assert.equal(res.code, 0, res.stderr);
 
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
@@ -927,8 +927,10 @@ test('setup repo: an all-Enter interview extracts a valid manifest from the chec
   assert.equal(manifest.workspace.repo, 'origin', 'the portable sentinel is the default');
   assert.equal(manifest.setup.image, 'node:22', 'a package.json names the ecosystem');
   assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs', 'the gate that exists is the default');
-  assert.equal(manifest.harness.commands[0].path, '.claude/commands/dev.md');
-  assert.equal(manifest.harness.commands[0].critic, 'code-reviewer');
+  // No command list at all (#240): setup stopped asking which one to run,
+  // because Fleet stopped picking. The operator says it at dispatch.
+  assert.equal(manifest.harness.commands, undefined, 'setup wrote a command list Fleet no longer reads');
+  assert.deepEqual(Object.keys(manifest.harness), ['cli'], 'the harness block is just which CLI to launch');
   assert.deepEqual(manifest.env.vars, ['API_TOKEN', 'DB_URL'], 'env var names come from .env.example');
   assert.equal(manifest.workspace.sync, undefined, 'an empty answer omits the section, never an empty array');
   assert.deepEqual(
@@ -960,22 +962,26 @@ test('setup repo headless: flags supply the answers, and a missing one names its
   const extracted = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
   assert.equal(extracted.code, 0, 'every repo prompt has an extractable default here');
 
+  // A bare directory used to fail here, because setup demanded a slash command
+  // to run and an empty checkout has none to offer. Since #240 there is nothing
+  // to demand — Fleet picks no command — so onboarding succeeds with a harness
+  // block that says only which CLI to launch.
   const bare = makeTempDir('fleet-setup-repo-bare-');
   const res = await runCli(['setup', 'repo'], { cwd: bare });
-  assert.equal(res.code, 1, 'nothing to extract a harness command from');
-  assert.match(res.stderr, /--command-path/);
-  assert.ok(!fs.existsSync(path.join(bare, '.fleet', 'manifest.json')), 'nothing written');
+  assert.equal(res.code, 0, res.stderr);
+  const bareManifest = JSON.parse(fs.readFileSync(path.join(bare, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(bareManifest.harness, { cli: 'claude-code' }, 'onboarding invented a command list');
 });
 
 test('setup repo: an existing manifest becomes the defaults, and overwriting takes a yes', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) })).code, 0);
   const first = fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8');
 
   const declined = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    stdin: `${'\n'.repeat(6)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /nothing written/);
@@ -984,18 +990,18 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    // Change one answer (the critic); everything else is the existing manifest.
-    stdin: `${'\n'.repeat(7)}sceptic\ny\n`,
+    // Change one answer (the pickup gate); everything else is the existing manifest.
+    stdin: `${'\n'.repeat(5)}node .fleet/other.mjs\ny\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
-  assert.equal(manifest.harness.commands[0].critic, 'sceptic');
-  assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs', 'unchanged answers came from the existing manifest');
+  assert.equal(manifest.gates.pickup, 'node .fleet/other.mjs', 'the changed answer took');
+  assert.equal(manifest.workspace.repo, 'origin', 'unchanged answers came from the existing manifest');
 });
 
 test('setup repo: no terminal and an existing manifest refuses instead of overwriting', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) })).code, 0);
   const res = await runCli(['setup', 'repo'], { cwd });
   assert.equal(res.code, 1);
   assert.match(res.stderr, /--yes/);
@@ -1010,7 +1016,7 @@ test('setup repo: a manifest the schema rejects is refused, not written', async 
   const code = await runSetupRepo({
     cwd,
     env: {},
-    flags: { repo: 'origin', image: 'node:22', pickup: 'gate', command_path: '.claude/commands/dev.md', critic: 'c' },
+    flags: { repo: 'origin', image: 'node:22', pickup: 'gate' },
     yes: true,
     interactive: false,
     log: () => {},
@@ -1035,7 +1041,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
   const declined = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    stdin: `${'\n'.repeat(6)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /is not a valid manifest/);
@@ -1045,7 +1051,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}y\n`,
+    stdin: `${'\n'.repeat(6)}y\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
@@ -1059,7 +1065,7 @@ test('setup repo: a manifest that is not JSON at all is not silently replaced ei
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    stdin: `${'\n'.repeat(6)}n\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /is not valid JSON/);
@@ -1088,7 +1094,7 @@ test('setup repo: a seat login and no credential walks the acquisition — one p
       CLAUDE_CODE_OAUTH_TOKEN: undefined,
     },
     // The eight repo prompts, then the one paste.
-    stdin: `${'\n'.repeat(8)}sk-ant-oat01-pasted\n`,
+    stdin: `${'\n'.repeat(6)}sk-ant-oat01-pasted\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /claude setup-token/, 'the walk teaches the vendor command');
@@ -1153,7 +1159,7 @@ test('setup repo: a credential already in the environment means no walk — the 
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CLAUDE_CONFIG_DIR: claudeDir, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: '\n'.repeat(8),
+    stdin: '\n'.repeat(6),
   });
   assert.equal(res.code, 0, res.stderr);
   assert.ok(!fs.existsSync(path.join(cwd, '.fleet', '.env')), 'nothing to acquire, nothing written');
@@ -1166,7 +1172,7 @@ test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: `${'\n'.repeat(8)}yes\n`,
+    stdin: `${'\n'.repeat(6)}yes\n`,
   });
   assert.equal(res.code, 0, res.stderr);
 
