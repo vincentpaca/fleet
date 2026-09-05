@@ -35,7 +35,7 @@ import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { imageExistsLocally } from '../src/cli/images.ts';
@@ -680,8 +680,8 @@ async function setupRepo(project: string, image: string, env: NodeJS.ProcessEnv)
     '--sync', GITCONFIG_PATH,
     '--env-vars', ENV_VARS.join(', '),
     '--pickup', 'npm test',
-    '--command-path', COMMAND_PATH,
-    '--critic', 'code-reviewer',
+    // No --command-path / --critic: setup stopped asking which command to run
+    // (#240). The instruction is named at dispatch instead, below.
   ];
   try {
     const res = await run('node', [cli, ...args], { cwd: project, env });
@@ -723,7 +723,10 @@ async function runProbe(t: { after(fn: () => void): void }, row: HarnessRow): Pr
   }
 
   const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
-  const delegated = await fleet(['delegate', TARGET]);
+  // The dispatch shape #240 exists for: an identity to name the job, and the
+  // target repo's OWN slash command as the instruction — which is the thing
+  // Fleet used to compose from the manifest and now never touches.
+  const delegated = await fleet(['delegate', TARGET, '--prompt', `/${basename(COMMAND_PATH, '.md')} ${TARGET}`]);
   const jobId = delegated.stdout.trim().split(/\s+/).find((word) => word.startsWith('job-'));
   assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
   t.after(() => removeJobContainer(jobId));

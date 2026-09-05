@@ -68,10 +68,31 @@ Two rules make the contracts real rather than decorative: the daemon validates *
 
 ## Harnesses
 
-`harness.cli` selects the coding CLI a job runs. One value, `claude-code`, is
-supported end to end: the runner derives the command from
-`harness.commands[0].path`, injects the output contract, and `src/runner/translate.ts`
-turns its stream into Fleet events, so the transcript renders.
+**What you type is what runs.** `fleet delegate "/dev-sprint"` launches
+`/dev-sprint`. `fleet delegate "use the feature-spec skill to write X"` launches
+that sentence. Fleet does not choose the verb (D8) — it carries the instruction
+and appends only what it owns: the output contract, and an adoption's
+continuation clause.
+
+A bare issue number is not an instruction — it names *which* work, not what to
+do about it. `fleet delegate 69` is therefore an error, and it says what to type
+instead: `fleet delegate 69 --prompt "/dev-work #69"`, which runs your workflow
+while `69` stays the identity the pickup gate, the claim guard and `Closes #69`
+all read.
+
+Fleet used to fill that gap from `harness.commands[0]`. Nothing reads that field
+any more — it survives in the schema as a deprecated tombstone only because
+`harness` is `additionalProperties: false` and removing the property would fail
+every existing manifest. Delete it from yours. `fleet setup repo` no longer asks
+for one, which is also why a bare checkout can now be onboarded.
+
+`harness.cli` selects which coding CLI executes it. `claude-code`, `codex`,
+`opencode` and `omp` each have a headless invocation in
+`src/runner/harness.ts` (`DIALECTS`); `harness.model` is passed to the ones that
+take a model, and omitted otherwise. Only `claude-code` streams a transcript —
+`src/runner/translate.ts` speaks its dialect — so the others report at settle
+rather than live. Delivery is identical for all four: the report and artifacts
+are read off disk, not off the stream.
 
 Every other CLI runs through **`FLEET_HARNESS_CMD`**, an environment variable
 naming the exact command to spawn. It is read *before* the `harness.cli` check
@@ -94,6 +115,10 @@ deliverables go — artifacts under `.fleet/out/artifacts/`, the report at
 speaks claude-code's dialect alone; the job still delivers, because the settle
 reads the report off disk rather than out of the stream. **Delivery is
 harness-agnostic; observability is not.**
+
+The override is also the only launch path that still runs through a shell: it is
+spawned as `/bin/sh -c '<your string>'`, so its content is trusted operator
+input, while the derived path is spawned as argv and never sees a shell (#241).
 
 Four harnesses are exercised against a real external repository in
 `test/e2e-foreign-repo.test.ts`. What each needed, since none of it is guessable:

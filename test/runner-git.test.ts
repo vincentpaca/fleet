@@ -8,7 +8,7 @@ import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setupWorkspace, pushWork, pushWip, jobBranch, getHeadSha, remoteHasHead, remoteMovedBeyond, renameRemoteBranch, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
+import { setupWorkspace, pushWork, pushWip, jobBranch, validBranchName, getHeadSha, remoteHasHead, remoteMovedBeyond, renameRemoteBranch, createDraftPr, composeDraftPrText, findOpenPr, gitCredentialEnv } from '../src/runner/git.ts';
 
 const IDENTITY = ['-c', 'user.name=Operator One', '-c', 'user.email=op@example.com'];
 const run = (cwd: string, args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd, encoding: 'utf8' });
@@ -101,6 +101,128 @@ test('partial work is pushed with a partial marker — evidence over tidiness', 
 test('jobBranch sanitizes hostile targets', () => {
   assert.equal(jobBranch('QA symptom: 403 on upload!', 'j9'), 'fleet/QA-symptom-403-on-upload-j9');
   assert.equal(jobBranch('...', 'j9'), 'fleet/work-j9');
+});
+
+/** A prose target the length of a whole prompt — the canary's shape, longer. */
+const LONG_TARGET = 'Canary: prove this deployment can run a job. '.repeat(9);
+
+test('jobBranch caps the name at what git can lock, keeping the job id whole', () => {
+  const jobId = 'job-mfk2z8x1-9a3c7e02';
+  const branch = jobBranch(LONG_TARGET, jobId);
+  const component = branch.slice('fleet/'.length);
+  // The measured ceiling: git locks a loose ref by creating <name>.lock, so a
+  // component may be NAME_MAX (255) minus five. 251 fails "File name too long".
+  assert.ok(component.length <= 250, `component is ${component.length} characters`);
+  // Truncation must eat the target, never the suffix that distinguishes jobs.
+  assert.ok(branch.endsWith(`-${jobId}`), branch);
+  assert.notEqual(branch, jobBranch(LONG_TARGET, 'job-mfk2z8x1-9a3c7e03'));
+  // fleet reclaim lists claims by jobBranch(target, ''); a cut whose width
+  // depends on the job id would leave it matching nothing.
+  assert.ok(branch.startsWith(jobBranch(LONG_TARGET, '')), 'the claim prefix must still prefix the branch');
+});
+
+test('a prose target long enough to break git still creates and pushes its branch', () => {
+  // The failure this replaces: an uncapped name reached setupWorkspace and the
+  // job died there on "cannot lock ref ... File name too long".
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const { branch } = setupWorkspace(workspace, { ...opts(remote), target: LONG_TARGET, jobId: 'job-mfk2z8x1-9a3c7e02' });
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote, branch], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${branch}`), `branch ${branch} never reached the remote`);
+  // And the claim it creates can still be released — the rename appends more.
+  assert.equal(renameRemoteBranch(workspace, branch, `${branch}-attempt1`), 'renamed');
+});
+
+/** Ask git itself whether a name is a legal ref — never re-implement its rules here. */
+function gitAcceptsRef(name: string): boolean {
+  try {
+    execFileSync('git', ['check-ref-format', `refs/heads/${name}`], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Targets shaped like the ones that reach dispatch: prose, punctuation, paths,
+ * control bytes, and the ellipsis that made this test necessary.
+ */
+const HOSTILE_TARGETS = [
+  'QA symptom: 403 on upload!',
+  '...',
+  '..',
+  'a..b',
+  'Fix the flake in auth... then re-run CI',
+  '.hidden',
+  'trailing.',
+  'refs.lock',
+  'HEAD@{1}',
+  '@',
+  '-oops',
+  'feature/../../etc/passwd',
+  'a b',
+  '   ',
+  '///',
+  '$(touch /tmp/pwn) && `id`',
+  'tab\tand\nnewline\x7f',
+  'ünïcødé prose target',
+  'x'.repeat(400),
+  LONG_TARGET,
+  `${'y'.repeat(199)}...tail`,
+];
+
+test('every name jobBranch emits is one git accepts, and one validBranchName admits', () => {
+  // The class this pins: a target reaching setupWorkspace as a ref git refuses,
+  // which kills the job there. Length was one instance; '.' surviving the
+  // sanitizer's character class into '..' — which git bans anywhere in a ref —
+  // was another. Both are the same defect, so both are checked the same way:
+  // against real git, not against a copy of its rules.
+  for (const target of HOSTILE_TARGETS) {
+    const branch = jobBranch(target, 'job-mfk2z8x1-9a3c7e02');
+    assert.ok(gitAcceptsRef(branch), `git refuses ${JSON.stringify(branch)} from target ${JSON.stringify(target)}`);
+    // And the vet applied to externally-chosen names must admit our own —
+    // if it did not, the two would be enforcing different shapes.
+    assert.equal(validBranchName(branch), true, branch);
+  }
+});
+
+test('two long targets sharing a cut prefix keep distinct claim namespaces', () => {
+  // Truncation alone made these one namespace, and `fleet reclaim <target>`
+  // releases by that namespace: reclaiming one would have renamed the other's
+  // live claim out from under a running job.
+  const shared = 'Investigate the intermittent 502 from the upload service. '.repeat(5);
+  const [a, b] = [`${shared} It reproduces on retry.`, `${shared} It never reproduces on retry.`];
+  assert.notEqual(jobBranch(a, 'job-1'), jobBranch(b, 'job-1'));
+  const [prefixA, prefixB] = [jobBranch(a, ''), jobBranch(b, '')];
+  assert.ok(!prefixA.startsWith(prefixB) && !prefixB.startsWith(prefixA), `${prefixA} vs ${prefixB}`);
+  // The discriminator comes off the target, not the job id, so the reclaim
+  // prefix still prefixes every job branch for that target.
+  assert.ok(jobBranch(a, 'job-1').startsWith(prefixA), prefixA);
+  assert.ok(jobBranch(a, 'job-2').startsWith(prefixA), prefixA);
+});
+
+test('validBranchName is a whitelist, refusing names git itself accepts', () => {
+  // git has no use for these bytes so it permits them. The consumer downstream
+  // is not git: the branch lands in the harness prompt (continuationClause) and
+  // on a command line, where every one of them means something.
+  for (const legalButUnsafe of ['a$b', 'a`b', 'a(b)', 'a|b', 'a{b}', 'a;b', 'a&b', 'a>b', "a'b", 'a"b', 'a#b', 'ünïcode']) {
+    assert.equal(gitAcceptsRef(legalButUnsafe), true, `git should still accept ${legalButUnsafe}`);
+    assert.equal(validBranchName(legalButUnsafe), false, legalButUnsafe);
+  }
+});
+
+test('validBranchName applies git ref rules to a name chosen elsewhere', () => {
+  for (const ok of ['fleet/9-job-old', 'feature/a.b', 'v2', 'a'.repeat(250)]) {
+    assert.equal(validBranchName(ok), true, ok);
+  }
+  const refused = [
+    '', '@', '-oops', '--upload-pack=touch /tmp/pwn', 'a b', 'a..b', 'a~1', 'a^', 'a:b', 'a?b',
+    'a*b', 'a[b', 'a\\b', 'a@{b', 'a/', '/a', 'a//b', 'a.', '.a', 'a/.b', 'a.lock', 'a/b.lock',
+    'a\nb', 'a\x7fb', 'a'.repeat(251),
+  ];
+  for (const bad of refused) {
+    assert.equal(validBranchName(bad), false, JSON.stringify(bad));
+  }
 });
 
 test('gitCredentialEnv wires gh as the github.com helper only when a token exists', () => {

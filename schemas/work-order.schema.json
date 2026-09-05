@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fleet.harnessx.net/schemas/work-order.schema.json",
   "title": "Fleet work order (dispatch contract)",
-  "description": "What a dispatch must say: a target, what authority it carries, where it stops. Generalizes battle-tested operator playbooks into a schema so the delegation contract is enforced, not restated in prose per prompt. Travels with `fleet delegate`. Dispatch shape — `continues` present means adoption, a numeric target means an issue, anything else is prose — is what the CLI keys defaults on and what a repo's pickup gate keys strictness on (#36, docs/decisions.md#d17). Migration window: `mode`, `report` and the unread `authority` subfields are accepted and ignored, and are removed in the follow-up release.",
+  "description": "What a dispatch must say: a target, optionally what to do with it, what authority it carries, where it stops. Generalizes battle-tested operator playbooks into a schema so the delegation contract is enforced, not restated in prose per prompt. Travels with `fleet delegate`. Dispatch shape — `continues` present means adoption, a numeric target means an issue, anything else is prose — is what the CLI keys defaults on and what a repo's pickup gate keys strictness on (#36, docs/decisions.md#d17). Migration window: `mode`, `report` and the unread `authority` subfields are accepted and ignored, and are removed in the follow-up release.",
   "type": "object",
   "required": ["target", "finish"],
   "additionalProperties": false,
@@ -16,7 +16,12 @@
     "target": {
       "type": "string",
       "minLength": 1,
-      "description": "Ticket key, PR reference, branch pair, or symptom statement."
+      "description": "Ticket key, PR reference, branch pair, or symptom statement. An identity, not an instruction: the job branch `fleet/<target>-<jobId>`, the pickup gate's claim guard, `Closes #n`, the board's lineage column and the dispatch shape all read it. `prompt` is where what-to-do lives."
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the operator wants done (#240). The runner uses it verbatim as the harness's launch line, in place of the `/<command> <target>` line Fleet composes from `harness.commands[0]` when it is absent (src/runner/harness.ts buildHarnessCommand). Fleet still appends the continuation clause and the output contract, which are guarantees of the pipe rather than of the instruction. Optional, and the CLI writes it only when asked: this object is `additionalProperties: false` and a deployed daemon validates orders against the schema baked into its own image, so an order carrying `prompt` is rejected outright by a deployment older than this field — `fleet upgrade` before dispatching one. It never decides the shape: strictness, publish and finish come from `target` and `continues` alone (docs/decisions.md#d17), so a prompt naming an issue does not buy a prose dispatch the issue readiness check, and a prompt on an issue target does not escape it."
     },
     "truth": {
       "type": "array",
@@ -53,7 +58,7 @@
       "description": "Post-settle feedback re-entry (#80): this dispatch adopts an existing open PR's head branch instead of creating a fresh job branch. The runner fetches and checks out `branch`, pushes work to it (the PR updates in place), and never opens a new PR. Its presence IS the adoption declaration (#36) — the repo's pickup gate subjects every continues-carrying order to the adopted PR's checks (open, head matches) plus the claim guard, which is where the guard against adoption-by-accident now lives.",
       "properties": {
         "pr": { "type": "integer", "minimum": 1, "description": "The open PR being continued." },
-        "branch": { "type": "string", "minLength": 1, "description": "The PR's head branch, resolved by the CLI at dispatch." }
+        "branch": { "type": "string", "pattern": "^[A-Za-z0-9._/-]+$", "description": "The PR's head branch, resolved by the CLI at dispatch. Whoever opened the PR chose this name, and the runner interpolates it into the harness prompt and into git argv — so the shape is a whitelist, not git's own ref rules, which permit `$`, backtick, parentheses, `|` and braces. Narrower than what GitHub allows as a branch name, deliberately: a PR whose head is outside this set cannot be adopted. The CLI refuses the same shape at dispatch (validBranchName, src/runner/git.ts); this is the enforcing half, since the daemon validates every work order at intake." }
       }
     },
     "limits": {
