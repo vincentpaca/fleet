@@ -250,7 +250,7 @@ the workspace is ready before any model spend.`;
 function initManifest(): unknown {
   return {
     version: 1,
-    setup: { image: 'node:22', script: '.fleet/setup.sh' },
+    setup: { image: 'node:24', script: '.fleet/setup.sh' },
     workspace: { repo: 'git@github.com:acme/example-app.git', strategy: 'branch-per-job' },
     harness: {
       cli: 'claude-code',

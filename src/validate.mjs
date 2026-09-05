@@ -6,7 +6,7 @@ import addFormats from 'ajv-formats';
 const schemaPath = (name) => fileURLToPath(new URL(`../schemas/${name}`, import.meta.url));
 const load = (name) => JSON.parse(readFileSync(schemaPath(name), 'utf8'));
 
-export const manifestSchema = load('manifest.schema.json'); // contract pin: test-only export, asserted by the suite
+export const manifestSchema = load('manifest.schema.json'); // harness.cli choices feed the setup interview (src/cli/setup.ts)
 const workOrderSchema = load('work-order.schema.json');
 const eventsSchema = load('events.schema.json');
 export const jobStates = load('job-states.json');

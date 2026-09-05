@@ -1,7 +1,7 @@
 {
   "version": 1,
   "setup": {
-    "image": "node:22",
+    "image": "node:24",
     "script": ".fleet/setup.sh"
   },
   "workspace": {

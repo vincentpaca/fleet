@@ -23,12 +23,14 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { manifestSchema } from '../validate.mjs';
 import { createIfAbsent } from '../shared/fs.ts';
 import { loadDotEnv, upsertDotEnv } from '../shared/dotenv.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
 import { renderBanner, detectColorLevel } from './board.ts';
+import { offerOnHeroScreen } from './hero.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
 import {
@@ -961,15 +963,29 @@ const VERSION_FILES: Record<string, Array<[string, RegExp]>> = {
   'package.json': [
     ['.nvmrc', /^\s*v?(\d+[^\s]*)/],
     ['.node-version', /^\s*v?(\d+[^\s]*)/],
+    ['.tool-versions', /^nodejs\s+v?(\d+\S*)/m],
     ['package.json', /"engines"\s*:\s*\{[^}]*"node"\s*:\s*"[^"\d]*(\d+[^"]*)"/],
+    ['Dockerfile', /^FROM\s+node:(\d[\d.]*)/m],
   ],
   'pyproject.toml': [
     ['.python-version', /^\s*(\d+\.\d+)/],
+    ['.tool-versions', /^python\s+(\d+\.\d+)/m],
     ['pyproject.toml', /requires-python\s*=\s*"[^"\d]*(\d+\.\d+)/],
+    ['Dockerfile', /^FROM\s+python:(\d+\.\d+)/m],
   ],
-  'requirements.txt': [['.python-version', /^\s*(\d+\.\d+)/]],
-  'go.mod': [['go.mod', /^go\s+(\d+\.\d+)/m]],
-  'Cargo.toml': [['rust-toolchain.toml', /channel\s*=\s*"(\d+[^"]*)"/]],
+  'requirements.txt': [
+    ['.python-version', /^\s*(\d+\.\d+)/],
+    ['.tool-versions', /^python\s+(\d+\.\d+)/m],
+    ['Dockerfile', /^FROM\s+python:(\d+\.\d+)/m],
+  ],
+  'go.mod': [
+    ['.tool-versions', /^golang\s+(\d+\.\d+)/m],
+    ['go.mod', /^go\s+(\d+\.\d+)/m],
+  ],
+  'Cargo.toml': [
+    ['rust-toolchain.toml', /channel\s*=\s*"(\d+[^"]*)"/],
+    ['.tool-versions', /^rust\s+(\d+\S*)/m],
+  ],
 };
 
 /** Ecosystems whose images are tagged major.minor rather than bare major. */
@@ -993,10 +1009,17 @@ function languageVersion(cwd: string, marker: string): { version: string; from: 
   return undefined;
 }
 
-/** Lockfiles, and the install command each one's package manager wants. */
+/**
+ * Lockfiles, and the install command each one's package manager wants.
+ *
+ * pnpm and yarn are not on a bare node image's PATH: corepack ships with node
+ * but activates nothing until told to. Without the enable, every job on a pnpm
+ * or yarn repo dies at setup with "pnpm: not found" — verified against a stock
+ * node container, where the enable-then-install pair runs unattended.
+ */
 const NODE_LOCKS: Array<[string, string]> = [
-  ['pnpm-lock.yaml', 'pnpm install --frozen-lockfile'],
-  ['yarn.lock', 'yarn install --frozen-lockfile'],
+  ['pnpm-lock.yaml', 'corepack enable pnpm && pnpm install --frozen-lockfile'],
+  ['yarn.lock', 'corepack enable yarn && yarn install --frozen-lockfile'],
   ['bun.lockb', 'bun install --frozen-lockfile'],
   ['bun.lock', 'bun install --frozen-lockfile'],
   ['package-lock.json', 'npm ci'],
@@ -1004,12 +1027,41 @@ const NODE_LOCKS: Array<[string, string]> = [
 
 /** Files that name an ecosystem, and what that ecosystem's defaults are. */
 const ECOSYSTEMS: Array<{ marker: string; image: string; setup: string }> = [
-  { marker: 'package.json', image: 'node:22', setup: 'npm ci' },
-  { marker: 'pyproject.toml', image: 'python:3.12', setup: 'pip install -e .' },
-  { marker: 'requirements.txt', image: 'python:3.12', setup: 'pip install -r requirements.txt' },
-  { marker: 'go.mod', image: 'golang:1.23', setup: 'go mod download' },
+  { marker: 'package.json', image: 'node:24', setup: 'npm ci' },
+  { marker: 'pyproject.toml', image: 'python:3.13', setup: 'pip install -e .' },
+  { marker: 'requirements.txt', image: 'python:3.13', setup: 'pip install -r requirements.txt' },
+  { marker: 'go.mod', image: 'golang:1.25', setup: 'go mod download' },
   { marker: 'Cargo.toml', image: 'rust:1', setup: 'cargo fetch' },
 ];
+
+/** Where a devcontainer lives — the file where the operator already answered the image question. */
+const DEVCONTAINER_FILES = ['.devcontainer/devcontainer.json', '.devcontainer.json'];
+
+/**
+ * What the devcontainer declares. A regex scan rather than a JSON parse,
+ * because the format allows comments and trailing commas; only the string
+ * forms of `image` and `postCreateCommand` are read, and anything fancier
+ * (a build block, an array command) degrades to the ecosystem defaults.
+ */
+function devcontainerPlan(cwd: string): { image: string; imageFrom: string; setup?: string; setupFrom?: string } | undefined {
+  for (const rel of DEVCONTAINER_FILES) {
+    const image = readMatch(cwd, rel, [/"image"\s*:\s*"([^"]+)"/]);
+    if (image === undefined) continue;
+    const setup = readMatch(cwd, rel, [/"postCreateCommand"\s*:\s*"([^"\\]+)"/]);
+    return { image, imageFrom: rel, setup, setupFrom: setup === undefined ? undefined : rel };
+  }
+  return undefined;
+}
+
+/** Bun is its own runtime, not a node package manager: its lockfile picks the bun image. */
+function bunImage(lock: [string, string] | undefined): { image: string; imageFrom: string } | undefined {
+  return lock?.[0].startsWith('bun.') ? { image: 'oven/bun:1', imageFrom: lock[0] } : undefined;
+}
+
+function pinnedImage(cwd: string, base: { marker: string; image: string }): { image: string; imageFrom: string } | undefined {
+  const pinned = languageVersion(cwd, base.marker);
+  return pinned && { image: `${base.image.split(':')[0]}:${pinned.version}`, imageFrom: pinned.from };
+}
 
 /** The install command, given the ecosystem and the lockfile that was found. */
 function nodeSetup(marker: string, fallback: string, lock: [string, string] | undefined): string {
@@ -1027,17 +1079,33 @@ function nodeSetup(marker: string, fallback: string, lock: [string, string] | un
  * manifest. Assuming `npm ci` was the second bug: on a pnpm or yarn repo it
  * fails at setup, which is every job, before any model runs — and it fails on a
  * repo with no lockfile at all, which `npm install` does not.
+ *
+ * A devcontainer outranks everything: the operator wrote its image name
+ * themselves, and it works on repos no marker file recognises.
  */
-export function detectEcosystem(cwd: string): { image: string; imageFrom: string; setup: string; setupFrom: string } | undefined { // contract pin: test-only export, asserted by the suite
+export function detectEcosystem(cwd: string): EcosystemPlan | undefined { // contract pin: test-only export, asserted by the suite
+  const dev = devcontainerPlan(cwd);
   const base = ECOSYSTEMS.find((e) => fs.existsSync(path.join(cwd, e.marker)));
-  if (!base) return undefined;
-  const pinned = languageVersion(cwd, base.marker);
-  const lock = NODE_LOCKS.find(([file]) => base.marker === 'package.json' && fs.existsSync(path.join(cwd, file)));
+  const plan = base ? markerPlan(cwd, base) : undefined;
+  return dev ? overlayDevcontainer(dev, plan) : plan;
+}
+
+type EcosystemPlan = { image: string; imageFrom: string; setup: string; setupFrom: string };
+
+/** The plan a marker file earns on its own: lockfile picks the install, pins sharpen the image. */
+function markerPlan(cwd: string, base: (typeof ECOSYSTEMS)[number]): EcosystemPlan {
+  const lock = base.marker === 'package.json' ? NODE_LOCKS.find(([file]) => fs.existsSync(path.join(cwd, file))) : undefined;
+  const image = bunImage(lock) ?? pinnedImage(cwd, base) ?? { image: base.image, imageFrom: base.marker };
+  return { ...image, setup: nodeSetup(base.marker, base.setup, lock), setupFrom: lock?.[0] ?? base.marker };
+}
+
+/** The devcontainer's answers win where it gave them; the marker plan fills the rest. */
+function overlayDevcontainer(dev: NonNullable<ReturnType<typeof devcontainerPlan>>, plan?: EcosystemPlan): EcosystemPlan {
   return {
-    image: pinned ? `${base.image.split(':')[0]}:${pinned.version}` : base.image,
-    imageFrom: pinned?.from ?? base.marker,
-    setup: nodeSetup(base.marker, base.setup, lock),
-    setupFrom: lock?.[0] ?? base.marker,
+    image: dev.image,
+    imageFrom: dev.imageFrom,
+    setup: dev.setup ?? plan?.setup ?? '',
+    setupFrom: dev.setupFrom ?? plan?.setupFrom ?? dev.imageFrom,
   };
 }
 
@@ -1053,6 +1121,47 @@ function envKeysFrom(cwd: string, rel: string): string[] {
   } catch {
     return [];
   }
+}
+
+/** Env templates, in the order repos usually name them. */
+const ENV_TEMPLATES = ['.env.example', '.env.sample', '.env.template', path.join('.fleet', '.env.example')];
+
+/** Repo files that say which coding agent already drives this project. */
+const HARNESS_SIGNS: Array<[string, string]> = [
+  ['.claude', 'claude-code'],
+  ['CLAUDE.md', 'claude-code'],
+  ['.codex', 'codex'],
+  ['.opencode', 'opencode'],
+  ['opencode.json', 'opencode'],
+];
+
+/** The adapters manifest `harness.cli` accepts — the schema owns the list. */
+const CLI_CHOICES: string[] = manifestSchema.properties.harness.properties.cli.enum;
+
+/**
+ * The coding agent jobs should run, and the evidence for saying so: the repo's
+ * own harness files first (a project already driven by codex should not get
+ * claude-code because the operator's laptop has it), then what is installed on
+ * this machine, then the first adapter that shipped.
+ */
+function detectCli(cwd: string, env: Record<string, string | undefined>, home?: string): { value: string; from?: string } {
+  const sign = HARNESS_SIGNS.find(([rel]) => fs.existsSync(path.join(cwd, rel)));
+  if (sign) return { value: sign[1], from: `${sign[0]} here` };
+  for (const target of HARNESS_TARGETS) {
+    const why = detectHarness(target, { env, home: home ?? os.homedir() });
+    if (why) return { value: target.id, from: why };
+  }
+  return { value: 'claude-code' };
+}
+
+/** Gitignored package-manager configs: exactly what workspace.sync exists for. */
+const SYNC_HINTS = ['.npmrc', '.yarnrc.yml'];
+
+/** The sync hints this repo has and gitignores. A committed one already ships with the clone. */
+function gitignoredSync(cwd: string): string[] {
+  return SYNC_HINTS.filter(
+    (rel) => fs.existsSync(path.join(cwd, rel)) && spawnSync('git', ['check-ignore', '-q', rel], { cwd }).status === 0,
+  );
 }
 
 /** Markdown files directly under a directory, sorted, as repo-relative paths. */
@@ -1225,10 +1334,10 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
  * acquisition. `seat` is computed by the caller (detection plus flags);
  * absent, the prompts exist only as flag surface and are never asked.
  */
-export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWalk): PromptSpec[] {
+export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWalk, home?: string): PromptSpec[] {
   const ecosystem = detectEcosystem(cwd);
   const gate = firstExisting(cwd, ['.fleet/gate.mjs', '.fleet/check-ready.js', '.fleet/check-ready.mjs']);
-  const envKeys = [...envKeysFrom(cwd, '.env.example'), ...envKeysFrom(cwd, path.join('.fleet', '.env.example'))];
+  const envKeys = [...new Set(ENV_TEMPLATES.flatMap((rel) => envKeysFrom(cwd, rel)))];
   const kept = (value: string | undefined, detected: string | undefined): (() => string | undefined) =>
     () => value ?? detected;
 
@@ -1243,7 +1352,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     {
       key: 'image',
       question: 'base image for the job container',
-      fallback: kept(existing?.setup.image, ecosystem?.image ?? 'node:22'),
+      fallback: kept(existing?.setup.image, ecosystem?.image ?? 'node:24'),
       required: true,
     },
     {
@@ -1252,10 +1361,11 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
       hint: 'the "new laptop" step: deps, build, seed. Written into .fleet/setup.sh',
       fallback: kept(undefined, ecosystem?.setup ?? ''),
     },
+    cliPrompt(cwd, existing, home),
     {
       key: 'sync',
       question: 'gitignored files to ship into the sandbox (comma-separated)',
-      fallback: kept(existing?.workspace.sync?.join(', '), ''),
+      fallback: () => existing?.workspace.sync?.join(', ') ?? gitignoredSync(cwd).join(', '),
       validate: (value) => {
         const missing = splitList(value).filter((rel) => !fs.existsSync(path.join(cwd, rel)));
         return missing.length === 0 ? undefined : `not in this checkout: ${missing.join(', ')}`;
@@ -1287,6 +1397,17 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
   ];
 }
 
+function cliPrompt(cwd: string, existing?: RepoManifest, home?: string): PromptSpec {
+  return {
+    key: 'cli',
+    question: 'coding agent that runs each job',
+    hint: CLI_CHOICES.join(' | '),
+    fallback: (env) => existing?.harness?.cli ?? detectCli(cwd, env, home).value,
+    required: true,
+    validate: (value) => (CLI_CHOICES.includes(value) ? undefined : `one of: ${CLI_CHOICES.join(', ')}`),
+  };
+}
+
 /** A gate for a repo that has not decided what "ready" means. Passes, always. */
 export const NO_OP_GATE = 'node -e "process.exit(0)"'; // contract pin: test-only export, asserted by the suite
 
@@ -1308,6 +1429,7 @@ export function planSummary(answers: Answers, sources: Record<string, string>): 
   };
   add('jobs run in', answers.image);
   add('first set up with', answers.setup_command);
+  add('driven by', answers.cli);
   // The no-op gate reads as line noise to someone who has never met the
   // concept, so it is described rather than quoted.
   const gate = answers.pickup === NO_OP_GATE ? 'nothing — jobs start straight away (no check found here)' : answers.pickup;
@@ -1327,10 +1449,9 @@ export function repoManifest(answers: Answers): RepoManifest { // contract pin: 
     version: 1,
     setup: { image: answers.image, script: '.fleet/setup.sh' },
     workspace: { repo: answers.repo, strategy: 'branch-per-job' },
-    // One runner adapter exists, so the CLI is shown rather than asked.
     // No command list (#240): the operator says what to run at dispatch, so
     // there is nothing here for Fleet to pick from.
-    harness: { cli: 'claude-code' },
+    harness: { cli: answers.cli ?? 'claude-code' },
     gates: { pickup: answers.pickup, default_finish: 'merge-ready' },
     // Not interviewed: these are the documented defaults (src/shared/time.ts),
     // written out so the manifest shows the cost model instead of hiding it.
@@ -1448,20 +1569,39 @@ function readSituation(fleetDir: string, manifestPath: string, opts: SetupRepoOp
  * which is a decision rather than a default. All or nothing, because a partial
  * block is a summary with a hole in it.
  */
-async function offerDetectedPlan(prompts: PromptSpec[], opts: SetupRepoOptions, ask?: Asker): Promise<Answers | undefined> {
-  if (!ask) return undefined;
+function detectedAnswers(prompts: PromptSpec[], env: Record<string, string | undefined>): Answers | undefined {
   const detected: Answers = {};
-  const askable = prompts.filter((spec) => !spec.when);
-  for (const spec of askable) {
-    const value = spec.fallback?.(opts.env);
+  for (const spec of prompts.filter((s) => !s.when)) {
+    const value = spec.fallback?.(env);
     if (value === undefined || (spec.required && value === '') || spec.validate?.(value)) return undefined;
     detected[spec.key] = value;
   }
-  const eco = detectEcosystem(opts.cwd);
-  const sources = eco ? { 'jobs run in': eco.imageFrom, 'first set up with': eco.setupFrom } : {};
+  return detected;
+}
+
+/** Where each detected row came from, keyed by its `planSummary` label. */
+function summarySources(cwd: string, env: Record<string, string | undefined>, home?: string): Record<string, string> {
+  const sources: Record<string, string> = {};
+  const eco = detectEcosystem(cwd);
+  if (eco) {
+    sources['jobs run in'] = eco.imageFrom;
+    sources['first set up with'] = eco.setupFrom;
+  }
+  const cli = detectCli(cwd, env, home);
+  if (cli.from) sources['driven by'] = cli.from;
+  const envFile = ENV_TEMPLATES.find((rel) => envKeysFrom(cwd, rel).length > 0);
+  if (envFile) sources['secrets passed through'] = envFile;
+  if (gitignoredSync(cwd).length > 0) sources['files shipped in'] = 'gitignored here';
+  return sources;
+}
+
+async function offerDetectedPlan(prompts: PromptSpec[], opts: SetupRepoOptions, ask?: Asker): Promise<Answers | undefined> {
+  if (!ask) return undefined;
+  const detected = detectedAnswers(prompts, opts.env);
+  if (!detected) return undefined;
   opts.log('  Here is what this repo says about itself:');
   opts.log('');
-  for (const line of planSummary(detected, sources)) opts.log(line);
+  for (const line of planSummary(detected, summarySources(opts.cwd, opts.env, opts.home))) opts.log(line);
   opts.log('');
   if (!opts.yes && !(await confirm('  use this?', ask, true))) return undefined;
   opts.log('');
@@ -1523,39 +1663,70 @@ async function mayOverwrite(
   return confirm(`overwrite ${path.relative(opts.cwd, situation.manifestPath)}?`, ask);
 }
 
-/** Frames the dart flies through, and how long each one holds. */
-const FLIGHT_OFFSETS = [14, 10, 7, 4, 2, 0];
-const FLIGHT_MS = 55;
-
-/**
- * Fly the dart in from the left, once, on a real terminal.
- *
- * Redraws the same block in place — cursor up, clear line, print at a smaller
- * left offset — so it lands exactly where the static banner would have been and
- * everything after it is unaffected. Skipped whenever the output is not a
- * terminal a human is watching (a pipe, a log, CI, NO_COLOR): the escape codes
- * would be garbage in a file, and the suite captures stdout, so an animation
- * that ignored this would be asserted against as literal control characters.
- */
-async function flyIn(banner: string, out: NodeJS.WriteStream): Promise<void> {
-  const lines = banner.split('\n');
-  for (const [frame, offset] of FLIGHT_OFFSETS.entries()) {
-    if (frame > 0) out.write(`\x1b[${lines.length}A`);
-    for (const line of lines) out.write(`\x1b[2K${' '.repeat(offset)}${line}\n`);
-    if (offset > 0) await new Promise((resolve) => setTimeout(resolve, FLIGHT_MS));
-  }
-}
-
 /** The face of the product, and where it is about to work (#217). */
-async function printHeader(opts: SetupRepoOptions): Promise<void> {
-  const banner = renderBanner(80, 'NO_COLOR' in opts.env, detectColorLevel(opts.env));
-  const out = process.stdout;
-  const watched = out.isTTY === true && !('NO_COLOR' in opts.env) && opts.env.CI === undefined;
-  if (watched) await flyIn(banner, out);
-  else opts.log(banner);
+function printHeader(opts: SetupRepoOptions): void {
+  opts.log(renderBanner(80, 'NO_COLOR' in opts.env, detectColorLevel(opts.env)));
   opts.log('');
   opts.log(`  Setting up ${opts.cwd}`);
   opts.log('');
+}
+
+/** Where setup is running, in the shape a human says it. */
+function homely(cwd: string, home: string): string {
+  return cwd === home || cwd.startsWith(home + path.sep) ? '~' + cwd.slice(home.length) : cwd;
+}
+
+/**
+ * The detected plan on the full-screen hero (#217): the dart bobbing over the
+ * wordmark, the summary, one question. `ran: false` means the screen could not
+ * run — no plan to show, or not a terminal worth animating at — and the caller
+ * owes the operator the static flow instead. When it did run, the transcript
+ * gets the receipt after the screen is gone, because the alternate buffer
+ * leaves no scrollback and "what did I agree to" must survive it.
+ */
+async function offerOnHero(prompts: PromptSpec[], opts: SetupRepoOptions, ask: Asker): Promise<{ ran: boolean; accepted?: Answers }> {
+  const detected = detectedAnswers(prompts, opts.env);
+  if (!detected) return { ran: false };
+  const summary = planSummary(detected, summarySources(opts.cwd, opts.env, opts.home));
+  const took = await offerOnHeroScreen({
+    out: process.stdout,
+    env: opts.env,
+    place: homely(opts.cwd, opts.home ?? os.homedir()),
+    summary,
+    question: '  use this?',
+    confirm: (question) => confirm(question, ask, true),
+  });
+  if (took === undefined) return { ran: false };
+  opts.log(`  Setting up ${opts.cwd}`);
+  opts.log('');
+  if (!took) return { ran: true };
+  opts.log('  using what this repo says about itself:');
+  opts.log('');
+  for (const line of summary) opts.log(line);
+  opts.log('');
+  return { ran: true, accepted: detected };
+}
+
+/**
+ * The detected plan, offered before the interview: on the hero screen for a
+ * TTY's first contact, under the plain banner otherwise. The hero is first
+ * contact only — a rerun over an existing manifest is the interview, and
+ * --yes asked for no questions at all. A hero that ran and was declined skips
+ * the banner offer too: the operator already saw the plan and said no.
+ */
+async function planShortcut(
+  prompts: PromptSpec[],
+  situation: { manifestExists: boolean },
+  opts: SetupRepoOptions,
+  ask?: Asker,
+): Promise<Answers | undefined> {
+  if (!ask) return undefined;
+  if (!situation.manifestExists && !opts.yes) {
+    const hero = await offerOnHero(prompts, opts, ask);
+    if (hero.ran) return hero.accepted;
+  }
+  printHeader(opts);
+  return situation.manifestExists ? undefined : offerDetectedPlan(prompts, opts, ask);
 }
 
 /**
@@ -1567,10 +1738,9 @@ async function askForAnswers(
   opts: SetupRepoOptions,
 ): Promise<Interview | undefined> {
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
-  const prompts = repoPrompts(opts.cwd, situation.existing, situation.seat);
+  const prompts = repoPrompts(opts.cwd, situation.existing, situation.seat, opts.home);
   try {
-    if (ask) await printHeader(opts);
-    const shortcut = situation.manifestExists ? undefined : await offerDetectedPlan(prompts, opts, ask);
+    const shortcut = await planShortcut(prompts, situation, opts, ask);
     const merged = await interview(prompts, {
       flags: shortcut ? { ...shortcut, ...opts.flags } : opts.flags,
       env: opts.env,

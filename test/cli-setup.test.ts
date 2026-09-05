@@ -927,9 +927,9 @@ test('setup repo detects the version and package manager the repo pins (#217)', 
   fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
   fs.writeFileSync(path.join(cwd, 'pnpm-lock.yaml'), '');
   assert.deepEqual(detectEcosystem(cwd), {
-    image: 'node:22', imageFrom: 'package.json',
-    setup: 'pnpm install --frozen-lockfile', setupFrom: 'pnpm-lock.yaml',
-  }, 'the lockfile names the package manager');
+    image: 'node:24', imageFrom: 'package.json',
+    setup: 'corepack enable pnpm && pnpm install --frozen-lockfile', setupFrom: 'pnpm-lock.yaml',
+  }, 'the lockfile names the package manager, and corepack puts it on a bare image\'s PATH');
 
   fs.writeFileSync(path.join(cwd, '.nvmrc'), 'v23.6.0\n');
   assert.equal(detectEcosystem(cwd)?.image, 'node:23', '.nvmrc pins the major');
@@ -945,6 +945,85 @@ test('setup repo detects the version and package manager the repo pins (#217)', 
   const py = makeTempDir('fleet-detect-py-');
   fs.writeFileSync(path.join(py, 'pyproject.toml'), 'requires-python = ">=3.11"\n');
   assert.equal(detectEcosystem(py)?.image, 'python:3.11');
+});
+
+test('setup repo detection: a devcontainer is the operator\'s own answer and wins (#247)', () => {
+  const cwd = makeTempDir('fleet-detect-dev-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'package-lock.json'), '{}');
+  fs.mkdirSync(path.join(cwd, '.devcontainer'));
+  fs.writeFileSync(
+    path.join(cwd, '.devcontainer', 'devcontainer.json'),
+    '{\n  // devcontainer.json allows comments, so a JSON.parse would choke here\n  "image": "node:23-bookworm",\n  "postCreateCommand": "npm ci && npm run build",\n}\n',
+  );
+  assert.deepEqual(detectEcosystem(cwd), {
+    image: 'node:23-bookworm',
+    imageFrom: '.devcontainer/devcontainer.json',
+    setup: 'npm ci && npm run build',
+    setupFrom: '.devcontainer/devcontainer.json',
+  }, 'the operator already answered both questions in their own file');
+
+  // No ecosystem marker at all: the devcontainer still carries the repo.
+  const bare = makeTempDir('fleet-detect-devbare-');
+  fs.writeFileSync(path.join(bare, '.devcontainer.json'), '{"image": "debian:12"}');
+  assert.equal(detectEcosystem(bare)?.image, 'debian:12');
+  assert.equal(detectEcosystem(bare)?.setup, '', 'no postCreateCommand string means no setup guess');
+});
+
+test('setup repo detection: .tool-versions, a Dockerfile FROM, and a bun lockfile pin the image (#247)', () => {
+  const cwd = makeTempDir('fleet-detect-tools-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'Dockerfile'), 'FROM node:20-alpine\nRUN true\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:20', 'a Dockerfile FROM is read when nothing stronger pins');
+  assert.equal(detectEcosystem(cwd)?.imageFrom, 'Dockerfile');
+  fs.writeFileSync(path.join(cwd, '.tool-versions'), 'ruby 3.3.0\nnodejs 21.7.1\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:21', '.tool-versions outranks the Dockerfile');
+
+  const py = makeTempDir('fleet-detect-pytools-');
+  fs.writeFileSync(path.join(py, 'requirements.txt'), 'requests\n');
+  fs.writeFileSync(path.join(py, '.tool-versions'), 'python 3.11.9\n');
+  assert.equal(detectEcosystem(py)?.image, 'python:3.11');
+
+  const bun = makeTempDir('fleet-detect-bun-');
+  fs.writeFileSync(path.join(bun, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(bun, 'bun.lockb'), '');
+  fs.writeFileSync(path.join(bun, '.nvmrc'), 'v23.6.0\n');
+  assert.deepEqual(detectEcosystem(bun), {
+    image: 'oven/bun:1', imageFrom: 'bun.lockb',
+    setup: 'bun install --frozen-lockfile', setupFrom: 'bun.lockb',
+  }, 'bun is its own runtime: on a node image, even a pinned one, bun install dies at setup');
+});
+
+test('setup repo detection: the harness CLI comes from the repo\'s files, and a rerun keeps the manifest\'s (#247)', async () => {
+  const cwd = makeTempDir('fleet-detect-cli-');
+  fs.mkdirSync(path.join(cwd, '.codex'));
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--yes'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.harness.cli, 'codex', 'a .codex directory outranks whatever this machine has installed');
+
+  // The rerun clobber: before #247, repoManifest hardcoded claude-code, so any
+  // rerun silently reverted a hand-set harness.
+  manifest.harness.cli = 'opencode';
+  fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  assert.equal((await runCli(['setup', 'repo', '--yes'], { cwd })).code, 0);
+  const rerun = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(rerun.harness.cli, 'opencode', 'the existing manifest is the strongest evidence there is');
+});
+
+test('setup repo detection: gitignored package-manager config is offered into sync, and every .env template is read (#247)', async () => {
+  const cwd = makeTempDir('fleet-detect-sync-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, '.env.sample'), 'FROM_SAMPLE=\n');
+  fs.writeFileSync(path.join(cwd, '.env.template'), 'FROM_TEMPLATE=\nFROM_SAMPLE=\n');
+  fs.writeFileSync(path.join(cwd, '.npmrc'), '# registry auth lives here, which is why it is gitignored\n');
+  fs.writeFileSync(path.join(cwd, '.gitignore'), '.npmrc\n');
+  assert.equal(spawnSync('git', ['init', '-q'], { cwd }).status, 0, 'fixture: sync detection reads the gitignore through git');
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--yes'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.workspace.sync, ['.npmrc'], 'a gitignored .npmrc is exactly what workspace.sync exists for');
+  assert.deepEqual(manifest.env.vars, ['FROM_SAMPLE', 'FROM_TEMPLATE'], 'both template spellings are read, deduplicated');
 });
 
 test('setup repo: no gate in the repo means a gate that passes, never a missing file (#217)', async () => {
@@ -975,6 +1054,7 @@ test('the banner animation never reaches anything but a terminal (#217)', async 
   assert.equal(res.code, 0, res.stderr);
   assert.equal(res.stdout.includes('\u001b[2K'), false, 'a clear-line code reached a pipe');
   assert.equal(/\u001b\[\d+A/.test(res.stdout), false, 'a cursor-up code reached a pipe');
+  assert.equal(res.stdout.includes('[?1049'), false, 'the alternate screen reached a pipe');
   // The banner itself still arrives — the fallback is the static one, not none.
   assert.match(res.stdout, /F L E E T/);
 });
@@ -992,7 +1072,8 @@ test('setup repo shows what it found and takes one Enter for all of it (#217)', 
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /Here is what this repo says about itself/);
   assert.match(res.stdout, /jobs run in +node:23 {2}\(\.nvmrc\)/, res.stdout);
-  assert.match(res.stdout, /first set up with +pnpm install --frozen-lockfile {2}\(pnpm-lock\.yaml\)/, res.stdout);
+  assert.match(res.stdout, /first set up with +corepack enable pnpm && pnpm install --frozen-lockfile {2}\(pnpm-lock\.yaml\)/, res.stdout);
+  assert.match(res.stdout, /driven by +claude-code {2}\(\.claude here\)/, res.stdout);
   assert.match(res.stdout, /use this\? \[Y\/n\]/, 'Enter must mean yes on the one question with nothing at stake');
   assert.match(res.stdout, /fleet doctor/, 'a first run ends with the command that checks it');
   // And the summary was not decoration: it is what got written.
@@ -1011,7 +1092,7 @@ test('setup repo: an all-Enter interview extracts a valid manifest from the chec
   const { ok, errors } = validateManifest(manifest);
   assert.equal(ok, true, JSON.stringify(errors));
   assert.equal(manifest.workspace.repo, 'origin', 'the portable sentinel is the default');
-  assert.equal(manifest.setup.image, 'node:22', 'a package.json names the ecosystem');
+  assert.equal(manifest.setup.image, 'node:24', 'a package.json names the ecosystem');
   assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs', 'the gate that exists is the default');
   // No command list at all (#240): setup stopped asking which one to run,
   // because Fleet stopped picking. The operator says it at dispatch.
@@ -1034,8 +1115,8 @@ test('setup repo: a rejected answer is asked again rather than written', async (
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    // repo, image, setup, sync, env vars (bad, then good), pickup, command, critic
-    stdin: 'n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
+    // repo, image, setup, cli, sync, env vars (bad, then good), pickup
+    stdin: 'n\n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /not env var names/);
@@ -1067,7 +1148,7 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
   const declined = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(6)}n\n`,
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /nothing written/);
@@ -1077,7 +1158,7 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
     // Change one answer (the pickup gate); everything else is the existing manifest.
-    stdin: `${'\n'.repeat(5)}node .fleet/other.mjs\ny\n`,
+    stdin: `${'\n'.repeat(6)}node .fleet/other.mjs\ny\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
@@ -1127,7 +1208,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
   const declined = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(6)}n\n`,
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /is not a valid manifest/);
@@ -1137,7 +1218,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(6)}y\n`,
+    stdin: `${'\n'.repeat(7)}y\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
@@ -1151,7 +1232,7 @@ test('setup repo: a manifest that is not JSON at all is not silently replaced ei
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(6)}n\n`,
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /is not valid JSON/);
@@ -1179,8 +1260,8 @@ test('setup repo: a seat login and no credential walks the acquisition — one p
       ANTHROPIC_API_KEY: undefined,
       CLAUDE_CODE_OAUTH_TOKEN: undefined,
     },
-    // The eight repo prompts, then the one paste.
-    stdin: `n\n${'\n'.repeat(6)}sk-ant-oat01-pasted\n`,
+    // The repo prompts, then the one paste.
+    stdin: `n\n${'\n'.repeat(7)}sk-ant-oat01-pasted\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /claude setup-token/, 'the walk teaches the vendor command');
@@ -1258,7 +1339,7 @@ test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: `n\n${'\n'.repeat(6)}yes\n`,
+    stdin: `n\n${'\n'.repeat(7)}yes\n`,
   });
   assert.equal(res.code, 0, res.stderr);
 

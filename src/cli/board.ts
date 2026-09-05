@@ -83,6 +83,10 @@ function artRows(art: BannerArt, level: ColorLevel | undefined): string[] {
 const WORDMARK_ROW = 2;
 const TAGLINE_ROW = 3;
 
+/** The styled wordmark, one voice everywhere it appears (here and ./hero.ts). */
+export const WORDMARK_STYLED = '\x1b[1;38;5;153mF L E E T\x1b[0m';
+export const TAGLINE_STYLED = '\x1b[2myour cloud\x1b[0m';
+
 /**
  * The banner: the baked dart, one space in from the left, with the wordmark and
  * tagline set beside it. Plain when `level` is omitted — the plain art carries
@@ -90,8 +94,8 @@ const TAGLINE_ROW = 3;
  */
 function composeBanner(art: BannerArt, level?: ColorLevel): string[] {
   const lines = artRows(art, level).map((row) => ' ' + row);
-  lines[WORDMARK_ROW] += !level ? '   F L E E T' : '   \x1b[1;38;5;153mF L E E T\x1b[0m';
-  lines[TAGLINE_ROW] += !level ? '   your cloud' : '   \x1b[2myour cloud\x1b[0m';
+  lines[WORDMARK_ROW] += !level ? '   F L E E T' : '   ' + WORDMARK_STYLED;
+  lines[TAGLINE_ROW] += !level ? '   your cloud' : '   ' + TAGLINE_STYLED;
   return lines;
 }
 
