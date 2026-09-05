@@ -22,6 +22,8 @@ import {
   terraformTooOld,
   MIN_TERRAFORM,
   SetupError,
+  detectEcosystem,
+  NO_OP_GATE,
 } from '../src/cli/setup.ts';
 import { SETUP_UNITS, unitFor } from '../src/cli/setup-units.ts';
 import { repinnedMainTf } from '../src/cli/upgrade.ts';
@@ -915,6 +917,74 @@ function scratchRepo(): string {
   return cwd;
 }
 
+test('setup repo detects the version and package manager the repo pins (#217)', () => {
+  // The two bugs that made the generated manifest not work, and this repo was
+  // the victim of the first: Fleet needs Node 23.6+ for type stripping, and
+  // setup wrote `node:22` for every package.json, so a job died on syntax it
+  // could not parse. The second fails at setup instead — `npm ci` on a pnpm
+  // repo, before any model runs. Both are silent until a dispatch.
+  const cwd = makeTempDir('fleet-detect-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'pnpm-lock.yaml'), '');
+  assert.deepEqual(detectEcosystem(cwd), {
+    image: 'node:22', imageFrom: 'package.json',
+    setup: 'pnpm install --frozen-lockfile', setupFrom: 'pnpm-lock.yaml',
+  }, 'the lockfile names the package manager');
+
+  fs.writeFileSync(path.join(cwd, '.nvmrc'), 'v23.6.0\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:23', '.nvmrc pins the major');
+  assert.equal(detectEcosystem(cwd)?.imageFrom, '.nvmrc', 'and the summary cites the file it read');
+
+  // engines is the weakest signal, so a pinned file must beat it.
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:23', 'engines overrode a pinned .nvmrc');
+  fs.rmSync(path.join(cwd, '.nvmrc'));
+  assert.equal(detectEcosystem(cwd)?.image, 'node:20', 'engines is still read when nothing is pinned');
+
+  // Python keeps the minor; a bare python:3 image is not a thing anyone wants.
+  const py = makeTempDir('fleet-detect-py-');
+  fs.writeFileSync(path.join(py, 'pyproject.toml'), 'requires-python = ">=3.11"\n');
+  assert.equal(detectEcosystem(py)?.image, 'python:3.11');
+});
+
+test('setup repo: no gate in the repo means a gate that passes, never a missing file (#217)', async () => {
+  // The old default named `.fleet/check-ready.js` whether or not it existed.
+  // Accepting it on a repo without one killed every dispatch at the gate —
+  // after the image build, before any model, on a concept the operator had not
+  // met yet. The failure mode this replaces is a first run that cannot work.
+  const cwd = makeTempDir('fleet-setup-nogate-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"scratch"}\n');
+  assert.equal(fs.existsSync(path.join(cwd, '.fleet', 'gate.mjs')), false, 'fixture assumption: no gate');
+  const res = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.gates.pickup, NO_OP_GATE);
+  const gate = spawnSync('sh', ['-c', manifest.gates.pickup], { cwd });
+  assert.equal(gate.status, 0, 'the gate a fresh repo gets must actually pass');
+});
+
+test('setup repo shows what it found and takes one Enter for all of it (#217)', async () => {
+  // #217's third principle: ask nothing by default. Six questions a first-time
+  // operator cannot answer become one block they can read and one Enter. The
+  // assertion is on the plain-English labels, not the manifest field names —
+  // a first run must not require Fleet's vocabulary.
+  const cwd = scratchRepo();
+  fs.writeFileSync(path.join(cwd, '.nvmrc'), '23.6.0\n');
+  fs.writeFileSync(path.join(cwd, 'pnpm-lock.yaml'), '');
+  // One Enter for the summary; the rest are the conditional seat prompts.
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', NO_COLOR: '1' }, stdin: '\n'.repeat(4) });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /Here is what this repo says about itself/);
+  assert.match(res.stdout, /jobs run in +node:23 {2}\(\.nvmrc\)/, res.stdout);
+  assert.match(res.stdout, /first set up with +pnpm install --frozen-lockfile {2}\(pnpm-lock\.yaml\)/, res.stdout);
+  assert.match(res.stdout, /use this\? \[Y\/n\]/, 'Enter must mean yes on the one question with nothing at stake');
+  assert.match(res.stdout, /fleet doctor/, 'a first run ends with the command that checks it');
+  // And the summary was not decoration: it is what got written.
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.setup.image, 'node:23');
+  assert.equal(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8').includes('pnpm install --frozen-lockfile'), true);
+});
+
 test('setup repo: an all-Enter interview extracts a valid manifest from the checkout', async () => {
   const cwd = scratchRepo();
   // repo, image, setup command, sync, env vars, pickup, command, critic.
@@ -939,7 +1009,7 @@ test('setup repo: an all-Enter interview extracts a valid manifest from the chec
     '#134: the interview writes the documented limit defaults explicitly',
   );
 
-  assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8'), /npm ci/);
+  assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8'), /npm install/);
   assert.equal((await runCli(['lint'], { cwd })).code, 0, 'the interview cannot produce a manifest lint rejects');
 });
 
@@ -949,7 +1019,7 @@ test('setup repo: a rejected answer is asked again rather than written', async (
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
     // repo, image, setup, sync, env vars (bad, then good), pickup, command, critic
-    stdin: '\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
+    stdin: 'n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /not env var names/);
@@ -1094,7 +1164,7 @@ test('setup repo: a seat login and no credential walks the acquisition — one p
       CLAUDE_CODE_OAUTH_TOKEN: undefined,
     },
     // The eight repo prompts, then the one paste.
-    stdin: `${'\n'.repeat(6)}sk-ant-oat01-pasted\n`,
+    stdin: `n\n${'\n'.repeat(6)}sk-ant-oat01-pasted\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /claude setup-token/, 'the walk teaches the vendor command');
@@ -1172,7 +1242,7 @@ test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: `${'\n'.repeat(6)}yes\n`,
+    stdin: `n\n${'\n'.repeat(6)}yes\n`,
   });
   assert.equal(res.code, 0, res.stderr);
 

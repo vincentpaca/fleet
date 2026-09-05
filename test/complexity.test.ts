@@ -82,6 +82,20 @@ const FUNCTION_BASELINE = [
   // 285-line span; the function's real direct body is several times that and
   // was never measured before #121, for the same segmentation reason as `run`.
   'src/cli/cockpit.ts::runCockpit',
+  // setup.ts: both pre-existing and both newly VISIBLE, the same way `run` was
+  // above. `runSetupRepo` used to contain a nested template literal —
+  // `` `${x.replace(`...`, '')}` `` — which Lizard's TS-as-C parse cannot close,
+  // so every function after it was absorbed into one mis-measured segment and
+  // never checked. #217 removed that literal, and these two surfaced unchanged:
+  // git blame shows neither line moved. Written down as debt rather than
+  // silenced, and neither is on #217's path.
+  //
+  // runSetupHarness: one branch per harness times per scope = CCN 11; genuine.
+  'src/cli/setup.ts::runSetupHarness',
+  // parseSkill: a hand-rolled frontmatter reader (zero runtime deps is a rule),
+  // 56 NLOC / CCN 15 of validation with a named error for each way a skill file
+  // can be wrong.
+  'src/cli/setup.ts::parseSkill',
 ];
 
 /** Files already over FILE_NLOC_LIMIT. Same bargain as FUNCTION_BASELINE. */

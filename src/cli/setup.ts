@@ -28,6 +28,7 @@ import { loadDotEnv, upsertDotEnv } from '../shared/dotenv.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
+import { renderBanner, detectColorLevel } from './board.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
 import {
@@ -194,9 +195,20 @@ export function flagName(key: string): string {
   return key.replaceAll('_', '-');
 }
 
-/** A yes/no gate. Anything but an explicit yes is a no — the default protects the account. */
-export async function confirm(question: string, ask: Asker): Promise<boolean> { // exported for ./upgrade.ts
-  const answer = (await ask.question(`${question} [y/N]: `)).trim().toLowerCase();
+/**
+ * A yes/no gate. Anything but an explicit yes is a no, because the default
+ * protects the account: every other caller is about to apply, destroy or
+ * overwrite something.
+ *
+ * `defaultYes` inverts that for the one question where nothing is at stake —
+ * accepting what setup detected about a repo (#217). Enter is the answer nine
+ * times out of ten there, and making a first-time operator type `y` to proceed
+ * is the friction the issue is about. Opt-in per call site, so a destroy can
+ * never acquire it by accident.
+ */
+export async function confirm(question: string, ask: Asker, defaultYes = false): Promise<boolean> { // exported for ./upgrade.ts
+  const answer = (await ask.question(`${question} [${defaultYes ? 'Y/n' : 'y/N'}]: `)).trim().toLowerCase();
+  if (defaultYes) return answer !== 'n' && answer !== 'no';
   return answer === 'y' || answer === 'yes';
 }
 
@@ -929,6 +941,67 @@ function firstExisting(cwd: string, candidates: string[]): string | undefined {
   return candidates.find((rel) => fs.existsSync(path.join(cwd, rel)));
 }
 
+/** First capture group of the first pattern that matches the file, if readable. */
+function readMatch(cwd: string, rel: string, patterns: RegExp[]): string | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(cwd, rel), 'utf8');
+  } catch {
+    return undefined;
+  }
+  for (const re of patterns) {
+    const found = re.exec(raw);
+    if (found?.[1]) return found[1];
+  }
+  return undefined;
+}
+
+/** Where each ecosystem states the version it needs, most specific first. */
+const VERSION_FILES: Record<string, Array<[string, RegExp]>> = {
+  'package.json': [
+    ['.nvmrc', /^\s*v?(\d+[^\s]*)/],
+    ['.node-version', /^\s*v?(\d+[^\s]*)/],
+    ['package.json', /"engines"\s*:\s*\{[^}]*"node"\s*:\s*"[^"\d]*(\d+[^"]*)"/],
+  ],
+  'pyproject.toml': [
+    ['.python-version', /^\s*(\d+\.\d+)/],
+    ['pyproject.toml', /requires-python\s*=\s*"[^"\d]*(\d+\.\d+)/],
+  ],
+  'requirements.txt': [['.python-version', /^\s*(\d+\.\d+)/]],
+  'go.mod': [['go.mod', /^go\s+(\d+\.\d+)/m]],
+  'Cargo.toml': [['rust-toolchain.toml', /channel\s*=\s*"(\d+[^"]*)"/]],
+};
+
+/** Ecosystems whose images are tagged major.minor rather than bare major. */
+const KEEPS_MINOR = new Set(['pyproject.toml', 'requirements.txt', 'go.mod']);
+
+/**
+ * The version this repo says it needs, and the file that said it.
+ *
+ * Hardcoding `node:22` was #217's worst detection bug, and this repo was its
+ * own victim: Fleet needs Node 23.6+ for type stripping, so the manifest Fleet
+ * wrote for Fleet named an image whose node could not parse the runner.
+ */
+function languageVersion(cwd: string, marker: string): { version: string; from: string } | undefined {
+  for (const [file, pattern] of VERSION_FILES[marker] ?? []) {
+    const raw = readMatch(cwd, file, [pattern]);
+    if (raw === undefined) continue;
+    const cleaned = raw.trim().replace(/^[^\d]*/, '');
+    const version = KEEPS_MINOR.has(marker) ? cleaned : cleaned.split('.')[0];
+    if (version) return { version, from: file };
+  }
+  return undefined;
+}
+
+/** Lockfiles, and the install command each one's package manager wants. */
+const NODE_LOCKS: Array<[string, string]> = [
+  ['pnpm-lock.yaml', 'pnpm install --frozen-lockfile'],
+  ['yarn.lock', 'yarn install --frozen-lockfile'],
+  ['bun.lockb', 'bun install --frozen-lockfile'],
+  ['bun.lock', 'bun install --frozen-lockfile'],
+  ['package-lock.json', 'npm ci'],
+];
+
 /** Files that name an ecosystem, and what that ecosystem's defaults are. */
 const ECOSYSTEMS: Array<{ marker: string; image: string; setup: string }> = [
   { marker: 'package.json', image: 'node:22', setup: 'npm ci' },
@@ -937,6 +1010,36 @@ const ECOSYSTEMS: Array<{ marker: string; image: string; setup: string }> = [
   { marker: 'go.mod', image: 'golang:1.23', setup: 'go mod download' },
   { marker: 'Cargo.toml', image: 'rust:1', setup: 'cargo fetch' },
 ];
+
+/** The install command, given the ecosystem and the lockfile that was found. */
+function nodeSetup(marker: string, fallback: string, lock: [string, string] | undefined): string {
+  if (marker !== 'package.json') return fallback;
+  // `npm ci` refuses to run without a lockfile, so a repo that has not
+  // committed one needs `npm install` or every job dies at setup.
+  return lock?.[1] ?? 'npm install';
+}
+
+/**
+ * The ecosystem's defaults, sharpened by what the repo actually pins (#217).
+ *
+ * `imageFrom` / `setupFrom` are what the summary cites, so an operator can see
+ * WHY an answer is what it is and go correct the file rather than hand-edit the
+ * manifest. Assuming `npm ci` was the second bug: on a pnpm or yarn repo it
+ * fails at setup, which is every job, before any model runs — and it fails on a
+ * repo with no lockfile at all, which `npm install` does not.
+ */
+export function detectEcosystem(cwd: string): { image: string; imageFrom: string; setup: string; setupFrom: string } | undefined { // contract pin: test-only export, asserted by the suite
+  const base = ECOSYSTEMS.find((e) => fs.existsSync(path.join(cwd, e.marker)));
+  if (!base) return undefined;
+  const pinned = languageVersion(cwd, base.marker);
+  const lock = NODE_LOCKS.find(([file]) => base.marker === 'package.json' && fs.existsSync(path.join(cwd, file)));
+  return {
+    image: pinned ? `${base.image.split(':')[0]}:${pinned.version}` : base.image,
+    imageFrom: pinned?.from ?? base.marker,
+    setup: nodeSetup(base.marker, base.setup, lock),
+    setupFrom: lock?.[0] ?? base.marker,
+  };
+}
 
 /** Uppercase KEY= names in a .env-style template — the shape env.vars wants. */
 function envKeysFrom(cwd: string, rel: string): string[] {
@@ -1123,7 +1226,7 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
  * absent, the prompts exist only as flag surface and are never asked.
  */
 export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWalk): PromptSpec[] {
-  const ecosystem = ECOSYSTEMS.find((e) => fs.existsSync(path.join(cwd, e.marker)));
+  const ecosystem = detectEcosystem(cwd);
   const gate = firstExisting(cwd, ['.fleet/gate.mjs', '.fleet/check-ready.js', '.fleet/check-ready.mjs']);
   const envKeys = [...envKeysFrom(cwd, '.env.example'), ...envKeysFrom(cwd, path.join('.fleet', '.env.example'))];
   const kept = (value: string | undefined, detected: string | undefined): (() => string | undefined) =>
@@ -1172,11 +1275,48 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
       key: 'pickup',
       question: 'pickup gate command',
       hint: 'must exit 0 or the job stops before any model spend',
-      fallback: kept(existing?.gates.pickup, gate ? `node ${gate}` : 'node .fleet/check-ready.js'),
+      // Never a path that is not there (#217): the old default named
+      // `.fleet/check-ready.js` whether or not it existed, so accepting it on a
+      // repo without one killed every dispatch at the gate — after the image
+      // build, before any model. A no-op passes, which is the honest starting
+      // point for a repo that has not decided what "ready" means yet.
+      fallback: kept(existing?.gates.pickup, gate ? `node ${gate}` : NO_OP_GATE),
       required: true,
     },
     ...seatPrompts(seat),
   ];
+}
+
+/** A gate for a repo that has not decided what "ready" means. Passes, always. */
+export const NO_OP_GATE = 'node -e "process.exit(0)"'; // contract pin: test-only export, asserted by the suite
+
+/**
+ * What the operator is about to get, in their words rather than the manifest's.
+ *
+ * #217's fourth principle: a first run must not require Fleet's vocabulary.
+ * "pickup gate", "sync" and "env.vars" are our nouns, and someone meeting the
+ * tool for the first time has met none of them. Each line says what will
+ * happen, and cites the file the answer came from so a wrong one gets corrected
+ * at its source instead of hand-edited into the manifest.
+ */
+export function planSummary(answers: Answers, sources: Record<string, string>): string[] { // contract pin: test-only export, asserted by the suite
+  const rows: Array<[string, string]> = [];
+  const add = (label: string, value: string | undefined): void => {
+    if (value === undefined || value.trim() === '') return;
+    const from = sources[label];
+    rows.push([label, from ? `${value}  (${from})` : value]);
+  };
+  add('jobs run in', answers.image);
+  add('first set up with', answers.setup_command);
+  // The no-op gate reads as line noise to someone who has never met the
+  // concept, so it is described rather than quoted.
+  const gate = answers.pickup === NO_OP_GATE ? 'nothing — jobs start straight away (no check found here)' : answers.pickup;
+  add("won't start until", gate);
+  add('code comes from', answers.repo === 'origin' ? "this checkout's origin remote" : answers.repo);
+  add('secrets passed through', answers.env_vars);
+  add('files shipped in', answers.sync);
+  const width = Math.max(...rows.map(([label]) => label.length));
+  return rows.map(([label, value]) => `  ${label.padEnd(width)}   ${value}`);
 }
 
 /** Assemble the manifest from answers. Optional sections are omitted, never empty. */
@@ -1264,13 +1404,17 @@ function readExistingManifest(manifestPath: string, opts: SetupRepoOptions): Rep
   return parsed as RepoManifest;
 }
 
-export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
-  const fleetDir = path.join(opts.cwd, '.fleet');
-  const manifestPath = path.join(fleetDir, 'manifest.json');
-
-  // Existence and usability are two questions, and conflating them cost both
-  // ways: a file too broken to read as defaults was also a file overwritten
-  // with no confirmation, while a valid one got the prompt.
+/**
+ * What is already here, before a single question is asked.
+ *
+ * Existence and usability are two questions, and conflating them cost both
+ * ways: a file too broken to read as defaults was also a file overwritten with
+ * no confirmation, while a valid one got the prompt. The seat walk (#205) is
+ * decided here rather than mid-interview so the prompts exist exactly when it
+ * applies; a flag is an explicit request and forces its walk on, because
+ * detection is a default and never a restriction.
+ */
+function readSituation(fleetDir: string, manifestPath: string, opts: SetupRepoOptions): { manifestExists: boolean; existing?: RepoManifest; seat: SeatWalk } {
   const manifestExists = fs.existsSync(manifestPath);
   let existing: RepoManifest | undefined;
   if (manifestExists) {
@@ -1281,42 +1425,146 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
       );
     }
   }
-
-  // The seat situation (#205), decided before the interview so the prompts
-  // exist exactly when the walk applies. The manifest this interview writes is
-  // always harness claude-code (the one runner adapter), so that leg of the
-  // condition is met by construction. A flag is an explicit request and
-  // forces its walk on — detection is a default, never a restriction.
-  const detected = detectSeatAuth({
-    env: opts.env,
-    home: opts.home ?? os.homedir(),
-    dotEnv: loadDotEnv(fleetDir),
-  });
+  const found = detectSeatAuth({ env: opts.env, home: opts.home ?? os.homedir(), dotEnv: loadDotEnv(fleetDir) });
   const seat: SeatWalk = {
-    claudeWalk: detected.claudeWalk || opts.flags.claude_oauth_token !== undefined,
-    codexOffer: detected.codexAuthPath !== undefined || opts.flags.codex_auth !== undefined,
-    ...(detected.codexAuthPath !== undefined ? { codexAuthPath: detected.codexAuthPath } : {}),
+    claudeWalk: found.claudeWalk || opts.flags.claude_oauth_token !== undefined,
+    codexOffer: found.codexAuthPath !== undefined || opts.flags.codex_auth !== undefined,
+    ...(found.codexAuthPath !== undefined ? { codexAuthPath: found.codexAuthPath } : {}),
   };
+  return { manifestExists, ...(existing !== undefined ? { existing } : {}), seat };
+}
 
+/**
+ * Offer everything setup detected as one block, and take one Enter for it.
+ *
+ * #217's third principle: ask nothing by default. Every repo answer already has
+ * a detected value — that is what `fallback` is for — so six questions a
+ * first-time operator cannot yet answer become one summary they can read.
+ * Returns the accepted answers, or undefined to fall through to the
+ * question-by-question interview, which is still the right tool once you know
+ * what you want to change.
+ *
+ * Only prompts with no `when`: the seat walk asks for a pasted credential,
+ * which is a decision rather than a default. All or nothing, because a partial
+ * block is a summary with a hole in it.
+ */
+async function offerDetectedPlan(prompts: PromptSpec[], opts: SetupRepoOptions, ask?: Asker): Promise<Answers | undefined> {
+  if (!ask) return undefined;
+  const detected: Answers = {};
+  const askable = prompts.filter((spec) => !spec.when);
+  for (const spec of askable) {
+    const value = spec.fallback?.(opts.env);
+    if (value === undefined || (spec.required && value === '') || spec.validate?.(value)) return undefined;
+    detected[spec.key] = value;
+  }
+  const eco = detectEcosystem(opts.cwd);
+  const sources = eco ? { 'jobs run in': eco.imageFrom, 'first set up with': eco.setupFrom } : {};
+  opts.log('  Here is what this repo says about itself:');
+  opts.log('');
+  for (const line of planSummary(detected, sources)) opts.log(line);
+  opts.log('');
+  if (!opts.yes && !(await confirm('  use this?', ask, true))) return undefined;
+  opts.log('');
+  return detected;
+}
+
+/**
+ * Write the scaffold, and leave the operator somewhere they can act.
+ *
+ * #217's fifth principle: first contact ends with something that works and one
+ * obvious next command, not a file to go and read. The gate is named rather
+ * than run — an operator's is `npm test` as often as not, and a setup command
+ * that silently runs someone's whole suite is not a pleasant surprise — so
+ * `doctor` goes first, as the thing that does check it end to end.
+ */
+function writeAndReport(fleetDir: string, manifest: RepoManifest, answers: Answers, seatPlan: { token?: string; codexSource?: string }, opts: SetupRepoOptions): void {
+  const setupCommand = answers.setup_command?.trim();
+  const scriptExisted = fs.existsSync(path.join(fleetDir, 'setup.sh'));
+  // Repo-relative and indented: an absolute tmp path is noise in the one place
+  // a first-time operator is looking for "did it work".
+  const absolute = `wrote ${opts.cwd}/`;
+  for (const line of writeScaffold(fleetDir, manifest, setupCommand ? setupScriptFor(setupCommand) : undefined)) {
+    opts.log('  ' + line.replace(absolute, 'wrote '));
+  }
+  // After the scaffold, whose gitignore write is what makes "gitignored" true.
+  for (const line of applySeatWalk(fleetDir, seatPlan)) opts.log(line);
+  if (scriptExisted && setupCommand) {
+    opts.log(`note: .fleet/setup.sh already existed and was left alone — make sure it runs \`${setupCommand}\``);
+  }
+  const gateFile = answers.pickup?.match(/(\S+\.(?:m?js|ts|sh|py))/)?.[1];
+  if (gateFile && !fs.existsSync(path.join(opts.cwd, gateFile))) {
+    opts.log('');
+    opts.log(`  heads up: ${gateFile} does not exist yet, and a job stops there before spending anything.`);
+    opts.log('  write it, or point at something else in .fleet/manifest.json.');
+  }
+  opts.log('');
+  opts.log('  Next');
+  opts.log('    fleet doctor                      checks all of this end to end');
+  opts.log('    fleet delegate "/your-command"    hands that command to an agent in the cloud');
+  opts.log('');
+}
+
+/**
+ * May this run replace the manifest that is already here?
+ *
+ * Only when there is one, the operator did not pass --yes, and the interview
+ * actually completed — a run that is about to fail on missing flags has nothing
+ * to overwrite with, and asking there is a question about a decision that is
+ * not going to happen.
+ */
+async function mayOverwrite(
+  merged: Interview,
+  situation: { manifestExists: boolean; manifestPath: string },
+  opts: SetupRepoOptions,
+  ask?: Asker,
+): Promise<boolean> {
+  if (!ask || opts.yes || !situation.manifestExists) return true;
+  if (merged.missing.length > 0) return true;
+  return confirm(`overwrite ${path.relative(opts.cwd, situation.manifestPath)}?`, ask);
+}
+
+/** The face of the product, and where it is about to work (#217). */
+function printHeader(opts: SetupRepoOptions): void {
+  opts.log(renderBanner(80, 'NO_COLOR' in opts.env, detectColorLevel(opts.env)));
+  opts.log('');
+  opts.log(`  Setting up ${opts.cwd}`);
+  opts.log('');
+}
+
+/**
+ * The banner, the detected-plan shortcut, and whatever is left to ask.
+ * Undefined means the operator declined to overwrite an existing manifest.
+ */
+async function askForAnswers(
+  situation: { manifestExists: boolean; existing?: RepoManifest; seat: SeatWalk; manifestPath: string },
+  opts: SetupRepoOptions,
+): Promise<Interview | undefined> {
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
-  let merged: Interview;
+  const prompts = repoPrompts(opts.cwd, situation.existing, situation.seat);
   try {
-    opts.log('harness: claude-code — the supported runner adapter');
-    merged = await interview(repoPrompts(opts.cwd, existing, seat), {
-      flags: opts.flags,
+    if (ask) printHeader(opts);
+    const shortcut = situation.manifestExists ? undefined : await offerDetectedPlan(prompts, opts, ask);
+    const merged = await interview(prompts, {
+      flags: shortcut ? { ...shortcut, ...opts.flags } : opts.flags,
       env: opts.env,
       ask,
       log: opts.log,
     });
-    if (merged.missing.length === 0 && manifestExists && !opts.yes && ask) {
-      const approved = await confirm(`overwrite ${path.relative(opts.cwd, manifestPath)}?`, ask);
-      if (!approved) {
-        opts.log('nothing written.');
-        return 0;
-      }
-    }
+    return (await mayOverwrite(merged, situation, opts, ask)) ? merged : undefined;
   } finally {
     ask?.close();
+  }
+}
+
+export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
+  const fleetDir = path.join(opts.cwd, '.fleet');
+  const manifestPath = path.join(fleetDir, 'manifest.json');
+  const { manifestExists, existing, seat } = readSituation(fleetDir, manifestPath, opts);
+
+  const merged = await askForAnswers({ manifestExists, existing, seat, manifestPath }, opts);
+  if (merged === undefined) {
+    opts.log('nothing written.');
+    return 0;
   }
   if (merged.missing.length > 0) {
     throw new SetupError(
@@ -1338,21 +1586,7 @@ export async function runSetupRepo(opts: SetupRepoOptions): Promise<number> {
       ['the answers do not make a valid manifest:', ...check.errors.map((e) => `  ${e.instancePath || '/'} ${e.message ?? 'invalid'}`)].join('\n'),
     );
   }
-
-  const setupCommand = merged.answers.setup_command?.trim();
-  const scriptExisted = fs.existsSync(path.join(fleetDir, 'setup.sh'));
-  for (const line of writeScaffold(fleetDir, manifest, setupCommand ? setupScriptFor(setupCommand) : undefined)) {
-    opts.log(line);
-  }
-  // After the scaffold, whose gitignore write is what makes "gitignored" true.
-  for (const line of applySeatWalk(fleetDir, seatPlan)) {
-    opts.log(line);
-  }
-  if (scriptExisted && setupCommand) {
-    opts.log(`note: .fleet/setup.sh already existed and was left alone — make sure it runs \`${setupCommand}\``);
-  }
-  opts.log('');
-  opts.log('Check it with: fleet lint');
+  writeAndReport(fleetDir, manifest, merged.answers, seatPlan, opts);
   return 0;
 }
 
