@@ -224,15 +224,20 @@ test('delegate: the window release writes a compat mode computed from shape', as
 
 // --- The operator's prompt (#240): instruction beside identity ---
 
-test('delegate: an un-prompted dispatch writes no prompt at all', async (t) => {
-  // The compatibility claim the whole field rests on. A deployed daemon
-  // validates orders against the schema baked into its own image, so a `prompt`
-  // written unconditionally — even the shape's own default — would 422 every
-  // dispatch until the deployment caught up. The assertion is the WHOLE order,
-  // not a `'prompt' in order` check: a defaulted prompt and any other field
-  // this release started writing both fail here, which is what "the same order
-  // the release before it posted" actually means. (Key ORDER is not asserted —
-  // deepEqual ignores it, and JSON object order is not part of the contract.)
+test('delegate: an issue dispatch is unchanged; a prose one runs what was typed', async (t) => {
+  // The two halves of #240 in one assertion, on the WHOLE order rather than a
+  // `'prompt' in order` check, so any other field this release started writing
+  // fails here too.
+  //
+  // Issue: no prompt. The target is an identity — the gate, the claim guard and
+  // `Closes #n` read it — so the runner still composes from the manifest, and
+  // the bytes posted are the ones the previous release posted. That also keeps
+  // issue dispatch working against a daemon validating with an older baked-in
+  // schema, which is the only compatibility this field can offer.
+  //
+  // Prose: the target IS the instruction, so it is carried as the prompt and
+  // the harness runs it as typed. This one does need an upgraded daemon; prose
+  // is where the behaviour changes, and it changes on purpose.
   const cwd = scaffold(MIN_MANIFEST);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
@@ -246,10 +251,11 @@ test('delegate: an un-prompted dispatch writes no prompt at all', async (t) => {
     authority: { publish: true, merge: false, deploy: false },
     title: 'Fix the flaky heartbeat',
   });
-  const prose = await postedOrder(['why do queued jobs sit behind the capacity cap'], cwd, daemon);
+  const prose = await postedOrder(['/dev-sprint'], cwd, daemon);
   assert.deepEqual(prose, {
     mode: 'investigate',
-    target: 'why do queued jobs sit behind the capacity cap',
+    target: '/dev-sprint',
+    prompt: '/dev-sprint',
     finish: 'inspected',
     authority: { publish: false, merge: false, deploy: false },
   });

@@ -68,11 +68,28 @@ Two rules make the contracts real rather than decorative: the daemon validates *
 
 ## Harnesses
 
-`harness.cli` selects the coding CLI a job runs. One value, `claude-code`, is
-supported end to end: the runner takes the work order's `prompt` when it carries
-one and otherwise composes `/<harness.commands[0]> <target>`, injects the output
-contract, and `src/runner/translate.ts` turns its stream into Fleet events, so
-the transcript renders.
+**What you type is what runs.** `fleet delegate "/dev-sprint"` launches
+`/dev-sprint`. `fleet delegate "use the feature-spec skill to write X"` launches
+that sentence. Fleet does not choose the verb (D8) — it carries the instruction
+and appends only what it owns: the output contract, and an adoption's
+continuation clause.
+
+The one exception is a target that is an *identity* rather than an instruction.
+`fleet delegate 69` names issue 69 — the pickup gate, the claim guard and
+`Closes #n` all read that number — so there is nothing in it to run, and the
+runner composes `/<harness.commands[0]> 69` from the manifest as it always has.
+That is the only surviving use of `harness.commands`, which is why the field is
+now optional: a repo whose jobs are all prompts declares none. To run your own
+workflow *with* issue strictness, name both:
+`fleet delegate 69 --prompt "/dev-work #69"`.
+
+`harness.cli` selects which coding CLI executes it. `claude-code`, `codex`,
+`opencode` and `omp` each have a headless invocation in
+`src/runner/harness.ts` (`DIALECTS`); `harness.model` is passed to the ones that
+take a model, and omitted otherwise. Only `claude-code` streams a transcript —
+`src/runner/translate.ts` speaks its dialect — so the others report at settle
+rather than live. Delivery is identical for all four: the report and artifacts
+are read off disk, not off the stream.
 
 Every other CLI runs through **`FLEET_HARNESS_CMD`**, an environment variable
 naming the exact command to spawn. It is read *before* the `harness.cli` check

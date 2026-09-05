@@ -24,7 +24,7 @@ import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { artifactTally, formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
-import { COMPAT_MODE, SHAPE_DEFAULTS, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
+import { COMPAT_MODE, SHAPE_DEFAULTS, defaultPrompt, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
 import { displayTarget, isIssueTarget, normalizeTarget } from '../shared/issue-ref.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
@@ -108,12 +108,18 @@ Commands:
   delegate <target> [--prompt text] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
-                                           --prompt is the instruction the agent runs, used as you
-                                           typed it: "/dev-sprint", "/spec add rate limiting",
-                                           or plain prose. Without one the job runs your first
-                                           harness.commands entry against the target, as before.
-                                           A deployment older than #240 rejects a prompted order
-                                           outright — fleet upgrade first.
+                                           What you type is what the agent runs:
+                                             fleet delegate "/dev-sprint"
+                                             fleet delegate "use the feature-spec skill for X"
+                                           A bare issue number is the exception — it is an
+                                           identity, not an instruction, so delegate 69 runs
+                                           your first harness.commands entry against issue 69 and
+                                           keeps the readiness gate, publish and Closes #69.
+                                           --prompt names both, so
+                                             fleet delegate 69 --prompt "/dev-work #69"
+                                           runs your workflow with issue strictness.
+                                           A deployment older than #240 rejects a prompt-carrying
+                                           order outright — fleet upgrade first.
                                            The target decides everything else either way, so a
                                            prompt on an issue number keeps issue strictness,
                                            publish and the readiness gate — and one on prose buys
@@ -841,7 +847,11 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   // Carried, and read nowhere else here: the target is never derived back out
   // of it — scanning a prompt for a `#69` would make gate strictness depend on
   // parsing English (D17).
-  if (req.prompt !== undefined) workOrder.prompt = req.prompt;
+  // --prompt wins; otherwise the shape decides (#240). Written only when there
+  // is one, so an issue dispatch posts the same bytes it always has and keeps
+  // working against a daemon whose baked-in schema predates the field.
+  const prompt = req.prompt ?? defaultPrompt(shape, target);
+  if (prompt !== undefined) workOrder.prompt = prompt;
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);

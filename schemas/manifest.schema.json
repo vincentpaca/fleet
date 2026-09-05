@@ -4,39 +4,123 @@
   "title": "Fleet manifest (environment contract)",
   "description": "Repo-owned declaration of everything a sandbox needs to be the developer's environment, elsewhere. Canonical path: .fleet/manifest.json (root-level fleet.json accepted as fallback; both present = dispatch error).",
   "type": "object",
-  "required": ["version", "setup", "workspace", "harness", "gates"],
+  "required": [
+    "version",
+    "setup",
+    "workspace",
+    "harness",
+    "gates"
+  ],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 1 },
+    "version": {
+      "const": 1
+    },
     "setup": {
       "description": "How the job image is built. Preferred: point at the repo's devcontainer. Fallback: image/dockerfile + setup script.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "devcontainer": { "type": "string", "description": "Path to devcontainer.json (image/build/postCreateCommand subset, built via @devcontainers/cli)." },
-        "image": { "type": "string", "description": "Base image (fallback form)." },
-        "dockerfile": { "type": "string", "description": "Dockerfile path (fallback form, mutually exclusive with image)." },
-        "script": { "type": "string", "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run. Runs as root — it is operator-authored (laptop trust class) and may install system packages; the runner drops to the unprivileged job user before the pickup gate and the harness, so the agent never runs as root." }
+        "devcontainer": {
+          "type": "string",
+          "description": "Path to devcontainer.json (image/build/postCreateCommand subset, built via @devcontainers/cli)."
+        },
+        "image": {
+          "type": "string",
+          "description": "Base image (fallback form)."
+        },
+        "dockerfile": {
+          "type": "string",
+          "description": "Dockerfile path (fallback form, mutually exclusive with image)."
+        },
+        "script": {
+          "type": "string",
+          "description": "Setup script: deps, build, seed. Runs with unrestricted egress; the allowlist clamps only the harness run. Runs as root \u2014 it is operator-authored (laptop trust class) and may install system packages; the runner drops to the unprivileged job user before the pickup gate and the harness, so the agent never runs as root."
+        }
       },
       "oneOf": [
-        { "required": ["devcontainer"], "not": { "anyOf": [{ "required": ["image"] }, { "required": ["dockerfile"] }] } },
-        { "required": ["image"], "not": { "anyOf": [{ "required": ["devcontainer"] }, { "required": ["dockerfile"] }] } },
-        { "required": ["dockerfile"], "not": { "anyOf": [{ "required": ["devcontainer"] }, { "required": ["image"] }] } }
+        {
+          "required": [
+            "devcontainer"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "image"
+                ]
+              },
+              {
+                "required": [
+                  "dockerfile"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "image"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "devcontainer"
+                ]
+              },
+              {
+                "required": [
+                  "dockerfile"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "dockerfile"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "devcontainer"
+                ]
+              },
+              {
+                "required": [
+                  "image"
+                ]
+              }
+            ]
+          }
+        }
       ]
     },
     "workspace": {
       "type": "object",
-      "required": ["repo", "strategy"],
+      "required": [
+        "repo",
+        "strategy"
+      ],
       "additionalProperties": false,
       "properties": {
-        "repo": { "type": "string", "description": "Git remote URL, or the sentinel \"origin\": resolve the URL from the workspace's origin remote at dispatch. Prefer the sentinel — it keeps the manifest portable across forks and mirrors and keeps org-specific URLs out of the file." },
+        "repo": {
+          "type": "string",
+          "description": "Git remote URL, or the sentinel \"origin\": resolve the URL from the workspace's origin remote at dispatch. Prefer the sentinel \u2014 it keeps the manifest portable across forks and mirrors and keeps org-specific URLs out of the file."
+        },
         "strategy": {
-          "enum": ["branch-per-job"],
+          "enum": [
+            "branch-per-job"
+          ],
           "description": "branch-per-job: branch fleet/<ticket>-<job-id>, based on the remote default branch at dispatch, pushed at creation so retain-for-evidence holds even if the container dies."
         },
         "sync": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Gitignored runtime config shipped from the operator's CLI to the daemon at dispatch. May carry secret values (laptop trust class) until a broker lints .env* out and moves values to env.vars. Injected env vars win over file-loaded values where the process environment is consulted."
         }
       }
@@ -47,8 +131,11 @@
       "properties": {
         "vars": {
           "type": "array",
-          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
-          "description": "Names only — values injected at task start, never stored in the manifest. Lookup: exact name in the dispatching shell's environment; missing value fails dispatch loudly."
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          },
+          "description": "Names only \u2014 values injected at task start, never stored in the manifest. Lookup: exact name in the dispatching shell's environment; missing value fails dispatch loudly."
         }
       }
     },
@@ -56,54 +143,114 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["kind"],
+        "required": [
+          "kind"
+        ],
         "additionalProperties": false,
         "properties": {
-          "kind": { "enum": ["github", "jira", "confluence", "mcp"] },
-          "name": { "type": "string" },
-          "scope": { "type": "array", "items": { "type": "string" } },
-          "permissions": { "type": "array", "items": { "type": "string" } },
-          "config": { "type": "string", "description": "For mcp: <path>#<key> where key is the entry under mcpServers in the referenced file. Creds ride the synced config (broker-exempt) until a broker templates the config and injects short-lived tokens." }
+          "kind": {
+            "enum": [
+              "github",
+              "jira",
+              "confluence",
+              "mcp"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "config": {
+            "type": "string",
+            "description": "For mcp: <path>#<key> where key is the entry under mcpServers in the referenced file. Creds ride the synced config (broker-exempt) until a broker templates the config and injects short-lived tokens."
+          }
         }
       }
     },
     "harness": {
       "type": "object",
-      "required": ["cli", "commands"],
+      "required": [
+        "cli"
+      ],
       "additionalProperties": false,
       "properties": {
-        "cli": { "enum": ["claude-code", "codex", "opencode"], "description": "Runner adapter: claude-code; others when an adopter needs them." },
-        "cli_version": { "type": "string", "description": "Pin the CLI version in the image — format churn arrives only when the repo chooses to upgrade." },
+        "cli": {
+          "enum": [
+            "claude-code",
+            "codex",
+            "opencode",
+            "omp"
+          ],
+          "description": "Which coding CLI the image ships and the runner launches. Every value here has a headless invocation in src/runner/harness.ts DIALECTS; anything else needs FLEET_HARNESS_CMD."
+        },
+        "cli_version": {
+          "type": "string",
+          "description": "Pin the CLI version in the image \u2014 format churn arrives only when the repo chooses to upgrade."
+        },
         "env": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "description": "Harness-runtime env flags baked into the task (e.g. CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1). Not secrets."
         },
-        "agents": { "type": "string", "description": "Path to the agent definitions directory (e.g. .claude/agents). Declared for dispatch-time validation: every agent file must match a registry entry by frontmatter name or dispatch refuses." },
+        "agents": {
+          "type": "string",
+          "description": "Path to the agent definitions directory (e.g. .claude/agents). Shipped into the workspace so the harness can find them. Not validated at dispatch \u2014 an earlier description claimed a registry check that has never existed."
+        },
         "commands": {
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["path", "critic"],
+            "required": [
+              "path"
+            ],
             "additionalProperties": false,
             "properties": {
-              "path": { "type": "string" },
-              "critic": { "type": "string", "description": "Named critic agent — the manifest lint enforcing the no-run-without-a-critic rule." }
+              "path": {
+                "type": "string"
+              },
+              "critic": {
+                "type": "string",
+                "description": "Deprecated (#240), unused. Nothing in src/ reads it: agents/dev.md hardcodes its reviewer, so a manifest naming another critic still runs that one. The property survives one train so existing manifests keep validating."
+              }
             }
-          }
+          },
+          "description": "Optional (#240). The repo's slash commands. Only the first is used, and only as the default instruction for an issue or adoption dispatch, where the target is an identity rather than something to run. A prose dispatch runs what the operator typed, so a repo whose jobs are all prompts needs no commands at all. Kept as a property because harness is additionalProperties:false and deployed daemons validate with their own baked-in schema, so removals ship daemon-first."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model id passed to the CLI when it takes one (#240). Omit to take the CLI's own default \u2014 which is right for claude-code and wrong for opencode, whose default is a model most keys cannot reach."
         }
       }
     },
     "gates": {
       "type": "object",
-      "required": ["pickup"],
+      "required": [
+        "pickup"
+      ],
       "additionalProperties": false,
       "properties": {
-        "pickup": { "type": "string", "description": "REQUIRED command; must exit 0 or the job aborts before model spend. The gate script owns its own force-fetch; the runner treats every nonzero exit identically." },
+        "pickup": {
+          "type": "string",
+          "description": "REQUIRED command; must exit 0 or the job aborts before model spend. The gate script owns its own force-fetch; the runner treats every nonzero exit identically."
+        },
         "default_finish": {
           "$ref": "work-order.schema.json#/$defs/targetableRung",
-          "description": "Repo-default target rung, consumed by the CLI at order construction (#36): it beats the dispatch shape's own default and loses to an explicit --finish. It applies only where the dispatch could reach it — a rung needing push authority (pr-open and above) is skipped on a dispatch that publishes nothing, and the shape default stands. Absent, the shape default is used: merge-ready for an issue or an adopted PR, inspected for prose. No inert \"default\" annotation here on purpose — the resolution lives in src/cli/dispatch.ts and having two sources of truth for it is the defect docs/decisions.md#d17 records."
+          "description": "Repo-default target rung, consumed by the CLI at order construction (#36): it beats the dispatch shape's own default and loses to an explicit --finish. It applies only where the dispatch could reach it \u2014 a rung needing push authority (pr-open and above) is skipped on a dispatch that publishes nothing, and the shape default stands. Absent, the shape default is used: merge-ready for an issue or an adopted PR, inspected for prose. No inert \"default\" annotation here on purpose \u2014 the resolution lives in src/cli/dispatch.ts and having two sources of truth for it is the defect docs/decisions.md#d17 records."
         }
       }
     },
@@ -111,15 +258,40 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "wall_clock": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained. Supports s/m/h units; zero is not a value (an instant death sentence is a typo, not a budget). No default — absent means unbounded, backstopped by idle." },
-        "idle": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Liveness check, not a cost bound: no harness output for this long (blocked time excluded) → SIGTERM + grace, partial work pushed, settle with the idle duration, state cancelled reason stall. Supports s/m/h units; zero is not a value — stall detection cannot be switched off, only widened. Must exceed the pickup gate's runtime: the daemon's mirror of this limit measures silence on the event stream, which the gate does not feed. Absent defaults to 20m — the default lives in src/shared/time.ts (idleLimitMs), the one source of truth (#134)." },
-        "block_hot": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "How long a blocked container stays hot before parking (WIP committed, task exits). Absent defaults to 30m — the default lives in src/shared/time.ts (blockHotLimitMs), the one source of truth (#134)." },
-        "decision_timeout": { "type": "string", "pattern": "^[0-9]+(m|h)$", "description": "Unanswered past this → job marked stale; stays parked; never auto-answered. Absent defaults to 24h — the default lives in src/shared/time.ts (decisionTimeoutMs), the one source of truth (#134)." },
-        "checkpoint": { "type": "string", "pattern": "^[1-9][0-9]*(s|m|h)$", "description": "Cadence of WIP checkpoint pushes to the job branch during the run (#190). On container providers the workspace dies with the task, so without checkpoints the teardown push is the work's only exit. Push failures log and the run continues; a checkpoint of a clean, fully-pushed workspace is a no-op. Zero is not a value — checkpointing cannot be switched off, only widened. Absent defaults to 10m — the default lives in src/shared/time.ts (checkpointLimitMs), the one source of truth (#134)." },
-        "model_spend": { "type": "string", "description": "OPEN — not enforced; the structural bounds apply meanwhile (scale to zero, the capacity cap, wall_clock). Per-job metering arrives with fleet-native cost reporting." },
+        "wall_clock": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(s|m|h)$",
+          "description": "Agent-runtime budget; pauses while blocked. Expiry: SIGTERM + grace, settle with partial outcome, state cancelled, branch retained. Supports s/m/h units; zero is not a value (an instant death sentence is a typo, not a budget). No default \u2014 absent means unbounded, backstopped by idle."
+        },
+        "idle": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(s|m|h)$",
+          "description": "Liveness check, not a cost bound: no harness output for this long (blocked time excluded) \u2192 SIGTERM + grace, partial work pushed, settle with the idle duration, state cancelled reason stall. Supports s/m/h units; zero is not a value \u2014 stall detection cannot be switched off, only widened. Must exceed the pickup gate's runtime: the daemon's mirror of this limit measures silence on the event stream, which the gate does not feed. Absent defaults to 20m \u2014 the default lives in src/shared/time.ts (idleLimitMs), the one source of truth (#134)."
+        },
+        "block_hot": {
+          "type": "string",
+          "pattern": "^[0-9]+(m|h)$",
+          "description": "How long a blocked container stays hot before parking (WIP committed, task exits). Absent defaults to 30m \u2014 the default lives in src/shared/time.ts (blockHotLimitMs), the one source of truth (#134)."
+        },
+        "decision_timeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(m|h)$",
+          "description": "Unanswered past this \u2192 job marked stale; stays parked; never auto-answered. Absent defaults to 24h \u2014 the default lives in src/shared/time.ts (decisionTimeoutMs), the one source of truth (#134)."
+        },
+        "checkpoint": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(s|m|h)$",
+          "description": "Cadence of WIP checkpoint pushes to the job branch during the run (#190). On container providers the workspace dies with the task, so without checkpoints the teardown push is the work's only exit. Push failures log and the run continues; a checkpoint of a clean, fully-pushed workspace is a no-op. Zero is not a value \u2014 checkpointing cannot be switched off, only widened. Absent defaults to 10m \u2014 the default lives in src/shared/time.ts (checkpointLimitMs), the one source of truth (#134)."
+        },
+        "model_spend": {
+          "type": "string",
+          "description": "OPEN \u2014 not enforced; the structural bounds apply meanwhile (scale to zero, the capacity cap, wall_clock). Per-job metering arrives with fleet-native cost reporting."
+        },
         "egress": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Hostname allowlist, applies after setup completes. Declared today, unenforced; once enforced, an absent field denies everything except hosts implied by services and the model API. TBD = DENY."
         },
         "resources": {
@@ -127,9 +299,21 @@
           "additionalProperties": false,
           "description": "Resource requirements for the sandbox container. ECS: injected as task-level cpu/memory overrides on run-task. Docker: --cpus/--memory flags. Process: noted but not enforced. A request that exceeds every offered capacity tier is rejected at dispatch with the exact numbers.",
           "properties": {
-            "cpu": { "type": "integer", "minimum": 1, "description": "CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU)." },
-            "memory": { "type": "integer", "minimum": 1, "description": "Memory limit in MiB." },
-            "disk": { "type": "integer", "minimum": 1, "description": "Ephemeral disk in GiB (advisory; not all providers enforce it)." }
+            "cpu": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "CPU in ECS units (256 = 0.25 vCPU, 1024 = 1 vCPU)."
+            },
+            "memory": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Memory limit in MiB."
+            },
+            "disk": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Ephemeral disk in GiB (advisory; not all providers enforce it)."
+            }
           }
         }
       }

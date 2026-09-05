@@ -142,6 +142,54 @@ function composeSlashCommand(harness: Record<string, unknown>, target: string): 
   return `/${name} ${target}`;
 }
 
+/**
+ * How each supported CLI takes an instruction with no human at the keyboard,
+ * as argv (#241 — never a shell string, because the instruction is operator
+ * text). Every row is one this repo has actually run a job through end to end
+ * (test/e2e-foreign-repo.ts); a CLI absent from here is unlaunchable and the
+ * operator's route is FLEET_HARNESS_CMD.
+ *
+ * Fleet owns the headless and approval flags only. It does not pick a model —
+ * that is `harness.model` when the CLI needs one, and the CLI's own default
+ * otherwise.
+ */
+const DIALECTS: Record<string, (prompt: string, model?: string) => { file: string; args: string[]; env?: Record<string, string> }> = {
+  'claude-code': (prompt, model) => ({
+    file: 'claude',
+    args: [
+      '-p', prompt,
+      '--output-format', 'stream-json', '--verbose',
+      ...(model ? ['--model', model] : []),
+      '--allowedTools', ...CLAUDE_ALLOWED_TOOLS,
+    ],
+    // claude-code caps a single response at 32k output tokens by default; a
+    // whole-file Write can exceed it and kill the job (observed on #28).
+    // Dialect knob, so it lives here — never in the manifest.
+    env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
+  }),
+  codex: (prompt) => ({ file: 'codex', args: ['exec', '--dangerously-bypass-approvals-and-sandbox', prompt] }),
+  opencode: (prompt, model) => ({ file: 'opencode', args: ['run', ...(model ? ['--model', model] : []), prompt] }),
+  omp: (prompt, model) => ({ file: 'omp', args: ['-p', '--auto-approve', ...(model ? ['--model', model] : []), prompt] }),
+};
+
+/**
+ * FLEET_HARNESS_CMD: a command line an operator wrote — pipes, redirects and
+ * `node -e "..."` are the point of it — so it stays a shell string and runs
+ * verbatim. The derived plan never does: its instruction comes from a work
+ * order and its branch name from whoever opened the PR (#241).
+ *
+ * An override is the entire launch line, so a work-order prompt has nowhere to
+ * go; splicing it in would put operator text back inside a shell string. It is
+ * dropped, and said out loud — the operator typed it and would otherwise spend
+ * the job wondering why it had no effect.
+ */
+function overridePlan(override: string, prompt: string | undefined): HarnessPlan {
+  const notes = prompt
+    ? ['FLEET_HARNESS_CMD is set, so it is the whole launch line and the work order prompt was not used']
+    : [];
+  return { file: override, args: [], shell: true, notes };
+}
+
 /** Build the launch plan, or undefined when no command can be derived. */
 export function buildHarnessCommand({ manifest, target, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
@@ -150,17 +198,7 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   // below is argv and never sees a shell: its target comes from a work order
   // and, on an adoption, its branch name comes from whoever opened the PR, so a
   // `$(...)` in either used to execute inside the job container (#241).
-  if (override) {
-    // An override is the entire launch line, so a work-order prompt has nowhere
-    // to go: splicing it in would put operator text back inside a shell string,
-    // which is the hole #241 closed. Dropping it is the right call and a silent
-    // drop is not — the operator typed the prompt and would otherwise spend the
-    // job wondering why it had no effect.
-    const notes = prompt
-      ? ['FLEET_HARNESS_CMD is set, so it is the whole launch line and the work order prompt was not used']
-      : [];
-    return { file: override, args: [], shell: true, notes };
-  }
+  if (override) return overridePlan(override, prompt);
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
@@ -169,7 +207,8 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   const required = typeof harness.cli_version === 'string' ? harness.cli_version : undefined;
   checkVersionNotes(actualVersion, required, notes);
 
-  if (cli !== 'claude-code') return undefined; // adapters for other CLIs arrive with demand
+  const dialect = DIALECTS[cli];
+  if (!dialect) return undefined; // an unknown cli has no headless invocation to guess at
 
   // An operator-supplied prompt (#240) replaces the whole composed line, so the
   // manifest's commands are not consulted at all: requiring them would make a
@@ -185,16 +224,9 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
   const promptText = `${instruction}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
-  return {
-    file: 'claude',
-    args: ['-p', promptText, '--output-format', 'stream-json', '--verbose', '--allowedTools', ...CLAUDE_ALLOWED_TOOLS],
-    shell: false,
-    notes,
-    // claude-code caps a single response at 32k output tokens by default; a
-    // whole-file Write can exceed it and kill the job (observed on #28).
-    // Dialect knob, so it lives here — never in the manifest.
-    env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
-  };
+  const model = typeof harness.model === 'string' ? harness.model : undefined;
+  if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
+  return { ...dialect(promptText, model), shell: false, notes };
 }
 
 /**

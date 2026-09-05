@@ -200,6 +200,56 @@ test('an override plus a prompt says the prompt was dropped, rather than droppin
   assert.deepStrictEqual(quiet?.notes, [], 'an un-prompted override gained a note it has no reason to carry');
 });
 
+test('a prose target runs as typed on every supported cli (#240)', () => {
+  // The whole point of the issue, at the far end of the pipe. `fleet delegate
+  // "/dev-sprint"` used to reach the agent as `/dev /dev-sprint` — the
+  // operator's workflow demoted to an argument of Fleet's. Now the prompt IS
+  // the instruction, and it is the first thing the CLI is asked to do on every
+  // dialect, not just claude-code's.
+  for (const [cli, file] of [['claude-code', 'claude'], ['codex', 'codex'], ['opencode', 'opencode'], ['omp', 'omp']]) {
+    const plan = buildHarnessCommand({
+      manifest: { harness: { cli, commands: [{ path: '.claude/commands/dev.md' }] } },
+      target: '/dev-sprint',
+      prompt: '/dev-sprint',
+    });
+    assert.ok(plan, `${cli} has no launch plan`);
+    assert.equal(plan.file, file);
+    assert.equal(plan.shell, false, `${cli} went through a shell`);
+    const instruction = plan.args.find((a) => a.startsWith('/dev-sprint'));
+    assert.ok(instruction, `${cli} did not pass the prompt as its own argument: ${JSON.stringify(plan.args)}`);
+    assert.equal(instruction.includes('/dev /dev-sprint'), false, `${cli} still glued the manifest command on`);
+    assert.ok(instruction.endsWith(OUTPUT_CONTRACT), `${cli} dropped the output contract`);
+  }
+});
+
+test('an unknown cli has no plan rather than a guessed one (#240)', () => {
+  // The guard that keeps DIALECTS honest: adding a `cli` enum value without an
+  // invocation must fail the job loudly, not launch something invented.
+  const plan = buildHarnessCommand({
+    manifest: { harness: { cli: 'aider', commands: [{ path: '.claude/commands/dev.md' }] } },
+    target: 'APP-14',
+  });
+  assert.equal(plan, undefined);
+});
+
+test('harness.model reaches the clis that need one, and is absent when unset (#240)', () => {
+  // opencode's default model is one most keys cannot reach — the failure that
+  // cost a real e2e run. Fleet passes a model when the manifest names one and
+  // never invents a default.
+  const withModel = buildHarnessCommand({
+    manifest: { harness: { cli: 'opencode', model: 'openai/gpt-5' } },
+    target: 'ship it',
+    prompt: 'ship it',
+  });
+  assert.deepEqual(withModel?.args.slice(0, 3), ['run', '--model', 'openai/gpt-5']);
+  const without = buildHarnessCommand({
+    manifest: { harness: { cli: 'opencode' } },
+    target: 'ship it',
+    prompt: 'ship it',
+  });
+  assert.equal(without?.args.includes('--model'), false, 'Fleet invented a model');
+});
+
 test('the launch line an operator reads survives argv (display only)', () => {
   const plan = buildHarnessCommand({ manifest, target: 'APP-14', actualVersion: '2.1.220' });
   assert.ok(plan);

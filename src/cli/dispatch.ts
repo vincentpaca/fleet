@@ -62,6 +62,26 @@ export const SHAPE_DEFAULTS: Record<DispatchShape, { publish: boolean; finish: s
  * The follow-up release stops writing this, and says "regenerate your repo gate
  * first".
  */
+/**
+ * The launch instruction for a shape, or undefined to leave it to the runner.
+ *
+ * This is the whole of #240. A prose target has never been an identity — no
+ * `Closes #n`, no readiness check, nothing reads it but the branch name — so it
+ * is the operator saying what they want run, and it now runs as typed:
+ * `fleet delegate "/dev-sprint"` launches `/dev-sprint`, not `/dev /dev-sprint`.
+ *
+ * An issue or an adoption returns undefined and the runner composes
+ * `/<harness.commands[0]> <target>` exactly as it always has, because there the
+ * target IS an identity — a number the gate, the claim guard and `Closes #n`
+ * all read — and `fleet delegate 69` must not change. The composition stays in
+ * the runner rather than moving here because only the runner has the cloned
+ * workspace's manifest; duplicating it in the CLI is the drift AGENTS.md
+ * forbids.
+ */
+export function defaultPrompt(shape: DispatchShape, target: string): string | undefined {
+  return shape === 'prose' ? target : undefined;
+}
+
 export const COMPAT_MODE: Record<DispatchShape, string> = {
   adoption: 'followthrough',
   issue: 'implement',

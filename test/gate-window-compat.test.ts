@@ -23,6 +23,7 @@ import type { ServerResponse } from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { dispatchShape } from '../src/cli/dispatch.ts';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 import { runCli, makeTempDir, startMockDaemon, sendJson, type MockRequest } from './cli-helpers.ts';
@@ -262,7 +263,12 @@ test('every order the window CLI writes validates against the frozen pre-window 
   // The compatibility claim the whole window rests on, checked rather than
   // asserted: a new CLI dispatching at an operator's un-upgraded daemon must
   // not 422 — for every dispatch that asks for nothing the old schema lacks,
-  // which since #240 is every dispatch without `--prompt`. It is also what
+  // which since #240 means an issue or an adoption. A prose dispatch is the
+  // deliberate exception: its target IS the instruction now, so it carries a
+  // `prompt` and an un-upgraded daemon refuses it. That is the price of the
+  // fix and it is bounded to the shape whose behaviour changed — identity
+  // dispatches, the ones with a gate and a `Closes #n` riding on them, still
+  // cross the window untouched. It is also what
   // licenses NOT writing `report` or the dead
   // authority subfields — the pre-window schema required only mode/target/
   // finish and nothing inside `authority`, so writing them would be dead weight
@@ -302,13 +308,11 @@ test('every order the window CLI writes validates against the frozen pre-window 
   for (const order of orders) {
     assert.ok(validate(order), `${order.mode}: ${JSON.stringify(validate.errors)}`);
   }
-  // `prompt` (#240) is the one field a pre-window daemon cannot take, and the
-  // cost is bounded by the CLI writing it only when the operator asked for one:
-  // every default dispatch above still validates, and `--prompt` against an
-  // un-upgraded deployment is a 422 the operator provoked and `fleet upgrade`
-  // resolves. Pinned as a failure rather than left unsaid, because the bug is
-  // making the field unconditional — that would move every order into this
-  // branch, and the loop below is what would say so.
+  // `prompt` (#240) is the one field a pre-window daemon cannot take. Pinned as
+  // a failure rather than left unsaid, and the loop below is what keeps the
+  // blast radius from growing: it fails the moment an ISSUE or ADOPTION
+  // dispatch starts carrying one, which is the version of this bug that would
+  // silently 422 every job at an un-upgraded deployment.
   const prompted = { ...orders[0], prompt: '/dev-work #42' };
   assert.equal(validate(prompted), false, 'the frozen schema is additionalProperties:false — this must not silently pass');
   assert.ok(
@@ -318,15 +322,19 @@ test('every order the window CLI writes validates against the frozen pre-window 
 
   assert.ok(ORDERS_SEEN.length > 0, 'no dispatch was recorded — the pin has nothing to compare');
   const keys = (o: Record<string, unknown>): string => JSON.stringify(Object.keys(o).sort());
-  const pinned = [...orders, prompted];
+  const promptedProse = { ...orders[1], prompt: 'a question' };
+  const pinned = [...orders, prompted, promptedProse];
   const strip = ({ order }: { order: Record<string, unknown> }): Record<string, unknown> => {
     const { title: _title, ...rest } = order;
     return rest;
   };
   for (const seen of ORDERS_SEEN) {
     const rest = strip(seen);
-    const asked = seen.args.includes('--prompt');
-    assert.equal('prompt' in rest, asked, `only an operator asking for a prompt may put one on the wire: ${seen.args.join(' ')}`);
+    // A prompt rides when the operator named one, or when the target is prose
+    // — because prose IS the instruction (#240). Never on a bare issue or
+    // adoption dispatch: those must keep crossing the window.
+    const asked = seen.args.includes('--prompt') || dispatchShape(rest.target as string, rest.continues) === 'prose';
+    assert.equal('prompt' in rest, asked, `prompt on the wire disagrees with the shape: ${seen.args.join(' ')}`);
     assert.equal(
       validate(rest),
       !asked,
