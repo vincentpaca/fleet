@@ -1301,10 +1301,13 @@ export function detectSeatAuth(opts: { // contract pin: test-only export, assert
   const hasCredential = ['ANTHROPIC_API_KEY', CLAUDE_OAUTH_VAR].some(
     (name) => opts.env[name] !== undefined || opts.dotEnv[name] !== undefined,
   );
-  const claudeDir = opts.env.CLAUDE_CONFIG_DIR ?? path.join(opts.home, '.claude');
   const codexAuth = path.join(opts.env.CODEX_HOME ?? path.join(opts.home, '.codex'), 'auth.json');
   return {
-    claudeWalk: !hasCredential && fs.existsSync(claudeDir),
+    // Project-first: the walk fires because the repo's agent needs a credential
+    // no dispatch from here could ship (shell env ∪ .fleet/.env) — whether
+    // ~/.claude exists on this machine says nothing about that. The Codex path
+    // stays a machine probe only because it names the file a yes would copy.
+    claudeWalk: !hasCredential,
     ...(fs.existsSync(codexAuth) ? { codexAuthPath: codexAuth } : {}),
   };
 }
@@ -1323,8 +1326,8 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
       key: 'claude_oauth_token',
       question: 'paste the token from `claude setup-token` (Enter to skip)',
       hint:
-        'your Claude login cannot ship into a job — run `claude setup-token` in another ' +
-        `terminal and paste the result; it lands in .fleet/.env (0600, gitignored) as ${CLAUDE_OAUTH_VAR}`,
+        'jobs need a credential to ship — run `claude setup-token` in another terminal ' +
+        `and paste the result; it lands in .fleet/.env (0600, gitignored) as ${CLAUDE_OAUTH_VAR}`,
       fallback: () => '',
       // The chosen agent creates the requirement: a Claude login on this
       // machine is no reason to ask a codex-driven repo for a Claude token.

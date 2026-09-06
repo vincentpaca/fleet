@@ -1226,12 +1226,12 @@ test('Ctrl-C at a terminal prompt reaches SIGINT listeners before the rejection 
 
 test('setup repo: an existing manifest becomes the defaults, and overwriting takes a yes', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' }, stdin: '\n'.repeat(6) })).code, 0);
   const first = fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8');
 
   const declined = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
@@ -1240,7 +1240,7 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
 
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     // Change one answer (the pickup gate); everything else is the existing manifest.
     stdin: `${'\n'.repeat(6)}node .fleet/other.mjs\ny\n`,
   });
@@ -1252,7 +1252,7 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
 
 test('setup repo: no terminal and an existing manifest refuses instead of overwriting', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' }, stdin: '\n'.repeat(6) })).code, 0);
   const res = await runCli(['setup', 'repo'], { cwd });
   assert.equal(res.code, 1);
   assert.match(res.stderr, /--yes/);
@@ -1291,7 +1291,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
 
   const declined = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
@@ -1301,7 +1301,7 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
 
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     stdin: `${'\n'.repeat(7)}y\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
@@ -1315,7 +1315,7 @@ test('setup repo: a manifest that is not JSON at all is not silently replaced ei
   fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), '{ "version": 1, }\n');
   const res = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(res.code, 0, res.stderr);
@@ -1335,12 +1335,12 @@ function seatScratch(): string {
 
 test('setup repo: a seat login and no credential walks the acquisition — one paste writes .fleet/.env and the manifest', async () => {
   const cwd = scratchRepo();
-  const claudeDir = makeTempDir('fleet-claude-login-'); // the probe is presence of the CLI's config surface
   const res = await runCli(['setup', 'repo'], {
     cwd,
+    // Project-first basis: the repo's agent is claude-code and no credential is
+    // reachable (shell or .fleet/.env) — no probe of ~/.claude decides this.
     env: {
       FLEET_FORCE_TTY: '1',
-      CLAUDE_CONFIG_DIR: claudeDir,
       ANTHROPIC_API_KEY: undefined,
       CLAUDE_CODE_OAUTH_TOKEN: undefined,
     },
