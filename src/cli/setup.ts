@@ -148,6 +148,9 @@ export function terminalAsker( // contract pin: test-only export, asserted by th
 function promptLine(spec: PromptSpec, fallback: string | undefined): string {
   if (fallback === undefined) return `${spec.question}: `;
   if (fallback === '') return `${spec.question} [none]: `;
+  // The no-op gate is line noise to someone who has never met the concept —
+  // the same call planSummary makes: describe what Enter does, never quote it.
+  if (fallback === NO_OP_GATE) return `${spec.question} [none — jobs start right away]: `;
   return `${spec.question} [${fallback}]: `;
 }
 
@@ -1316,8 +1319,8 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
       key: 'claude_oauth_token',
       question: 'paste the token from `claude setup-token` (Enter to skip)',
       hint:
-        'a Claude seat login is here but no credential a job can ship — in another terminal run `claude setup-token`, approve it, and paste the result.\n' +
-        `  It lands in .fleet/.env (mode 0600, gitignored) as ${CLAUDE_OAUTH_VAR}, and the manifest declares the var — you never manage either by hand`,
+        'your Claude login cannot ship into a job — run `claude setup-token` in another ' +
+        `terminal and paste the result; it lands in .fleet/.env (0600, gitignored) as ${CLAUDE_OAUTH_VAR}`,
       fallback: () => '',
       when: () => seat?.claudeWalk === true,
       validate: (value) => (/\s/.test(value) ? 'a token has no whitespace in it — paste it alone' : undefined),
@@ -1411,7 +1414,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     {
       key: 'repo',
       question: 'git remote to clone code from',
-      hint: '"origin" resolves the URL from this checkout at dispatch — portable across forks',
+      hint: '"origin" resolves the URL from this checkout at dispatch',
       fallback: kept(existing?.workspace.repo, 'origin'),
       required: true,
     },
@@ -1430,7 +1433,8 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     cliPrompt(cwd, existing, home),
     {
       key: 'sync',
-      question: 'gitignored files to ship into the sandbox (comma-separated)',
+      question: 'gitignored files the job also needs',
+      hint: 'comma-separated paths, copied into the sandbox at dispatch',
       fallback: () => existing?.workspace.sync?.join(', ') ?? gitignoredSync(cwd).join(', '),
       validate: (value) => {
         const missing = splitList(value).filter((rel) => !fs.existsSync(path.join(cwd, rel)));
@@ -1439,8 +1443,8 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     },
     {
       key: 'env_vars',
-      question: 'env var names the job needs (comma-separated)',
-      hint: 'names only — values are read from your shell or .fleet/.env at dispatch',
+      question: 'env vars to pass through',
+      hint: 'comma-separated names — the values come from your shell or .fleet/.env at dispatch',
       fallback: kept(existing?.env?.vars.join(', '), envKeys.join(', ')),
       validate: (value) => {
         const bad = splitList(value).filter((name) => !/^[A-Z][A-Z0-9_]*$/.test(name));
@@ -1450,7 +1454,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     {
       key: 'pickup',
       question: 'command that must pass before a job starts',
-      hint: 'runs in the fresh workspace before any model spend: exit 0 lets the job start, anything else blocks it',
+      hint: 'exit 0 lets the job start — runs before any model spend',
       // Never a path that is not there (#217): the old default named
       // `.fleet/check-ready.js` whether or not it existed, so accepting it on a
       // repo without one killed every dispatch at the gate — after the image

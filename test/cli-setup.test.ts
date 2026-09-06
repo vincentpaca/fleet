@@ -1041,6 +1041,22 @@ test('setup repo: no gate in the repo means a gate that passes, never a missing 
   assert.equal(manifest.gates.pickup, NO_OP_GATE);
   const gate = spawnSync('sh', ['-c', manifest.gates.pickup], { cwd });
   assert.equal(gate.status, 0, 'the gate a fresh repo gets must actually pass');
+
+  // The no-op is an implementation detail: the interview describes what Enter
+  // does instead of quoting it — the same call planSummary makes.
+  const asked = await runCli(['setup', 'repo'], {
+    cwd: makeTempDir('fleet-setup-nogate-tty-'),
+    env: {
+      FLEET_FORCE_TTY: '1',
+      CLAUDE_CONFIG_DIR: makeTempDir('fleet-no-claude-'),
+      CODEX_HOME: makeTempDir('fleet-no-codex-'),
+      ANTHROPIC_API_KEY: 'sk-ant-api-here',
+    },
+    stdin: `n\n${'\n'.repeat(10)}`, // decline the plan: the gate question must actually ask
+  });
+  assert.equal(asked.code, 0, asked.stderr);
+  assert.ok(!asked.stdout.includes(NO_OP_GATE), 'the raw no-op gate never reaches the operator');
+  assert.match(asked.stdout, /\[none — jobs start right away\]/, 'Enter is described, not quoted');
 });
 
 test('the banner animation never reaches anything but a terminal (#217)', async () => {
