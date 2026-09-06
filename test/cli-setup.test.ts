@@ -24,6 +24,7 @@ import {
   SetupError,
   detectEcosystem,
   NO_OP_GATE,
+  terminalAsker,
 } from '../src/cli/setup.ts';
 import { SETUP_UNITS, unitFor } from '../src/cli/setup-units.ts';
 import { repinnedMainTf } from '../src/cli/upgrade.ts';
@@ -1139,6 +1140,72 @@ test('setup repo headless: flags supply the answers, and a missing one names its
   assert.equal(res.code, 0, res.stderr);
   const bareManifest = JSON.parse(fs.readFileSync(path.join(bare, '.fleet', 'manifest.json'), 'utf8'));
   assert.deepEqual(bareManifest.harness, { cli: 'claude-code' }, 'onboarding invented a command list');
+});
+
+test('a real terminal gets a line editor: arrows are inert and type-ahead is not dropped', async () => {
+  const { PassThrough } = await import('node:stream');
+  const readline = await import('node:readline');
+  const input = new PassThrough() as InstanceType<typeof PassThrough> & { setRawMode: (mode: boolean) => void };
+  const rawCalls: boolean[] = [];
+  input.setRawMode = (mode: boolean) => void rawCalls.push(mode);
+  let echoed = '';
+  const output = new PassThrough();
+  output.on('data', (chunk) => (echoed += chunk));
+  const ask = terminalAsker(readline, input, output);
+
+  // Raw mode is scoped to a pending question: cooked at rest (so Ctrl-C stays
+  // a real signal during the terraform steps other flows run with the asker
+  // open), raw only while the operator is typing an answer.
+  assert.equal(rawCalls.at(-1), false, 'the tty rests cooked');
+
+  // Both answers arrive before any question is asked: they must wait their
+  // turn, not be dropped on the floor (the reason the pipe asker iterates).
+  input.write('typed\n');
+  // Up, then Enter: up must not recall 'typed' from history (a paired down
+  // would mask that by undoing the recall), and the arrow must leave nothing
+  // in the answer — the canonical-mode asker used to hand back the raw ^[[A
+  // bytes as if they were typed.
+  input.write('\x1b[A\n');
+  assert.equal(await ask.question('image [node:24]: '), 'typed', 'a buffered line waits for its question');
+  assert.equal(await ask.question('next: '), '', 'arrow keys leave nothing in the answer');
+  assert.equal(rawCalls.at(-1), false, 'answered means cooked again');
+  const midQuestion = ask.question('again: ');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rawCalls.at(-1), true, 'a pending question holds raw mode');
+  input.write('\n');
+  assert.equal(await midQuestion, '', 'Enter takes the empty answer');
+  assert.equal(rawCalls.at(-1), false, 'cooked again after the answer');
+  assert.match(echoed, /image \[node:24\]: /, 'the editor draws the prompt');
+
+  const pending = ask.question('gone: ');
+  ask.close();
+  await assert.rejects(pending, /stdin ended/, 'input running out is an error, not a wait');
+});
+
+test('Ctrl-C at a terminal prompt reaches SIGINT listeners before the rejection unwinds', async () => {
+  const { PassThrough } = await import('node:stream');
+  const readline = await import('node:readline');
+  const input = new PassThrough();
+  const ask = terminalAsker(readline, input, new PassThrough());
+
+  // The hero registers a process SIGINT handler that restores the screen and
+  // exits 130. If the interrupt is delivered as a real (asynchronous) signal,
+  // the pending question's rejection unwinds first and unhooks that handler —
+  // the operator gets exit 1 and a lying "stdin ended" error. The listener
+  // below stands in for the hero's; it must have run by the time the
+  // rejection settles.
+  let interrupts = 0;
+  const onSigint = (): void => void (interrupts += 1);
+  process.once('SIGINT', onSigint);
+  try {
+    const pending = ask.question('int: ');
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write('\x03');
+    await assert.rejects(pending, /stdin ended/, 'the interrupt closes the editor');
+    assert.equal(interrupts, 1, 'the SIGINT listener ran synchronously, before the unwind');
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+  }
 });
 
 test('setup repo: an existing manifest becomes the defaults, and overwriting takes a yes', async () => {

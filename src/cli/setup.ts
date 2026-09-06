@@ -54,21 +54,29 @@ export type Asker = { // exported for ./upgrade.ts, which re-enters this intervi
   close: () => void;
 };
 
+/** What an arrow key (or any control chord) leaves in a canonical-mode line. */
+const CONTROL_SEQ = /\x1b\[[0-9;]*[A-Za-z~]/g;
+
 /**
  * An asker over stdin, reading one line per question.
  *
- * The line iterator rather than `rl.question`: a wizard asks several questions
- * in a row, and on non-terminal input readline delivers every buffered line as
- * soon as it arrives — `question` takes the first and the rest are dropped on
- * the floor, so the second question sees an input that has already ended. The
- * iterator applies backpressure and hands over exactly one line at a time,
- * which makes a piped answer script behave the way a typing human does.
+ * On a real terminal (both ends), readline runs in terminal mode: it owns raw
+ * mode and echo, so arrow keys edit the line instead of leaking `^[[C` into
+ * the answer, and an empty history keeps up/down inert. Everywhere else the
+ * plain line iterator reads piped answers: readline in non-terminal mode
+ * delivers every buffered line as soon as it arrives — `question` takes the
+ * first and the rest are dropped on the floor — so the iterator applies
+ * backpressure and hands over exactly one line at a time, which makes a piped
+ * answer script behave the way a typing human does.
  *
  * Input that runs out is an error, never a wait: "never hang waiting for input"
  * has to hold for a stdin that ends mid-interview too, not only for no stdin.
  */
 export async function stdinAsker(): Promise<Asker> { // exported for ./upgrade.ts
-  const readline = await import('node:readline/promises'); // lazy: only when there is someone to ask
+  const readline = await import('node:readline'); // lazy: only when there is someone to ask
+  if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
+    return terminalAsker(readline, process.stdin, process.stdout);
+  }
   // No `output`: the prompt text is written by the caller, so every line the
   // wizard prints goes through one path and tests can read it from stdout.
   const rl = readline.createInterface({ input: process.stdin });
@@ -78,7 +86,59 @@ export async function stdinAsker(): Promise<Asker> { // exported for ./upgrade.t
       process.stdout.write(prompt);
       const next = await lines.next();
       if (next.done) throw new SetupError('stdin ended before the wizard finished');
-      return next.value;
+      return next.value.replace(CONTROL_SEQ, '');
+    },
+    close: () => rl.close(),
+  };
+}
+
+/**
+ * The terminal-mode half of `stdinAsker`. Lines are queued rather than taken
+ * from `rl.question`, for the same backpressure reason as the pipe path; the
+ * prompt goes through setPrompt so a redraw (backspace, left-arrow) repaints
+ * the whole row instead of erasing the question.
+ *
+ * Raw mode is held only while a question is pending. Between questions the
+ * tty stays cooked, so Ctrl-C is a real signal that lands immediately — the
+ * flows that keep an asker open across synchronous terraform steps (setup
+ * infra, upgrade) must stay abortable mid-apply. While a question IS pending,
+ * Ctrl-C arrives as a keypress: it is handed to the process's SIGINT
+ * listeners synchronously — the hero screen's restore-then-exit(130) has to
+ * run before the pending question's rejection unwinds and unhooks it — and
+ * re-raised as the real signal when nobody is listening.
+ */
+export function terminalAsker( // contract pin: test-only export, asserted by the suite
+  readline: typeof import('node:readline'),
+  input: NodeJS.ReadableStream & { setRawMode?: (mode: boolean) => void },
+  output: NodeJS.WritableStream,
+): Asker {
+  // historySize 0: up and down are inert, never a recall of a previous answer.
+  const rl = readline.createInterface({ input, output, terminal: true, historySize: 0 });
+  const raw = (on: boolean): void => void input.setRawMode?.(on);
+  raw(false); // readline turned raw on at construction; cook until a question needs it
+  const queue: string[] = [];
+  let wake: (() => void) | undefined;
+  let ended = false;
+  rl.on('line', (line: string) => (queue.push(line), void wake?.()));
+  rl.on('close', () => ((ended = true), void wake?.()));
+  rl.on('SIGINT', () => {
+    rl.close(); // cooked mode back before anything can exit
+    if (!process.emit('SIGINT', 'SIGINT')) process.kill(process.pid, 'SIGINT');
+  });
+  return {
+    question: async (prompt: string): Promise<string> => {
+      raw(true);
+      try {
+        rl.setPrompt(prompt);
+        rl.prompt();
+        while (queue.length === 0) {
+          if (ended) throw new SetupError('stdin ended before the wizard finished');
+          await new Promise<void>((resolve) => (wake = resolve));
+        }
+        return queue.shift()!.replace(CONTROL_SEQ, '');
+      } finally {
+        raw(false);
+      }
     },
     close: () => rl.close(),
   };
@@ -1700,7 +1760,7 @@ function stageIo(stage: HeroStage, ask: Asker): { log: (line: string) => void; a
         if (!noted) stage.clearNote(); // no hint of its own: drop the previous question's
         noted = false;
         stage.clearPrompt();
-        return ask.question(dimDefault(prompt));
+        return ask.question(stage.indent + dimDefault(prompt));
       },
       close: ask.close,
     },

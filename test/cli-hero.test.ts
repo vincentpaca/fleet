@@ -62,15 +62,18 @@ test('the follow-up runs on the screen: its two rows are real, and restore waits
     write: (s: string) => ((buf += s), true),
   } as unknown as NodeJS.WriteStream;
   const order: string[] = [];
+  let indent = '';
+  let confirmPrompt = '';
   const took = await offerOnHeroScreen({
     out: tty,
     env: {},
     place: '~/repo',
     summary: ['  jobs run in   node:24'],
     question: '  use this?',
-    confirm: async () => (order.push('confirm'), false),
+    confirm: async (q) => ((confirmPrompt = q), order.push('confirm'), false),
     followUp: async (stage, accepted) => {
       order.push(`followUp accepted=${accepted}`);
+      indent = stage.indent;
       stage.note('  a hint that\n  spans two lines');
       stage.note('  long '.repeat(30));
       stage.note('  one of: a, b'); // a short note after a wrapped one: the overflow row must clear
@@ -81,16 +84,24 @@ test('the follow-up runs on the screen: its two rows are real, and restore waits
   assert.deepEqual(order, ['confirm', 'followUp accepted=false'], 'the follow-up runs after the answer');
 
   // The stage's rows are anchored to the layout: notes get the two rows above
-  // the prompt at the prompt's column, dimmed and clipped to the block's own
-  // width. Drift here scatters the interview across the art.
-  const park = buf.match(/\x1b\[(\d+);(\d+)H\x1b\[\?25h/);
-  assert.ok(park, 'drawScreen parked the cursor at the prompt');
+  // the prompt at the block's left edge, dimmed and clipped to the block's own
+  // width. The prompt row is parked at column 1 and every prompt carries the
+  // block edge as an indent, because a terminal-mode line editor redraws its
+  // row from column 0. Drift here scatters the interview across the art.
+  const park = buf.match(/\x1b\[(\d+);1H\x1b\[\?25h/);
+  assert.ok(park, 'drawScreen parked the cursor on the prompt row');
   const promptRow = Number(park[1]);
+  const summaryAt = buf.match(/\x1b\[\d+;(\d+)H {2}jobs run in/);
+  assert.ok(summaryAt, 'the summary landed at the block edge');
+  const blockCol = Number(summaryAt[1]);
+  assert.equal(indent, ' '.repeat(blockCol - 1), 'the stage indent is the block edge as spaces');
+  assert.ok(confirmPrompt.endsWith('  use this?'), 'the confirm question is intact behind its indent');
+  assert.equal(confirmPrompt, ' '.repeat(blockCol - 1) + '  use this?', 'the confirm prompt carries the same indent');
   const note = buf.match(/\x1b\[(\d+);1H\x1b\[2K\x1b\[(\d+);(\d+)H\x1b\[2mone of: a, b\x1b\[0m/);
   assert.ok(note, 'the note landed dimmed, indent trimmed');
   assert.equal(Number(note[1]), promptRow - 2, 'the first note row is two above the prompt');
-  assert.equal(note[3], park[2], 'the note keeps the prompt column');
-  assert.ok(buf.includes(`\x1b[${promptRow};1H\x1b[2K\x1b[${promptRow};${park[2]}H`), 'clearPrompt re-parks at the prompt');
+  assert.equal(Number(note[3]), blockCol, 'the note keeps the block edge');
+  assert.ok(buf.includes(`\x1b[${promptRow};1H\x1b[2K`), 'clearPrompt clears the prompt row from column 1');
   // A multi-line hint is flattened, then wrapped at the block width: a raw
   // newline written on a note row would walk the cursor onto the prompt row,
   // and an unwrapped line would run to the terminal's edge.
@@ -103,7 +114,7 @@ test('the follow-up runs on the screen: its two rows are real, and restore waits
   // overflow row, or the previous hint's tail stays glued to the new question.
   const afterShort = buf.slice(buf.lastIndexOf('one of: a, b'));
   assert.ok(afterShort.includes(`\x1b[${promptRow - 1};1H\x1b[2K`), 'a shorter note clears the stale overflow row');
-  assert.ok(!afterShort.includes(`\x1b[${promptRow - 1};${park[2]}H`), 'nothing repaints the overflow row after the short note');
+  assert.ok(!afterShort.includes(`\x1b[${promptRow - 1};${blockCol}H`), 'nothing repaints the overflow row after the short note');
   const restore = buf.lastIndexOf('\x1b[?1049l');
   assert.ok(restore > buf.indexOf('one of: a, b'), 'the screen outlives the interview');
 });

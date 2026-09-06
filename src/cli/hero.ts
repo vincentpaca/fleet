@@ -107,7 +107,9 @@ function drawScreen(out: NodeJS.WriteStream, layout: HeroLayout, art: string[]):
   drawWindow(out, layout, art, 0);
   let buf = '';
   for (const line of layout.body) buf += `\x1b[${line.row};${line.col}H${line.text}`;
-  buf += `\x1b[${layout.promptRow};${layout.promptCol}H\x1b[?25h`;
+  // Park at column 1: the prompt carries its own indent (see HeroStage.indent),
+  // because a terminal-mode line editor redraws its row from column 0.
+  buf += `\x1b[${layout.promptRow};1H\x1b[?25h`;
   out.write(buf);
 }
 
@@ -120,8 +122,11 @@ export type HeroStage = {
   /** Replace the note rows (hints, validation errors). */
   note: (line: string) => void;
   clearNote: () => void;
-  /** Clear the prompt row and park the cursor where the next question goes. */
+  /** Clear the prompt row and park the cursor for the next question. */
   clearPrompt: () => void;
+  /** Prepend to every prompt: the block's left edge, as spaces, so a line
+   *  editor that redraws its row from column 0 keeps the composition. */
+  indent: string;
 };
 
 /** Word-wrap into at most two rows of `width`; a third row becomes an ellipsis. */
@@ -157,7 +162,8 @@ function stageFor(out: NodeJS.WriteStream, layout: HeroLayout): HeroStage {
   return {
     note: (line: string) => paint(wrapNote(line.trim().replace(/\s*\n\s*/g, ' '), layout.blockW)),
     clearNote: () => paint([]),
-    clearPrompt: () => void out.write(`\x1b[${layout.promptRow};1H\x1b[2K\x1b[${layout.promptRow};${layout.promptCol}H`),
+    clearPrompt: () => void out.write(`\x1b[${layout.promptRow};1H\x1b[2K`),
+    indent: ' '.repeat(Math.max(0, layout.promptCol - 1)),
   };
 }
 
@@ -235,7 +241,7 @@ export async function offerOnHeroScreen(opts: {
   }, BOB_TICK_MS);
   try {
     drawScreen(out, layout, art);
-    const took = await opts.confirm(opts.question);
+    const took = await opts.confirm(' '.repeat(layout.promptCol - 1) + opts.question);
     if (opts.followUp) await opts.followUp(stageFor(out, layout), took);
     return took;
   } finally {
