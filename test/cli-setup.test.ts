@@ -1128,6 +1128,7 @@ test('setup repo headless: flags supply the answers, and a missing one names its
   const cwd = scratchRepo();
   const extracted = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
   assert.equal(extracted.code, 0, 'every repo prompt has an extractable default here');
+  assert.doesNotMatch(extracted.stdout, /F L E E T|\u001b\[/, 'headless output carries no banner, art or color codes');
 
   // A bare directory used to fail here, because setup demanded a slash command
   // to run and an empty checkout has none to offer. Since #240 there is nothing

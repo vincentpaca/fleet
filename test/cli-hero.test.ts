@@ -53,6 +53,51 @@ test('the hero layout centres the block and says when it cannot', () => {
   assert.equal(styled.body[0].col, 26 + 13, 'ANSI codes take no columns');
 });
 
+test('the follow-up runs on the screen: its two rows are real, and restore waits for it', async () => {
+  let buf = '';
+  const tty = {
+    isTTY: true,
+    columns: 120,
+    rows: 40,
+    write: (s: string) => ((buf += s), true),
+  } as unknown as NodeJS.WriteStream;
+  const order: string[] = [];
+  const took = await offerOnHeroScreen({
+    out: tty,
+    env: {},
+    place: '~/repo',
+    summary: ['  jobs run in   node:24'],
+    question: '  use this?',
+    confirm: async () => (order.push('confirm'), false),
+    followUp: async (stage, accepted) => {
+      order.push(`followUp accepted=${accepted}`);
+      stage.note('  one of: a, b');
+      stage.note('  a hint that\n  spans two lines');
+      stage.clearPrompt();
+    },
+  });
+  assert.equal(took, false, 'the answer is still what confirm said');
+  assert.deepEqual(order, ['confirm', 'followUp accepted=false'], 'the follow-up runs after the answer');
+
+  // The stage's rows are anchored to the layout: the note sits one row above
+  // the prompt at the prompt's column, and clearPrompt parks the cursor back
+  // on the prompt row. Drift here scatters the interview across the art.
+  const park = buf.match(/\x1b\[(\d+);(\d+)H\x1b\[\?25h/);
+  assert.ok(park, 'drawScreen parked the cursor at the prompt');
+  const promptRow = Number(park[1]);
+  const note = buf.match(/\x1b\[(\d+);1H\x1b\[2K\x1b\[(\d+);(\d+)Hone of: a, b/);
+  assert.ok(note, 'the note landed, indent trimmed');
+  assert.equal(Number(note[1]), promptRow - 1, 'the note row is just above the prompt');
+  assert.equal(note[3], park[2], 'the note keeps the prompt column');
+  assert.ok(buf.includes(`\x1b[${promptRow};1H\x1b[2K\x1b[${promptRow};${park[2]}H`), 'clearPrompt re-parks at the prompt');
+  // A multi-line hint stays inside its one row: a raw newline written on the
+  // note row would walk the cursor onto the prompt row.
+  assert.ok(buf.includes('a hint that spans two lines'), 'the note flattened the newline');
+  assert.ok(!buf.includes('a hint that\n'), 'no raw newline reached the screen');
+  const restore = buf.lastIndexOf('\x1b[?1049l');
+  assert.ok(restore > buf.indexOf('one of: a, b'), 'the screen outlives the interview');
+});
+
 test('the hero screen refuses everything that is not a human terminal', async () => {
   // A stream that throws on write: the gate must answer before any escape code
   // moves, or a pipe (or a CI log) gets the alternate screen.

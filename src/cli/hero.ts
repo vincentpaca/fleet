@@ -1,9 +1,10 @@
 /**
  * First contact, full screen (#217): `fleet setup repo` on a fresh repo takes
  * the whole terminal — the paper dart bobbing softly in the centre, the
- * wordmark under it, what setup detected under that, and the one question at
- * the bottom. The alternate screen buffer, entered and restored the way the
- * cockpit does it, so the operator's scrollback is exactly as they left it.
+ * wordmark under it, what setup detected under that, and the questions at the
+ * bottom, one at a time. The alternate screen buffer, entered and restored the
+ * way the cockpit does it, so the operator's scrollback is exactly as they
+ * left it.
  *
  * The bob is the site's own motion (fleet-web tether.ts: one sine, "gently"),
  * translated to terminal resolution: rows are the only vertical unit, so the
@@ -108,6 +109,34 @@ function drawScreen(out: NodeJS.WriteStream, layout: HeroLayout, art: string[]):
 }
 
 /**
+ * The two rows the interview is allowed to touch while the screen is up: the
+ * prompt row, and the blank row above it for hints and rejections. One
+ * question at a time, each replacing the last — the dart never stops bobbing.
+ */
+export type HeroStage = {
+  /** Replace the note row (hints, validation errors). */
+  note: (line: string) => void;
+  clearNote: () => void;
+  /** Clear the prompt row and park the cursor where the next question goes. */
+  clearPrompt: () => void;
+};
+
+function stageFor(out: NodeJS.WriteStream, layout: HeroLayout): HeroStage {
+  const noteRow = layout.promptRow - 1;
+  const width = Math.max(0, out.columns - layout.promptCol);
+  return {
+    note: (line: string) =>
+      // One positioned row: a newline here would walk onto the prompt row.
+      void out.write(
+        `\x1b[${noteRow};1H\x1b[2K\x1b[${noteRow};${layout.promptCol}H` +
+          line.trimStart().replace(/\s*\n\s*/g, ' ').slice(0, width),
+      ),
+    clearNote: () => void out.write(`\x1b[${noteRow};1H\x1b[2K`),
+    clearPrompt: () => void out.write(`\x1b[${layout.promptRow};1H\x1b[2K\x1b[${layout.promptRow};${layout.promptCol}H`),
+  };
+}
+
+/**
  * Offer the detected plan on the hero screen, and return the operator's answer.
  *
  * Undefined means the screen never ran — not a terminal a human is watching
@@ -129,6 +158,8 @@ export async function offerOnHeroScreen(opts: {
   summary: string[];
   question: string;
   confirm: (question: string) => Promise<boolean>;
+  /** Runs after the answer, still on the screen: the rest of the interview. */
+  followUp?: (stage: HeroStage, accepted: boolean) => Promise<void>;
 }): Promise<boolean | undefined> {
   const { out, env } = opts;
   if (out.isTTY !== true || 'NO_COLOR' in env || env.CI !== undefined) return undefined;
@@ -170,7 +201,9 @@ export async function offerOnHeroScreen(opts: {
   }, BOB_TICK_MS);
   try {
     drawScreen(out, layout, art);
-    return await opts.confirm(opts.question);
+    const took = await opts.confirm(opts.question);
+    if (opts.followUp) await opts.followUp(stageFor(out, layout), took);
+    return took;
   } finally {
     clearInterval(bob);
     process.off('SIGINT', onSigint);

@@ -30,7 +30,7 @@ import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
 import { renderBanner, detectColorLevel } from './board.ts';
-import { offerOnHeroScreen } from './hero.ts';
+import { offerOnHeroScreen, type HeroStage } from './hero.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
 import {
@@ -1676,62 +1676,113 @@ function homely(cwd: string, home: string): string {
   return cwd === home || cwd.startsWith(home + path.sep) ? '~' + cwd.slice(home.length) : cwd;
 }
 
+/** Route the interview's log and ask through the two rows the hero lends it. */
+function stageIo(stage: HeroStage, ask: Asker): { log: (line: string) => void; ask: Asker } {
+  let noted = false;
+  return {
+    log: (line) => {
+      if (line.trim() === '') return; // the screen has no vertical flow to space out
+      stage.note(line);
+      noted = true;
+    },
+    ask: {
+      question: (prompt) => {
+        if (!noted) stage.clearNote(); // no hint of its own: drop the previous question's
+        noted = false;
+        stage.clearPrompt();
+        return ask.question(prompt);
+      },
+      close: ask.close,
+    },
+  };
+}
+
+/** Keep a citation only where the final answer is still the detected one. */
+function receiptSources(detected: Answers, final: Answers, sources: Record<string, string>): Record<string, string> {
+  const keyByLabel: Record<string, string> = {
+    'jobs run in': 'image',
+    'first set up with': 'setup_command',
+    'driven by': 'cli',
+    "won't start until": 'pickup',
+    'code comes from': 'repo',
+    'secrets passed through': 'env_vars',
+    'files shipped in': 'sync',
+  };
+  return Object.fromEntries(
+    Object.entries(sources).filter(([label]) => final[keyByLabel[label]] === detected[keyByLabel[label]]),
+  );
+}
+
 /**
- * The detected plan on the full-screen hero (#217): the dart bobbing over the
- * wordmark, the summary, one question. `ran: false` means the screen could not
- * run — no plan to show, or not a terminal worth animating at — and the caller
- * owes the operator the static flow instead. When it did run, the transcript
- * gets the receipt after the screen is gone, because the alternate buffer
- * leaves no scrollback and "what did I agree to" must survive it.
+ * First contact on the full-screen hero (#217): the dart bobbing over the
+ * wordmark, the detected plan, one question — and the rest of the interview on
+ * the same screen. Accepting keeps the detected answers and asks only what
+ * detection cannot know (the seat questions); declining asks everything, one
+ * question at a time at the prompt row. The screen closes when the interview
+ * is done, never between (#247's "it reverts back").
+ *
+ * Undefined means the screen could not run — no plan to show, or not a
+ * terminal worth animating at — and the caller owes the operator the static
+ * flow instead. When it did run, the transcript gets the receipt after the
+ * screen is gone, because the alternate buffer leaves no scrollback and "what
+ * did I agree to" must survive it. Citations stay only on rows the operator
+ * did not retype: a file source under a hand-typed answer would be a lie.
  */
-async function offerOnHero(prompts: PromptSpec[], opts: SetupRepoOptions, ask: Asker): Promise<{ ran: boolean; accepted?: Answers }> {
+async function heroInterview(prompts: PromptSpec[], opts: SetupRepoOptions, ask: Asker): Promise<Interview | undefined> {
   const detected = detectedAnswers(prompts, opts.env);
-  if (!detected) return { ran: false };
-  const summary = planSummary(detected, summarySources(opts.cwd, opts.env, opts.home));
+  if (!detected) return undefined;
+  const sources = summarySources(opts.cwd, opts.env, opts.home);
+  let merged: Interview | undefined;
   const took = await offerOnHeroScreen({
     out: process.stdout,
     env: opts.env,
     place: homely(opts.cwd, opts.home ?? os.homedir()),
-    summary,
+    summary: planSummary(detected, sources),
     question: '  use this?',
     confirm: (question) => confirm(question, ask, true),
+    followUp: async (stage, accepted) => {
+      const io = stageIo(stage, ask);
+      merged = await interview(prompts, {
+        flags: accepted ? { ...detected, ...opts.flags } : opts.flags,
+        env: opts.env,
+        ask: io.ask,
+        log: io.log,
+      });
+    },
   });
-  if (took === undefined) return { ran: false };
+  if (took === undefined || merged === undefined) return undefined;
   opts.log(`  Setting up ${opts.cwd}`);
   opts.log('');
-  if (!took) return { ran: true };
-  opts.log('  using what this repo says about itself:');
+  opts.log(took ? '  using what this repo says about itself:' : '  using your answers:');
   opts.log('');
-  for (const line of summary) opts.log(line);
+  for (const line of planSummary(merged.answers, receiptSources(detected, merged.answers, sources))) opts.log(line);
   opts.log('');
-  return { ran: true, accepted: detected };
+  return merged;
 }
 
-/**
- * The detected plan, offered before the interview: on the hero screen for a
- * TTY's first contact, under the plain banner otherwise. The hero is first
- * contact only — a rerun over an existing manifest is the interview, and
- * --yes asked for no questions at all. A hero that ran and was declined skips
- * the banner offer too: the operator already saw the plan and said no.
- */
-async function planShortcut(
+/** The banner flow: header, the detected-plan offer on first contact, the interview. */
+async function staticInterview(
   prompts: PromptSpec[],
   situation: { manifestExists: boolean },
   opts: SetupRepoOptions,
   ask?: Asker,
-): Promise<Answers | undefined> {
-  if (!ask) return undefined;
-  if (!situation.manifestExists && !opts.yes) {
-    const hero = await offerOnHero(prompts, opts, ask);
-    if (hero.ran) return hero.accepted;
-  }
-  printHeader(opts);
-  return situation.manifestExists ? undefined : offerDetectedPlan(prompts, opts, ask);
+): Promise<Interview> {
+  if (ask) printHeader(opts); // headless output is for machines: no art, no color codes
+  const shortcut = situation.manifestExists ? undefined : await offerDetectedPlan(prompts, opts, ask);
+  return interview(prompts, {
+    flags: shortcut ? { ...shortcut, ...opts.flags } : opts.flags,
+    env: opts.env,
+    ask,
+    log: opts.log,
+  });
 }
 
 /**
- * The banner, the detected-plan shortcut, and whatever is left to ask.
- * Undefined means the operator declined to overwrite an existing manifest.
+ * The whole conversation: on the hero screen when this is first contact on a
+ * real terminal, the static banner flow everywhere else. The hero is first
+ * contact only — a rerun over an existing manifest is the interview, and
+ * --yes asked for no questions at all. Undefined means the operator declined
+ * to overwrite an existing manifest.
  */
 async function askForAnswers(
   situation: { manifestExists: boolean; existing?: RepoManifest; seat: SeatWalk; manifestPath: string },
@@ -1740,13 +1791,9 @@ async function askForAnswers(
   const ask = opts.interactive ? await (opts.openAsker ?? stdinAsker)() : undefined;
   const prompts = repoPrompts(opts.cwd, situation.existing, situation.seat, opts.home);
   try {
-    const shortcut = await planShortcut(prompts, situation, opts, ask);
-    const merged = await interview(prompts, {
-      flags: shortcut ? { ...shortcut, ...opts.flags } : opts.flags,
-      env: opts.env,
-      ask,
-      log: opts.log,
-    });
+    const fresh = !situation.manifestExists && !opts.yes;
+    const onHero = ask && fresh ? await heroInterview(prompts, opts, ask) : undefined;
+    const merged = onHero ?? (await staticInterview(prompts, situation, opts, ask));
     return (await mayOverwrite(merged, situation, opts, ask)) ? merged : undefined;
   } finally {
     ask?.close();
