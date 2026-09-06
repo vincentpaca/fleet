@@ -1312,7 +1312,11 @@ export function detectSeatAuth(opts: { // contract pin: test-only export, assert
 /** What the seat prompts decide; `when` closes over it (flags force a walk on). */
 type SeatWalk = { claudeWalk: boolean; codexOffer: boolean; codexAuthPath?: string };
 
-/** The two acquisition prompts (#205). Always in the list — the prompt list owns the flag surface — and skipped by `when` outside the seat situation. */
+/** The two acquisition prompts (#205). Always in the list — the prompt list
+ *  owns the flag surface — and `when`-guarded on BOTH halves of the basis:
+ *  what this machine holds (a login without a shippable credential) and what
+ *  the operator just chose at `driven by`. Machine state alone asked every
+ *  Codex-logged-in operator about Codex on claude-code repos. */
 function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
   return [
     {
@@ -1322,7 +1326,9 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
         'your Claude login cannot ship into a job — run `claude setup-token` in another ' +
         `terminal and paste the result; it lands in .fleet/.env (0600, gitignored) as ${CLAUDE_OAUTH_VAR}`,
       fallback: () => '',
-      when: () => seat?.claudeWalk === true,
+      // The chosen agent creates the requirement: a Claude login on this
+      // machine is no reason to ask a codex-driven repo for a Claude token.
+      when: (answers) => seat?.claudeWalk === true && answers.cli === 'claude-code',
       validate: (value) => (/\s/.test(value) ? 'a token has no whitespace in it — paste it alone' : undefined),
     },
     {
@@ -1330,7 +1336,7 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
       question: 'ship your Codex login into job sandboxes? (yes/no)',
       hint: `found ${seat?.codexAuthPath ?? 'a Codex auth.json'} — yes copies it to ${CODEX_SYNC_PATH} (mode 0600, gitignored) and lists it in workspace.sync`,
       fallback: () => 'no',
-      when: () => seat?.codexOffer === true,
+      when: (answers) => seat?.codexOffer === true && answers.cli === 'codex',
       validate: (value) => (value === 'yes' || value === 'no' ? undefined : 'yes or no'),
     },
   ];

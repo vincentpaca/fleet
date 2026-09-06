@@ -1423,7 +1423,10 @@ test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: `n\n${'\n'.repeat(7)}yes\n`,
+    // Decline the plan, take the defaults, but say `codex` at "driven by" —
+    // the offer exists because the chosen agent needs it, not because a login
+    // happens to sit on this machine.
+    stdin: `n\n${'\n'.repeat(3)}codex\n${'\n'.repeat(3)}yes\n`,
   });
   assert.equal(res.code, 0, res.stderr);
 
@@ -1444,7 +1447,7 @@ test('setup repo: declining the Codex offer copies nothing and syncs nothing', a
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     // Enter on the offer takes the default, which is no — protecting the account.
-    stdin: '\n'.repeat(9),
+    stdin: `n\n${'\n'.repeat(3)}codex\n${'\n'.repeat(4)}`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'codex-auth.json')));
@@ -1452,9 +1455,26 @@ test('setup repo: declining the Codex offer copies nothing and syncs nothing', a
   assert.equal(manifest.workspace.sync, undefined);
 });
 
+test('setup repo: a Codex login on this machine is not offered to a claude-code repo', async () => {
+  // The operator's verdict on the old behavior: asked to paste a Claude token,
+  // then asked to ship a Codex login — on one repo. The basis is the chosen
+  // agent, not what happens to be logged in on this machine.
+  const cwd = seatScratch();
+  const codexHome = makeTempDir('fleet-codex-home-');
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":"codex-login"}\n');
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: '\n'.repeat(8), // accept the plan (cli: claude-code): no Codex question may follow
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!res.stdout.includes('Codex'), 'a claude-code repo is never asked about Codex');
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'codex-auth.json')), 'nothing copied');
+});
+
 test('setup repo: --codex-auth yes with no Codex login here is a refusal, not a broken manifest', async () => {
   const cwd = seatScratch();
-  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--codex-auth', 'yes'], {
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--cli', 'codex', '--codex-auth', 'yes'], {
     cwd,
     env: { ANTHROPIC_API_KEY: 'sk-ant-api-here' },
   });
