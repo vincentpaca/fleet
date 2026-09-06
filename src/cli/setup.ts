@@ -30,6 +30,7 @@ import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
 import { renderBanner, detectColorLevel } from './board.ts';
+import { makeCol } from './ansi.ts';
 import { offerOnHeroScreen, type HeroStage } from './hero.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
@@ -1676,7 +1677,16 @@ function homely(cwd: string, home: string): string {
   return cwd === home || cwd.startsWith(home + path.sep) ? '~' + cwd.slice(home.length) : cwd;
 }
 
-/** Route the interview's log and ask through the two rows the hero lends it. */
+/** On the hero screen only: colour is safe (the screen never runs under NO_COLOR or a pipe). */
+const heroDim = makeCol(false);
+
+/** What Enter accepts is metadata, like the citations: dimmed, so the
+ *  question itself is the brightest thing on the row. */
+function dimDefault(prompt: string): string {
+  return prompt.replace(/ \[([^\]]*)\]: $/, (_, take: string) => ` ${heroDim(`[${take}]`, 2)}: `);
+}
+
+/** Route the interview's log and ask through the rows the hero lends it. */
 function stageIo(stage: HeroStage, ask: Asker): { log: (line: string) => void; ask: Asker } {
   let noted = false;
   return {
@@ -1690,11 +1700,16 @@ function stageIo(stage: HeroStage, ask: Asker): { log: (line: string) => void; a
         if (!noted) stage.clearNote(); // no hint of its own: drop the previous question's
         noted = false;
         stage.clearPrompt();
-        return ask.question(prompt);
+        return ask.question(dimDefault(prompt));
       },
       close: ask.close,
     },
   };
+}
+
+/** Dim a summary row's trailing citation: on the screen it is provenance, not content. */
+function dimCitation(row: string): string {
+  return row.replace(/ {2}\(([^)]+)\)$/, (_, src: string) => `  ${heroDim(`(${src})`, 2)}`);
 }
 
 /** Keep a citation only where the final answer is still the detected one. */
@@ -1737,9 +1752,11 @@ async function heroInterview(prompts: PromptSpec[], opts: SetupRepoOptions, ask:
     out: process.stdout,
     env: opts.env,
     place: homely(opts.cwd, opts.home ?? os.homedir()),
-    summary: planSummary(detected, sources),
+    summary: planSummary(detected, sources).map(dimCitation),
     question: '  use this?',
-    confirm: (question) => confirm(question, ask, true),
+    // The [Y/n] is appended inside confirm(), so the dim wraps the asker: the
+    // first prompt keeps the same content-bright/metadata-dim rule as the rest.
+    confirm: (question) => confirm(question, { question: (p) => ask.question(dimDefault(p)), close: ask.close }, true),
     followUp: async (stage, accepted) => {
       const io = stageIo(stage, ask);
       merged = await interview(prompts, {

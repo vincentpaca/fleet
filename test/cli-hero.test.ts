@@ -71,29 +71,39 @@ test('the follow-up runs on the screen: its two rows are real, and restore waits
     confirm: async () => (order.push('confirm'), false),
     followUp: async (stage, accepted) => {
       order.push(`followUp accepted=${accepted}`);
-      stage.note('  one of: a, b');
       stage.note('  a hint that\n  spans two lines');
+      stage.note('  long '.repeat(30));
+      stage.note('  one of: a, b'); // a short note after a wrapped one: the overflow row must clear
       stage.clearPrompt();
     },
   });
   assert.equal(took, false, 'the answer is still what confirm said');
   assert.deepEqual(order, ['confirm', 'followUp accepted=false'], 'the follow-up runs after the answer');
 
-  // The stage's rows are anchored to the layout: the note sits one row above
-  // the prompt at the prompt's column, and clearPrompt parks the cursor back
-  // on the prompt row. Drift here scatters the interview across the art.
+  // The stage's rows are anchored to the layout: notes get the two rows above
+  // the prompt at the prompt's column, dimmed and clipped to the block's own
+  // width. Drift here scatters the interview across the art.
   const park = buf.match(/\x1b\[(\d+);(\d+)H\x1b\[\?25h/);
   assert.ok(park, 'drawScreen parked the cursor at the prompt');
   const promptRow = Number(park[1]);
-  const note = buf.match(/\x1b\[(\d+);1H\x1b\[2K\x1b\[(\d+);(\d+)Hone of: a, b/);
-  assert.ok(note, 'the note landed, indent trimmed');
-  assert.equal(Number(note[1]), promptRow - 1, 'the note row is just above the prompt');
+  const note = buf.match(/\x1b\[(\d+);1H\x1b\[2K\x1b\[(\d+);(\d+)H\x1b\[2mone of: a, b\x1b\[0m/);
+  assert.ok(note, 'the note landed dimmed, indent trimmed');
+  assert.equal(Number(note[1]), promptRow - 2, 'the first note row is two above the prompt');
   assert.equal(note[3], park[2], 'the note keeps the prompt column');
   assert.ok(buf.includes(`\x1b[${promptRow};1H\x1b[2K\x1b[${promptRow};${park[2]}H`), 'clearPrompt re-parks at the prompt');
-  // A multi-line hint stays inside its one row: a raw newline written on the
-  // note row would walk the cursor onto the prompt row.
+  // A multi-line hint is flattened, then wrapped at the block width: a raw
+  // newline written on a note row would walk the cursor onto the prompt row,
+  // and an unwrapped line would run to the terminal's edge.
   assert.ok(buf.includes('a hint that spans two lines'), 'the note flattened the newline');
   assert.ok(!buf.includes('a hint that\n'), 'no raw newline reached the screen');
+  const wrapped = buf.match(/\x1b\[(\d+);(\d+)H\x1b\[2mlong[^\x1b]*…\x1b\[0m/);
+  assert.ok(wrapped, 'a long note wraps onto the second row and ends in an ellipsis');
+  assert.equal(Number(wrapped[1]), promptRow - 1, 'the overflow lands on the second note row');
+  // The short note comes after the wrapped one: its paint must clear the
+  // overflow row, or the previous hint's tail stays glued to the new question.
+  const afterShort = buf.slice(buf.lastIndexOf('one of: a, b'));
+  assert.ok(afterShort.includes(`\x1b[${promptRow - 1};1H\x1b[2K`), 'a shorter note clears the stale overflow row');
+  assert.ok(!afterShort.includes(`\x1b[${promptRow - 1};${park[2]}H`), 'nothing repaints the overflow row after the short note');
   const restore = buf.lastIndexOf('\x1b[?1049l');
   assert.ok(restore > buf.indexOf('one of: a, b'), 'the screen outlives the interview');
 });

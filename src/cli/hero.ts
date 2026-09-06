@@ -19,7 +19,7 @@
  */
 import { DART_HERO } from './banner-art.ts';
 import { ENTER_ALT, RESTORE_SEQ, TAGLINE_STYLED, WORDMARK_STYLED, detectColorLevel } from './board.ts';
-import { visualLength } from './ansi.ts';
+import { visualClip, visualLength } from './ansi.ts';
 
 /** One full rise and fall, in ms — fleet-web's own period. */
 const BOB_PERIOD_MS = 6200;
@@ -46,6 +46,8 @@ export type HeroLayout = { // contract pin: test-only export, asserted by the su
   body: Array<{ row: number; col: number; text: string }>;
   promptRow: number;
   promptCol: number;
+  /** Visible width of the composed block: the stage clips its rows to it. */
+  blockW: number;
 };
 
 /**
@@ -83,6 +85,7 @@ export function heroLayout(opts: { // contract pin: test-only export, asserted b
     body,
     promptRow: windowTop + windowRows + opts.bodyLines.length,
     promptCol: left,
+    blockW,
   };
 }
 
@@ -109,31 +112,72 @@ function drawScreen(out: NodeJS.WriteStream, layout: HeroLayout, art: string[]):
 }
 
 /**
- * The two rows the interview is allowed to touch while the screen is up: the
- * prompt row, and the blank row above it for hints and rejections. One
+ * The rows the interview is allowed to touch while the screen is up: the
+ * prompt row, and the two rows above it for hints and rejections. One
  * question at a time, each replacing the last — the dart never stops bobbing.
  */
 export type HeroStage = {
-  /** Replace the note row (hints, validation errors). */
+  /** Replace the note rows (hints, validation errors). */
   note: (line: string) => void;
   clearNote: () => void;
   /** Clear the prompt row and park the cursor where the next question goes. */
   clearPrompt: () => void;
 };
 
+/** Word-wrap into at most two rows of `width`; a third row becomes an ellipsis. */
+function wrapNote(text: string, width: number): string[] {
+  const rows: string[] = [];
+  let cur = '';
+  for (const word of text.split(/\s+/)) {
+    if (cur !== '' && cur.length + 1 + word.length > width) {
+      rows.push(cur);
+      cur = word;
+    } else {
+      cur = cur === '' ? word : `${cur} ${word}`;
+    }
+  }
+  if (cur !== '') rows.push(cur);
+  if (rows.length > 2) rows.splice(1, rows.length - 1, rows.slice(1).join(' '));
+  return rows.map((row) => visualClip(row, width));
+}
+
 function stageFor(out: NodeJS.WriteStream, layout: HeroLayout): HeroStage {
-  const noteRow = layout.promptRow - 1;
-  const width = Math.max(0, out.columns - layout.promptCol);
+  const noteTop = layout.promptRow - 2;
+  // Notes are context, not content: dimmed, wrapped at the block's own width
+  // so they never run to the terminal edge. A raw newline would walk onto the
+  // prompt row, so wrapping is the only way a note gets a second line.
+  const paint = (rows: string[]): void => {
+    let buf = '';
+    for (let i = 0; i < 2; i++) {
+      buf += `\x1b[${noteTop + i};1H\x1b[2K`;
+      if (rows[i]) buf += `\x1b[${noteTop + i};${layout.promptCol}H\x1b[2m${rows[i]}\x1b[0m`;
+    }
+    out.write(buf);
+  };
   return {
-    note: (line: string) =>
-      // One positioned row: a newline here would walk onto the prompt row.
-      void out.write(
-        `\x1b[${noteRow};1H\x1b[2K\x1b[${noteRow};${layout.promptCol}H` +
-          line.trimStart().replace(/\s*\n\s*/g, ' ').slice(0, width),
-      ),
-    clearNote: () => void out.write(`\x1b[${noteRow};1H\x1b[2K`),
+    note: (line: string) => paint(wrapNote(line.trim().replace(/\s*\n\s*/g, ' '), layout.blockW)),
+    clearNote: () => paint([]),
     clearPrompt: () => void out.write(`\x1b[${layout.promptRow};1H\x1b[2K\x1b[${layout.promptRow};${layout.promptCol}H`),
   };
+}
+
+/** Everything under the dart, in reading order. The last three rows are the
+ *  stage: a separator and the two note rows, blank until the interview speaks. */
+function heroBody(place: string, summary: string[]): BodyLine[] {
+  return [
+    { text: '' },
+    { text: WORDMARK_STYLED, centered: true },
+    { text: TAGLINE_STYLED, centered: true },
+    { text: '' },
+    { text: `Setting up ${place}` },
+    { text: '' },
+    { text: 'Here is what this repo says about itself:' },
+    { text: '' },
+    ...summary.map((text) => ({ text })),
+    { text: '' },
+    { text: '' },
+    { text: '' },
+  ];
 }
 
 /**
@@ -164,17 +208,7 @@ export async function offerOnHeroScreen(opts: {
   const { out, env } = opts;
   if (out.isTTY !== true || 'NO_COLOR' in env || env.CI !== undefined) return undefined;
   const art = detectColorLevel(env) === '24bit' ? DART_HERO.truecolor : DART_HERO.c256;
-  const bodyLines: BodyLine[] = [
-    { text: '' },
-    { text: WORDMARK_STYLED, centered: true },
-    { text: TAGLINE_STYLED, centered: true },
-    { text: '' },
-    { text: `Setting up ${opts.place}` },
-    { text: 'Here is what this repo says about itself:' },
-    { text: '' },
-    ...opts.summary.map((text) => ({ text })),
-    { text: '' },
-  ];
+  const bodyLines = heroBody(opts.place, opts.summary);
   const layout = heroLayout({
     cols: out.columns,
     rows: out.rows,
