@@ -1388,6 +1388,11 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
  * defaults are evidence (a package.json, a .claude/commands file, an
  * .env.example), never a house style guess dressed up as one.
  *
+ * Questions follow the same rule as `planSummary` (#217's fourth principle):
+ * they ask for the thing in the operator's words, never in the manifest's.
+ * "pickup gate" is our noun — the question asks for "a command that must pass
+ * before a job starts", which is what the noun means.
+ *
  * The trailing seat-auth prompts (#205) are the exception that proves it:
  * they describe this *machine's* login state, not the repo — but the wall a
  * seat user hits is `fleet setup repo` writing an env var they cannot supply,
@@ -1405,14 +1410,14 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
   return [
     {
       key: 'repo',
-      question: 'workspace git remote',
+      question: 'git remote to clone code from',
       hint: '"origin" resolves the URL from this checkout at dispatch — portable across forks',
       fallback: kept(existing?.workspace.repo, 'origin'),
       required: true,
     },
     {
       key: 'image',
-      question: 'base image for the job container',
+      question: 'container image jobs run in',
       fallback: kept(existing?.setup.image, ecosystem?.image ?? 'node:24'),
       required: true,
     },
@@ -1444,8 +1449,8 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     },
     {
       key: 'pickup',
-      question: 'pickup gate command',
-      hint: 'must exit 0 or the job stops before any model spend',
+      question: 'command that must pass before a job starts',
+      hint: 'runs in the fresh workspace before any model spend: exit 0 lets the job start, anything else blocks it',
       // Never a path that is not there (#217): the old default named
       // `.fleet/check-ready.js` whether or not it existed, so accepting it on a
       // repo without one killed every dispatch at the gate — after the image
