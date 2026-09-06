@@ -1391,10 +1391,12 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
  * defaults are evidence (a package.json, a .claude/commands file, an
  * .env.example), never a house style guess dressed up as one.
  *
- * Questions follow the same rule as `planSummary` (#217's fourth principle):
- * they ask for the thing in the operator's words, never in the manifest's.
- * "pickup gate" is our noun — the question asks for "a command that must pass
- * before a job starts", which is what the noun means.
+ * Questions ARE the plan summary's rows (#217's fourth principle: a first run
+ * must not require Fleet's vocabulary). The operator reads the summary, and
+ * declining re-asks it one row at a time in the same words — `PLAN_ROW` is the
+ * single table behind the summary, the questions, and the receipt, so the
+ * three can never drift into separate phrasings. Each question's hint says
+ * what the answer is and what happens with it.
  *
  * The trailing seat-auth prompts (#205) are the exception that proves it:
  * they describe this *machine's* login state, not the repo — but the wall a
@@ -1413,48 +1415,30 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
   return [
     {
       key: 'repo',
-      question: 'git remote to clone code from',
-      hint: '"origin" resolves the URL from this checkout at dispatch',
+      question: PLAN_ROW.repo,
+      hint: 'a git remote — "origin" means this checkout\'s, resolved at dispatch',
       fallback: kept(existing?.workspace.repo, 'origin'),
       required: true,
     },
     {
       key: 'image',
-      question: 'container image jobs run in',
+      question: PLAN_ROW.image,
+      hint: 'a Docker image — every job gets a fresh container built from it',
       fallback: kept(existing?.setup.image, ecosystem?.image ?? 'node:24'),
       required: true,
     },
     {
       key: 'setup_command',
-      question: 'setup command',
-      hint: 'the "new laptop" step: deps, build, seed. Written into .fleet/setup.sh',
+      question: PLAN_ROW.setup_command,
+      hint: 'deps, build, seed — runs once in the fresh container; saved to .fleet/setup.sh',
       fallback: kept(undefined, ecosystem?.setup ?? ''),
     },
     cliPrompt(cwd, existing, home),
-    {
-      key: 'sync',
-      question: 'gitignored files the job also needs',
-      hint: 'comma-separated paths, copied into the sandbox at dispatch',
-      fallback: () => existing?.workspace.sync?.join(', ') ?? gitignoredSync(cwd).join(', '),
-      validate: (value) => {
-        const missing = splitList(value).filter((rel) => !fs.existsSync(path.join(cwd, rel)));
-        return missing.length === 0 ? undefined : `not in this checkout: ${missing.join(', ')}`;
-      },
-    },
-    {
-      key: 'env_vars',
-      question: 'env vars to pass through',
-      hint: 'comma-separated names — the values come from your shell or .fleet/.env at dispatch',
-      fallback: kept(existing?.env?.vars.join(', '), envKeys.join(', ')),
-      validate: (value) => {
-        const bad = splitList(value).filter((name) => !/^[A-Z][A-Z0-9_]*$/.test(name));
-        return bad.length === 0 ? undefined : `not env var names: ${bad.join(', ')}`;
-      },
-    },
+    ...passThroughPrompts(cwd, existing, envKeys),
     {
       key: 'pickup',
-      question: 'command that must pass before a job starts',
-      hint: 'exit 0 lets the job start — runs before any model spend',
+      question: PLAN_ROW.pickup,
+      hint: 'a command; exit 0 lets the job start — runs before any model spend',
       // Never a path that is not there (#217): the old default named
       // `.fleet/check-ready.js` whether or not it existed, so accepting it on a
       // repo without one killed every dispatch at the gate — after the image
@@ -1467,11 +1451,37 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
   ];
 }
 
+/** The two comma-separated list questions: what crosses from here into the sandbox. */
+function passThroughPrompts(cwd: string, existing: RepoManifest | undefined, envKeys: string[]): PromptSpec[] {
+  return [
+    {
+      key: 'sync',
+      question: PLAN_ROW.sync,
+      hint: 'gitignored files the job still needs (.npmrc, auth) — comma-separated paths',
+      fallback: () => existing?.workspace.sync?.join(', ') ?? gitignoredSync(cwd).join(', '),
+      validate: (value) => {
+        const missing = splitList(value).filter((rel) => !fs.existsSync(path.join(cwd, rel)));
+        return missing.length === 0 ? undefined : `not in this checkout: ${missing.join(', ')}`;
+      },
+    },
+    {
+      key: 'env_vars',
+      question: PLAN_ROW.env_vars,
+      hint: 'env var names, comma-separated — values come from your shell or .fleet/.env',
+      fallback: () => existing?.env?.vars.join(', ') ?? envKeys.join(', '),
+      validate: (value) => {
+        const bad = splitList(value).filter((name) => !/^[A-Z][A-Z0-9_]*$/.test(name));
+        return bad.length === 0 ? undefined : `not env var names: ${bad.join(', ')}`;
+      },
+    },
+  ];
+}
+
 function cliPrompt(cwd: string, existing?: RepoManifest, home?: string): PromptSpec {
   return {
     key: 'cli',
-    question: 'coding agent that runs each job',
-    hint: CLI_CHOICES.join(' | '),
+    question: PLAN_ROW.cli,
+    hint: `the coding agent that does the work: ${CLI_CHOICES.join(' | ')}`,
     fallback: (env) => existing?.harness?.cli ?? detectCli(cwd, env, home).value,
     required: true,
     validate: (value) => (CLI_CHOICES.includes(value) ? undefined : `one of: ${CLI_CHOICES.join(', ')}`),
@@ -1480,6 +1490,23 @@ function cliPrompt(cwd: string, existing?: RepoManifest, home?: string): PromptS
 
 /** A gate for a repo that has not decided what "ready" means. Passes, always. */
 export const NO_OP_GATE = 'node -e "process.exit(0)"'; // contract pin: test-only export, asserted by the suite
+
+/**
+ * One vocabulary for the whole conversation: these rows are the plan summary's
+ * labels, the interview's questions, and the receipt's rows. A question is a
+ * summary row being re-asked — the operator fills in the sentence they just
+ * read, and never has to map two phrasings of the same thing (keyed by prompt
+ * key, so the receipt's citation filter derives from the same table).
+ */
+const PLAN_ROW = {
+  image: 'jobs run in',
+  setup_command: 'first set up with',
+  cli: 'driven by',
+  pickup: "won't start until",
+  repo: 'code comes from',
+  env_vars: 'secrets passed through',
+  sync: 'files shipped in',
+} as const;
 
 /**
  * What the operator is about to get, in their words rather than the manifest's.
@@ -1497,16 +1524,16 @@ export function planSummary(answers: Answers, sources: Record<string, string>): 
     const from = sources[label];
     rows.push([label, from ? `${value}  (${from})` : value]);
   };
-  add('jobs run in', answers.image);
-  add('first set up with', answers.setup_command);
-  add('driven by', answers.cli);
+  add(PLAN_ROW.image, answers.image);
+  add(PLAN_ROW.setup_command, answers.setup_command);
+  add(PLAN_ROW.cli, answers.cli);
   // The no-op gate reads as line noise to someone who has never met the
   // concept, so it is described rather than quoted.
   const gate = answers.pickup === NO_OP_GATE ? 'nothing — jobs start straight away (no check found here)' : answers.pickup;
-  add("won't start until", gate);
-  add('code comes from', answers.repo === 'origin' ? "this checkout's origin remote" : answers.repo);
-  add('secrets passed through', answers.env_vars);
-  add('files shipped in', answers.sync);
+  add(PLAN_ROW.pickup, gate);
+  add(PLAN_ROW.repo, answers.repo === 'origin' ? "this checkout's origin remote" : answers.repo);
+  add(PLAN_ROW.env_vars, answers.env_vars);
+  add(PLAN_ROW.sync, answers.sync);
   const width = Math.max(...rows.map(([label]) => label.length));
   return rows.map(([label, value]) => `  ${label.padEnd(width)}   ${value}`);
 }
@@ -1783,15 +1810,7 @@ function dimCitation(row: string): string {
 
 /** Keep a citation only where the final answer is still the detected one. */
 function receiptSources(detected: Answers, final: Answers, sources: Record<string, string>): Record<string, string> {
-  const keyByLabel: Record<string, string> = {
-    'jobs run in': 'image',
-    'first set up with': 'setup_command',
-    'driven by': 'cli',
-    "won't start until": 'pickup',
-    'code comes from': 'repo',
-    'secrets passed through': 'env_vars',
-    'files shipped in': 'sync',
-  };
+  const keyByLabel = Object.fromEntries(Object.entries(PLAN_ROW).map(([key, label]) => [label, key]));
   return Object.fromEntries(
     Object.entries(sources).filter(([label]) => final[keyByLabel[label]] === detected[keyByLabel[label]]),
   );
