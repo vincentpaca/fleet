@@ -1326,8 +1326,8 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
       key: 'claude_oauth_token',
       question: 'paste the token from `claude setup-token` (Enter to skip)',
       hint:
-        'jobs need a credential to ship — run `claude setup-token` in another terminal ' +
-        `and paste the result; it lands in .fleet/.env (0600, gitignored) as ${CLAUDE_OAUTH_VAR}`,
+        "the job's claude-code needs its own login — run `claude setup-token` in another " +
+        'terminal and paste it here; stored in .fleet/.env (0600, gitignored)',
       fallback: () => '',
       // The chosen agent creates the requirement: a Claude login on this
       // machine is no reason to ask a codex-driven repo for a Claude token.
@@ -1337,7 +1337,7 @@ function seatPrompts(seat: SeatWalk | undefined): PromptSpec[] {
     {
       key: 'codex_auth',
       question: 'ship your Codex login into job sandboxes? (yes/no)',
-      hint: `found ${seat?.codexAuthPath ?? 'a Codex auth.json'} — yes copies it to ${CODEX_SYNC_PATH} (mode 0600, gitignored) and lists it in workspace.sync`,
+      hint: `found ${seat?.codexAuthPath ?? 'a Codex auth.json'} — yes copies it to ${CODEX_SYNC_PATH} (0600, gitignored) and ships it with every job`,
       fallback: () => 'no',
       when: (answers) => seat?.codexOffer === true && answers.cli === 'codex',
       validate: (value) => (value === 'yes' || value === 'no' ? undefined : 'yes or no'),
@@ -1404,8 +1404,13 @@ function applySeatWalk(fleetDir: string, plan: { token?: string; codexSource?: s
  * must not require Fleet's vocabulary). The operator reads the summary, and
  * declining re-asks it one row at a time in the same words — `PLAN_ROW` is the
  * single table behind the summary, the questions, and the receipt, so the
- * three can never drift into separate phrasings. Each question's hint says
- * what the answer is and what happens with it.
+ * three can never drift into separate phrasings.
+ *
+ * Hints state what Fleet DOES with the answer, in the audience's own terms:
+ * developers. Never define a term a developer already knows ("a git remote —"
+ * was an insult), never use a word that only means something inside Fleet
+ * ("resolved at dispatch" was noise). Plain language, technical content — the
+ * hint earns its row by naming the consequence, not the concept.
  *
  * The trailing seat-auth prompts (#205) are the exception that proves it:
  * they describe this *machine's* login state, not the repo — but the wall a
@@ -1425,21 +1430,27 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     {
       key: 'repo',
       question: PLAN_ROW.repo,
-      hint: 'a git remote — "origin" means this checkout\'s, resolved at dispatch',
+      hint: 'each job clones from this git URL; "origin" = this checkout\'s origin URL',
       fallback: kept(existing?.workspace.repo, 'origin'),
       required: true,
+      // Only the literal "origin" is resolved; anything else ships verbatim as
+      // the clone URL — so a bare remote name would fail every job at boot.
+      validate: (value) =>
+        value === 'origin' || value.includes(':') || value.includes('/')
+          ? undefined
+          : 'jobs clone outside this checkout — a git URL, or "origin" for this checkout\'s',
     },
     {
       key: 'image',
       question: PLAN_ROW.image,
-      hint: 'a Docker image — every job gets a fresh container built from it',
+      hint: 'each job runs in a fresh container started from this image',
       fallback: kept(existing?.setup.image, ecosystem?.image ?? 'node:24'),
       required: true,
     },
     {
       key: 'setup_command',
       question: PLAN_ROW.setup_command,
-      hint: 'deps, build, seed — runs once in the fresh container; saved to .fleet/setup.sh',
+      hint: 'runs in the container before the agent starts: install deps, build — saved to .fleet/setup.sh',
       fallback: kept(undefined, ecosystem?.setup ?? ''),
     },
     cliPrompt(cwd, existing, home),
@@ -1447,7 +1458,7 @@ export function repoPrompts(cwd: string, existing?: RepoManifest, seat?: SeatWal
     {
       key: 'pickup',
       question: PLAN_ROW.pickup,
-      hint: 'a command; exit 0 lets the job start — runs before any model spend',
+      hint: 'if this command fails, the job stops before the agent runs and spends anything',
       // Never a path that is not there (#217): the old default named
       // `.fleet/check-ready.js` whether or not it existed, so accepting it on a
       // repo without one killed every dispatch at the gate — after the image
@@ -1466,7 +1477,7 @@ function passThroughPrompts(cwd: string, existing: RepoManifest | undefined, env
     {
       key: 'sync',
       question: PLAN_ROW.sync,
-      hint: 'gitignored files the job still needs (.npmrc, auth) — comma-separated paths',
+      hint: "a fresh clone won't have these, so they're copied into the job (.npmrc, auth files)",
       fallback: () => existing?.workspace.sync?.join(', ') ?? gitignoredSync(cwd).join(', '),
       validate: (value) => {
         const missing = splitList(value).filter((rel) => !fs.existsSync(path.join(cwd, rel)));
@@ -1476,7 +1487,7 @@ function passThroughPrompts(cwd: string, existing: RepoManifest | undefined, env
     {
       key: 'env_vars',
       question: PLAN_ROW.env_vars,
-      hint: 'env var names, comma-separated — values come from your shell or .fleet/.env',
+      hint: 'set in each job\'s environment — the values come from your shell or .fleet/.env',
       fallback: () => existing?.env?.vars.join(', ') ?? envKeys.join(', '),
       validate: (value) => {
         const bad = splitList(value).filter((name) => !/^[A-Z][A-Z0-9_]*$/.test(name));

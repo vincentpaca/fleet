@@ -1132,12 +1132,17 @@ test('setup repo: a rejected answer is asked again rather than written', async (
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    // repo, image, setup, cli, sync, env vars (bad, then good), pickup
-    stdin: 'n\n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
+    // repo (a bare remote name: rejected, then Enter), image, setup, cli,
+    // sync, env vars (bad, then good), pickup
+    stdin: 'n\nupstream\n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
   });
   assert.equal(res.code, 0, res.stderr);
+  // Only the literal "origin" resolves; a bare remote name would ship verbatim
+  // as the clone URL and fail every job at boot — refused at the question.
+  assert.match(res.stdout, /jobs clone outside this checkout/);
   assert.match(res.stdout, /not env var names/);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.workspace.repo, 'origin', 'the rejected remote name never reached the manifest');
   assert.deepEqual(manifest.env.vars, ['API_TOKEN']);
 });
 
