@@ -22,6 +22,9 @@ import {
   terraformTooOld,
   MIN_TERRAFORM,
   SetupError,
+  detectEcosystem,
+  NO_OP_GATE,
+  terminalAsker,
 } from '../src/cli/setup.ts';
 import { SETUP_UNITS, unitFor } from '../src/cli/setup-units.ts';
 import { repinnedMainTf } from '../src/cli/upgrade.ts';
@@ -915,20 +918,203 @@ function scratchRepo(): string {
   return cwd;
 }
 
+test('setup repo detects the version and package manager the repo pins (#217)', () => {
+  // The two bugs that made the generated manifest not work, and this repo was
+  // the victim of the first: Fleet needs Node 23.6+ for type stripping, and
+  // setup wrote `node:22` for every package.json, so a job died on syntax it
+  // could not parse. The second fails at setup instead — `npm ci` on a pnpm
+  // repo, before any model runs. Both are silent until a dispatch.
+  const cwd = makeTempDir('fleet-detect-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'pnpm-lock.yaml'), '');
+  assert.deepEqual(detectEcosystem(cwd), {
+    image: 'node:24', imageFrom: 'package.json',
+    setup: 'corepack enable pnpm && pnpm install --frozen-lockfile', setupFrom: 'pnpm-lock.yaml',
+  }, 'the lockfile names the package manager, and corepack puts it on a bare image\'s PATH');
+
+  fs.writeFileSync(path.join(cwd, '.nvmrc'), 'v23.6.0\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:23', '.nvmrc pins the major');
+  assert.equal(detectEcosystem(cwd)?.imageFrom, '.nvmrc', 'and the summary cites the file it read');
+
+  // engines is the weakest signal, so a pinned file must beat it.
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:23', 'engines overrode a pinned .nvmrc');
+  fs.rmSync(path.join(cwd, '.nvmrc'));
+  assert.equal(detectEcosystem(cwd)?.image, 'node:20', 'engines is still read when nothing is pinned');
+
+  // Python keeps the minor; a bare python:3 image is not a thing anyone wants.
+  const py = makeTempDir('fleet-detect-py-');
+  fs.writeFileSync(path.join(py, 'pyproject.toml'), 'requires-python = ">=3.11"\n');
+  assert.equal(detectEcosystem(py)?.image, 'python:3.11');
+});
+
+test('setup repo detection: a devcontainer is the operator\'s own answer and wins (#247)', () => {
+  const cwd = makeTempDir('fleet-detect-dev-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'package-lock.json'), '{}');
+  fs.mkdirSync(path.join(cwd, '.devcontainer'));
+  fs.writeFileSync(
+    path.join(cwd, '.devcontainer', 'devcontainer.json'),
+    '{\n  // devcontainer.json allows comments, so a JSON.parse would choke here\n  "image": "node:23-bookworm",\n  "postCreateCommand": "npm ci && npm run build",\n}\n',
+  );
+  assert.deepEqual(detectEcosystem(cwd), {
+    image: 'node:23-bookworm',
+    imageFrom: '.devcontainer/devcontainer.json',
+    setup: 'npm ci && npm run build',
+    setupFrom: '.devcontainer/devcontainer.json',
+  }, 'the operator already answered both questions in their own file');
+
+  // No ecosystem marker at all: the devcontainer still carries the repo.
+  const bare = makeTempDir('fleet-detect-devbare-');
+  fs.writeFileSync(path.join(bare, '.devcontainer.json'), '{"image": "debian:12"}');
+  assert.equal(detectEcosystem(bare)?.image, 'debian:12');
+  assert.equal(detectEcosystem(bare)?.setup, '', 'no postCreateCommand string means no setup guess');
+});
+
+test('setup repo detection: .tool-versions, a Dockerfile FROM, and a bun lockfile pin the image (#247)', () => {
+  const cwd = makeTempDir('fleet-detect-tools-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, 'Dockerfile'), 'FROM node:20-alpine\nRUN true\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:20', 'a Dockerfile FROM is read when nothing stronger pins');
+  assert.equal(detectEcosystem(cwd)?.imageFrom, 'Dockerfile');
+  fs.writeFileSync(path.join(cwd, '.tool-versions'), 'ruby 3.3.0\nnodejs 21.7.1\n');
+  assert.equal(detectEcosystem(cwd)?.image, 'node:21', '.tool-versions outranks the Dockerfile');
+
+  const py = makeTempDir('fleet-detect-pytools-');
+  fs.writeFileSync(path.join(py, 'requirements.txt'), 'requests\n');
+  fs.writeFileSync(path.join(py, '.tool-versions'), 'python 3.11.9\n');
+  assert.equal(detectEcosystem(py)?.image, 'python:3.11');
+
+  const bun = makeTempDir('fleet-detect-bun-');
+  fs.writeFileSync(path.join(bun, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(bun, 'bun.lockb'), '');
+  fs.writeFileSync(path.join(bun, '.nvmrc'), 'v23.6.0\n');
+  assert.deepEqual(detectEcosystem(bun), {
+    image: 'oven/bun:1', imageFrom: 'bun.lockb',
+    setup: 'bun install --frozen-lockfile', setupFrom: 'bun.lockb',
+  }, 'bun is its own runtime: on a node image, even a pinned one, bun install dies at setup');
+});
+
+test('setup repo detection: the harness CLI comes from the repo\'s files, and a rerun keeps the manifest\'s (#247)', async () => {
+  const cwd = makeTempDir('fleet-detect-cli-');
+  fs.mkdirSync(path.join(cwd, '.codex'));
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--yes'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.harness.cli, 'codex', 'a .codex directory outranks whatever this machine has installed');
+
+  // The rerun clobber: before #247, repoManifest hardcoded claude-code, so any
+  // rerun silently reverted a hand-set harness.
+  manifest.harness.cli = 'opencode';
+  fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  assert.equal((await runCli(['setup', 'repo', '--yes'], { cwd })).code, 0);
+  const rerun = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(rerun.harness.cli, 'opencode', 'the existing manifest is the strongest evidence there is');
+});
+
+test('setup repo detection: gitignored package-manager config is offered into sync, and every .env template is read (#247)', async () => {
+  const cwd = makeTempDir('fleet-detect-sync-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"x"}');
+  fs.writeFileSync(path.join(cwd, '.env.sample'), 'FROM_SAMPLE=\n');
+  fs.writeFileSync(path.join(cwd, '.env.template'), 'FROM_TEMPLATE=\nFROM_SAMPLE=\n');
+  fs.writeFileSync(path.join(cwd, '.npmrc'), '# registry auth lives here, which is why it is gitignored\n');
+  fs.writeFileSync(path.join(cwd, '.gitignore'), '.npmrc\n');
+  assert.equal(spawnSync('git', ['init', '-q'], { cwd }).status, 0, 'fixture: sync detection reads the gitignore through git');
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--yes'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(manifest.workspace.sync, ['.npmrc'], 'a gitignored .npmrc is exactly what workspace.sync exists for');
+  assert.deepEqual(manifest.env.vars, ['FROM_SAMPLE', 'FROM_TEMPLATE'], 'both template spellings are read, deduplicated');
+});
+
+test('setup repo: no gate in the repo means a gate that passes, never a missing file (#217)', async () => {
+  // The old default named `.fleet/check-ready.js` whether or not it existed.
+  // Accepting it on a repo without one killed every dispatch at the gate —
+  // after the image build, before any model, on a concept the operator had not
+  // met yet. The failure mode this replaces is a first run that cannot work.
+  const cwd = makeTempDir('fleet-setup-nogate-');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{"name":"scratch"}\n');
+  assert.equal(fs.existsSync(path.join(cwd, '.fleet', 'gate.mjs')), false, 'fixture assumption: no gate');
+  const res = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.gates.pickup, NO_OP_GATE);
+  const gate = spawnSync('sh', ['-c', manifest.gates.pickup], { cwd });
+  assert.equal(gate.status, 0, 'the gate a fresh repo gets must actually pass');
+
+  // The no-op is an implementation detail: the interview describes what Enter
+  // does instead of quoting it — the same call planSummary makes.
+  const asked = await runCli(['setup', 'repo'], {
+    cwd: makeTempDir('fleet-setup-nogate-tty-'),
+    env: {
+      FLEET_FORCE_TTY: '1',
+      CLAUDE_CONFIG_DIR: makeTempDir('fleet-no-claude-'),
+      CODEX_HOME: makeTempDir('fleet-no-codex-'),
+      ANTHROPIC_API_KEY: 'sk-ant-api-here',
+    },
+    stdin: `n\n${'\n'.repeat(10)}`, // decline the plan: the gate question must actually ask
+  });
+  assert.equal(asked.code, 0, asked.stderr);
+  assert.ok(!asked.stdout.includes(NO_OP_GATE), 'the raw no-op gate never reaches the operator');
+  assert.match(asked.stdout, /\[none — jobs start right away\]/, 'Enter is described, not quoted');
+});
+
+test('the banner animation never reaches anything but a terminal (#217)', async () => {
+  // The dart flies in on a real TTY by redrawing itself in place. Those cursor
+  // codes are garbage in a file, and this suite captures stdout — so a version
+  // that animated regardless would put literal escape sequences into every
+  // assertion here, and into every operator's CI log. FLEET_FORCE_TTY makes the
+  // interview interactive without making stdout a terminal, which is exactly
+  // the case that must stay clean.
+  const cwd = scratchRepo();
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(4) });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stdout.includes('\u001b[2K'), false, 'a clear-line code reached a pipe');
+  assert.equal(/\u001b\[\d+A/.test(res.stdout), false, 'a cursor-up code reached a pipe');
+  assert.equal(res.stdout.includes('[?1049'), false, 'the alternate screen reached a pipe');
+  // The banner itself still arrives — the fallback is the static one, not none.
+  assert.match(res.stdout, /F L E E T/);
+});
+
+test('setup repo shows what it found and takes one Enter for all of it (#217)', async () => {
+  // #217's third principle: ask nothing by default. Six questions a first-time
+  // operator cannot answer become one block they can read and one Enter. The
+  // assertion is on the plain-English labels, not the manifest field names —
+  // a first run must not require Fleet's vocabulary.
+  const cwd = scratchRepo();
+  fs.writeFileSync(path.join(cwd, '.nvmrc'), '23.6.0\n');
+  fs.writeFileSync(path.join(cwd, 'pnpm-lock.yaml'), '');
+  // One Enter for the summary; the rest are the conditional seat prompts.
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', NO_COLOR: '1' }, stdin: '\n'.repeat(4) });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /Here is what this repo says about itself/);
+  assert.match(res.stdout, /jobs run in +node:23 {2}\(\.nvmrc\)/, res.stdout);
+  assert.match(res.stdout, /first set up with +corepack enable pnpm && pnpm install --frozen-lockfile {2}\(pnpm-lock\.yaml\)/, res.stdout);
+  assert.match(res.stdout, /driven by +claude-code {2}\(\.claude here\)/, res.stdout);
+  assert.match(res.stdout, /use this\? \[Y\/n\]/, 'Enter must mean yes on the one question with nothing at stake');
+  assert.match(res.stdout, /fleet doctor/, 'a first run ends with the command that checks it');
+  // And the summary was not decoration: it is what got written.
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.setup.image, 'node:23');
+  assert.equal(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8').includes('pnpm install --frozen-lockfile'), true);
+});
+
 test('setup repo: an all-Enter interview extracts a valid manifest from the checkout', async () => {
   const cwd = scratchRepo();
   // repo, image, setup command, sync, env vars, pickup, command, critic.
-  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) });
+  const res = await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(6) });
   assert.equal(res.code, 0, res.stderr);
 
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
   const { ok, errors } = validateManifest(manifest);
   assert.equal(ok, true, JSON.stringify(errors));
   assert.equal(manifest.workspace.repo, 'origin', 'the portable sentinel is the default');
-  assert.equal(manifest.setup.image, 'node:22', 'a package.json names the ecosystem');
+  assert.equal(manifest.setup.image, 'node:24', 'a package.json names the ecosystem');
   assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs', 'the gate that exists is the default');
-  assert.equal(manifest.harness.commands[0].path, '.claude/commands/dev.md');
-  assert.equal(manifest.harness.commands[0].critic, 'code-reviewer');
+  // No command list at all (#240): setup stopped asking which one to run,
+  // because Fleet stopped picking. The operator says it at dispatch.
+  assert.equal(manifest.harness.commands, undefined, 'setup wrote a command list Fleet no longer reads');
+  assert.deepEqual(Object.keys(manifest.harness), ['cli'], 'the harness block is just which CLI to launch');
   assert.deepEqual(manifest.env.vars, ['API_TOKEN', 'DB_URL'], 'env var names come from .env.example');
   assert.equal(manifest.workspace.sync, undefined, 'an empty answer omits the section, never an empty array');
   assert.deepEqual(
@@ -937,7 +1123,7 @@ test('setup repo: an all-Enter interview extracts a valid manifest from the chec
     '#134: the interview writes the documented limit defaults explicitly',
   );
 
-  assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8'), /npm ci/);
+  assert.match(fs.readFileSync(path.join(cwd, '.fleet', 'setup.sh'), 'utf8'), /npm install/);
   assert.equal((await runCli(['lint'], { cwd })).code, 0, 'the interview cannot produce a manifest lint rejects');
 });
 
@@ -946,12 +1132,17 @@ test('setup repo: a rejected answer is asked again rather than written', async (
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1' },
-    // repo, image, setup, sync, env vars (bad, then good), pickup, command, critic
-    stdin: '\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
+    // repo (a bare remote name: rejected, then Enter), image, setup, cli,
+    // sync, env vars (bad, then good), pickup
+    stdin: 'n\nupstream\n\n\n\n\n\nnot-a-var-name\nAPI_TOKEN\n\n\n\n',
   });
   assert.equal(res.code, 0, res.stderr);
+  // Only the literal "origin" resolves; a bare remote name would ship verbatim
+  // as the clone URL and fail every job at boot — refused at the question.
+  assert.match(res.stdout, /jobs clone outside this checkout/);
   assert.match(res.stdout, /not env var names/);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
+  assert.equal(manifest.workspace.repo, 'origin', 'the rejected remote name never reached the manifest');
   assert.deepEqual(manifest.env.vars, ['API_TOKEN']);
 });
 
@@ -959,23 +1150,94 @@ test('setup repo headless: flags supply the answers, and a missing one names its
   const cwd = scratchRepo();
   const extracted = await runCli(['setup', 'repo', '--repo', 'origin'], { cwd });
   assert.equal(extracted.code, 0, 'every repo prompt has an extractable default here');
+  assert.doesNotMatch(extracted.stdout, /F L E E T|\u001b\[/, 'headless output carries no banner, art or color codes');
 
+  // A bare directory used to fail here, because setup demanded a slash command
+  // to run and an empty checkout has none to offer. Since #240 there is nothing
+  // to demand — Fleet picks no command — so onboarding succeeds with a harness
+  // block that says only which CLI to launch.
   const bare = makeTempDir('fleet-setup-repo-bare-');
   const res = await runCli(['setup', 'repo'], { cwd: bare });
-  assert.equal(res.code, 1, 'nothing to extract a harness command from');
-  assert.match(res.stderr, /--command-path/);
-  assert.ok(!fs.existsSync(path.join(bare, '.fleet', 'manifest.json')), 'nothing written');
+  assert.equal(res.code, 0, res.stderr);
+  const bareManifest = JSON.parse(fs.readFileSync(path.join(bare, '.fleet', 'manifest.json'), 'utf8'));
+  assert.deepEqual(bareManifest.harness, { cli: 'claude-code' }, 'onboarding invented a command list');
+});
+
+test('a real terminal gets a line editor: arrows are inert and type-ahead is not dropped', async () => {
+  const { PassThrough } = await import('node:stream');
+  const readline = await import('node:readline');
+  const input = new PassThrough() as InstanceType<typeof PassThrough> & { setRawMode: (mode: boolean) => void };
+  const rawCalls: boolean[] = [];
+  input.setRawMode = (mode: boolean) => void rawCalls.push(mode);
+  let echoed = '';
+  const output = new PassThrough();
+  output.on('data', (chunk) => (echoed += chunk));
+  const ask = terminalAsker(readline, input, output);
+
+  // Raw mode is scoped to a pending question: cooked at rest (so Ctrl-C stays
+  // a real signal during the terraform steps other flows run with the asker
+  // open), raw only while the operator is typing an answer.
+  assert.equal(rawCalls.at(-1), false, 'the tty rests cooked');
+
+  // Both answers arrive before any question is asked: they must wait their
+  // turn, not be dropped on the floor (the reason the pipe asker iterates).
+  input.write('typed\n');
+  // Up, then Enter: up must not recall 'typed' from history (a paired down
+  // would mask that by undoing the recall), and the arrow must leave nothing
+  // in the answer — the canonical-mode asker used to hand back the raw ^[[A
+  // bytes as if they were typed.
+  input.write('\x1b[A\n');
+  assert.equal(await ask.question('image [node:24]: '), 'typed', 'a buffered line waits for its question');
+  assert.equal(await ask.question('next: '), '', 'arrow keys leave nothing in the answer');
+  assert.equal(rawCalls.at(-1), false, 'answered means cooked again');
+  const midQuestion = ask.question('again: ');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rawCalls.at(-1), true, 'a pending question holds raw mode');
+  input.write('\n');
+  assert.equal(await midQuestion, '', 'Enter takes the empty answer');
+  assert.equal(rawCalls.at(-1), false, 'cooked again after the answer');
+  assert.match(echoed, /image \[node:24\]: /, 'the editor draws the prompt');
+
+  const pending = ask.question('gone: ');
+  ask.close();
+  await assert.rejects(pending, /stdin ended/, 'input running out is an error, not a wait');
+});
+
+test('Ctrl-C at a terminal prompt reaches SIGINT listeners before the rejection unwinds', async () => {
+  const { PassThrough } = await import('node:stream');
+  const readline = await import('node:readline');
+  const input = new PassThrough();
+  const ask = terminalAsker(readline, input, new PassThrough());
+
+  // The hero registers a process SIGINT handler that restores the screen and
+  // exits 130. If the interrupt is delivered as a real (asynchronous) signal,
+  // the pending question's rejection unwinds first and unhooks that handler —
+  // the operator gets exit 1 and a lying "stdin ended" error. The listener
+  // below stands in for the hero's; it must have run by the time the
+  // rejection settles.
+  let interrupts = 0;
+  const onSigint = (): void => void (interrupts += 1);
+  process.once('SIGINT', onSigint);
+  try {
+    const pending = ask.question('int: ');
+    await new Promise((resolve) => setImmediate(resolve));
+    input.write('\x03');
+    await assert.rejects(pending, /stdin ended/, 'the interrupt closes the editor');
+    assert.equal(interrupts, 1, 'the SIGINT listener ran synchronously, before the unwind');
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+  }
 });
 
 test('setup repo: an existing manifest becomes the defaults, and overwriting takes a yes', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' }, stdin: '\n'.repeat(6) })).code, 0);
   const first = fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8');
 
   const declined = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /nothing written/);
@@ -983,19 +1245,19 @@ test('setup repo: an existing manifest becomes the defaults, and overwriting tak
 
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
-    // Change one answer (the critic); everything else is the existing manifest.
-    stdin: `${'\n'.repeat(7)}sceptic\ny\n`,
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    // Change one answer (the pickup gate); everything else is the existing manifest.
+    stdin: `${'\n'.repeat(6)}node .fleet/other.mjs\ny\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
-  assert.equal(manifest.harness.commands[0].critic, 'sceptic');
-  assert.equal(manifest.gates.pickup, 'node .fleet/gate.mjs', 'unchanged answers came from the existing manifest');
+  assert.equal(manifest.gates.pickup, 'node .fleet/other.mjs', 'the changed answer took');
+  assert.equal(manifest.workspace.repo, 'origin', 'unchanged answers came from the existing manifest');
 });
 
 test('setup repo: no terminal and an existing manifest refuses instead of overwriting', async () => {
   const cwd = scratchRepo();
-  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1' }, stdin: '\n'.repeat(8) })).code, 0);
+  assert.equal((await runCli(['setup', 'repo'], { cwd, env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' }, stdin: '\n'.repeat(6) })).code, 0);
   const res = await runCli(['setup', 'repo'], { cwd });
   assert.equal(res.code, 1);
   assert.match(res.stderr, /--yes/);
@@ -1010,7 +1272,7 @@ test('setup repo: a manifest the schema rejects is refused, not written', async 
   const code = await runSetupRepo({
     cwd,
     env: {},
-    flags: { repo: 'origin', image: 'node:22', pickup: 'gate', command_path: '.claude/commands/dev.md', critic: 'c' },
+    flags: { repo: 'origin', image: 'node:22', pickup: 'gate' },
     yes: true,
     interactive: false,
     log: () => {},
@@ -1034,8 +1296,8 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
 
   const declined = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(declined.code, 0, declined.stderr);
   assert.match(declined.stdout, /is not a valid manifest/);
@@ -1044,8 +1306,8 @@ test('setup repo: a manifest that parses but is not one becomes no defaults, and
 
   const accepted = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}y\n`,
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: `${'\n'.repeat(7)}y\n`,
   });
   assert.equal(accepted.code, 0, accepted.stderr);
   const manifest = JSON.parse(fs.readFileSync(path.join(cwd, '.fleet', 'manifest.json'), 'utf8'));
@@ -1058,8 +1320,8 @@ test('setup repo: a manifest that is not JSON at all is not silently replaced ei
   fs.writeFileSync(path.join(cwd, '.fleet', 'manifest.json'), '{ "version": 1, }\n');
   const res = await runCli(['setup', 'repo'], {
     cwd,
-    env: { FLEET_FORCE_TTY: '1' },
-    stdin: `${'\n'.repeat(8)}n\n`,
+    env: { FLEET_FORCE_TTY: '1', ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: `${'\n'.repeat(7)}n\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /is not valid JSON/);
@@ -1078,17 +1340,17 @@ function seatScratch(): string {
 
 test('setup repo: a seat login and no credential walks the acquisition — one paste writes .fleet/.env and the manifest', async () => {
   const cwd = scratchRepo();
-  const claudeDir = makeTempDir('fleet-claude-login-'); // the probe is presence of the CLI's config surface
   const res = await runCli(['setup', 'repo'], {
     cwd,
+    // Project-first basis: the repo's agent is claude-code and no credential is
+    // reachable (shell or .fleet/.env) — no probe of ~/.claude decides this.
     env: {
       FLEET_FORCE_TTY: '1',
-      CLAUDE_CONFIG_DIR: claudeDir,
       ANTHROPIC_API_KEY: undefined,
       CLAUDE_CODE_OAUTH_TOKEN: undefined,
     },
-    // The eight repo prompts, then the one paste.
-    stdin: `${'\n'.repeat(8)}sk-ant-oat01-pasted\n`,
+    // The repo prompts, then the one paste.
+    stdin: `n\n${'\n'.repeat(7)}sk-ant-oat01-pasted\n`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stdout, /claude setup-token/, 'the walk teaches the vendor command');
@@ -1153,7 +1415,7 @@ test('setup repo: a credential already in the environment means no walk — the 
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CLAUDE_CONFIG_DIR: claudeDir, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: '\n'.repeat(8),
+    stdin: '\n'.repeat(6),
   });
   assert.equal(res.code, 0, res.stderr);
   assert.ok(!fs.existsSync(path.join(cwd, '.fleet', '.env')), 'nothing to acquire, nothing written');
@@ -1166,7 +1428,10 @@ test('setup repo: a Codex login is offered into sync, copied 0600 and gitignored
   const res = await runCli(['setup', 'repo'], {
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
-    stdin: `${'\n'.repeat(8)}yes\n`,
+    // Decline the plan, take the defaults, but say `codex` at "driven by" —
+    // the offer exists because the chosen agent needs it, not because a login
+    // happens to sit on this machine.
+    stdin: `n\n${'\n'.repeat(3)}codex\n${'\n'.repeat(3)}yes\n`,
   });
   assert.equal(res.code, 0, res.stderr);
 
@@ -1187,7 +1452,7 @@ test('setup repo: declining the Codex offer copies nothing and syncs nothing', a
     cwd,
     env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
     // Enter on the offer takes the default, which is no — protecting the account.
-    stdin: '\n'.repeat(9),
+    stdin: `n\n${'\n'.repeat(3)}codex\n${'\n'.repeat(4)}`,
   });
   assert.equal(res.code, 0, res.stderr);
   assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'codex-auth.json')));
@@ -1195,9 +1460,26 @@ test('setup repo: declining the Codex offer copies nothing and syncs nothing', a
   assert.equal(manifest.workspace.sync, undefined);
 });
 
+test('setup repo: a Codex login on this machine is not offered to a claude-code repo', async () => {
+  // The operator's verdict on the old behavior: asked to paste a Claude token,
+  // then asked to ship a Codex login — on one repo. The basis is the chosen
+  // agent, not what happens to be logged in on this machine.
+  const cwd = seatScratch();
+  const codexHome = makeTempDir('fleet-codex-home-');
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":"codex-login"}\n');
+  const res = await runCli(['setup', 'repo'], {
+    cwd,
+    env: { FLEET_FORCE_TTY: '1', CODEX_HOME: codexHome, ANTHROPIC_API_KEY: 'sk-ant-api-here' },
+    stdin: '\n'.repeat(8), // accept the plan (cli: claude-code): no Codex question may follow
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!res.stdout.includes('Codex'), 'a claude-code repo is never asked about Codex');
+  assert.ok(!fs.existsSync(path.join(cwd, '.fleet', 'codex-auth.json')), 'nothing copied');
+});
+
 test('setup repo: --codex-auth yes with no Codex login here is a refusal, not a broken manifest', async () => {
   const cwd = seatScratch();
-  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--codex-auth', 'yes'], {
+  const res = await runCli(['setup', 'repo', '--repo', 'origin', '--cli', 'codex', '--codex-auth', 'yes'], {
     cwd,
     env: { ANTHROPIC_API_KEY: 'sk-ant-api-here' },
   });

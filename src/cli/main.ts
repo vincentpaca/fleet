@@ -17,14 +17,14 @@ import {
   retainedDir,
   type RetainedRecord,
 } from '../shared/retained.ts';
-import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch } from '../runner/git.ts';
+import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch, validBranchName } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
 import { runCockpit } from './cockpit.ts';
 import { artifactTally, formatEvent, formatJobState, logsNoColor, isNarrativeEvent } from './format.ts';
-import { COMPAT_MODE, SHAPE_DEFAULTS, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
+import { COMPAT_MODE, SHAPE_DEFAULTS, defaultPrompt, dispatchShape, reachableRepoDefault, shapeAuthority } from './dispatch.ts';
 import { displayTarget, isIssueTarget, normalizeTarget } from '../shared/issue-ref.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
@@ -105,9 +105,23 @@ Commands:
   init [--existing]                        Scaffold .fleet/ (manifest, setup.sh, out/) with
                                            placeholders — the non-interactive alias of setup repo
   lint [path]                              Validate manifest (+ .fleet/orders/*.json), no daemon
-  delegate <target> [--finish rung] [--manifest path] [--watch]
+  delegate <target> [--prompt text] [--finish rung] [--manifest path] [--watch]
                                            Build a work order and POST it to the daemon
                                            (--watch: follow the job, answer decisions from stdin)
+                                           What you type is what the agent runs:
+                                             fleet delegate "/dev-sprint"
+                                             fleet delegate "use the feature-spec skill for X"
+                                           An issue number says which work, not what to do
+                                           about it, so it needs --prompt as well:
+                                             fleet delegate 69 --prompt "/dev-work #69"
+                                           That keeps the readiness gate, publish and Closes #69
+                                           while still running your workflow, not Fleet's.
+                                           A deployment older than #240 rejects a prompt-carrying
+                                           order outright — fleet upgrade first.
+                                           The target decides everything else either way, so a
+                                           prompt on an issue number keeps issue strictness,
+                                           publish and the readiness gate — and one on prose buys
+                                           none of them.
                                            Defaults follow the target's shape: an issue number
                                            (or a PR) publishes and aims at merge-ready; for a
                                            prose target the runner composes no PR — delivery is
@@ -236,7 +250,7 @@ the workspace is ready before any model spend.`;
 function initManifest(): unknown {
   return {
     version: 1,
-    setup: { image: 'node:22', script: '.fleet/setup.sh' },
+    setup: { image: 'node:24', script: '.fleet/setup.sh' },
     workspace: { repo: 'git@github.com:acme/example-app.git', strategy: 'branch-per-job' },
     harness: {
       cli: 'claude-code',
@@ -650,6 +664,24 @@ async function ghPrViewJson(target: string, ref: string, signal?: AbortSignal): 
 }
 
 /**
+ * The head branch gh reported, admitted only against validBranchName's
+ * whitelist. That name is chosen by whoever opened the PR, and from here it
+ * travels in the work order into the harness prompt and the runner's git argv,
+ * so the admission test is applied at the boundary the value enters on and a
+ * refusal names the value. The daemon re-applies the same shape from the work
+ * order schema at intake; this is the earlier, louder half of that pair.
+ */
+function prHeadBranch(target: string, headRefName: unknown): string {
+  if (typeof headRefName !== 'string' || headRefName === '') {
+    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  }
+  if (!validBranchName(headRefName)) {
+    fail(`cannot resolve PR target ${target}: refusing head branch ${JSON.stringify(headRefName)} — only [A-Za-z0-9._/-] in a name git can use as a ref`);
+  }
+  return headRefName;
+}
+
+/**
  * Resolve a PR target via gh at dispatch (#80): the head branch the job will
  * adopt, the PR title, and the linked issue when exactly one is derivable.
  * Refuses non-open PRs — a merged or closed PR has no branch to continue, and
@@ -671,8 +703,9 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
   } catch {
     fail(`cannot resolve PR target ${target}: gh returned unparseable JSON`);
   }
-  if (typeof pr.number !== 'number' || typeof pr.headRefName !== 'string' || pr.headRefName === '') {
-    fail(`cannot resolve PR target ${target}: gh reported no head branch`);
+  const branch = prHeadBranch(target, pr.headRefName);
+  if (typeof pr.number !== 'number') {
+    fail(`cannot resolve PR target ${target}: gh reported no PR number`);
   }
   if (pr.state !== 'OPEN') {
     fail(`PR #${pr.number} is ${String(pr.state ?? 'unknown')}, not open — only an open PR can be continued`);
@@ -682,7 +715,7 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
     : undefined;
   return {
     number: pr.number,
-    branch: pr.headRefName,
+    branch,
     ...(typeof pr.title === 'string' && pr.title !== '' ? { title: pr.title } : {}),
     ...(typeof linked === 'number' ? { issue: linked } : {}),
   };
@@ -691,6 +724,14 @@ async function resolvePrTarget(target: string, prNumber: number, signal?: AbortS
 /** A dispatch as asked for, with somewhere to put its progress. */
 type DelegateRequest = {
   target: string;
+  /**
+   * What the operator wants done (#240), carried on the order and used by the
+   * runner as the harness's launch line (src/runner/harness.ts). Written only
+   * when asked for: the work order schema is `additionalProperties: false`, and
+   * a daemon validates against the copy baked into its own image, so a prompted
+   * order 422s at a deployment that predates the field.
+   */
+  prompt?: string;
   /** Deprecated (#36); mapped onto the shape table for the life of the flag. */
   mode?: string;
   finish?: string;
@@ -797,6 +838,29 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
     finish,
     authority: shapeAuthority(publish),
   };
+  // Written only when the operator asked for one, so an un-prompted order is
+  // byte-identical to what the previous release posted — a deployed daemon
+  // validates against the schema baked into its own image, and a field written
+  // unconditionally would 422 every dispatch until it caught up (fleet upgrade).
+  // Carried, and read nowhere else here: the target is never derived back out
+  // of it — scanning a prompt for a `#69` would make gate strictness depend on
+  // parsing English (D17).
+  // --prompt wins; otherwise the shape decides (#240). Written only when there
+  // is one, so an issue dispatch posts the same bytes it always has and keeps
+  // working against a daemon whose baked-in schema predates the field.
+  const prompt = req.prompt ?? defaultPrompt(shape, target);
+  if (prompt === undefined) {
+    // An identity target says which issue, never what to do about it, and Fleet
+    // no longer invents the verb from the manifest (#240). Refused here rather
+    // than in the runner: this costs nothing, and the alternative is finding out
+    // after a container has booted and cloned.
+    fail(
+      `nothing to run: "${target}" names the work but does not say what to do with it.\n` +
+        `  fleet delegate ${target} --prompt "/your-command #${target}"\n` +
+        '  (or dispatch the instruction on its own: fleet delegate "/your-command")',
+    );
+  }
+  workOrder.prompt = prompt;
   if (issueTitle !== undefined) workOrder.title = issueTitle;
   if (continues !== undefined) workOrder.continues = continues;
   const orderCheck = validateWorkOrder(workOrder);
@@ -910,6 +974,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   const { values, positionals } = parseCommand(
     args,
     {
+      prompt: { type: 'string' },
       mode: { type: 'string' },
       finish: { type: 'string' },
       manifest: { type: 'string' },
@@ -920,6 +985,7 @@ async function cmdDelegate(args: string[]): Promise<number> {
   );
   const created = await dispatchDelegate({
     target: positionals[0],
+    prompt: typeof values.prompt === 'string' ? values.prompt : undefined,
     mode: typeof values.mode === 'string' ? values.mode : undefined,
     finish: typeof values.finish === 'string' ? values.finish : undefined,
     manifestPath: typeof values.manifest === 'string' ? values.manifest : undefined,

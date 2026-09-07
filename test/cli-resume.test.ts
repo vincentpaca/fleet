@@ -39,7 +39,7 @@ test('delegate writes a pointer entry to .fleet/dispatched.jsonl', async (t) => 
   });
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', '42'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  const res = await runCli(['delegate', '42', '--prompt', '/dev'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
   assert.equal(res.code, 0, res.stderr);
 
   const ledgerPath = path.join(cwd, '.fleet', 'dispatched.jsonl');
@@ -69,8 +69,8 @@ test('delegate twice → dispatched.jsonl has exactly two pointer lines', async 
   });
   t.after(daemon.close);
 
-  await runCli(['delegate', '10'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
-  await runCli(['delegate', '11'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  await runCli(['delegate', '10', '--prompt', '/dev'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  await runCli(['delegate', '11', '--prompt', '/dev'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
 
   const ledgerPath = path.join(cwd, '.fleet', 'dispatched.jsonl');
   const lines = fs.readFileSync(ledgerPath, 'utf8').trim().split('\n');

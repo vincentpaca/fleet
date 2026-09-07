@@ -35,10 +35,17 @@ test('manifest rejects missing pickup gate', () => {
   assert.equal(validateManifest(m).ok, false, 'gateless dispatch must fail lint');
 });
 
-test('manifest rejects critic-less command', () => {
+test('manifest: commands and critic are both optional now (#240)', () => {
+  // Both were required to enforce "Fleet composes /<command> and every run gets
+  // a critic". Neither survived contact: the composition is what #240 removes
+  // for prose, and nothing in src/ has ever read `critic` — agents/dev.md
+  // hardcodes its reviewer, so a manifest naming another one never had an
+  // effect. Required fields that buy nothing are just dispatch failures.
   const m = read('examples/full.manifest.json');
   delete m.harness.commands[0].critic;
-  assert.equal(validateManifest(m).ok, false, 'a run with no critic is invalid');
+  assert.equal(validateManifest(m).ok, true, 'critic is no longer required');
+  delete m.harness.commands;
+  assert.equal(validateManifest(m).ok, true, 'a prompt-only repo declares no commands');
 });
 
 test('manifest rejects devcontainer+image both set', () => {

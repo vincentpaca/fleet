@@ -407,7 +407,7 @@ const COCKPIT_VERBS = ['delegate', 'answer', 'logs', 'attach', 'cancel', 'help',
 
 /** A submitted line, resolved to an intent. Nothing here talks to the daemon. */
 type CockpitCommand =
-  | { kind: 'delegate'; target: string; mode?: string; finish?: string }
+  | { kind: 'delegate'; target: string; prompt?: string; mode?: string; finish?: string }
   | { kind: 'answer'; option?: string; text?: string }
   | { kind: 'cancel'; jobId?: string }
   | { kind: 'focus'; jobId?: string }
@@ -427,10 +427,34 @@ const VERB_FOCUS = new Set(['logs', 'attach']);
 const WORDS_RE = /\s+/;
 
 /** Every flag `delegate` understands here; must match `fleet delegate`'s own. */
-const DELEGATE_FLAGS = ['--finish', '--mode'];
+const DELEGATE_FLAGS = ['--finish', '--mode', '--prompt'];
 
-/** Of those, the ones that take a following value. `--mode` is deprecated (#36). */
+/** Of those, the ones whose value is the single next word. `--mode` is deprecated (#36). */
 const DELEGATE_VALUE_FLAGS = new Set(['--mode', '--finish']);
+
+/**
+ * `--prompt` (#240) takes the whole rest of the line, not the next word.
+ *
+ * A prompt is prose, and this line has no quoting layer, so the one-token rule
+ * the other value flags use would take `fix` and push `the flaky heartbeat`
+ * into the target — a dispatch wrong in both slots that reads on the board like
+ * a typo nobody made. Greedy is the only reading that cannot do that. The cost
+ * is that a flag written after `--prompt` becomes prompt text, which is why the
+ * refusal below names the ordering; `fleet delegate --prompt "…" --finish x`
+ * from a shell, where quoting is real, is not constrained this way.
+ */
+const DELEGATE_REST_FLAG = '--prompt';
+
+/**
+ * The target words and the flags they were mixed with, or one refusal.
+ *
+ * Named rather than written inline on the signature because Lizard's TypeScript
+ * reader loses the function's end on a braced return type spread over its own
+ * line, and then charges {@link splitDelegateFlags} for every line below it —
+ * which had it sitting at 49 of its 50-line budget while its body was twenty.
+ * Same class of tokeniser trap as the hoisted {@link WORDS_RE} above.
+ */
+type DelegateSplit = { args: string[]; flags: Record<string, string | true> } | { error: string };
 
 /**
  * Split a delegate line into the words that make up its target and the flags it
@@ -447,14 +471,18 @@ const DELEGATE_VALUE_FLAGS = new Set(['--mode', '--finish']);
  * rather than in a refusal; guessing at near-misses would refuse `--node` on a
  * Node repo, which is the worse failure.
  */
-function splitDelegateFlags(
-  rest: string[],
-): { args: string[]; flags: Record<string, string | true> } | { error: string } {
+function splitDelegateFlags(rest: string[]): DelegateSplit {
   const args: string[] = [];
   const flags: Record<string, string | true> = {};
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i]!;
     if (!DELEGATE_FLAGS.includes(arg)) { args.push(arg); continue; }
+    if (arg === DELEGATE_REST_FLAG) {
+      const line = rest.slice(i + 1).join(' ');
+      if (line === '') return { error: `delegate: ${arg} needs a value — it takes the rest of the line, so put other flags first` };
+      flags[arg] = line;
+      break;
+    }
     if (!DELEGATE_VALUE_FLAGS.has(arg)) { flags[arg] = true; continue; }
     const value = rest[i + 1];
     i += 1;
@@ -479,6 +507,7 @@ function parseDelegateCommand(rest: string[]): CockpitCommand {
   const { flags } = split;
   return {
     kind: 'delegate', target,
+    ...(typeof flags['--prompt'] === 'string' ? { prompt: flags['--prompt'] } : {}),
     ...(typeof flags['--mode'] === 'string' ? { mode: flags['--mode'] } : {}),
     ...(typeof flags['--finish'] === 'string' ? { finish: flags['--finish'] } : {}),
   };
@@ -692,6 +721,8 @@ type CockpitDeps = {
    */
   delegate: (req: {
     target: string;
+    /** What the operator wants done (#240); carried on the order, unread by the runner so far. */
+    prompt?: string;
     /** Deprecated (#36); passed through for the life of the flag. */
     mode?: string;
     finish?: string;
@@ -715,7 +746,7 @@ function errorText(err: unknown): string {
  * `abort()` (wired to the view closing) kills the build's docker child.
  */
 /** The delegate intent, minus its discriminant — what the runner hands on. */
-type DelegateCommand = { target: string; mode?: string; finish?: string };
+type DelegateCommand = { target: string; prompt?: string; mode?: string; finish?: string };
 
 function delegateRunner(io: {
   delegate: CockpitDeps['delegate'];
@@ -729,6 +760,7 @@ function delegateRunner(io: {
     try {
       const created = await io.delegate({
         target: command.target,
+        prompt: command.prompt,
         mode: command.mode,
         finish: command.finish,
         // Progress holds the footer the way a refusal does: a build is minutes

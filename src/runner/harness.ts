@@ -1,11 +1,16 @@
 /**
  * Harness command construction (issue #4): derive the exact headless launch
- * line from the manifest and the work order. FLEET_HARNESS_CMD (tests, exotic
+ * plan from the manifest and the work order. FLEET_HARNESS_CMD (tests, exotic
  * setups) overrides everything and is used verbatim.
  */
 
 type HarnessPlan = {
-  cmd: string;
+  /** The executable on the derived path; the whole operator command line on the override path. */
+  file: string;
+  /** argv after `file`. Empty on the override path, which carries its arguments inside `file`. */
+  args: string[];
+  /** Whether `file` must go through `/bin/sh -c` — true only for the override (see buildHarnessCommand). */
+  shell: boolean;
   /** Non-fatal findings to surface as log events (version drift, fallbacks). */
   notes: string[];
   /** Harness-dialect env defaults; the job's real env always wins on conflict. */
@@ -68,7 +73,8 @@ export function versionSatisfies(actual: string, requirement: string): boolean |
 
 type HarnessInputs = {
   manifest: Record<string, unknown>;
-  target: string;
+  /** The job's identity. Not part of the launch line any more (#240) — kept for callers' shape. */
+  target?: string;
   /** FLEET_HARNESS_CMD, when set. */
   override?: string;
   /** Actual CLI version when measurable (runner probes `claude --version`). */
@@ -79,6 +85,16 @@ type HarnessInputs = {
    * gh itself — no runner-side feedback plumbing exists on purpose.
    */
   continues?: { pr: number; branch: string };
+  /**
+   * The work order's `prompt` (#240): what the operator wants done, used
+   * verbatim as the launch line. Required: Fleet composes no instruction of its
+   * own any more, so an order without one has no job to run. Fleet still
+   * appends what it owns — the continuation clause and the output contract —
+   * because those are guarantees of the pipe, not of the instruction. It is
+   * operator text, so it must reach the harness as literal characters; the
+   * derived plan is argv and never sees a shell (#241).
+   */
+  prompt?: string;
 };
 
 /** Append version-drift notes when an actual version is measurable and required. */
@@ -89,7 +105,18 @@ function checkVersionNotes(actualVersion: string | undefined, required: string |
   if (satisfied === undefined) notes.push(`cannot evaluate cli_version requirement "${required}" against ${actualVersion}`);
 }
 
-/** Build the adopted-PR continuation clause, or empty string. */
+/**
+ * Build the adopted-PR continuation clause, or empty string.
+ *
+ * `continues.branch` is a headRefName the CLI read from `gh pr view`, so its
+ * text is chosen by whoever pushed the branch, not by the operator dispatching
+ * the job — which is why it must never reach a shell (#241). A fork's PR is NOT
+ * the reach, contrary to what 1c9f6ad's commit body says: src/runner/main.ts
+ * runs setupWorkspace before it builds this prompt, and adoption checks the
+ * branch out with `git fetch origin <branch>`, which fails for a branch that is
+ * not on origin, so the job dies before the clause exists. The reach is a branch
+ * pushed to origin (anyone with push access) plus targets an operator types.
+ */
 function continuationClause(continues: { pr: number; branch: string } | undefined): string {
   if (!continues) return '';
   return (
@@ -99,9 +126,63 @@ function continuationClause(continues: { pr: number; branch: string } | undefine
   );
 }
 
-/** Build the launch line, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, target, override, actualVersion, continues }: HarnessInputs): HarnessPlan | undefined {
-  if (override) return { cmd: override, notes: [] };
+/**
+ * How each supported CLI takes an instruction with no human at the keyboard,
+ * as argv (#241 — never a shell string, because the instruction is operator
+ * text). Every row is one this repo has actually run a job through end to end
+ * (test/e2e-foreign-repo.ts); a CLI absent from here is unlaunchable and the
+ * operator's route is FLEET_HARNESS_CMD.
+ *
+ * Fleet owns the headless and approval flags only. It does not pick a model —
+ * that is `harness.model` when the CLI needs one, and the CLI's own default
+ * otherwise.
+ */
+const DIALECTS: Record<string, (prompt: string, model?: string) => { file: string; args: string[]; env?: Record<string, string> }> = {
+  'claude-code': (prompt, model) => ({
+    file: 'claude',
+    args: [
+      '-p', prompt,
+      '--output-format', 'stream-json', '--verbose',
+      ...(model ? ['--model', model] : []),
+      '--allowedTools', ...CLAUDE_ALLOWED_TOOLS,
+    ],
+    // claude-code caps a single response at 32k output tokens by default; a
+    // whole-file Write can exceed it and kill the job (observed on #28).
+    // Dialect knob, so it lives here — never in the manifest.
+    env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
+  }),
+  codex: (prompt) => ({ file: 'codex', args: ['exec', '--dangerously-bypass-approvals-and-sandbox', prompt] }),
+  opencode: (prompt, model) => ({ file: 'opencode', args: ['run', ...(model ? ['--model', model] : []), prompt] }),
+  omp: (prompt, model) => ({ file: 'omp', args: ['-p', '--auto-approve', ...(model ? ['--model', model] : []), prompt] }),
+};
+
+/**
+ * FLEET_HARNESS_CMD: a command line an operator wrote — pipes, redirects and
+ * `node -e "..."` are the point of it — so it stays a shell string and runs
+ * verbatim. The derived plan never does: its instruction comes from a work
+ * order and its branch name from whoever opened the PR (#241).
+ *
+ * An override is the entire launch line, so a work-order prompt has nowhere to
+ * go; splicing it in would put operator text back inside a shell string. It is
+ * dropped, and said out loud — the operator typed it and would otherwise spend
+ * the job wondering why it had no effect.
+ */
+function overridePlan(override: string, prompt: string | undefined): HarnessPlan {
+  const notes = prompt
+    ? ['FLEET_HARNESS_CMD is set, so it is the whole launch line and the work order prompt was not used']
+    : [];
+  return { file: override, args: [], shell: true, notes };
+}
+
+/** Build the launch plan, or undefined when no command can be derived. */
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
+  // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
+  // line an operator wrote — pipes, redirects and `node -e "..."` are the point
+  // of it — so it stays a shell string and runs verbatim. The derived plan
+  // below is argv and never sees a shell: its target comes from a work order
+  // and, on an adoption, its branch name comes from whoever opened the PR, so a
+  // `$(...)` in either used to execute inside the job container (#241).
+  if (override) return overridePlan(override, prompt);
 
   const harness = (manifest.harness ?? {}) as Record<string, unknown>;
   const cli = typeof harness.cli === 'string' ? harness.cli : 'claude-code';
@@ -110,27 +191,35 @@ export function buildHarnessCommand({ manifest, target, override, actualVersion,
   const required = typeof harness.cli_version === 'string' ? harness.cli_version : undefined;
   checkVersionNotes(actualVersion, required, notes);
 
-  if (cli !== 'claude-code') return undefined; // adapters for other CLIs arrive with demand
+  const dialect = DIALECTS[cli];
+  if (!dialect) return undefined; // an unknown cli has no headless invocation to guess at
 
-  const commands = Array.isArray(harness.commands) ? harness.commands : [];
-  const first = commands[0] as { path?: string } | undefined;
-  if (!first?.path) return undefined;
-  // .claude/commands/dev.md -> /dev — the repo's own slash command, which the
-  // CLI discovers from the cloned workspace.
-  const name = first.path.split('/').pop()?.replace(/\.md$/, '');
-  if (!name) return undefined;
+  // The instruction is the operator's, always (#240). Fleet used to compose
+  // `/<harness.commands[0]> <target>` when the order carried no prompt, which
+  // is how a repo with four workflows could only ever reach the first one, and
+  // how Fleet ended up choosing the verb — the harness's job, not the pipe's
+  // (D8). There is no fallback now: an order with no prompt is underivable, and
+  // the CLI refuses to build one, so this is a guard rather than a path.
+  if (prompt === undefined || prompt === '') return undefined;
 
-  // The output contract (#81) rides on every prompt, continuation included: a
-  // continuation that produces a report instead of commits still owes its
-  // deliverables to the artifact lane.
-  const prompt = JSON.stringify(`/${name} ${target}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`);
-  const tools = CLAUDE_ALLOWED_TOOLS.map((tool) => JSON.stringify(tool)).join(' ');
-  return {
-    cmd: `claude -p ${prompt} --output-format stream-json --verbose --allowedTools ${tools}`,
-    notes,
-    // claude-code caps a single response at 32k output tokens by default; a
-    // whole-file Write can exceed it and kill the job (observed on #28).
-    // Dialect knob, so it lives here — never in the manifest.
-    env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
-  };
+  // The output contract (#81) and the continuation clause ride on every prompt,
+  // operator-written included: a continuation that produces a report instead of
+  // commits still owes its deliverables to the artifact lane, and an adoption is
+  // still an adoption whoever wrote the instruction.
+  const promptText = `${prompt}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
+  const model = typeof harness.model === 'string' ? harness.model : undefined;
+  if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
+  return { ...dialect(promptText, model), shell: false, notes };
+}
+
+/**
+ * The launch plan as an operator reads it in the log. Display only: the derived
+ * plan is spawned as argv, so anything that parsed this string back into a
+ * command would reintroduce the shell the argv exists to avoid. Arguments are
+ * JSON-quoted so a prompt's newlines stay on one line and an argument boundary
+ * is visible.
+ */
+export function describeHarnessPlan(plan: HarnessPlan): string {
+  if (plan.shell) return plan.file;
+  return [plan.file, ...plan.args.map((arg) => JSON.stringify(arg))].join(' ');
 }

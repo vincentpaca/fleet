@@ -6,24 +6,60 @@
   "workspace": {
     "repo": "git@github.com:acme/webapp.git",
     "strategy": "branch-per-job",
-    "sync": [".env.development", ".claude/settings.local.json"]
+    "sync": [
+      ".env.development",
+      ".claude/settings.local.json"
+    ]
   },
   "env": {
-    "vars": ["DATABASE_URL", "TRACKER_API_TOKEN", "ANTHROPIC_API_KEY"]
+    "vars": [
+      "DATABASE_URL",
+      "TRACKER_API_TOKEN",
+      "ANTHROPIC_API_KEY"
+    ]
   },
   "services": [
-    { "kind": "github", "scope": ["repo:acme/webapp"], "permissions": ["contents:rw", "pull_requests:rw"] },
-    { "kind": "jira", "scope": ["project:APP"], "permissions": ["read", "comment", "transition"] },
-    { "kind": "mcp", "name": "design", "config": ".mcp.json#design" }
+    {
+      "kind": "github",
+      "scope": [
+        "repo:acme/webapp"
+      ],
+      "permissions": [
+        "contents:rw",
+        "pull_requests:rw"
+      ]
+    },
+    {
+      "kind": "jira",
+      "scope": [
+        "project:APP"
+      ],
+      "permissions": [
+        "read",
+        "comment",
+        "transition"
+      ]
+    },
+    {
+      "kind": "mcp",
+      "name": "design",
+      "config": ".mcp.json#design"
+    }
   ],
   "harness": {
     "cli": "claude-code",
     "cli_version": ">=2.0.0",
-    "env": { "EXAMPLE_FEATURE_FLAG": "1" },
+    "env": {
+      "EXAMPLE_FEATURE_FLAG": "1"
+    },
     "agents": ".claude/agents",
     "commands": [
-      { "path": ".claude/commands/dev-sprint.md", "critic": "code-reviewer" },
-      { "path": ".claude/commands/dev-spec.md", "critic": "spec-reviewer" }
+      {
+        "path": ".claude/commands/dev-sprint.md"
+      },
+      {
+        "path": ".claude/commands/dev-spec.md"
+      }
     ]
   },
   "gates": {
@@ -36,6 +72,10 @@
     "block_hot": "30m",
     "decision_timeout": "24h",
     "checkpoint": "10m",
-    "egress": ["github.com", "api.anthropic.com", "your-tracker.example.com"]
+    "egress": [
+      "github.com",
+      "api.anthropic.com",
+      "your-tracker.example.com"
+    ]
   }
 }

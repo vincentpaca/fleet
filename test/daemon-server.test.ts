@@ -83,6 +83,35 @@ test("POST /jobs rejects invalid manifest and work order with 422", async (t) =>
   assert.equal(ctx.provider.launches.length, 0);
 });
 
+test("POST /jobs rejects a continues.branch outside the name whitelist with 422", async (t) => {
+  // The CLI vets a PR's head branch at dispatch, but the CLI is not the only
+  // way to reach this endpoint and the schema is what owns the shape. An
+  // adopted branch is interpolated into the harness prompt and into git argv,
+  // so a name carrying a command substitution must not get past intake.
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+
+  const res = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: { ...WORK_ORDER, continues: { pr: 7, branch: "fleet/$(touch /tmp/pwn)-job-1" } },
+    manifest: MANIFEST,
+  });
+  assert.equal(res.status, 422, res.body);
+  const { errors } = res.json as { errors: { in: string; instancePath?: string }[] };
+  assert.ok(
+    errors.some((e) => e.in === "workOrder" && e.instancePath === "/continues/branch"),
+    `expected a /continues/branch error, got ${res.body}`,
+  );
+  assert.equal(ctx.provider.launches.length, 0, "nothing launched");
+
+  // The same order with a legal head branch is accepted — the rule refuses the
+  // shape, not adoption.
+  const ok = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: { ...WORK_ORDER, continues: { pr: 7, branch: "fleet/9-job-old" } },
+    manifest: MANIFEST,
+  });
+  assert.equal(ok.status, 201, ok.body);
+});
+
 test("POST /jobs rejects non-string env/sync values with 422", async (t) => {
   const ctx = await startDaemon();
   t.after(() => ctx.daemon.stop());

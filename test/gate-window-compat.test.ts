@@ -23,9 +23,13 @@ import type { ServerResponse } from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { dispatchShape } from '../src/cli/dispatch.ts';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 import { runCli, makeTempDir, startMockDaemon, sendJson, type MockRequest } from './cli-helpers.ts';
+
+/** An identity dispatch says which work, never what to do about it (#240). */
+const DEV_PROMPT = '/dev';
 
 const oldGate = fileURLToPath(new URL('../fixtures/gate-pre-window.mjs', import.meta.url));
 const preWindowSchemaPath = fileURLToPath(new URL('../fixtures/work-order-pre-window.schema.json', import.meta.url));
@@ -34,9 +38,12 @@ const preWindowSchemaPath = fileURLToPath(new URL('../fixtures/work-order-pre-wi
  * Every work order this file's dispatches posted. Node runs the tests in one
  * file sequentially, so by the time the last test reads this the dispatches
  * above have all happened — which is what lets the pre-window-schema test
- * assert against the real thing rather than a hand-written imitation.
+ * assert against the real thing rather than a hand-written imitation. The
+ * dispatch's argv rides along: since #240 what an order may legally contain
+ * depends on what the operator asked for, and the args are the only record of
+ * that.
  */
-const ORDERS_SEEN: Record<string, unknown>[] = [];
+const ORDERS_SEEN: { args: string[]; order: Record<string, unknown> }[] = [];
 
 const MANIFEST = {
   version: 1,
@@ -117,7 +124,7 @@ async function windowOrderAgainstOldGate(
     });
     assert.equal(res.code, 0, res.stderr);
     order = JSON.parse(daemon.requests[0].body).workOrder;
-    ORDERS_SEEN.push(order);
+    ORDERS_SEEN.push({ args, order });
   } finally {
     await daemon.close();
   }
@@ -135,7 +142,7 @@ async function windowOrderAgainstOldGate(
 }
 
 test('window CLI → old gate: an issue dispatch gates exactly as it did', async () => {
-  const { order, status, out } = await windowOrderAgainstOldGate(['42'], fakeBins(READY_GH));
+  const { order, status, out } = await windowOrderAgainstOldGate(['42', '--prompt', DEV_PROMPT], fakeBins(READY_GH));
   assert.equal(order.mode, 'implement', 'the compat mode is what the old gate keys on');
   assert.equal(status, 0, out);
   assert.match(out, /issue 42 is ready/);
@@ -144,13 +151,13 @@ test('window CLI → old gate: an issue dispatch gates exactly as it did', async
 test('window CLI → old gate: an unready issue still dies', async () => {
   // Same fake gh, minus the label. The compat field must not have bought a
   // relaxation: an issue dispatch pays the full check on both gates.
-  const { status, out } = await windowOrderAgainstOldGate(['42'], fakeBins(UNREADY_GH));
+  const { status, out } = await windowOrderAgainstOldGate(['42', '--prompt', DEV_PROMPT], fakeBins(UNREADY_GH));
   assert.equal(status, 1, out);
   assert.match(out, /lacks the "ready" label/);
 });
 
 test('window CLI → old gate: an adoption gates exactly as it did', async () => {
-  const { order, status, out } = await windowOrderAgainstOldGate(['pr/41'], fakeBins(READY_GH));
+  const { order, status, out } = await windowOrderAgainstOldGate(['pr/41', '--prompt', DEV_PROMPT], fakeBins(READY_GH));
   assert.equal(order.mode, 'followthrough', 'the old gate only checks a PR when the mode says followthrough');
   assert.deepEqual(order.continues, { pr: 41, branch: 'fleet/9-job-old' });
   assert.equal(order.target, '9', 'target rewritten to the linked issue, as before');
@@ -173,9 +180,27 @@ test('window CLI → old gate: --mode assess on an issue still gates strict (D17
   // mapped flag moves the dispatch's own defaults and nothing else, so the
   // compat mode stays `implement` and the readiness check is still paid. An
   // unready issue must die here whatever the operator asked for.
-  const { order, status, out } = await windowOrderAgainstOldGate(['--mode', 'assess', '42'], fakeBins(UNREADY_GH));
+  const { order, status, out } = await windowOrderAgainstOldGate(['--mode', 'assess', '42', '--prompt', DEV_PROMPT], fakeBins(UNREADY_GH));
   assert.equal(order.mode, 'implement', 'a read-only --mode must not soften the compat mode');
   assert.equal((order.authority as { publish: boolean }).publish, false, 'it does move the dispatch defaults');
+  assert.equal(status, 1, out);
+  assert.match(out, /lacks the "ready" label/);
+});
+
+test('window CLI → old gate: an operator prompt on an issue still gates strict (#240)', async () => {
+  // The invariant #240 could most easily have broken, checked on the gate an
+  // operator actually has rather than on this repo's regenerated one: the
+  // prompt says what the agent does, never what the dispatch is, so "/dev-work
+  // #42" against an unready issue must still die at pickup. A CLI that read the
+  // prompt as the job — or
+  // that let a prompt-carrying order fall through to the prose row — would pass
+  // this issue through with no readiness check and no `Closes #n`.
+  const { order, status, out } = await windowOrderAgainstOldGate(
+    ['42', '--prompt', '/dev-work #42'],
+    fakeBins(UNREADY_GH),
+  );
+  assert.equal(order.prompt, '/dev-work #42', 'carried verbatim');
+  assert.equal(order.mode, 'implement', 'the old gate keys on this, and the prompt must not have moved it');
   assert.equal(status, 1, out);
   assert.match(out, /lacks the "ready" label/);
 });
@@ -237,62 +262,38 @@ test('both pre-window fixtures are byte-identical to the originals', () => {
   );
 });
 
-test('every order the window CLI writes validates against the frozen pre-window schema', () => {
-  // The compatibility claim the whole window rests on, checked rather than
-  // asserted: a new CLI dispatching at an operator's un-upgraded daemon must
-  // not 422. It is also what licenses NOT writing `report` or the dead
-  // authority subfields — the pre-window schema required only mode/target/
-  // finish and nothing inside `authority`, so writing them would be dead weight
-  // justified by a compatibility need that does not exist.
+test('no order the CLI writes crosses a pre-window daemon any more (#240)', () => {
+  // This used to assert the opposite, and the inversion is the honest cost of
+  // #240. Every dispatch now carries `prompt` — an identity dispatch because
+  // the operator must say what to run, a prose one because the target IS the
+  // instruction — and the frozen pre-window work order is
+  // additionalProperties:false. A daemon validates with the schema baked into
+  // its own image, so a deployment older than #240 refuses every job this CLI
+  // sends. `fleet upgrade` is not optional across this release.
   //
-  // Note what the frozen schema also shows: its `dependentSchemas` makes
-  // `mode: "followthrough"` mandatory whenever `continues` is present. So the
-  // compat mode is load-bearing twice over — for un-regenerated repo gates AND
-  // for pre-window intake of every adoption dispatch.
+  // Kept as a test rather than deleted because the refusal must stay a 422 on
+  // an unknown FIELD. If it ever became a refusal on a value, or the schema
+  // stopped being closed, orders would be silently accepted and half-honoured
+  // by a daemon that cannot run them.
   const raw = JSON.parse(fs.readFileSync(preWindowSchemaPath, 'utf8')) as Record<string, unknown>;
   assert.deepEqual(raw.required, ['mode', 'target', 'finish'], 'the licence for not writing the other legacy fields');
-  // Same Ajv construction as src/validate.mjs — the frozen schema declares
-  // draft 2020-12, and a plain Ajv cannot resolve that meta-schema. Its `$id` is
-  // dropped rather than registered: it is byte-identical to the live schema's,
-  // and registering both on one instance would be a duplicate-$id throw.
   delete raw.$id;
   const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true, allowUnionTypes: true });
   addFormats(ajv);
   const validate = ajv.compile(raw);
 
-  // One per shape, hand-written from what dispatch.ts builds. ORDERS_SEEN below
-  // is what stops this list drifting into fiction: it holds every order the
-  // dispatches earlier in this file actually posted (node:test runs a file's
-  // top-level tests in declaration order, and the length check below fails if
-  // that ever stops being true), and each is validated in its own right — the
-  // shape comparison is a no-unexpected-fields check, not a value check, since
-  // the values are constrained by the frozen schema above.
-  const orders = [
-    { mode: 'implement', target: '42', finish: 'merge-ready', authority: { publish: true, merge: false, deploy: false } },
-    { mode: 'investigate', target: 'a question', finish: 'inspected', authority: { publish: false, merge: false, deploy: false } },
-    {
-      mode: 'followthrough', target: '9', finish: 'merge-ready',
-      authority: { publish: true, merge: false, deploy: false },
-      continues: { pr: 41, branch: 'fleet/9-job-old' },
-    },
-  ];
-  for (const order of orders) {
-    assert.ok(validate(order), `${order.mode}: ${JSON.stringify(validate.errors)}`);
-  }
   assert.ok(ORDERS_SEEN.length > 0, 'no dispatch was recorded — the pin has nothing to compare');
-  const keys = (o: Record<string, unknown>): string => JSON.stringify(Object.keys(o).sort());
   for (const seen of ORDERS_SEEN) {
-    const { title: _title, ...rest } = seen;
-    assert.ok(validate(rest), `a posted order failed the pre-window schema: ${JSON.stringify(validate.errors)}`);
+    const { title: _title, ...rest } = seen.order;
+    assert.ok('prompt' in rest, `an order went out with no instruction in it: ${seen.args.join(' ')}`);
+    assert.equal(validate(rest), false, `a prompted order passed the pre-window schema: ${seen.args.join(' ')}`);
     assert.ok(
-      orders.some((o) => keys(o) === keys(rest)),
-      `a posted order has fields none of the pinned shapes do: ${keys(rest)}`,
+      validate.errors?.some((e) => e.params?.additionalProperty === 'prompt'),
+      `the refusal must be about prompt, not something else: ${JSON.stringify(validate.errors)}`,
     );
-  }
-  // Every pinned shape must actually have been dispatched, or the list is
-  // documenting an order the CLI no longer writes.
-  const seenKeys = new Set(ORDERS_SEEN.map(({ title: _t, ...rest }) => keys(rest)));
-  for (const order of orders) {
-    assert.ok(seenKeys.has(keys(order)), `no dispatch in this file produced the pinned shape ${keys(order)}`);
+    // Strip the one new field and the rest must still be exactly what the
+    // previous release posted — the blast radius is one field, not a rewrite.
+    const { prompt: _p, ...legacy } = rest;
+    assert.ok(validate(legacy), `beyond prompt, the order drifted: ${JSON.stringify(validate.errors)}`);
   }
 });

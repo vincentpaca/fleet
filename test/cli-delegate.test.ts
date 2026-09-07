@@ -7,6 +7,9 @@ import { targetableRungs, validateWorkOrder } from '../src/validate.mjs';
 import { runCli, makeTempDir, startMockDaemon, sendJson, type MockRequest } from './cli-helpers.ts';
 import { toHttpsGitUrl } from '../src/shared/giturl.ts';
 
+/** An identity dispatch says which work, never what to do about it (#240). */
+const DEV_PROMPT = '/dev';
+
 const MANIFEST = {
   version: 1,
   setup: { image: 'node:22', script: '.fleet/setup.sh' },
@@ -96,7 +99,7 @@ test('delegate: an issue dispatch publishes and aims at merge-ready; prose does 
   t.after(daemon.close);
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
 
-  const issue = await postedOrder(['42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  const issue = await postedOrder(['42', '--prompt', DEV_PROMPT], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
   assert.equal(issue.finish, 'merge-ready');
   // The authority block is `publish` plus D5's two const-false limits, and
   // nothing else: the deprecated subfields have no reader and are not written
@@ -118,7 +121,7 @@ test('delegate: #42 and 42 are the same issue dispatch — normalized at parse',
   t.after(daemon.close);
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
 
-  const order = await postedOrder(['#42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  const order = await postedOrder(['#42', '--prompt', DEV_PROMPT], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
   assert.equal(order.target, '42', 'the hash is stripped — branch naming and the claim guard read this');
   assert.equal(order.finish, 'merge-ready', 'and it gets the issue row, not the prose row');
   assert.equal(order.title, 'Fix the flaky heartbeat', 'the title lookup sees an issue number too');
@@ -151,14 +154,14 @@ test('delegate: manifest.gates.default_finish beats the shape default and loses 
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
   const env = { PATH: `${bin}:${process.env.PATH}` };
 
-  assert.equal((await postedOrder(['42'], cwd, daemon, env)).finish, 'ci-green', 'manifest beats the shape default');
+  assert.equal((await postedOrder(['42', '--prompt', DEV_PROMPT], cwd, daemon, env)).finish, 'ci-green', 'manifest beats the shape default');
   assert.equal(
-    (await postedOrder(['42', '--finish', 'pushed'], cwd, daemon, env)).finish,
+    (await postedOrder(['42', '--finish', 'pushed', '--prompt', DEV_PROMPT], cwd, daemon, env)).finish,
     'pushed',
     '--finish beats the manifest',
   );
   // A mapped --mode is still a per-dispatch request, so it outranks repo config.
-  assert.equal((await postedOrder(['42', '--mode', 'assess'], cwd, daemon, env)).finish, 'inspected');
+  assert.equal((await postedOrder(['42', '--mode', 'assess', '--prompt', DEV_PROMPT], cwd, daemon, env)).finish, 'inspected');
 });
 
 test('delegate: a repo default_finish applies only where the dispatch could reach it (D17)', async (t) => {
@@ -215,11 +218,105 @@ test('delegate: the window release writes a compat mode computed from shape', as
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
 
   assert.equal((await postedOrder(['some open question'], cwd, daemon)).mode, 'investigate');
-  assert.equal((await postedOrder(['42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` })).mode, 'implement');
+  assert.equal((await postedOrder(['42', '--prompt', DEV_PROMPT], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` })).mode, 'implement');
   // A mapped --mode must NOT soften it: this is what keeps `--mode assess 42`
   // gating strict on an old gate as well as a new one (D17's inversion).
-  const mapped = await postedOrder(['--mode', 'assess', '42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  const mapped = await postedOrder(['--mode', 'assess', '42', '--prompt', DEV_PROMPT], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
   assert.equal(mapped.mode, 'implement', 'the compat mode is keyed on shape, never on the flag');
+});
+
+// --- The operator's prompt (#240): instruction beside identity ---
+
+test('every dispatch carries an instruction, and prose supplies its own (#240)', async (t) => {
+  // The whole order both ways, so any other field this release started writing
+  // fails here too.
+  //
+  // An issue number is an identity — the gate, the claim guard and `Closes #42`
+  // read it — so it says which work and never what to do about it, and the
+  // operator supplies the instruction. Prose IS the instruction, so it is
+  // carried as typed and nothing has to be repeated.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const issue = await postedOrder(['42', '--prompt', DEV_PROMPT], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.deepEqual(issue, {
+    mode: 'implement',
+    target: '42',
+    prompt: DEV_PROMPT,
+    finish: 'merge-ready',
+    authority: { publish: true, merge: false, deploy: false },
+    title: 'Fix the flaky heartbeat',
+  });
+
+  const prose = await postedOrder(['/dev-sprint'], cwd, daemon);
+  assert.deepEqual(prose, {
+    mode: 'investigate',
+    target: '/dev-sprint',
+    prompt: '/dev-sprint',
+    finish: 'inspected',
+    authority: { publish: false, merge: false, deploy: false },
+  });
+});
+test('delegate --prompt: what the operator typed reaches the order verbatim', async (t) => {
+  // What the field exists for: before it, the operator's own workflow could
+  // only arrive as an argument to Fleet's. This covers the dispatch leg only —
+  // that the runner then launches the harness with these same bytes is pinned
+  // separately in test/runner-harness.test.ts. The characters are chosen:
+  // backticks around an identifier and a `$` are idiomatic in a prompt, and
+  // both survive JSON round-trips that a naive shell-quoting fix would eat.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+  const prompt = '/dev-work #42 — keep `parseVersion` reading $HOME, and say "why" in the body';
+
+  const order = await postedOrder(['42', '--prompt', prompt], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(order.prompt, prompt, 'byte-for-byte, nothing prepended and nothing escaped');
+  assert.equal(order.target, '42', 'and the target is still the identity every consumer reads');
+});
+
+test('delegate --prompt: the shape still comes from the target alone (D17)', async (t) => {
+  // The inversion this field could have introduced, and the reason the prompt
+  // is never parsed for an issue reference. Two bugs it catches: a prompt
+  // naming an issue promoting a prose dispatch to issue strictness and publish
+  // authority, and — the direction that costs a readiness check — a prompt on
+  // an issue target demoting it to prose because the CLI decided the operator
+  // asking for something specific means the number is no longer the job.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+  const bin = fakeGh('echo "Fix the flaky heartbeat"');
+
+  const onIssue = await postedOrder(['42', '--prompt', '/dev-work #42'], cwd, daemon, { PATH: `${bin}:${process.env.PATH}` });
+  assert.equal(onIssue.target, '42', 'the branch, the claim guard and Closes #n all read this');
+  assert.equal(onIssue.finish, 'merge-ready');
+  assert.deepEqual(onIssue.authority, { publish: true, merge: false, deploy: false });
+  assert.equal(onIssue.mode, 'implement', 'so an un-regenerated repo gate still runs the readiness check');
+
+  const onProse = await postedOrder(['compare the two retry approaches', '--prompt', '/dev-work #42'], cwd, daemon);
+  assert.equal(onProse.target, 'compare the two retry approaches', 'never derived back out of the prompt');
+  assert.equal(onProse.finish, 'inspected');
+  assert.equal((onProse.authority as { publish: boolean }).publish, false, 'a prompt grants no authority');
+  assert.equal(onProse.mode, 'investigate');
+});
+
+test('delegate --prompt: an empty prompt is refused by the schema, before any POST', async (t) => {
+  // `--prompt ""` is a typo, not a request to run with no instruction, and the
+  // schema is where that is decided (minLength 1) rather than in a hand-rolled
+  // check beside it.
+  const cwd = scaffold(MIN_MANIFEST);
+  const daemon = await startMockDaemon(jobsRoute());
+  t.after(daemon.close);
+
+  const res = await runCli(['delegate', 'some open question', '--prompt', ''], {
+    cwd,
+    env: { FLEET_DAEMON_URL: daemon.url },
+  });
+  assert.equal(res.code, 1, res.stderr);
+  assert.match(res.stderr, /prompt/);
+  assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
 // --- The deprecated --mode flag, for the life of the window ---
@@ -231,7 +328,7 @@ test('delegate --mode: read-only names ask for read-only and inspected, and it w
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
   const env = { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` };
 
-  const res = await runCli(['delegate', '42', '--mode', 'assess'], { cwd, env });
+  const res = await runCli(['delegate', '42', '--mode', 'assess', '--prompt', DEV_PROMPT], { cwd, env });
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stderr, /--mode is deprecated \(#36\)/, 'the flag announces its own removal');
   const order = JSON.parse(daemon.requests[0].body).workOrder;
@@ -258,10 +355,10 @@ test('delegate --mode implement/followthrough grant publish and no more, on any 
   // against ci-green, which is neither the shape default nor the old preset's
   // merge-ready — so this cannot pass by coincidence.
   assert.equal(prose.finish, 'ci-green');
-  const issue = await postedOrder(['42', '--mode', 'implement'], cwd, daemon, env);
+  const issue = await postedOrder(['42', '--mode', 'implement', '--prompt', DEV_PROMPT], cwd, daemon, env);
   assert.equal(issue.finish, 'ci-green');
   assert.deepEqual(
-    await postedOrder(['42'], cwd, daemon, env),
+    await postedOrder(['42', '--prompt', DEV_PROMPT], cwd, daemon, env),
     issue,
     '--mode implement must produce the same order as no flag at all',
   );
@@ -274,7 +371,7 @@ test('delegate: the specific --finish flag beats the mapped --mode bundle', asyn
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
   const env = { PATH: `${bin}:${process.env.PATH}` };
 
-  const order = await postedOrder(['42', '--mode', 'assess', '--finish', 'merge-ready'], cwd, daemon, env);
+  const order = await postedOrder(['42', '--mode', 'assess', '--finish', 'merge-ready', '--prompt', DEV_PROMPT], cwd, daemon, env);
   assert.equal(order.finish, 'merge-ready', '--finish beats the mapped bundle');
   assert.equal((order.authority as { publish: boolean }).publish, false, 'and only --finish moved');
 });
@@ -446,7 +543,7 @@ test('delegate: numeric target stamps workOrder.title from gh', async (t) => {
   t.after(daemon.close);
   const bin = fakeGh('echo "Fix the flaky heartbeat"');
 
-  const res = await runCli(['delegate', '42'], {
+  const res = await runCli(['delegate', '42', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
   });
@@ -464,7 +561,7 @@ test('delegate: a gh failure degrades to no title, never an empty one', async (t
   t.after(daemon.close);
   const bin = fakeGh('exit 1');
 
-  const res = await runCli(['delegate', '42'], {
+  const res = await runCli(['delegate', '42', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, PATH: `${bin}:${process.env.PATH}` },
   });
@@ -542,7 +639,7 @@ test('delegate pr/<n> implies followthrough, resolves the head branch, and ships
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'pr/41'], {
+  const res = await runCli(['delegate', 'pr/41', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
   });
@@ -566,7 +663,7 @@ test('delegate accepts a full GitHub PR URL and falls back to a pr/<n> target wi
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'https://github.com/acme/example-app/pull/41'], {
+  const res = await runCli(['delegate', 'https://github.com/acme/example-app/pull/41', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
   });
@@ -585,7 +682,7 @@ test('delegate refuses a non-open PR before any POST', async (t) => {
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'pr/41'], {
+  const res = await runCli(['delegate', 'pr/41', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
   });
@@ -594,13 +691,39 @@ test('delegate refuses a non-open PR before any POST', async (t) => {
   assert.equal(daemon.requests.length, 0, 'nothing posted');
 });
 
+// headRefName is chosen by whoever opened the PR and flows into the harness
+// prompt and the runner's git argv. The second of these is a name git itself
+// accepts as a ref — the vet is a whitelist for exactly that reason.
+const HOSTILE_HEADS = ['--upload-pack=touch /tmp/pwned', 'fix/$(id)'];
+
+for (const headRefName of HOSTILE_HEADS) {
+  test(`delegate refuses PR head branch ${headRefName}, naming it, before any POST`, async (t) => {
+    const cwd = scaffold();
+    const gh = fakeGhBin(JSON.stringify({
+      number: 41, state: 'OPEN', headRefName, title: 'x',
+      closingIssuesReferences: [{ number: 9 }],
+    }));
+    const daemon = await startMockDaemon(jobsRoute());
+    t.after(daemon.close);
+
+    const res = await runCli(['delegate', 'pr/41', '--prompt', DEV_PROMPT], {
+      cwd,
+      env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
+    });
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /refusing head branch/);
+    assert.ok(res.stderr.includes(headRefName), 'the refusal names the value it rejected');
+    assert.equal(daemon.requests.length, 0, 'nothing posted');
+  });
+}
+
 test('delegate refuses a gh resolution failure before any POST', async (t) => {
   const cwd = scaffold();
   const gh = fakeGhBin('', 1);
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'pr/404'], {
+  const res = await runCli(['delegate', 'pr/404', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value', PATH: `${gh.bin}:${process.env.PATH}` },
   });
@@ -614,7 +737,7 @@ test('delegate rejects a PR target with a conflicting --mode', async (t) => {
   const daemon = await startMockDaemon(jobsRoute());
   t.after(daemon.close);
 
-  const res = await runCli(['delegate', 'pr/41', '--mode', 'implement'], {
+  const res = await runCli(['delegate', 'pr/41', '--mode', 'implement', '--prompt', DEV_PROMPT], {
     cwd,
     env: { FLEET_DAEMON_URL: daemon.url, ACME_API_TOKEN: 'token-value' },
   });
