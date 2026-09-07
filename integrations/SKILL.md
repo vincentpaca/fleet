@@ -21,20 +21,22 @@ Every `fleet` command resolves one address, highest priority first:
 2. `.fleet/infra/<provider>/fleet-config.json` under the current directory — its `daemon_url` field, captured by `fleet setup infra`. The first parseable capture carrying a usable `daemon_url` wins.
 3. The unix socket at `$FLEET_HOME/daemon.sock` (default `~/.fleet/daemon.sock`) — a daemon running on this machine.
 
-Two consequences worth knowing before you debug anything: the resolution reads the **current working directory**, so running `fleet` from outside the repo can silently mean a different daemon; and a cloud deployment that resolves to the socket has a capture with no `daemon_url`, which is a missing field, not a dead daemon. `fleet doctor` names the address it resolved — read that before concluding anything about reachability, and relay it rather than guessing.
+Two consequences worth knowing before you debug anything: the resolution reads the **current working directory**, so running `fleet` from outside the repo can silently mean a different daemon; and a cloud deployment that resolves to the socket has a capture with no `daemon_url`, which is a missing field, not a dead daemon. `fleet doctor` names the resolved address when the target is a tunnel; for a socket resolution it stays silent today, so the direct probe is any daemon command — a failing `fleet status` names the exact address it tried. Relay what they said rather than guessing.
 
 ## Dispatch
 
 ```sh
-fleet delegate <target> [--finish <rung>]
+fleet delegate "<instruction>"                       # prose: runs exactly as typed
+fleet delegate <issue> --prompt "<instruction>"      # delivery against an issue
+fleet delegate pr/<n> --prompt "<instruction>"       # continue an existing PR
 ```
 
-A dispatch is a target and a prompt — there is nothing to configure. The target's shape sets the defaults:
+A dispatch is a target and a prompt. The target is an identity — it names the job branch, the `Closes #n`, what the pickup gate checks — and the prompt is the instruction, which the remote agent runs exactly as typed. Fleet composes no instruction of its own, so an issue or PR target **requires `--prompt`**: a bare `fleet delegate 42` is refused before any container boots, and the refusal prints the line to type. The target's shape sets the defaults:
 
-- **An issue number** (`42`, `#42`) or a **PR reference** — a delivery dispatch. It gets push and PR authority, and aims at whatever `gates.default_finish` in the manifest says, or `merge-ready` if it says nothing. The repo's pickup gate holds it to that repo's readiness rules, so an unready ticket dies before any model spend; relay the gate's words rather than working around them.
-- **Anything else is prose** — `fleet delegate "why do queued jobs sit behind the capacity cap"`. The deliverable is the report and whatever files the job writes to its artifact lane; the runner composes no PR for it. (It still gets a job branch — the runner pushes one at creation so evidence survives the container — so "no runner PR", not "no writes".) This is the right shape for research, assessment, review and comparison, including assessing an issue that is not ready yet — phrase it as prose (`fleet delegate "assess issue 42: is it ready to implement"`) rather than passing the number.
+- **An issue number** (`42`, `#42`) with `--prompt` — a delivery dispatch. It gets push and PR authority, and aims at whatever `gates.default_finish` in the manifest says, or `merge-ready` if it says nothing. The repo's pickup gate holds it to that repo's readiness rules, so an unready ticket dies before any model spend; relay the gate's words rather than working around them.
+- **Anything else is prose** — `fleet delegate "why do queued jobs sit behind the capacity cap"`. The target is the prompt: it runs as typed, no `--prompt` needed. The deliverable is the report and whatever files the job writes to its artifact lane; the runner composes no PR for it. (It still gets a job branch — the runner pushes one at creation so evidence survives the container — so "no runner PR", not "no writes".) This is the right shape for research, assessment, review and comparison, including assessing an issue that is not ready yet — phrase it as prose (`fleet delegate "assess issue 42: is it ready to implement"`) rather than passing the number.
 - A prose dispatch that should end in a PR says so in the prompt — the sandboxed agent can open one itself, and the settle reports what actually happened: an agent-opened PR on the job branch settles at `pr-open`; a prompt that asked for a PR whose agent opened none settles honestly short, with the gap visible in the report. Pass `--finish <rung>` to move the finish line either way.
-- A PR target — `pr/<n>` or a full GitHub PR URL — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. Non-open PRs are refused before dispatching.
+- A PR target — `pr/<n>` or a full GitHub PR URL, with `--prompt` — continues an existing open PR: the job adopts the PR's head branch, addresses its review comments and failing checks, and pushes to the same branch so the PR updates in place. Non-open PRs are refused before dispatching.
 - The command prints a job id. Report it to the human immediately with one line about what was dispatched.
 - Sync files and env vars are read from the current shell and repo; if `delegate` fails naming a missing var or file, relay that verbatim.
 
@@ -75,7 +77,7 @@ If the settle's `produced[]` contains entries with `type: "file"`, the job deliv
 ```sh
 fleet artifacts <jobId>               # list artifact paths and sizes
 fleet artifacts <jobId> get <path>    # stream artifact to stdout
-fleet artifacts <jobId> get <path> -o <dir>  # save to dir/<filename>
+fleet artifacts <jobId> get <path> --out <dir>  # save to dir/<filename>
 ```
 
 ## Never

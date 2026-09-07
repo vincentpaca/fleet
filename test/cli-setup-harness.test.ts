@@ -53,6 +53,29 @@ function whereItLives(text: string): string | undefined {
 
 // ---------- the canonical, and the variants generated from it ----------
 
+test('the canonical skill teaches only commands and flags the CLI actually has', async () => {
+  // The skill shipped a whole release teaching `fleet delegate 42` (now
+  // refused without --prompt) and an artifacts `-o` flag that never existed —
+  // both found by executing it. This gate holds every `fleet` line in the
+  // canonical against the CLI's own help: a flag the help does not list is a
+  // usage error waiting inside someone's harness.
+  const help = (await runCli(['--help'], {})).stdout;
+  const fleetLines = CANONICAL.match(/^\s*fleet [^\n]*$/gm) ?? [];
+  assert.ok(fleetLines.length >= 8, 'the skill stopped showing fleet commands at all');
+  for (const line of fleetLines) {
+    const command = line.trim().split(/\s+/)[1];
+    assert.ok(help.includes(`  ${command} `) || help.includes(`  ${command}\n`), `\`${command}\` taught but not in fleet --help`);
+    for (const flag of line.match(/--[a-z-]+/g) ?? []) {
+      assert.ok(help.includes(flag), `${flag} taught but not in fleet --help`);
+    }
+    assert.deepEqual(line.match(/\s-[a-z]\b/g) ?? [], [], `short flag taught in \`${line.trim()}\` — the CLI defines none`);
+  }
+  // The delivery flow's load-bearing flag: an issue or PR target without it is
+  // a refusal, so the skill must teach it.
+  assert.match(CANONICAL, /--prompt/, 'the skill omits --prompt (#252 all over again)');
+});
+
+
 test('parseSkill refuses a canonical no harness could discover', () => {
   assert.throws(() => parseSkill('# just a document\n', 'x.md'), SetupError, 'frontmatter-less file accepted');
   assert.throws(() => parseSkill('---\nname: fleet-delegate\n---\nbody\n', 'x.md'), SetupError, 'missing description accepted');
