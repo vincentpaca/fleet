@@ -29,6 +29,7 @@ import { loadDotEnv, upsertDotEnv } from '../shared/dotenv.ts';
 import { gitValue } from '../shared/git.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { chooseLocalPort } from './connect.ts';
+import { fleetConfigFiles, configDaemonUrl } from './client.ts';
 import { renderBanner, detectColorLevel } from './board.ts';
 import { makeCol } from './ansi.ts';
 import { offerOnHeroScreen, type HeroStage } from './hero.ts';
@@ -1757,8 +1758,25 @@ function writeAndReport(fleetDir: string, manifest: RepoManifest, answers: Answe
   opts.log('');
   opts.log('  Next');
   opts.log('    fleet doctor                      checks all of this end to end');
-  opts.log('    fleet delegate "/your-command"    hands that command to an agent in the cloud');
+  if (deploymentReachable(opts.cwd, opts.env)) {
+    opts.log('    fleet delegate "/your-command"    hands that command to an agent in the cloud');
+  } else {
+    opts.log('    fleet setup infra                 jobs need a cloud to run in — none is reachable yet');
+  }
   opts.log('');
+}
+
+/**
+ * A daemon this repo could dispatch to: env override or a captured deployment,
+ * judged by the same predicate dispatch uses (configDaemonUrl) — a
+ * half-captured config that delegate would skip must not satisfy setup either.
+ */
+export function deploymentReachable(cwd: string, env: Record<string, string | undefined>): boolean { // consumers: the Next block above, main.ts's setup chain
+  if (env.FLEET_DAEMON_URL) return true;
+  for (const { config } of fleetConfigFiles(cwd)) {
+    if (configDaemonUrl(config) !== undefined) return true;
+  }
+  return false;
 }
 
 /**

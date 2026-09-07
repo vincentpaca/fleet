@@ -360,7 +360,13 @@ test('on a terminal it asks which harnesses and which scope', async () => {
 });
 
 test('setup names harness among its subcommands', async () => {
-  const res = await runCli(['setup'], {});
-  assert.equal(res.code, 2);
-  assert.match(res.stderr, /infra, repo, harness/);
+  // Bare `fleet setup` became the checklist (the chain's entry point): it
+  // prints where the repo stands, naming each missing piece's command — which
+  // is where harness stays discoverable. HOME is pinned so a skill installed
+  // on the machine running the suite cannot satisfy the row.
+  const res = await runCli(['setup'], { env: { HOME: makeTempDir('fleet-bare-home-') } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /fleet setup repo/);
+  assert.match(res.stdout, /fleet setup infra/);
+  assert.match(res.stdout, /fleet setup harness/);
 });

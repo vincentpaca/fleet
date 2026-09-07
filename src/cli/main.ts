@@ -28,10 +28,15 @@ import { COMPAT_MODE, SHAPE_DEFAULTS, defaultPrompt, dispatchShape, reachableRep
 import { displayTarget, isIssueTarget, normalizeTarget } from '../shared/issue-ref.ts';
 import type { FleetEvent, PendingDecision } from '../shared/events.ts';
 import { unitFor, SETUP_UNITS } from './setup-units.ts';
+import { HARNESS_TARGETS, detectHarness, skillPath } from './setup-harnesses.ts';
 import {
   runSetupInfra,
   runSetupRepo,
   runSetupHarness,
+  stdinAsker,
+  confirm,
+  deploymentReachable,
+  type Asker,
   repoPrompts,
   harnessPrompts,
   flagName,
@@ -69,6 +74,10 @@ selected job's tail, and a command line to dispatch and answer from. It adopts a
 healthy daemon tunnel or opens its own, and closing it leaves running jobs alone.
 
 Commands:
+  setup                                    Where this repo stands — manifest, deployment, agent
+                                           skill — and, on a terminal, the interview for the
+                                           first missing piece. Each setup below ends by offering
+                                           the next one.
   setup infra [--destroy] [--yes] [...]    Stand up (or tear down) the infrastructure in your
                                            cloud. A wizard on a terminal: it asks only what the
                                            infra contract cannot assume (name, region, optional
@@ -332,15 +341,153 @@ function promptOptions(prompts: { key: string }[]): Record<string, { type: 'stri
   return Object.fromEntries(prompts.map(({ key }) => [flagName(key), { type: 'string' as const }]));
 }
 
+// ---------- the setup chain ----------
+//
+// Three setups, one journey: repo (the manifest), infra (a deployment to run
+// jobs on), harness (the skill that lets a coding agent drive fleet). Each
+// command ends by OFFERING the first missing piece — never by falling into it:
+// an Enter must not start a terraform apply, so the infra offer defaults to
+// no, while the skill offer (one reversible file copy) defaults to yes.
+
+function anyHarnessDetected(): boolean {
+  const detect = { env: process.env as Record<string, string | undefined>, home: os.homedir() };
+  return HARNESS_TARGETS.some((harness) => detectHarness(harness, detect) !== undefined);
+}
+
+/** Is the fleet skill installed for any harness present on this machine? */
+function hasSkill(): boolean {
+  const roots = { home: os.homedir(), cwd: process.cwd() };
+  const detect = { env: process.env as Record<string, string | undefined>, home: roots.home };
+  // 'fleet-delegate' is the canonical skill's frontmatter name
+  // (integrations/SKILL.md); its install directory must match it.
+  return HARNESS_TARGETS.some(
+    (harness) =>
+      detectHarness(harness, detect) !== undefined &&
+      (['user', 'project'] as const).some((scope) => fs.existsSync(skillPath(harness, scope, 'fleet-delegate', roots))),
+  );
+}
+
+/**
+ * One stdin asker for a whole chained session. A second readline over the same
+ * stdin loses whatever lines the first had already buffered when it closed, so
+ * scripted answers to a later question would vanish: every consumer in the
+ * chain leases the same asker (its close is a no-op), and `done` closes the
+ * real one when the chain ends.
+ */
+function chainSession(): { open: () => Promise<Asker>; done: () => void } {
+  let real: Asker | undefined;
+  return {
+    open: async () => {
+      real ??= await stdinAsker();
+      const ask = real;
+      return { question: (prompt) => ask.question(prompt), close: () => {} };
+    },
+    done: () => real?.close(),
+  };
+}
+
+type Session = ReturnType<typeof chainSession>;
+
+/** One yes/no on the session's asker. A stdin that has ended is a script saying nothing — a no. */
+async function askYes(session: Session, question: string, defaultYes = false): Promise<boolean> {
+  try {
+    return await confirm(question, await session.open(), defaultYes);
+  } catch (err) {
+    if (err instanceof SetupError) return false;
+    throw err;
+  }
+}
+
+async function chainFromRepo(session: Session): Promise<number> {
+  if (!promptable()) return EXIT_OK;
+  // A reachable deployment is a satisfied piece, not the end of the journey:
+  // the first missing piece is then the skill.
+  if (deploymentReachable(process.cwd(), process.env as Record<string, string | undefined>)) return await chainFromInfra(session);
+  if (!(await askYes(session, 'stand one up now? (runs terraform in your AWS account, takes a few minutes)'))) {
+    console.log('later: fleet setup infra — or point FLEET_DAEMON_URL at an existing deployment');
+    return EXIT_OK;
+  }
+  console.log('');
+  return await infraChained([], session);
+}
+
+async function chainFromInfra(session: Session): Promise<number> {
+  // No harness on this machine means nothing to install the skill into — an
+  // offer whose yes can only fail is worse than none.
+  if (!promptable() || !anyHarnessDetected() || hasSkill()) return EXIT_OK;
+  console.log('');
+  if (!(await askYes(session, 'teach your coding agent to drive fleet? (installs the skill file)', true))) {
+    console.log('later: fleet setup harness');
+    return EXIT_OK;
+  }
+  console.log('');
+  return await cmdSetupHarness([], session.open);
+}
+
+async function repoChained(rest: string[], session: Session): Promise<number> {
+  const code = await cmdSetupRepo(rest, session.open);
+  // --yes asked for no questions at all (askForAnswers): it gets no offers either.
+  return code === EXIT_OK && !rest.includes('--yes') ? await chainFromRepo(session) : code;
+}
+
+async function infraChained(rest: string[], session: Session): Promise<number> {
+  const code = await cmdSetupInfra(rest, session.open);
+  // A teardown or an image roll is maintenance, not onboarding, and --yes
+  // asked for no questions at all: neither gets an offer.
+  const quiet = rest.includes('--destroy') || rest.includes('--rebuild-images') || rest.includes('--yes');
+  return code === EXIT_OK && !quiet ? await chainFromInfra(session) : code;
+}
+
+async function runRepoChained(rest: string[]): Promise<number> {
+  const session = chainSession();
+  try {
+    return await repoChained(rest, session);
+  } finally {
+    session.done();
+  }
+}
+
+async function runInfraChained(rest: string[]): Promise<number> {
+  const session = chainSession();
+  try {
+    return await infraChained(rest, session);
+  } finally {
+    session.done();
+  }
+}
+
+/** Bare \`fleet setup\`: where this repo stands, then the first missing piece. */
+async function cmdSetupStatus(): Promise<number> {
+  const manifest = fs.existsSync(path.join(process.cwd(), '.fleet', 'manifest.json'));
+  const deployment = deploymentReachable(process.cwd(), process.env as Record<string, string | undefined>);
+  const skill = hasSkill();
+  const row = (done: boolean, label: string, detail: string): void =>
+    console.log(`  ${done ? '✓' : '·'} ${label.padEnd(9)} ${detail}`);
+  console.log('where this repo stands:');
+  console.log('');
+  row(manifest, 'repo', manifest ? '.fleet/manifest.json' : 'no manifest — fleet setup repo writes one');
+  row(deployment, 'infra', deployment ? 'a deployment is reachable' : 'no deployment — fleet setup infra stands one up');
+  row(skill, 'harness', skill ? 'your coding agent can drive fleet' : 'skill not installed — fleet setup harness');
+  console.log('');
+  if (!promptable()) return EXIT_OK;
+  const session = chainSession();
+  try {
+    if (!manifest) return await repoChained([], session);
+    if (!deployment) return await chainFromRepo(session);
+    if (!skill) return await chainFromInfra(session);
+  } finally {
+    session.done();
+  }
+  console.log('everything is here — fleet doctor checks it end to end');
+  return EXIT_OK;
+}
+
 async function cmdSetup(args: string[]): Promise<number> {
   const [subcommand, ...rest] = args;
-  if (subcommand === 'infra') return await cmdSetupInfra(rest);
-  if (subcommand === 'repo') return await cmdSetupRepo(rest);
+  if (subcommand === 'infra') return await runInfraChained(rest);
+  if (subcommand === 'repo') return await runRepoChained(rest);
   if (subcommand === 'harness') return await cmdSetupHarness(rest);
-  if (!subcommand) {
-    console.error('fleet setup: subcommand required (infra, repo, harness)');
-    return EXIT_USAGE;
-  }
+  if (!subcommand) return await cmdSetupStatus();
   console.error(`fleet setup: unknown subcommand: ${subcommand}`);
   return EXIT_USAGE;
 }
@@ -360,7 +507,7 @@ function providerArg(args: string[]): string | undefined {
   return at === -1 ? undefined : (args[at + 1] ?? '');
 }
 
-async function cmdSetupInfra(args: string[]): Promise<number> {
+async function cmdSetupInfra(args: string[], openAsker?: () => Promise<Asker>): Promise<number> {
   const provider = providerArg(args) ?? SETUP_UNITS[0].provider;
   const unit = unitFor(provider);
   if (!unit) {
@@ -398,6 +545,7 @@ async function cmdSetupInfra(args: string[]): Promise<number> {
       backend: typeof values.backend === 'string' ? values.backend : undefined,
       backendConfig: Array.isArray(values['backend-config']) ? values['backend-config'] : [],
       moduleSource: typeof values['module-source'] === 'string' ? values['module-source'] : undefined,
+      openAsker,
       interactive: promptable(),
       log: (line) => console.log(line),
     });
@@ -407,7 +555,7 @@ async function cmdSetupInfra(args: string[]): Promise<number> {
   }
 }
 
-async function cmdSetupRepo(args: string[]): Promise<number> {
+async function cmdSetupRepo(args: string[], openAsker?: () => Promise<Asker>): Promise<number> {
   const prompts = repoPrompts(process.cwd());
   const { values } = parseCommand(args, { ...promptOptions(prompts), yes: { type: 'boolean' } }, 0, 0);
   try {
@@ -417,6 +565,7 @@ async function cmdSetupRepo(args: string[]): Promise<number> {
       home: os.homedir(),
       flags: suppliedFlags(prompts, values),
       yes: values.yes === true,
+      openAsker,
       interactive: promptable(),
       log: (line) => console.log(line),
       validate: validateManifest,
@@ -427,7 +576,7 @@ async function cmdSetupRepo(args: string[]): Promise<number> {
   }
 }
 
-async function cmdSetupHarness(args: string[]): Promise<number> {
+async function cmdSetupHarness(args: string[], openAsker?: () => Promise<Asker>): Promise<number> {
   // The prompt list owns the flag surface here too; detection happens inside,
   // where it can also be reported, so the flags are the same either way.
   const prompts = harnessPrompts();
@@ -441,6 +590,7 @@ async function cmdSetupHarness(args: string[]): Promise<number> {
       version: fleetVersion(),
       flags: suppliedFlags(prompts, values),
       force: values.force === true,
+      openAsker,
       interactive: promptable(),
       log: (line) => console.log(line),
     });
