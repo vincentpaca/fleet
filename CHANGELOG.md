@@ -5,6 +5,80 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.3.0 — 2026-09-07
+
+One pull request, two halves of the same idea: Fleet stops speaking for you.
+Dispatch runs exactly what you typed, and setup asks its questions in your
+words instead of Fleet's.
+
+### What's new for you
+
+- **`fleet delegate` runs what you type, on whatever CLI you use.**
+  `fleet delegate "/dev-sprint"` runs `/dev-sprint`;
+  `fleet delegate "use the feature-spec skill"` runs that sentence;
+  `fleet delegate 69 --prompt "/dev-work #69"` runs it with the issue's gate
+  and `Closes #69`. Fleet composes no instruction of its own any more —
+  `harness.commands` has no reader left — and a bare `fleet delegate 69` fails
+  at the CLI with the line to type, before a container boots. The launch line
+  lands correctly on all four supported CLIs (claude-code, codex, opencode,
+  omp), with `harness.model` passed to the ones that take one; three of those
+  four previously produced no launch plan at all.
+- **`fleet setup repo` first contact is a moment.** On a real terminal it opens
+  a full-screen hero — the dart bobbing over the wordmark — with what the repo
+  says about itself in plain words, one Enter from a written manifest.
+  Declining re-asks the plan one row at a time in the same words, on the same
+  screen, each hint naming what Fleet does with the answer ("if this command
+  fails, the job stops before the agent runs and spends anything"). The receipt
+  survives in scrollback, citing the repo file behind every row you didn't
+  retype. Pipes, CI, NO_COLOR and small terminals get the plain flow, and no
+  escape code ever reaches a pipe.
+- **A real terminal gets a real line editor.** Arrow keys edit the answer
+  instead of leaking `^[[C` into it, up/down are inert instead of recalling
+  the previous answer, and Ctrl-C restores the screen and exits clean — while
+  still aborting a running terraform step mid-apply.
+- **Detection stopped guessing.** A devcontainer outranks every inference; bun
+  repos get `oven/bun:1`; `.tool-versions` and Dockerfile `FROM` join the
+  version pins; pnpm and yarn go through corepack, so setup stops dying at
+  `pnpm: not found` before any model spend; the pickup gate defaults to a
+  check that passes instead of a file that isn't there; and a rerun stops
+  clobbering a hand-edited `harness.cli`.
+- **Credential questions follow the repo, not your laptop.** Setup asks which
+  coding agent drives jobs (default cited from the repo's own harness files),
+  and only that agent's credential story follows: a claude-code repo walks
+  `claude setup-token` when no shippable credential exists, and a Codex login
+  is offered only to a codex-driven repo — never because a login happens to
+  sit in your home directory.
+- **`infra/aws/tunnel.sh`** keeps the SSM port-forward to the daemon alive: a
+  keepalive loop stops Session Manager's idle timeout, and the outer loop
+  re-resolves the ECS task and reconnects after a deploy replaces it.
+
+### Upgrade notes
+
+- **Run `fleet upgrade` before dispatching with 0.3.0.** The work order grew an
+  optional `prompt` field, and a deployed daemon validates orders against the
+  schema baked into its own image — a v0.2.x deployment rejects any order
+  carrying one. `fleet upgrade` converges the daemon and rebuilds the runner
+  images, whose launch-line composition also moved in this release.
+- **`harness.commands` in your manifest is deprecated and unread.** It still
+  validates for this one release train so existing manifests don't fail;
+  delete the block (or re-run `fleet setup repo`). The follow-up release
+  removes it together with the `--mode`/`report` migration window.
+- `infra/` gained only `tunnel.sh`, a helper terraform doesn't read — no
+  `terraform apply` needed for this release.
+
+### Breaking changes
+
+- **`fleet delegate <issue>` with no `--prompt` no longer dispatches.** A
+  number says which work, never what to do about it; the error names the exact
+  line to type. Anything scripted around the manifest's `commands[0]` must now
+  pass `--prompt`.
+- **The new CLI cannot dispatch prompts to an old deployment** — the daemon
+  rejects the unknown field at intake (see upgrade notes). Upgrade first.
+
+### All merged PRs
+
+- #247: #240: delegate runs what you type — and setup is worth running (#217)
+
 ## 0.2.1 — 2026-09-05
 
 A fix release that turned into the week Fleet stopped being a one-harness tool.
