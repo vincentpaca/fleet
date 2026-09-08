@@ -51,9 +51,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # Harness CLI — one layer; HARNESS_CLI selects the npm package.
+# The mapping is pinned by fixtures/harness-packages.json via
+# test/images-runner.test.ts: the npm package `opencode` does not exist
+# (#228 — the real one is `opencode-ai`), and this comment once said it did.
 #   claude-code → @anthropic-ai/claude-code
 #   codex       → @openai/codex
-#   opencode    → opencode
+#   opencode    → opencode-ai
 RUN set -eu; \
     case "$HARNESS_CLI" in \
       claude-code) pkg="@anthropic-ai/claude-code" ;; \
