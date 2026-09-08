@@ -1,0 +1,6 @@
+{
+  "claude-code": "@anthropic-ai/claude-code",
+  "codex": "@openai/codex",
+  "opencode": "opencode-ai",
+  "omp": "@oh-my-pi/pi-coding-agent"
+}
