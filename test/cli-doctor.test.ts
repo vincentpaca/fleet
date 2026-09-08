@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { runCli, makeTempDir, startMockDaemon } from './cli-helpers.ts';
+import { runCli, makeTempDir, startMockDaemon, sendJson } from './cli-helpers.ts';
 
 // Minimal valid-for-doctor manifest; sync/env.vars empty so no base findings.
 const BASE_MANIFEST = {
@@ -577,4 +577,58 @@ test('doctor: skew keeps working with no daemon reachable — the unit ref is st
   assert.match(res.stderr, /nothing is listening/);
   assert.match(res.stderr, /deployment skew: aws unit is applied at ref/);
   assert.ok(!res.stderr.includes('daemon image'), 'the unreachable image is not a second finding');
+});
+
+
+// ---------- the daemon itself (#253) ----------
+
+test('doctor: a capture without a daemon_url is a finding naming the socket fallback, not a clean run', async () => {
+  // The lying case #253 was filed for: a deployment is captured, its config
+  // carries no daemon_url, resolution silently falls to the local socket where
+  // nothing answers — and doctor said "clean" while every dispatch failed.
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  fs.mkdirSync(path.join(cwd, '.fleet', 'infra', 'aws'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, '.fleet', 'infra', 'aws', 'fleet-config.json'), '{"cluster":"fleet"}\n');
+  const res = await runDoctor(['doctor'], { cwd });
+  assert.equal(res.code, 1, `expected the dead socket to be a finding:\n${res.stdout}`);
+  assert.match(res.stderr, /no fleet-config\.json carries a daemon_url/);
+  assert.match(res.stderr, /fell to the local socket at .*daemon\.sock/);
+  assert.match(res.stderr, /re-run fleet setup infra to recapture|FLEET_DAEMON_URL/);
+});
+
+test('doctor: a captured daemon_url nothing answers at stays the tunnel section\'s finding — one cause, one finding', async () => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  fs.mkdirSync(path.join(cwd, '.fleet', 'infra', 'aws'), { recursive: true });
+  fs.writeFileSync(
+    path.join(cwd, '.fleet', 'infra', 'aws', 'fleet-config.json'),
+    '{"daemon_url":"http://127.0.0.1:1/"}\n',
+  );
+  const res = await runDoctor(['doctor'], { cwd });
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /nothing is listening on http:\/\/127\.0\.0\.1:1/);
+  assert.match(res.stderr, /fleet connect/);
+  // stderr also carries the first-use trust NOTE for a new daemon_url; count
+  // only reachability complaints.
+  const complaints = stderrLines(res.stderr).filter((line) => /nothing is listening|cannot reach/.test(line));
+  assert.equal(complaints.length, 1, 'the daemon section must not double the tunnel finding');
+});
+
+test('doctor: no deployment captured is a note, never a finding — first contact is not broken', async () => {
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const res = await runDoctor(['doctor'], { cwd });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /daemon: nothing answering at .*daemon\.sock, and no deployment captured/);
+  assert.match(res.stdout, /doctor: clean/);
+});
+
+test('doctor: a daemon that answers is named, address and all', async (t) => {
+  const daemon = await startMockDaemon({
+    'GET /health': (_req, res) => sendJson(res, 200, { ok: true }),
+    'POST /reconcile': (_req, res) => sendJson(res, 404, {}),
+    'GET /jobs': (_req, res) => sendJson(res, 200, { jobs: [] }),
+  });
+  t.after(daemon.close);
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url } });
+  assert.match(res.stdout, /daemon: answering at http:\/\//, res.stderr);
 });

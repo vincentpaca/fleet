@@ -18,7 +18,7 @@ import {
   type RetainedRecord,
 } from '../shared/retained.ts';
 import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch, validBranchName } from '../runner/git.ts';
-import { request, describeTarget, daemonTarget, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
+import { request, describeTarget, daemonTarget, daemonHealthy, fleetConfigFiles, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
 import { parseAnswerLine, renderBanner, detectColorLevel, fetchPendingDecision, followJobEvents } from './board.ts';
@@ -1737,6 +1737,37 @@ async function doctorTunnel(home: string): Promise<{ notes: string[]; findings: 
  * already reports that) and when the daemon predates the endpoint (404) —
  * not knowing is not a defect.
  */
+/**
+ * Is anything answering at the address this checkout resolves (#253)?
+ *
+ * Ownership is split with the tunnel section: a dead TCP address is the
+ * tunnel's finding (it probes and names the port — one cause, one finding,
+ * pinned by its tests), so this section stays silent for unreachable TCP.
+ * What was nobody's before is the socket half: a capture without a daemon_url
+ * makes resolution fall to the local socket silently, and doctor said "clean"
+ * over the dead socket. Unreachable-socket splits by what the operator
+ * believes: a capture exists — a finding naming the fallback; nothing
+ * captured — a note, because a repo that has not stood up infra yet is not
+ * broken, and the setup chain sends first contacts here.
+ */
+async function doctorDaemon(): Promise<{ notes: string[]; findings: string[] }> {
+  const target = daemonTarget(process.env, { cwd: process.cwd() });
+  const address = describeTarget(process.env, { cwd: process.cwd() });
+  if (await daemonHealthy(process.env, process.cwd())) {
+    return { notes: [`daemon: answering at ${address}`], findings: [] };
+  }
+  if (target.kind === 'tcp') return { notes: [], findings: [] }; // the tunnel section names the dead port
+  if ([...fleetConfigFiles(process.cwd())].length === 0) {
+    return { notes: [`daemon: nothing answering at ${address}, and no deployment captured here — fleet setup infra stands one up`], findings: [] };
+  }
+  return {
+    notes: [],
+    findings: [
+      `cannot reach a daemon: a deployment is captured here but no fleet-config.json carries a daemon_url, so resolution fell to the local socket at ${address} — re-run fleet setup infra to recapture, or set FLEET_DAEMON_URL`,
+    ],
+  };
+}
+
 async function doctorOrphans(): Promise<{ notes: string[]; findings: string[] }> {
   let res: DaemonResponse;
   try {
@@ -1983,18 +2014,26 @@ async function cmdDoctor(args: string[]): Promise<number> {
     }
   }
 
+  // 6. The daemon itself (#253): name the address this checkout resolves, and
+  //    whether anything answers there. Every daemon-facing check below skips
+  //    silently when unreachable — which is how doctor once said "clean" over
+  //    a dead socket — so the address and the failure are stated here, first.
+  const daemon = await doctorDaemon();
+  for (const note of daemon.notes) console.log(note);
+  findings.push(...daemon.findings);
+
   // Snapshot the local token before the first daemon call below: the client
   // heals a stale token transparently (#188), and doctorToken has to be able
   // to say "was stale, refetched" rather than pretending it always matched.
   const tokenBefore = readTokenFile(operatorTokenPath(fleetHome()));
 
-  // 6. Tunnel (#57): when the daemon lives behind a port-forward, say what the
+  // 7. Tunnel (#57): when the daemon lives behind a port-forward, say what the
   //    tunnel is doing rather than letting every command report ECONNREFUSED.
   const tunnel = await doctorTunnel(fleetHome());
   for (const note of tunnel.notes) console.log(note);
   findings.push(...tunnel.findings);
 
-  // 7. Retained workspaces (#38): a workspace kept because its work push failed
+  // 8. Retained workspaces (#38): a workspace kept because its work push failed
   //    holds the only copy of that job's work. It is a finding until recovered —
   //    silence here is exactly how hours of agent time disappear.
   for (const record of listRetainedRecords(fleetHome())) {
@@ -2010,21 +2049,21 @@ async function cmdDoctor(args: string[]): Promise<number> {
     );
   }
 
-  // 8. Orphaned cloud tasks (#147): run the daemon's reconcile sweep on demand
+  // 9. Orphaned cloud tasks (#147): run the daemon's reconcile sweep on demand
   //    and list what it found — a task billing behind a terminal job is exactly
   //    the spend nothing else surfaces until the runner's wall-clock cap.
   const orphans = await doctorOrphans();
   for (const note of orphans.notes) console.log(note);
   findings.push(...orphans.findings);
 
-  // 9. Operator token (#188): say whether the daemon accepts ours — and when
+  // 10. Operator token (#188): say whether the daemon accepts ours — and when
   //    it does not, name the file and the fix instead of leaving the next
   //    command to print a bare 401.
   const token = await doctorToken(fleetHome(), tokenBefore);
   for (const note of token.notes) console.log(note);
   findings.push(...token.findings);
 
-  // 10. Deployment skew (#207): does what is running match what this CLI is?
+  // 11. Deployment skew (#207): does what is running match what this CLI is?
   //     A daemon image or applied unit predating the CLI is how #197 lost a
   //     job's work; name each stale component and its fix here.
   const skew = await doctorSkew(process.cwd());
