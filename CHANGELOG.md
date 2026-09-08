@@ -5,6 +5,70 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.3.2 — 2026-09-08
+
+The release where onboarding stops lying anywhere: the infra interview joins
+the screen the repo interview got, doctor tells the truth about a daemon
+nothing can reach, and the last two places still teaching dead commands — the
+README and a Dockerfile comment — were caught by the same medicine that cured
+the skill: execute what the docs say, pin what the execution proved.
+
+### What's new for you
+
+- **`fleet setup infra` joins the graphical onboarding.** Saying yes at the
+  chain's offer opens the same screen the repo interview uses: the deployment's
+  shape up top, the questions at the prompt row with their hints dimmed above —
+  then the screen closes *before* terraform, because init/plan/apply output
+  belongs in scrollback where you can read it, and the apply confirm sits under
+  the plan it approves, naming what you're consenting to: `apply this plan to
+  aws as "fleet"?`. The composition fits an 80×30 terminal; anything smaller
+  (or piped, or CI) gets the plain flow, unchanged.
+- **Its questions answer themselves.** `name this deployment [fleet]:` with
+  *"every resource it creates is tagged with it, and teardown targets it"*
+  above — Enter works on first contact, and on a rerun the default is **the
+  name already deployed here**, because a review of this change proved a
+  static default would silently rename (and force-recreate) a live deployment
+  on a flagless rerun. `AWS region to deploy into` and `existing VPC to reuse`
+  (*Enter creates a dedicated VPC*) got the same treatment. A bare
+  `fleet setup infra --yes` on first contact now stands up `fleet` instead of
+  refusing for a missing `--name`.
+- **`fleet doctor` names the daemon and means it.** It prints the address this
+  checkout resolves and probes it. The lying case is fixed: a captured
+  deployment whose `fleet-config.json` carries no `daemon_url` silently fell
+  back to the local socket and doctor said "clean" — now it's a finding naming
+  the fallback and the recapture fix. A repo with no deployment yet stays
+  clean: that's a note, not a defect, because the setup chain sends first
+  contacts to doctor.
+- **The README teaches the shipped dispatch.** `fleet delegate 42` (refused
+  since 0.3.0) is gone from the front page; examples carry `--prompt` where
+  the contract requires it, and the drift gate that guards the installed skill
+  now reads the README too — including the shape rule that an identity target
+  without `--prompt` is a dead command.
+- The runner image's harness-package mapping is pinned data
+  (`fixtures/harness-packages.json`): the Dockerfile's install arms, its own
+  comment (which still named the nonexistent `opencode` package after the arm
+  was fixed), and the manifest's `harness.cli` enum must all agree, so every
+  harness the manifest accepts provably has an install arm.
+
+### Upgrade notes
+
+- None that touch your deployment: no schema, infra or image-content changes —
+  the one `images/` diff is the corrected comment. A 0.3.1 deployment works
+  with this CLI unchanged.
+- If a script relied on `fleet setup infra --yes` *failing* without `--name`,
+  it now succeeds and applies as `fleet` — pass `--name` to pin one.
+
+### Breaking changes
+
+None.
+
+### All merged PRs
+
+- #257: #256: setup infra joins the graphical onboarding, and its questions answer themselves
+- #259: #258: README stops teaching the dispatch the CLI refuses
+- #260: #228: Runner image cannot build for opencode: the npm package name is wrong
+- #261: #253: fleet doctor reports clean over an unreachable socket daemon
+
 ## 0.3.1 — 2026-09-08
 
 Two fixes to first contact, both from watching a real operator meet 0.3.0: the
