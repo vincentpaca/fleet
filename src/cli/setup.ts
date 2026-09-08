@@ -32,7 +32,7 @@ import { chooseLocalPort } from './connect.ts';
 import { fleetConfigFiles, configDaemonUrl } from './client.ts';
 import { renderBanner, detectColorLevel } from './board.ts';
 import { makeCol } from './ansi.ts';
-import { offerOnHeroScreen, type HeroStage } from './hero.ts';
+import { offerOnHeroScreen, wrapNote, type HeroStage } from './hero.ts';
 import { splitList } from './setup-units.ts';
 import type { Answers, PromptSpec, SetupUnit } from './setup-units.ts';
 import {
@@ -646,6 +646,72 @@ export async function runSetupInfra(opts: SetupInfraOptions): Promise<number> {
   }
 }
 
+/**
+ * The infra interview on the hero screen (#256): the chain must not hand the
+ * operator from the composed screen into bare scrollback the moment they say
+ * yes. Only the QUESTIONS live on the screen — the screen closes before
+ * terraform runs, because init/plan/apply output belongs in scrollback where
+ * it can be read and scrolled, and the apply confirm must sit under the plan
+ * it approves. Undefined means the screen could not run (a pipe, CI, NO_COLOR,
+ * too small): the caller owes the operator the static flow.
+ */
+async function heroInfraInterview(unit: SetupUnit, prompts: PromptSpec[], opts: SetupInfraOptions, ask: Asker): Promise<Interview | undefined> {
+  let merged: Interview | undefined;
+  // The label wraps into block-width rows: one 97-column row would push the
+  // screen's minimum past every 80-column terminal, and the deployment is
+  // account-scoped, so the lead carries no checkout path to widen it either.
+  const shape = wrapNote(unit.label, 58);
+  const ran = await offerOnHeroScreen({
+    out: process.stdout,
+    env: opts.env,
+    lead: 'Standing up your deployment',
+    heading: 'Here is the shape of it:',
+    // The label leads with the provider's own name, so one prefixed row pair
+    // carries both — a separate provider row costs the exact row that keeps
+    // the composition inside a 30-row terminal.
+    summary: shape.map((row, i) => (i === 0 ? `  provider   ${row}` : `             ${row}`)),
+    // Never rendered — with no confirm the questions start straight away, and
+    // this string is only measured: the widest of the unit's own questions,
+    // plus room to type an answer beside it.
+    question: ' '.repeat(prompts.reduce((w, p) => Math.max(w, p.question.length + 32), 0)),
+    followUp: async (stage) => {
+      const io = stageIo(stage, ask);
+      merged = await interview(prompts, { flags: opts.flags, env: opts.env, ask: io.ask, log: io.log });
+    },
+  });
+  if (ran === undefined || merged === undefined) return undefined;
+  // The scrollback record the alternate buffer would have eaten: the same
+  // provider line the static flow prints, then the caller's wrote/args block.
+  opts.log(`provider: ${unit.provider} — ${unit.label}`);
+  return merged;
+}
+
+/**
+ * The unit's prompts, with the name defaulting to the deployment that already
+ * exists here: a rerun must never silently rename — and therefore re-create —
+ * a live deployment (review of #256 proved a static default did exactly that,
+ * where the old missing-value refusal used to block it). First contact, with
+ * no main.tf to read, defaults to "fleet".
+ */
+function infraPrompts(unit: SetupUnit, dir: string): PromptSpec[] {
+  let existing: string | undefined;
+  try {
+    existing = generatedName(fs.readFileSync(path.join(dir, 'main.tf'), 'utf8'));
+  } catch {
+    existing = undefined; // no deployment generated here yet
+  }
+  return unit.prompts.map((p) => (p.key === 'name' ? { ...p, fallback: () => existing ?? 'fleet' } : p));
+}
+
+/** The infra interview: on the hero screen for a real terminal, the static flow otherwise. */
+async function infraInterview(unit: SetupUnit, opts: SetupInfraOptions, dir: string, ask: Asker | undefined): Promise<Interview> {
+  const prompts = infraPrompts(unit, dir);
+  const onHero = ask && !opts.yes ? await heroInfraInterview(unit, prompts, opts, ask) : undefined;
+  if (onHero) return onHero;
+  opts.log(`provider: ${unit.provider} — ${unit.label}`);
+  return await interview(prompts, { flags: opts.flags, env: opts.env, ask, log: opts.log });
+}
+
 async function interviewAndApply(
   opts: SetupInfraOptions,
   run: Runner,
@@ -659,8 +725,7 @@ async function interviewAndApply(
   }
   if (opts.destroy) return await destroyInfra(opts, run, dir, ask);
 
-  opts.log(`provider: ${unit.provider} — ${unit.label}`);
-  const merged = await interview(unit.prompts, { flags: opts.flags, env: opts.env, ask, log: opts.log });
+  const merged = await infraInterview(unit, opts, dir, ask);
   if (merged.missing.length > 0) {
     throw new SetupError(
       `no terminal to prompt on, and these were not supplied: ${merged.missing.join(' ')}\n` +
@@ -1874,10 +1939,12 @@ async function heroInterview(prompts: PromptSpec[], opts: SetupRepoOptions, ask:
   if (!detected) return undefined;
   const sources = summarySources(opts.cwd, opts.env, opts.home);
   let merged: Interview | undefined;
+  const place = homely(opts.cwd, opts.home ?? os.homedir());
   const took = await offerOnHeroScreen({
     out: process.stdout,
     env: opts.env,
-    place: homely(opts.cwd, opts.home ?? os.homedir()),
+    lead: `Setting up ${place}`,
+    heading: 'Here is what this repo says about itself:',
     summary: planSummary(detected, sources).map(dimCitation),
     question: '  use this?',
     // The [Y/n] is appended inside confirm(), so the dim wraps the asker: the
@@ -1894,7 +1961,7 @@ async function heroInterview(prompts: PromptSpec[], opts: SetupRepoOptions, ask:
     },
   });
   if (took === undefined || merged === undefined) return undefined;
-  opts.log(`  Setting up ${opts.cwd}`);
+  opts.log(`  Setting up ${place}`);
   opts.log('');
   opts.log(took ? '  using what this repo says about itself:' : '  using your answers:');
   opts.log('');

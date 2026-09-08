@@ -188,22 +188,27 @@ const AWS: SetupUnit = {
   prompts: [
     {
       key: 'name',
-      question: 'name',
-      hint: 'tags every resource (cost tracking) and names the deployment for teardown',
+      question: 'name this deployment',
+      hint: 'every resource it creates is tagged with it, and teardown targets it',
+      // No fallback here: setup.ts's infraPrompts injects one per call — the
+      // existing deployment's name on a rerun (a silent rename re-creates the
+      // deployment's identity), "fleet" on first contact. A duplicate name in
+      // one account fails mid-apply (AlreadyExists), not at plan — plan never
+      // checks account-level uniqueness — so the default must never guess.
       required: true,
       validate: validateName,
     },
     {
       key: 'region',
-      question: 'region',
+      question: 'AWS region to deploy into',
       fallback: (env) => env.AWS_REGION ?? env.AWS_DEFAULT_REGION ?? 'us-east-1',
       required: true,
       validate: validateRegion,
     },
     {
       key: 'vpc_id',
-      question: 'existing VPC to deploy into',
-      hint: 'blank creates a dedicated VPC — the default, and what most operators want',
+      question: 'existing VPC to reuse',
+      hint: 'Enter creates a dedicated VPC — the default, and what most operators want',
       fallback: () => '',
       validate: (v) => (v === '' ? undefined : validateVpcId(v)),
     },

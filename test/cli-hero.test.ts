@@ -67,7 +67,8 @@ test('the follow-up runs on the screen: its two rows are real, and restore waits
   const took = await offerOnHeroScreen({
     out: tty,
     env: {},
-    place: '~/repo',
+    lead: 'Setting up ~/repo',
+    heading: 'Here is what this repo says about itself:',
     summary: ['  jobs run in   node:24'],
     question: '  use this?',
     confirm: async (q) => ((confirmPrompt = q), order.push('confirm'), false),
@@ -130,7 +131,7 @@ test('the hero screen refuses everything that is not a human terminal', async ()
       throw new Error('wrote to a non-terminal');
     },
   } as unknown as NodeJS.WriteStream;
-  const base = { out: untouchable, env: {}, place: 'here', summary: [], question: 'use this?', confirm: async () => true };
+  const base = { out: untouchable, env: {}, lead: 'here', heading: 'h:', summary: [], question: 'use this?', confirm: async () => true };
 
   assert.equal(await offerOnHeroScreen(base), undefined, 'a pipe never sees the screen');
 
@@ -140,4 +141,35 @@ test('the hero screen refuses everything that is not a human terminal', async ()
 
   const tiny = { ...untouchable, isTTY: true, columns: 20, rows: 6 } as unknown as NodeJS.WriteStream;
   assert.equal(await offerOnHeroScreen({ ...base, out: tiny }), undefined, 'a terminal too small falls back whole');
+});
+
+
+test('no confirm means the interview starts immediately, accepted', async () => {
+  // The infra interview has no plan to confirm: the screen opens straight into
+  // its questions. A [Y/n] rendered here would be a question nobody asked.
+  let buf = '';
+  const tty = {
+    isTTY: true,
+    columns: 120,
+    rows: 40,
+    write: (s: string) => ((buf += s), true),
+  } as unknown as NodeJS.WriteStream;
+  const order: string[] = [];
+  const took = await offerOnHeroScreen({
+    out: tty,
+    env: {},
+    lead: 'Standing up a deployment from ~/repo',
+    heading: 'Your own cloud, in your own account:',
+    summary: ['  provider   aws'],
+    question: '  existing VPC to reuse [none]: vpc-0123456789abcdef0',
+    followUp: async (stage, accepted) => {
+      order.push(`followUp accepted=${accepted}`);
+      stage.note('  a hint');
+      stage.clearPrompt();
+    },
+  });
+  assert.equal(took, true, 'no confirm means accepted');
+  assert.deepEqual(order, ['followUp accepted=true'], 'the interview ran on the screen without a gate');
+  assert.ok(!buf.includes('[Y/n]'), 'no confirm question rendered');
+  assert.ok(buf.includes('\x1b[?1049l'), 'the screen still restores');
 });

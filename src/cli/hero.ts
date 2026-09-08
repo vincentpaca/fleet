@@ -130,7 +130,7 @@ export type HeroStage = {
 };
 
 /** Word-wrap into at most two rows of `width`; a third row becomes an ellipsis. */
-function wrapNote(text: string, width: number): string[] {
+export function wrapNote(text: string, width: number): string[] { // consumers: the stage below, setup.ts's infra hero summary
   const rows: string[] = [];
   let cur = '';
   for (const word of text.split(/\s+/)) {
@@ -169,15 +169,15 @@ function stageFor(out: NodeJS.WriteStream, layout: HeroLayout): HeroStage {
 
 /** Everything under the dart, in reading order. The last three rows are the
  *  stage: a separator and the two note rows, blank until the interview speaks. */
-function heroBody(place: string, summary: string[]): BodyLine[] {
+function heroBody(lead: string, heading: string, summary: string[]): BodyLine[] {
   return [
     { text: '' },
     { text: WORDMARK_STYLED, centered: true },
     { text: TAGLINE_STYLED, centered: true },
     { text: '' },
-    { text: `Setting up ${place}` },
+    { text: lead },
     { text: '' },
-    { text: 'Here is what this repo says about itself:' },
+    { text: heading },
     { text: '' },
     ...summary.map((text) => ({ text })),
     { text: '' },
@@ -202,19 +202,23 @@ function heroBody(place: string, summary: string[]): BodyLine[] {
 export async function offerOnHeroScreen(opts: {
   out: NodeJS.WriteStream;
   env: Record<string, string | undefined>;
-  /** Where setup is running, already shortened for humans. */
-  place: string;
-  /** `planSummary` rows, indentation included. */
+  /** The line under the tagline — 'Setting up ~/repo', already shortened for humans. */
+  lead: string;
+  /** The line above the summary rows. */
+  heading: string;
+  /** Summary rows, indentation included. */
   summary: string[];
+  /** The widest prompt line, for width reservation — and the confirm's question when one runs. */
   question: string;
-  confirm: (question: string) => Promise<boolean>;
+  /** Absent means no plan to confirm: the follow-up starts immediately, accepted. */
+  confirm?: (question: string) => Promise<boolean>;
   /** Runs after the answer, still on the screen: the rest of the interview. */
   followUp?: (stage: HeroStage, accepted: boolean) => Promise<void>;
 }): Promise<boolean | undefined> {
   const { out, env } = opts;
   if (out.isTTY !== true || 'NO_COLOR' in env || env.CI !== undefined) return undefined;
   const art = detectColorLevel(env) === '24bit' ? DART_HERO.truecolor : DART_HERO.c256;
-  const bodyLines = heroBody(opts.place, opts.summary);
+  const bodyLines = heroBody(opts.lead, opts.heading, opts.summary);
   const layout = heroLayout({
     cols: out.columns,
     rows: out.rows,
@@ -241,7 +245,7 @@ export async function offerOnHeroScreen(opts: {
   }, BOB_TICK_MS);
   try {
     drawScreen(out, layout, art);
-    const took = await opts.confirm(' '.repeat(layout.promptCol - 1) + opts.question);
+    const took = opts.confirm ? await opts.confirm(' '.repeat(layout.promptCol - 1) + opts.question) : true;
     if (opts.followUp) await opts.followUp(stageFor(out, layout), took);
     return took;
   } finally {

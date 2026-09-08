@@ -148,11 +148,11 @@ test('setup infra: a rejected answer is asked again, not accepted', async () => 
   const res = await runCli(['setup', 'infra'], {
     cwd: s.cwd,
     env: { ...s.env, FLEET_FORCE_TTY: '1' },
-    // An empty name (required), then a name AWS would reject, then a good one.
-    stdin: '\nNot A Name\ndemo\n\n\ny\n',
+    // A name AWS would reject, then a good one. (Enter is no longer a way to
+    // hit "required" here — name falls back to "fleet".)
+    stdin: 'Not A Name\ndemo\n\n\ny\n',
   });
   assert.equal(res.code, 0, res.stderr);
-  assert.match(res.stdout, /required/);
   assert.match(res.stdout, /lower-case letters/);
   assert.match(fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8'), /name\s*=\s*"demo"/);
 });
@@ -198,11 +198,33 @@ test('setup infra headless: flags supply every prompt, and nothing is asked', as
 
 test('setup infra headless: a missing value exits naming its flag, before terraform', async () => {
   const s = scratch();
-  const res = await runCli(['setup', 'infra', '--region', 'us-east-1', '--yes'], { cwd: s.cwd, env: s.env });
+  // Every base prompt now has a default (name falls back to "fleet"), so the
+  // missing value that still exists headless is the subnets a reused VPC needs.
+  const res = await runCli(['setup', 'infra', '--vpc-id', 'vpc-0abc123', '--yes'], { cwd: s.cwd, env: s.env });
   assert.equal(res.code, 1);
-  assert.match(res.stderr, /--name/, 'names the flag that was missing');
+  assert.match(res.stderr, /--subnet-ids/, 'names the flag that was missing');
   assert.deepEqual(subcommands(s.calls()), ['version'], 'preflight only — nothing was planned');
   assert.ok(!fs.existsSync(path.join(s.cwd, '.fleet', 'infra')), 'nothing generated');
+});
+
+test('setup infra: first contact all-defaults stands up "fleet"', async () => {
+  const s = scratch();
+  const res = await runCli(['setup', 'infra', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8'), /name\s*=\s*"fleet"/);
+});
+
+test('setup infra: a rerun keeps the deployed name — never a silent rename', async () => {
+  // Review of #256 proved a static default did exactly this: a flagless
+  // headless rerun rewrote a live deployment to name="fleet" and applied it,
+  // where the old missing-value refusal used to block. A rename re-creates the
+  // deployment's identity (cluster, roles, log groups), so the rerun default
+  // must be the name that is already deployed.
+  const s = scratch();
+  assert.equal((await runCli(['setup', 'infra', '--name', 'demo', '--yes'], { cwd: s.cwd, env: s.env })).code, 0);
+  const rerun = await runCli(['setup', 'infra', '--yes'], { cwd: s.cwd, env: s.env });
+  assert.equal(rerun.code, 0, rerun.stderr);
+  assert.match(fs.readFileSync(path.join(infraDir(s.cwd), 'main.tf'), 'utf8'), /name\s*=\s*"demo"/, 'a flagless rerun renamed the deployment');
 });
 
 test('setup infra headless: no --yes stops at the plan instead of applying unasked', async () => {
@@ -757,6 +779,9 @@ test('merge: a flag wins over its prompt, and the prompt is not asked', async ()
 });
 
 test('merge: Enter takes the fallback, and an unanswerable prompt keeps asking', async () => {
+  // The raw unit's name prompt has no fallback by design: setup.ts injects one
+  // per call (the existing deployment's name, or "fleet" on first contact), so
+  // here Enter is not an answer and the prompt asks again.
   const { asker } = scriptedAsker(['', 'demo', '', '']);
   const merged = await interview(AWS.prompts, { flags: {}, env: { AWS_REGION: 'us-west-2' }, ask: asker, log: quiet });
   assert.deepEqual(merged.answers, { name: 'demo', region: 'us-west-2', vpc_id: '' });
@@ -765,8 +790,17 @@ test('merge: Enter takes the fallback, and an unanswerable prompt keeps asking',
 
 test('merge: headless collects every missing flag rather than failing on the first', async () => {
   const merged = await interview(AWS.prompts, { flags: {}, env: {}, log: quiet });
-  assert.deepEqual(merged.missing, ['--name'], 'region and vpc-id have defaults; name cannot');
+  assert.deepEqual(merged.missing, ['--name'], 'region and vpc-id have defaults; the raw unit name cannot');
   assert.equal(merged.answers.region, 'us-east-1');
+
+  // Collection, not first-failure: two required prompts with no defaults are
+  // both named, so a script fixes its invocation once.
+  const twoBare = [
+    { ...AWS.prompts[0], fallback: undefined },
+    { ...AWS.prompts[1], fallback: undefined },
+  ];
+  const missing = await interview(twoBare, { flags: {}, env: {}, log: quiet });
+  assert.deepEqual(missing.missing, ['--name', '--region'], 'every gap named in one pass');
 });
 
 test('merge: a prompt its predecessor made irrelevant is skipped, both ways', async () => {
