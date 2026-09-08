@@ -5,6 +5,53 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.3.1 — 2026-09-08
+
+Two fixes to first contact, both from watching a real operator meet 0.3.0: the
+three setups now form one journey, and the skill Fleet installs into your
+coding agent stops teaching commands the CLI refuses.
+
+### What's new for you
+
+- **The setups are connected.** Each one ends by offering the first missing
+  piece: `fleet setup repo` with no reachable deployment asks whether to stand
+  one up — Enter is a no, and nothing ever falls into terraform by default —
+  and a finished `fleet setup infra` offers to install the skill (Enter is a
+  yes; it is one reversible file copy, and only offered when a coding agent is
+  actually on the machine). Bare `fleet setup` prints where the repo stands —
+  manifest, deployment, agent skill — and on a terminal walks you into the
+  first missing piece. `--yes`, `--destroy` and `--rebuild-images` never
+  chain: a scripted run gets no offers.
+- **The "Next" block stops pointing at dead ends.** With no reachable
+  deployment it names `fleet setup infra` instead of recommending a
+  `fleet delegate` no daemon would receive — and "reachable" is judged by the
+  same rule dispatch uses, so a half-captured config that `delegate` would
+  skip no longer counts.
+- **The installed skill teaches the contract the CLI actually has.** 0.3.0's
+  copy predated the delegate rework: it taught `fleet delegate 42` (now
+  refused — an issue or PR target needs `--prompt`) and an artifacts `-o`
+  flag that never existed (`--out`). Both were found by executing every
+  command the skill documents; a new gate now holds every `fleet` line in the
+  skill against `fleet --help`, so this class of drift cannot ship again.
+
+### Upgrade notes
+
+- **Re-run `fleet setup harness` wherever the skill is installed.** The 0.3.0
+  copy teaches a dispatch the CLI refuses and a flag it doesn't have. An
+  unedited install refreshes in place; a hand-edited copy is refused and takes
+  `--force` (your edits are not recoverable after it — read the refusal).
+- Nothing else: no schema, infra or image changes — a 0.3.0 deployment works
+  with this CLI unchanged.
+
+### Breaking changes
+
+None.
+
+### All merged PRs
+
+- #251: #250: Chain the three setups by offer, never by fall-through
+- #254: #252: The installed skill teaches a dead delegate contract and a flag that doesn't exist
+
 ## 0.3.0 — 2026-09-07
 
 One pull request, two halves of the same idea: Fleet stops speaking for you.
