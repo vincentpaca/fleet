@@ -869,6 +869,37 @@ test('pinned source: a git source with a ref yields the repository and ref, noth
   assert.equal(pinnedSource('git::ssh://git@git.invalid/fleet.git//infra/aws?ref=v9'), undefined, 'a build host clones anonymously — ssh is not a source it can fetch');
 });
 
+test('module source: an npm install derives its own release — repository plus v<version>', () => {
+  // The chain offered "stand one up now?" to an npm install and a yes
+  // face-planted at this refusal (#263). The install knows which Fleet it is:
+  // the publish pipeline tags v<version> before npm sees the package, and main
+  // carries the last released version, so a git install derives honestly too.
+  const root = makeTempDir('fleet-npm-root-');
+  fs.writeFileSync(
+    path.join(root, 'package.json'),
+    JSON.stringify({ name: 'ownfleet', version: '9.9.9', repository: { type: 'git', url: 'git+https://github.com/acme/fleet.git' } }),
+  );
+  const source = resolveModuleSource({ provider: 'aws', env: {}, root });
+  assert.equal(source, 'git::https://github.com/acme/fleet.git//infra/aws?ref=v9.9.9');
+});
+
+test('module source: a checkout outranks the release fallback — dogfood pins its own commit', () => {
+  const root = makeTempDir('fleet-dual-root-');
+  fs.mkdirSync(path.join(root, 'infra', 'aws'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'infra', 'aws', 'main.tf'), 'module "fleet" {}\n');
+  fs.writeFileSync(
+    path.join(root, 'package.json'),
+    JSON.stringify({ version: '9.9.9', repository: 'git+https://github.com/acme/fleet.git' }),
+  );
+  const source = resolveModuleSource({
+    provider: 'aws',
+    env: {},
+    root,
+    git: (args) => (args[0] === 'remote' ? 'git@github.com:acme/fleet.git' : 'deadbeef'),
+  });
+  assert.match(source, /ref=deadbeef$/, 'a checkout must pin its own HEAD, not the last release');
+});
+
 test('module source: no unit beside the install and no override is an actionable refusal', () => {
   const root = makeTempDir('fleet-fake-root-');
   assert.throws(
