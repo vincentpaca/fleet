@@ -410,10 +410,45 @@ export function resolveModuleSource(opts: { // contract pin: test-only export, a
     }
   }
 
+  // No checkout beside this install. An npm install still knows exactly which
+  // Fleet it is: its package names the repository and the released version,
+  // the publish pipeline tags v<version> before npm ever sees the package, and
+  // main always carries the last released version (agents/release.md), so a
+  // git install derives honestly too. The unit's in-account image build clones
+  // this same ref (#189), so nothing downstream needs a local checkout (#263).
+  const release = releaseSource(opts.root, opts.provider);
+  if (release !== undefined) return release;
+
   throw new SetupError(
-    `cannot tell which Fleet terraform module to use for ${opts.provider}: this installation has no infra/${opts.provider}/ beside it with a git remote to pin\n` +
+    `cannot tell which Fleet terraform module to use for ${opts.provider}: this installation has no infra/${opts.provider}/ beside it with a git remote to pin, and its package.json names no repository to derive a release source from\n` +
       `  pass --module-source <source> (a git source such as git::https://github.com/<org>/fleet.git//infra/${opts.provider}?ref=<tag>, or the path to a Fleet checkout's infra/${opts.provider})`,
   );
+}
+
+/** The install's own release as a module source: repository + v<version>, or undefined when the package names no usable repository. */
+function releaseSource(root: string, provider: string): string | undefined {
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  const version = typeof pkg.version === 'string' ? pkg.version : undefined;
+  const raw = packageRepository(pkg);
+  const url = raw === undefined ? undefined : toHttpsGitUrl(raw.replace(/^git\+/, ''));
+  if (version === undefined || url === undefined || !/^(https?|ssh):\/\//.test(url)) return undefined;
+  return `git::${url.replace(/\.git$/, '')}.git//infra/${provider}?ref=v${version}`;
+}
+
+/** npm's two `repository` shapes: a plain string, or `{ url }`. */
+function packageRepository(pkg: Record<string, unknown>): string | undefined {
+  const repository = pkg.repository;
+  if (typeof repository === 'string') return repository;
+  if (typeof repository === 'object' && repository !== null) {
+    const url = (repository as { url?: unknown }).url;
+    if (typeof url === 'string') return url;
+  }
+  return undefined;
 }
 
 /**

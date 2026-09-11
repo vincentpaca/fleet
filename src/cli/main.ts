@@ -36,6 +36,7 @@ import {
   stdinAsker,
   confirm,
   deploymentReachable,
+  resolveModuleSource,
   type Asker,
   repoPrompts,
   harnessPrompts,
@@ -398,11 +399,32 @@ async function askYes(session: Session, question: string, defaultYes = false): P
   }
 }
 
+/** Could `setup infra` actually run from this install? An offer whose yes can only fail is worse than none. */
+function infraOfferable(): boolean {
+  try {
+    resolveModuleSource({
+      provider: SETUP_UNITS[0].provider,
+      env: process.env as Record<string, string | undefined>,
+      root: installRoot(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function chainFromRepo(session: Session): Promise<number> {
   if (!promptable()) return EXIT_OK;
   // A reachable deployment is a satisfied piece, not the end of the journey:
   // the first missing piece is then the skill.
   if (deploymentReachable(process.cwd(), process.env as Record<string, string | undefined>)) return await chainFromInfra(session);
+  if (!infraOfferable()) {
+    // Near-unreachable since the release-source fallback (#263) — only a
+    // package naming no repository lands here — kept because the offer rule
+    // is absolute. Prompt-level: no test fakes an install root.
+    console.log('later: fleet setup infra --module-source <a Fleet checkout or git source> — this install cannot derive one');
+    return EXIT_OK;
+  }
   if (!(await askYes(session, 'stand one up now? (runs terraform in your AWS account, takes a few minutes)'))) {
     console.log('later: fleet setup infra — or point FLEET_DAEMON_URL at an existing deployment');
     return EXIT_OK;
