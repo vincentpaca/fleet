@@ -84,3 +84,51 @@ test('installed fleet init scaffolds .fleet/ in a foreign cwd, and lint accepts 
   const lint = fleet(cwd, 'lint');
   assert.equal(lint.status, 0, `exit ${lint.status}: ${lint.stderr}`);
 });
+
+
+// ---------- the first-contact journey, on the shipped shape (#265) ----------
+//
+// The class these hunt: behavior that only exists in the packed layout or only
+// appears when commands are walked in the order the product sends people —
+// #263 (an offer the install couldn't honor) and #265 (doctor failing on the
+// gate setup just wrote) both lived here while the per-command suite was green.
+
+test('journey: setup repo → doctor is clean out of the box', () => {
+  const cwd = fs.mkdtempSync(join(prefix, 'journey-'));
+  fs.writeFileSync(join(cwd, 'package.json'), '{"name":"scratch"}\n');
+  const setup = fleet(cwd, 'setup', 'repo', '--repo', 'origin');
+  assert.equal(setup.status, 0, setup.stderr);
+
+  // The Next block's first pointer must not lead into a failure: the no-op
+  // gate the wizard writes has to pass the doctor that inspects it.
+  const doctor = fleet(cwd, 'doctor');
+  assert.ok(!/gate script missing/.test(doctor.stderr), `the default gate failed doctor: ${doctor.stderr}`);
+  assert.ok(!/gate script failed/.test(doctor.stderr), `the default gate failed doctor: ${doctor.stderr}`);
+  assert.equal(doctor.status, 0, `doctor found: ${doctor.stderr}`);
+  assert.match(doctor.stdout, /doctor: clean/);
+});
+
+test('journey: bare fleet setup prints the checklist from the shipped shape', () => {
+  const cwd = fs.mkdtempSync(join(prefix, 'journey-'));
+  const res = fleet(cwd, 'setup');
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /fleet setup repo/);
+  assert.match(res.stdout, /fleet setup infra/);
+  assert.match(res.stdout, /fleet setup harness/);
+});
+
+test('journey: the refusals teach the living contract', () => {
+  const cwd = fs.mkdtempSync(join(prefix, 'journey-'));
+  fs.writeFileSync(join(cwd, 'package.json'), '{"name":"scratch"}\n');
+  assert.equal(fleet(cwd, 'setup', 'repo', '--repo', 'origin').status, 0, 'the refusals are asked of a set-up repo');
+  const bare = fleet(cwd, 'delegate', '42');
+  assert.equal(bare.status, 1);
+  assert.match(bare.stderr, /--prompt/, 'the bare-number refusal names the flag to add');
+
+  const badFlag = fleet(cwd, 'artifacts', 'job-1', 'get', 'x', '-o', '.');
+  assert.equal(badFlag.status, 2, 'the -o the docs once taught stays a usage error');
+
+  const unknown = fleet(cwd, 'frobnicate');
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /unknown command/);
+});

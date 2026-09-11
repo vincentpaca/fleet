@@ -1713,7 +1713,10 @@ function gateScriptFile(pickup: string): string | undefined {
   let skipNext = false;
   for (const token of tokens) {
     if (skipNext) { skipNext = false; continue; }
-    if (token === '-c' || token === '--command') { skipNext = true; continue; }
+    // -c/--command and -e/--eval both take a code snippet, not a file: the
+    // no-op gate `node -e "process.exit(0)"` read as a script path is how a
+    // fresh repo's doctor failed on the gate setup itself just wrote (#265).
+    if (token === '-c' || token === '--command' || token === '-e' || token === '--eval') { skipNext = true; continue; }
     if (token.startsWith('-') || INTERPRETERS.has(token)) continue;
     return token;
   }
