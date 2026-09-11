@@ -47,7 +47,7 @@ import {
   SETUP_STUB,
 } from './setup.ts';
 import { loadDotEnv } from '../shared/dotenv.ts';
-import { appliedUnitPins, skewReport, type DaemonBuild } from './skew.ts';
+import { appliedUnitPins, cliIdentity, skewReport, type DaemonBuild } from './skew.ts';
 import { runUpgrade } from './upgrade.ts';
 import { runCanary } from './canary.ts';
 import {
@@ -1863,11 +1863,24 @@ async function doctorSkew(cwd: string): Promise<{ notes: string[]; findings: str
   const pins = appliedUnitPins(cwd);
   if (pins.length === 0) return { notes: [], findings: [] };
   const root = installRoot();
+  const cli = cliIdentity(root);
+  if (cli.kind === 'unreleased') {
+    // A note, not a finding: an unidentifiable CLI (a prerelease, an offline
+    // machine) leaves the deployment uncompared — it does not make it sick.
+    const why =
+      cli.reason === 'no such tag'
+        ? `version ${cli.version} has no v${cli.version} tag on ${cli.repository}`
+        : `${cli.repository} could not be reached to resolve the v${cli.version} tag`;
+    return { notes: [`skew: cannot identify this CLI — ${why} — the deployment goes uncompared`], findings: [] };
+  }
   return skewReport({
-    cliSha: gitValue(['rev-parse', 'HEAD'], root),
+    cli,
     pins,
     daemon: await daemonBuild(),
-    resolveRef: (ref) => gitValue(['rev-parse', '--verify', `${ref}^{commit}`], root),
+    // A version-identified CLI has no checkout to resolve refs in; a pin that
+    // is not its own tag or a sha compares unresolved, which is honest skew.
+    resolveRef: (ref) =>
+      cli.kind === 'checkout' ? gitValue(['rev-parse', '--verify', `${ref}^{commit}`], root) : undefined,
   });
 }
 

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { runCli, makeTempDir, startMockDaemon, sendJson } from './cli-helpers.ts';
+import { runCli, makeTempDir, startMockDaemon, sendJson, fakeNpmInstall, bareRemoteWithTag } from './cli-helpers.ts';
 
 // Minimal valid-for-doctor manifest; sync/env.vars empty so no base findings.
 const BASE_MANIFEST = {
@@ -42,7 +42,7 @@ const EMPTY_HOME = makeTempDir('fleet-doctor-home-');
 
 function runDoctor(
   args: string[],
-  opts: { cwd?: string; env?: Record<string, string | undefined> } = {},
+  opts: { cwd?: string; env?: Record<string, string | undefined>; cli?: string } = {},
 ): ReturnType<typeof runCli> {
   return runCli(args, { ...opts, env: { FLEET_HOME: EMPTY_HOME, ...opts.env } });
 }
@@ -435,7 +435,8 @@ test('doctor: a daemon that predates the reconcile endpoint stays clean (#147)',
 // its work, and nothing named the gap. doctor compares the applied unit ref
 // (deployment-local .fleet/infra/<provider>/main.tf) and the daemon image's
 // build stamp (/health `build`, baked by images/build.sh) against this CLI's
-// own checkout — git SHAs until #183 mints release versions.
+// own identity — its HEAD commit from a checkout, or its release tag from an
+// npm install (#239, tested further down).
 
 // The suite runs from a checkout, so HEAD is the CLI's own identity — the same
 // value doctor resolves, read the same way.
@@ -577,6 +578,89 @@ test('doctor: skew keeps working with no daemon reachable — the unit ref is st
   assert.match(res.stderr, /nothing is listening/);
   assert.match(res.stderr, /deployment skew: aws unit is applied at ref/);
   assert.ok(!res.stderr.includes('daemon image'), 'the unreachable image is not a second finding');
+});
+
+// ── Release identity (#239) ──────────────────────────────────────────────────
+// An npm install carries no HEAD; it identifies by the v<version> tag its
+// package.json names, resolved on the package's own repository. These tests
+// run a real npm-install-shaped copy of the package against a local stand-in
+// remote — no network anywhere.
+
+test('doctor: an npm-installed CLI at the deployment tag is clean (#239)', async (t) => {
+  const remote = bareRemoteWithTag('v9.9.9');
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: remote.url });
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, 'v9.9.9');
+  // The daemon image was built from the tag's clone, so its stamp is a commit
+  // sha — it must compare against the tag's resolved commit, not its name.
+  const daemon = await healthDaemon(remote.sha);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url }, cli });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.match(
+    res.stdout,
+    new RegExp(`skew: deployment matches this CLI at v9\\.9\\.9 \\(unit ref v9\\.9\\.9, daemon image ${remote.sha.slice(0, 12)}\\)`),
+  );
+});
+
+test('doctor: a sha-pinned deployment compares by commit under a version-identified CLI (#239)', async (t) => {
+  // The mixed case: setup from a checkout pinned a sha, and doctor now runs
+  // from an npm install of the release that sha became.
+  const remote = bareRemoteWithTag('v9.9.9');
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: remote.url });
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, remote.sha);
+  const daemon = await healthDaemon(remote.sha);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url }, cli });
+  assert.equal(res.code, 0, `expected clean but got: ${res.stderr}`);
+  assert.match(res.stdout, /skew: deployment matches this CLI at v9\.9\.9/);
+});
+
+test('doctor: npm CLI over a deployment at an older tag is a finding (#239)', async (t) => {
+  const remote = bareRemoteWithTag('v9.9.9');
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: remote.url });
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, 'v9.9.8');
+  const daemon = await healthDaemon(remote.sha);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url }, cli });
+  assert.equal(res.code, 1, `expected a finding but got: ${res.stdout}`);
+  const lines = stderrLines(res.stderr);
+  assert.equal(lines.length, 1, `exactly one finding:\n${res.stderr}`);
+  assert.match(lines[0], /deployment skew: aws unit is applied at ref v9\.9\.8, this CLI is at v9\.9\.9/);
+  assert.match(lines[0], /run fleet upgrade/, 'the command that owns the fix');
+});
+
+test('doctor: a version with no tag on the remote is an honest note, never a fake identity (#239)', async (t) => {
+  const remote = bareRemoteWithTag(); // a repository, but nothing released on it
+  const cli = fakeNpmInstall({ version: '9.9.9-pre.1', repositoryUrl: remote.url });
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, 'v9.9.8');
+  const daemon = await healthDaemon(remote.sha);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url }, cli });
+  assert.equal(res.code, 0, `an unidentifiable CLI is a note, not a finding: ${res.stderr}`);
+  assert.match(res.stdout, /skew: cannot identify this CLI/);
+  assert.match(res.stdout, new RegExp(`no v9\\.9\\.9-pre\\.1 tag on ${remote.url}`));
+  assert.ok(!`${res.stdout}${res.stderr}`.includes('#183'), 'the spent promise is gone');
+});
+
+test('doctor: an unreachable repository is named, and the deployment goes uncompared (#239)', async (t) => {
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: path.join(makeTempDir('fleet-doctor-gone-'), 'absent') });
+  const cwd = setupDir(BASE_MANIFEST, 'process.exit(0);\n');
+  writeDeployment(cwd, 'v9.9.8');
+  const daemon = await healthDaemon(STALE_SHA);
+  t.after(() => daemon.close());
+
+  const res = await runDoctor(['doctor'], { cwd, env: { FLEET_DAEMON_URL: daemon.url }, cli });
+  assert.equal(res.code, 0, `expected a note, not a finding: ${res.stderr}`);
+  assert.match(res.stdout, /skew: cannot identify this CLI/);
+  assert.match(res.stdout, /could not be reached/);
 });
 
 

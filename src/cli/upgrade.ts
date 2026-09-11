@@ -8,8 +8,9 @@
  * those gaps; this command closes them, re-entering the machinery that
  * created the deployment rather than growing a second convention:
  *
- *   1. the target is the CLI's own git SHA — the same anchor doctor's skew
- *      check compares against (./skew.ts), read the same way;
+ *   1. the target is the CLI's own identity — a checkout's HEAD commit, or the
+ *      release tag an npm install's version names (#239) — the same anchor
+ *      doctor's skew check compares against (./skew.ts), read the same way;
  *   2. the re-pin is a string edit of the deployment-local main.tf's `?ref=`
  *      — the same one-line edit the operator was doing by hand;
  *   3. init/plan/apply and the capture are `fleet setup infra`'s own steps
@@ -29,7 +30,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { gitValue } from '../shared/git.ts';
-import { appliedUnitPins, sameCommit, shortSha, type UnitPin } from './skew.ts';
+import { appliedUnitPins, cliIdentity, sameCommit, shortSha, type UnitPin } from './skew.ts';
 import { unitFor, type SetupUnit } from './setup-units.ts';
 import {
   SetupError,
@@ -60,18 +61,22 @@ export type UpgradeOptions = {
 };
 
 /**
- * What upgrade would converge: this CLI's commit, and every pin behind it.
+ * What upgrade would converge: this CLI's identity, and every pin behind it.
  * The three ways the answer cannot exist are refusals with the way out named
- * — an install with no SHA, a directory with no deployment, and a pin with no
- * ref to re-pin.
+ * — an install with no identity, a directory with no deployment, and a pin
+ * with no ref to re-pin.
  */
-function upgradeTargets(opts: UpgradeOptions): { cliSha: string; stale: UnitPin[] } {
-  const cliSha = gitValue(['rev-parse', 'HEAD'], opts.root);
-  if (cliSha === undefined) {
-    // The same honest silence doctor's skew section keeps: an npm install
-    // carries no git SHA, so there is no commit to converge to (#183).
+function upgradeTargets(opts: UpgradeOptions): { cli: { ref: string; sha: string }; stale: UnitPin[] } {
+  const cli = cliIdentity(opts.root);
+  if (cli.kind === 'unreleased') {
+    // Refusing beats pinning: a ref the remote does not carry is one the
+    // module source and the in-account image build could never clone (#239).
     throw new SetupError(
-      'this CLI is not a git checkout, so it has no commit to converge the deployment to (#183 will version releases)',
+      cli.reason === 'no such tag'
+        ? `this CLI is not a git checkout, and version ${cli.version} has no v${cli.version} tag on ${cli.repository} — a prerelease or locally-built package pins nothing a deployment could clone\n` +
+          '  upgrade from a released install (npm i -g ownfleet) or from a checkout'
+        : `this CLI is not a git checkout, and ${cli.repository} could not be reached to resolve its v${cli.version} tag\n` +
+          '  check network access to the repository and rerun',
     );
   }
   const pins = appliedUnitPins(opts.cwd);
@@ -81,7 +86,7 @@ function upgradeTargets(opts: UpgradeOptions): { cliSha: string; stale: UnitPin[
         '  fleet setup infra stands one up; upgrade converges what setup created',
     );
   }
-  const stale = pins.filter((pin) => !upToDate(pin, cliSha, opts.root));
+  const stale = pins.filter((pin) => !upToDate(pin, cli, opts.root));
   const unpinned = stale.find((pin) => pin.ref === undefined);
   if (unpinned !== undefined) {
     throw new SetupError(
@@ -89,7 +94,7 @@ function upgradeTargets(opts: UpgradeOptions): { cliSha: string; stale: UnitPin[
         '  re-apply it with fleet setup infra: a pinned module source is what makes a deployment convergeable',
     );
   }
-  return { cliSha, stale };
+  return { cli, stale };
 }
 
 /**
@@ -100,10 +105,10 @@ function upgradeTargets(opts: UpgradeOptions): { cliSha: string; stale: UnitPin[
  */
 export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   const run = opts.run ?? spawnRunner;
-  const { cliSha, stale } = upgradeTargets(opts);
+  const { cli, stale } = upgradeTargets(opts);
   if (stale.length === 0) {
     // Before any preflight or terraform: nothing to do needs nothing proven.
-    opts.log(`nothing to do: the deployment is already at this CLI's commit (${shortSha(cliSha)})`);
+    opts.log(`nothing to do: the deployment is already at this CLI's version (${shortSha(cli.ref)})`);
     return 0;
   }
 
@@ -119,7 +124,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
       // Before the first edit, exactly as setup infra orders it: a re-pin that
       // then dies on a missing binary leaves a file describing nothing.
       preflight(unit, opts.cwd, run);
-      const applied = await upgradeOne(pin, unit, cliSha, opts, run, ask);
+      const applied = await upgradeOne(pin, unit, cli.ref, opts, run, ask);
       if (!applied) return 0;
     }
   } finally {
@@ -128,13 +133,16 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<number> {
   return 0;
 }
 
-/** Is this pin already at the CLI's commit? Ref-less pins are never "done" — the caller refuses them by name. */
-function upToDate(pin: UnitPin, cliSha: string, root: string): boolean {
+/** Is this pin already at the CLI's identity? Ref-less pins are never "done" — the caller refuses them by name. */
+function upToDate(pin: UnitPin, cli: { ref: string; sha: string }, root: string): boolean {
   if (pin.ref === undefined) return false;
-  // A tag ref compares by the commit it names, resolved in the CLI's own
-  // checkout — the same resolution doctor's skew section uses.
+  // A pin at the CLI's own tag matches by name; anything else compares by the
+  // commit it names — resolved in the CLI's checkout when there is one, or
+  // taken as-is when the pin is already a sha (the mixed case: a sha-pinned
+  // deployment inspected by a version-identified CLI).
+  if (pin.ref === cli.ref) return true;
   const resolved = gitValue(['rev-parse', '--verify', `${pin.ref}^{commit}`], root);
-  return sameCommit(resolved ?? pin.ref, cliSha);
+  return sameCommit(resolved ?? pin.ref, cli.sha);
 }
 
 /** The `source_ref` module argument (#189), hoisted so Lizard's TS-as-C parse
@@ -143,7 +151,7 @@ const SOURCE_REF_RE = /(source_ref\s*=\s*")[^"]*(")/;
 
 /**
  * The re-pinned file text: the module source's `?ref=` swapped for the CLI's
- * sha, and — when the file carries one — the `source_ref` module argument with
+ * identity ref (a commit sha, or a release tag — both clone), and — when the file carries one — the `source_ref` module argument with
  * it, because setup derived that argument from this very pin (#189: images and
  * infra move as one ref or not at all) and a re-pin that missed it would have
  * the in-account build clone the ref the apply just left behind. Nothing else
@@ -151,15 +159,15 @@ const SOURCE_REF_RE = /(source_ref\s*=\s*")[^"]*(")/;
  * split/join rather than replace for the source, so a sha in the replacement
  * can never be read as a replacement pattern.
  */
-export function repinnedMainTf(text: string, pin: UnitPin, cliSha: string): string { // contract pin: test-only export, asserted by the suite
+export function repinnedMainTf(text: string, pin: UnitPin, cliRef: string): string { // contract pin: test-only export, asserted by the suite
   const source = pin.source;
-  const repinned = source.replace(/([?&]ref=)[^&"\s]+/, `$1${cliSha}`);
+  const repinned = source.replace(/([?&]ref=)[^&"\s]+/, `$1${cliRef}`);
   if (!text.includes(source) || repinned === source) {
     throw new SetupError(
       `cannot re-pin ${pin.provider}: its main.tf no longer contains the module source that was read from it (${source})`,
     );
   }
-  return text.split(source).join(repinned).replace(SOURCE_REF_RE, `$1${cliSha}$2`);
+  return text.split(source).join(repinned).replace(SOURCE_REF_RE, `$1${cliRef}$2`);
 }
 
 /**
@@ -170,7 +178,7 @@ export function repinnedMainTf(text: string, pin: UnitPin, cliSha: string): stri
 async function upgradeOne(
   pin: UnitPin,
   unit: SetupUnit,
-  cliSha: string,
+  cliRef: string,
   opts: UpgradeOptions,
   run: Runner,
   ask: Asker | undefined,
@@ -179,8 +187,8 @@ async function upgradeOne(
   const mainTf = path.join(dir, 'main.tf');
   const shownTf = path.relative(opts.cwd, mainTf);
   const before = fs.readFileSync(mainTf, 'utf8');
-  fs.writeFileSync(mainTf, repinnedMainTf(before, pin, cliSha));
-  opts.log(`re-pinned ${shownTf}: ref ${shortSha(pin.ref!)} -> ${shortSha(cliSha)}`);
+  fs.writeFileSync(mainTf, repinnedMainTf(before, pin, cliRef));
+  opts.log(`re-pinned ${shownTf}: ref ${shortSha(pin.ref!)} -> ${shortSha(cliRef)}`);
 
   const planFile = 'fleet.tfplan';
   // Any ending short of an apply restores the file byte-for-byte and drops the
@@ -197,7 +205,7 @@ async function upgradeOne(
     // 2026-08-26/27 cycle in one flag.
     terraformStep(run, dir, ['init', '-input=false', '-upgrade'], 'init');
     terraformStep(run, dir, ['plan', '-input=false', `-out=${planFile}`], 'plan');
-    if (!opts.yes && !(await planApproved(pin, cliSha, opts, ask))) {
+    if (!opts.yes && !(await planApproved(pin, cliRef, opts, ask))) {
       revert();
       opts.log(`nothing applied. ${shownTf} restored to ref ${shortSha(pin.ref!)} — it keeps describing what is deployed.`);
       return false;
@@ -215,12 +223,12 @@ async function upgradeOne(
 }
 
 /** The plan gate. Headless without --yes has nobody to consent, so it is a no — and says what would continue. */
-async function planApproved(pin: UnitPin, cliSha: string, opts: UpgradeOptions, ask: Asker | undefined): Promise<boolean> {
+async function planApproved(pin: UnitPin, cliRef: string, opts: UpgradeOptions, ask: Asker | undefined): Promise<boolean> {
   if (!ask) {
     opts.log('planned only: no terminal to confirm on. Rerun with --yes to apply.');
     return false;
   }
-  return await confirm(`apply this plan, upgrading the ${pin.provider} deployment to ${shortSha(cliSha)}?`, ask);
+  return await confirm(`apply this plan, upgrading the ${pin.provider} deployment to ${shortSha(cliRef)}?`, ask);
 }
 
 /**

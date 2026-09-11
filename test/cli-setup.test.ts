@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { validateManifest } from '../src/validate.mjs';
-import { runCli, makeTempDir, fakeCloudBin, startMockDaemon, sendJson } from './cli-helpers.ts';
+import { runCli, makeTempDir, fakeCloudBin, startMockDaemon, sendJson, fakeNpmInstall, bareRemoteWithTag } from './cli-helpers.ts';
 import {
   interview,
   renderMainTf,
@@ -717,6 +717,59 @@ test('upgrade: no deployment here is an actionable refusal', async () => {
   assert.match(res.stderr, /no deployment to upgrade/);
   assert.match(res.stderr, /fleet setup infra/, 'names the command that creates one');
   assert.deepEqual(s.calls(), [], 'nothing ran');
+});
+
+// ---------- fleet upgrade from an npm install (#239) ----------
+// No checkout, no HEAD: the CLI identifies by the v<version> tag its
+// package.json names, verified on a local stand-in remote — never the network.
+
+test('upgrade from an npm install: re-pins at the released tag and converges', async () => {
+  const remote = bareRemoteWithTag('v9.9.9');
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: remote.url });
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}` });
+  const { mainTf } = await staleDeployment(s);
+
+  const res = await runCli(['upgrade', '--yes'], { cwd: s.cwd, env: s.env, cli });
+  assert.equal(res.code, 0, res.stderr);
+
+  const text = fs.readFileSync(mainTf, 'utf8');
+  assert.match(text, /\?ref=v9\.9\.9"/, 'the root module is re-pinned at the released tag');
+  assert.ok(!text.includes(STALE_SHA), 'the stale ref is gone — from the source AND the source_ref module arg');
+  assert.match(text, /source_ref\s+= "v9\.9\.9"/, '#189: the in-account build clones the same tag');
+  assert.deepEqual(subcommands(s.calls()), ['version', 'init', 'plan', 'apply', 'output']);
+  assert.equal(s.buildCalls().filter((line) => line.startsWith('codebuild start-build')).length, 1);
+  assert.match(res.stdout, /skew: deployment matches this CLI at v9\.9\.9/);
+});
+
+test('upgrade from an npm install: a deployment already at the release commit is nothing to do', async () => {
+  // The mixed case: setup from a checkout pinned the sha this release became.
+  const remote = bareRemoteWithTag('v9.9.9');
+  const cli = fakeNpmInstall({ version: '9.9.9', repositoryUrl: remote.url });
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${remote.sha}` });
+  const { mainTf } = await staleDeployment(s);
+  const before = fs.readFileSync(mainTf, 'utf8');
+
+  const res = await runCli(['upgrade'], { cwd: s.cwd, env: s.env, cli });
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /nothing to do: .*\(v9\.9\.9\)/);
+  assert.deepEqual(s.calls(), [], 'no terraform ran');
+  assert.equal(fs.readFileSync(mainTf, 'utf8'), before, 'the root module is untouched');
+});
+
+test('upgrade from an unreleased version refuses, naming the missing tag — and pins nothing', async () => {
+  const remote = bareRemoteWithTag(); // a repository, but nothing released on it
+  const cli = fakeNpmInstall({ version: '0.0.0-dev.1', repositoryUrl: remote.url });
+  const s = scratch({ FLEET_MODULE_SOURCE: `git::https://git.invalid/fleet.git//infra/aws?ref=${STALE_SHA}` });
+  const { mainTf } = await staleDeployment(s);
+  const before = fs.readFileSync(mainTf, 'utf8');
+
+  const res = await runCli(['upgrade', '--yes'], { cwd: s.cwd, env: s.env, cli });
+  assert.equal(res.code, 1, res.stdout);
+  assert.match(res.stderr, /no v0\.0\.0-dev\.1 tag/);
+  assert.ok(res.stderr.includes(remote.url), 'names the repository it checked');
+  assert.ok(!res.stderr.includes('#183'), 'the spent promise is gone');
+  assert.equal(fs.readFileSync(mainTf, 'utf8'), before, 'nothing re-pinned');
+  assert.deepEqual(s.calls(), [], 'no terraform ran');
 });
 
 test('repinnedMainTf edits exactly the ref, and refuses a file that moved under it', () => {

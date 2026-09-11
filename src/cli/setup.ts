@@ -440,8 +440,8 @@ function releaseSource(root: string, provider: string): string | undefined {
   return `git::${url.replace(/\.git$/, '')}.git//infra/${provider}?ref=v${version}`;
 }
 
-/** npm's two `repository` shapes: a plain string, or `{ url }`. */
-function packageRepository(pkg: Record<string, unknown>): string | undefined {
+/** npm's two `repository` shapes: a plain string, or `{ url }`. Shared with the CLI's release identity (./skew.ts, #239). */
+export function packageRepository(pkg: Record<string, unknown>): string | undefined {
   const repository = pkg.repository;
   if (typeof repository === 'string') return repository;
   if (typeof repository === 'object' && repository !== null) {

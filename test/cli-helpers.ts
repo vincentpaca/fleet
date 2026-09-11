@@ -1,5 +1,5 @@
 // Shared helpers for CLI tests (not a test file itself: no .test suffix).
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -7,6 +7,47 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const CLI = fileURLToPath(new URL('../src/cli/main.ts', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+/**
+ * An npm-install-shaped copy of this package (#239): the `files` allowlist's
+ * directories and a package.json, outside any git repository — so the CLI run
+ * from it has no HEAD and must identify by its version, exactly as a
+ * `npm i -g ownfleet` install does. `repositoryUrl` is where that identity is
+ * verified; point it at a local repo from `bareRemoteWithTag` so no test ever
+ * touches the network. Returns the copy's main.ts to pass as runCli's `cli`.
+ */
+export function fakeNpmInstall(opts: { version: string; repositoryUrl: string }): string {
+  const dir = makeTempDir('fleet-npm-install-');
+  for (const entry of ['src', 'schemas', 'presets', 'examples', 'integrations', 'docs']) {
+    fs.cpSync(path.join(REPO_ROOT, entry), path.join(dir, entry), { recursive: true });
+  }
+  // A real install has its dependencies installed; borrow the checkout's.
+  fs.symlinkSync(path.join(REPO_ROOT, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')) as Record<string, unknown>;
+  pkg.version = opts.version;
+  pkg.repository = { type: 'git', url: opts.repositoryUrl };
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg, null, 2));
+  return path.join(dir, 'src', 'cli', 'main.ts');
+}
+
+/**
+ * A local git repository standing in for the package's remote: one commit,
+ * optionally tagged. `git ls-remote` answers over the filesystem, so release
+ * identity resolves with no network anywhere in the test.
+ */
+export function bareRemoteWithTag(tag?: string): { url: string; sha: string } {
+  const dir = makeTempDir('fleet-fake-remote-');
+  const git = (...args: string[]): string =>
+    execFileSync('git', ['-c', 'user.email=fleet-test@invalid', '-c', 'user.name=fleet-test', ...args], {
+      cwd: dir,
+      encoding: 'utf8',
+    }).trim();
+  git('init', '--quiet');
+  git('commit', '--allow-empty', '--quiet', '-m', 'release');
+  if (tag !== undefined) git('tag', '-a', tag, '-m', tag);
+  return { url: dir, sha: git('rev-parse', 'HEAD') };
+}
 
 /**
  * One event of every type the renderers know, plus an unknown one ('pair').
@@ -64,7 +105,13 @@ function noLoginPath(): string {
 
 export function runCli(
   args: string[],
-  opts: { cwd?: string; env?: Record<string, string | undefined>; stdin?: string } = {},
+  opts: {
+    cwd?: string;
+    env?: Record<string, string | undefined>;
+    stdin?: string;
+    /** Entry point to run instead of this checkout's CLI — a fakeNpmInstall copy. */
+    cli?: string;
+  } = {},
 ): Promise<CliResult> {
   const { promise, resolve, reject } = Promise.withResolvers<CliResult>();
   const env: Record<string, string | undefined> = {
@@ -82,7 +129,7 @@ export function runCli(
     CODEX_HOME: noLoginPath(),
     ...opts.env,
   };
-  const child = spawn(process.execPath, [CLI, ...args], {
+  const child = spawn(process.execPath, [opts.cli ?? CLI, ...args], {
     // Never inherit the checkout as cwd: daemon resolution scans
     // .fleet/infra/*/fleet-config.json under cwd (#15), so a test run from a
     // checkout with a live deployment would silently query — or dispatch to —
