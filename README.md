@@ -18,7 +18,7 @@ npm install -g ownfleet                   # the npm registry name; may lag main
 
 Releases are operator-cut, not per-merge: the registry copy is the last release ([`CHANGELOG.md`](CHANGELOG.md) says what it contains), while the git install tracks current `main`.
 
-That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs one more tool — Terraform >= 1.7 — and runs from a Fleet checkout (`fleet setup infra` in the quick start below), because the Terraform unit ships by git, not in the npm package. The container images are built inside your own cloud account by the wizard, so Docker on your machine is only needed for the developer path (`images/build.sh`).
+That is the whole install: no clone, no build step. It needs Node >= 23.6 (the CLI is TypeScript run via type stripping) and puts `fleet` on your PATH. First-time infrastructure bring-up needs one more tool — Terraform >= 1.7. The Terraform unit ships by git rather than in the npm package, and `fleet setup infra` pins it to what you installed: a checkout pins its own commit, a released install pins its version's tag. The container images are built inside your own cloud account by the wizard, so Docker on your machine is only needed for the developer path (`images/build.sh`).
 
 ## What Fleet owns
 
@@ -68,7 +68,22 @@ fleet delegate 42 --prompt "/dev-work #42"    # an issue: ends in a draft PR
 fleet delegate "why do queued jobs sit behind the capacity cap"   # prose: ends in a report
 ```
 
-`setup infra` pins the Terraform unit at the exact ref of the Fleet checkout it runs from, which is also how the Terraform reaches you without shipping in the npm package — so run it from a checkout, or point it at one with `--module-source`. The runner and daemon images are built by the same command, inside your account (a one-shot CodeBuild project the unit provisions), from that same pinned ref — images and infrastructure can never skew, and there is no clone and no local Docker anywhere on this path. `fleet setup infra --rebuild-images` re-runs just the build when you upgrade. Both `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
+`setup infra` pins the Terraform unit at what this CLI is — a checkout's exact commit, a released install's version tag — and `--module-source` overrides the derivation when you need a fork or a local unit. The runner and daemon images are built by the same command, inside your account (a one-shot CodeBuild project the unit provisions), from that same pinned ref — images and infrastructure can never skew, and there is no clone and no local Docker anywhere on this path. `fleet setup infra --rebuild-images` re-runs just the build when you upgrade. All three `setup` commands are interviews on a terminal and driveable headless: every prompt has a flag that pre-supplies it and `--yes` skips the confirmation, so CI and agents run the same code path a human does. With no terminal and a value missing, the command exits naming the flag rather than waiting for input that will never come.
+
+### The agent path
+
+Pointing an agent (or CI) at Fleet is the same sequence with every question pre-supplied — defaults are read from the checkout, and anything the defaults cannot answer exits naming its flag instead of waiting for input. From a fresh checkout to a verified deployment:
+
+```sh
+npm install -g ownfleet
+fleet setup repo --cli claude-code
+fleet setup infra --name fleet --region us-east-1 --yes
+fleet setup harness --harness claude-code --scope project
+fleet connect
+fleet doctor
+```
+
+`fleet connect` holds the daemon tunnel, so it keeps a terminal (or background process) of its own. The repo interview covers the model seat too: with `ANTHROPIC_API_KEY` in the environment or a Claude login on the machine it asks nothing; otherwise pass `--claude-oauth-token` (or `--codex-auth yes` for a Codex seat). The sequence ends at `fleet doctor` reporting clean — a finding names its own fix, so a non-clean ending says exactly what to do next. This block is executable documentation: the test suite runs it as written (`test/cli-agent-path.test.ts`), so a command that drifts from the CLI fails CI.
 
 ## Using Fleet from your coding harness
 

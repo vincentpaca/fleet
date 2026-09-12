@@ -96,7 +96,9 @@ Commands:
                                            --module-source. Without a terminal, a missing value
                                            exits 1 naming it — it never waits for input.
   setup repo [--yes] [...]                 Write .fleet/manifest.json by interview, with defaults
-                                           extracted from this checkout. Same flag-override rules.
+                                           extracted from this checkout. Same flag-override rules
+                                           (--repo, --image, --setup-command, --pickup, --sync,
+                                           --env-vars, --cli).
                                            On a machine with a Claude seat login and no API
                                            credential, walks acquiring one: run \`claude
                                            setup-token\`, paste the result, and the wizard writes
