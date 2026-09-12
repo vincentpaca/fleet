@@ -50,10 +50,25 @@ publishes to npm. Nothing in this playbook publishes anything.
    install reports honestly — this bump lands only by merging the release PR.
 5. **Verify.** `npm ci && npm test` — the full suite, green. The publish
    workflow re-runs it after merge, but a release PR opened red is noise.
-6. **Open the draft release PR.** Branch `release/v<version>`, base `main`,
+6. **The fresh-deployment drill.** The suite proves the code against itself;
+   this step proves it against the live cloud a *new* user gets. From the
+   release candidate, in a scratch directory with real credentials:
+   `fleet setup infra --name <scratch-name> --yes` (fresh images, built now —
+   never the operator's aged dogfood deployment), then `fleet connect` held
+   for at least a minute, `fleet doctor` clean through the tunnel, and
+   `fleet setup infra --destroy --yes`. This exists because v0.3.3 shipped a
+   `fleet connect` that died in 4 seconds on every fresh deployment (#271):
+   old deployments carried old SSM agents and masked it, so every drill run
+   against existing infra stayed green while first contact was broken. The
+   drill is manual by nature (it spends real money in a real account, minutes
+   of it) and this playbook step is its only enforcement — prompt-level,
+   honestly; the release PR's Verification section is where the evidence
+   lands, and a release PR without it is not ready to merge.
+7. **Open the draft release PR.** Branch `release/v<version>`, base `main`,
    title `Release v<version>`, draft. Body in this repo's PR shape:
    `## Problem` (one line: what span of merges this release cuts), `## Status`,
-   `## Verification` (the exact commands from step 5 and their results),
+   `## Verification` (the exact commands from steps 5 and 6 and their results
+   — the fresh-deployment drill included, or the release is not verified),
    `## Not done` (anything deliberately left out of this release). The operator
    reads and edits the changelog like any other review; nothing ships before
    they merge.

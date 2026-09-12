@@ -26,6 +26,7 @@ test('the playbook carries the four changelog sections, the bump, and the draft 
     'Breaking changes',
     'All merged PRs',
     'package.json', // the version-bump step
+    'fresh-deployment drill', // the live gate that would have caught #271 before v0.3.3 shipped it
     'draft release PR', // the finish line
   ];
   for (const needle of required) {
