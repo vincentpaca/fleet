@@ -38,8 +38,8 @@ Run it against a live deployment after any change to the daemon, the runner life
 
      ```sh
      aws ssm start-session --target "ecs:<cluster>_<task-id>_<runtime-id>" \
-       --document-name AWS-StartPortForwardingSessionToRemoteHost \
-       --parameters '{"host":["localhost"],"portNumber":["9000"],"localPortNumber":["19000"]}'
+       --document-name AWS-StartPortForwardingSession \
+       --parameters '{"portNumber":["9000"],"localPortNumber":["19000"]}'
      curl -X POST http://127.0.0.1:19000/jobs/<job>/answer \
        -H 'content-type: application/json' -d '{"option":"<id>"}'
      ```
