@@ -1188,12 +1188,15 @@ test("buildPortForwardArgs forwards the daemon port to the chosen local port", (
     "ecs:fleet_task_rt",
     "--document-name",
   ]);
-  assert.equal(args[5], "AWS-StartPortForwardingSessionToRemoteHost");
+  // The plain document, with no host parameter: 2026 SSM agents kill a
+  // RemoteHost session pointed at localhost ("Forwarding to IP address
+  // localhost is forbidden"), so the tunnel died ~4s after opening on every
+  // deployment whose daemon image was built with a current agent.
+  assert.equal(args[5], "AWS-StartPortForwardingSession");
   assert.equal(args[6], "--parameters");
   // Ports are strings inside arrays — the SSM document rejects bare numbers,
   // and swapping the two ports produces a tunnel to the wrong end.
   assert.deepEqual(JSON.parse(args[7]), {
-    host: ["localhost"],
     portNumber: ["9000"],
     localPortNumber: ["19000"],
   });

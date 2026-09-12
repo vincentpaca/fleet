@@ -102,10 +102,12 @@ while :; do
   fi
 
   echo "tunnel up: http://localhost:${LOCAL_PORT} -> ${SERVICE}:${PORT} (task ${TASK##*/})"
+  # The plain port-forward document: 2026 SSM agents refuse loopback hosts on
+  # the ...ToRemoteHost variant ("Forwarding to IP address localhost is forbidden").
   aws ssm start-session --region "$REGION" \
     --target "ecs:${CLUSTER}_${TASK##*/}_${RUNTIME_ID}" \
-    --document-name AWS-StartPortForwardingSessionToRemoteHost \
-    --parameters "{\"host\":[\"localhost\"],\"portNumber\":[\"${PORT}\"],\"localPortNumber\":[\"${LOCAL_PORT}\"]}" &
+    --document-name AWS-StartPortForwardingSession \
+    --parameters "{\"portNumber\":[\"${PORT}\"],\"localPortNumber\":[\"${LOCAL_PORT}\"]}" &
   SESSION_PID=$!
   wait "$SESSION_PID"
   SESSION_PID=""

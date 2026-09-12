@@ -377,7 +377,14 @@ export function ssmSessionTarget(cluster: string, taskArn: string, runtimeId: st
   return `ecs:${cluster}_${taskId}_${runtimeId}`;
 }
 
-/** argv after `aws` for the port-forward session that holds the tunnel open. */
+/**
+ * argv after `aws` for the port-forward session that holds the tunnel open.
+ * The plain port-forward document, never ...ToRemoteHost with host localhost:
+ * SSM agents from 2026 refuse loopback hosts on the RemoteHost document
+ * ("Forwarding to IP address localhost is forbidden"), so every fresh daemon
+ * image broke the tunnel after ~4s while old deployments kept working — the
+ * plain document targets the task itself and needs no host at all.
+ */
 export function buildPortForwardArgs( // contract pin: test-only export, asserted by the suite
   target: string,
   remotePort: number,
@@ -391,10 +398,9 @@ export function buildPortForwardArgs( // contract pin: test-only export, asserte
       "--target",
       target,
       "--document-name",
-      "AWS-StartPortForwardingSessionToRemoteHost",
+      "AWS-StartPortForwardingSession",
       "--parameters",
       JSON.stringify({
-        host: ["localhost"],
         portNumber: [String(remotePort)],
         localPortNumber: [String(localPort)],
       }),

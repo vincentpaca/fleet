@@ -62,8 +62,8 @@ output "connect_hint" {
     #    at it.
     aws ssm start-session \
       --target "ecs:${aws_ecs_cluster.this.name}_$${TASK##*/}_$RUNTIME_ID" \
-      --document-name AWS-StartPortForwardingSessionToRemoteHost \
-      --parameters '{"host":["localhost"],"portNumber":["${var.daemon_tcp_port}"],"localPortNumber":["1${var.daemon_tcp_port}"]}'
+      --document-name AWS-StartPortForwardingSession \
+      --parameters '{"portNumber":["${var.daemon_tcp_port}"],"localPortNumber":["1${var.daemon_tcp_port}"]}'
   EOT
 }
 
