@@ -9,14 +9,21 @@
 // the first live week: the #197 incident was a runner image predating an
 // already-merged fix, and nothing named the gap until the work was lost.
 //
-// Until #183 mints release versions that travel together, the honest
-// comparison is git SHAs — imperfect (a tag and the commit it names read
-// differently until git resolves them) but never wrong about a mismatch it
-// reports. `fleet upgrade` (src/cli/upgrade.ts) owns the fix: doctor names the
-// component, both SHAs, and the command that converges them.
+// The CLI's own identity depends on how it was installed (#239): a checkout
+// identifies by its HEAD commit; an npm install carries no commit, so it
+// identifies by the release tag its package.json version names — `v<version>`
+// is tagged on every publish, a tag is a valid `?ref=`, and the remote resolves
+// it to the commit every comparison below runs on. A version with no such tag
+// (a prerelease, a locally-built package) has no identity a deployment could
+// be converged to, and both consumers refuse it by name rather than inventing
+// one. `fleet upgrade` (src/cli/upgrade.ts) owns the fix for every gap doctor
+// names: the component, both identities, and the command that converges them.
 import fs from 'node:fs';
 import path from 'node:path';
-import { pinnedSource } from './setup.ts';
+import { spawnSync } from 'node:child_process';
+import { gitValue } from '../shared/git.ts';
+import { toHttpsGitUrl } from '../shared/giturl.ts';
+import { packageRepository, pinnedSource } from './setup.ts';
 
 /** One deployment root module's pin: where the applied unit came from. */
 export type UnitPin = {
@@ -94,9 +101,65 @@ export function sameCommit(a: string, b: string): boolean {
   return short.length >= 7 && /^[0-9a-f]+$/.test(short) && long.startsWith(short);
 }
 
+/**
+ * How this CLI identifies itself to a deployment (#239). A checkout is its
+ * HEAD commit (ref and sha are the same string). An npm install is the
+ * `v<version>` tag its package.json names, resolved on the package's own
+ * repository to the commit the tag pins — a tag is a valid `?ref=`, so it can
+ * be pinned, cloned, and compared exactly as a sha can. `unreleased` is the
+ * one identity-less state: the version has no tag on the remote (a prerelease,
+ * a locally-built package) or the remote could not be asked; both consumers
+ * name that rather than pinning a ref nothing can clone.
+ */
+export type CliIdentity =
+  | { kind: 'checkout'; ref: string; sha: string }
+  | { kind: 'release'; ref: string; sha: string; repository: string }
+  | { kind: 'unreleased'; version: string; repository: string; reason: 'no such tag' | 'unreachable remote' };
+
+/** The identity of the installation rooted at `root`, however it was installed. */
+export function cliIdentity(root: string): CliIdentity {
+  // Only the install's own .git counts: an `npm i` into some project's
+  // node_modules sits inside THAT repo, and its HEAD is not this CLI.
+  if (fs.existsSync(path.join(root, '.git'))) {
+    const sha = gitValue(['rev-parse', 'HEAD'], root);
+    if (sha !== undefined) return { kind: 'checkout', ref: sha, sha };
+  }
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as Record<string, unknown>;
+  // The same repository derivation the release module source uses (setup.ts):
+  // strip npm's git+ prefix, normalise a github ssh remote to anonymous https.
+  const repository = toHttpsGitUrl((packageRepository(pkg) ?? '').replace(/^git\+/, ''));
+  const tag = `v${pkg.version as string}`;
+  const found = remoteTagCommit(repository, tag);
+  if (found.kind === 'found') return { kind: 'release', ref: tag, sha: found.sha, repository };
+  return {
+    kind: 'unreleased',
+    version: pkg.version,
+    repository,
+    reason: found.kind === 'missing' ? 'no such tag' : 'unreachable remote',
+  };
+}
+
+/** The commit a tag names on `repository`, asked over ls-remote — no clone, no checkout. */
+function remoteTagCommit(
+  repository: string,
+  tag: string,
+): { kind: 'found'; sha: string } | { kind: 'missing' } | { kind: 'unreachable' } {
+  const res = spawnSync('git', ['ls-remote', repository, `refs/tags/${tag}`, `refs/tags/${tag}^{}`], {
+    encoding: 'utf8',
+    // A remote that wants credentials must fail, not park doctor on a prompt.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+  if (res.status !== 0) return { kind: 'unreachable' };
+  const rows = res.stdout.trim().split('\n').filter(Boolean).map((line) => line.split('\t'));
+  // An annotated tag lists two rows; the peeled ^{} one is the commit itself.
+  const peeled = rows.find(([, name]) => name?.endsWith('^{}'));
+  const sha = (peeled ?? rows[0])?.[0];
+  return sha !== undefined ? { kind: 'found', sha } : { kind: 'missing' };
+}
+
 export type SkewInput = {
-  /** HEAD of the CLI's own checkout; undefined when the install is not one. */
-  cliSha: string | undefined;
+  /** What this CLI is: a checkout's commit or a release tag with its commit. */
+  cli: { ref: string; sha: string };
   pins: UnitPin[];
   daemon: DaemonBuild;
   /** ref → commit sha in the CLI's checkout, undefined when unresolvable. */
@@ -109,27 +172,21 @@ export type SkewInput = {
  * message contract is testable without a checkout or a daemon.
  */
 export function skewReport(input: SkewInput): { notes: string[]; findings: string[] } { // contract pin: test-only export, asserted by the suite
-  const { cliSha } = input;
-  if (cliSha === undefined) {
-    // No anchor to compare against: an npm install carries no git SHA. Honest
-    // silence beats a fake identity; #183's release versions close this gap.
-    return { notes: ['skew: this CLI is not a git checkout — no SHA to compare the deployment against (#183 will version releases)'], findings: [] };
-  }
   const findings: string[] = [];
   const notes: string[] = [];
   const matched: string[] = [];
-  for (const pin of input.pins) comparePin(pin, cliSha, input.resolveRef, { findings, notes, matched });
-  compareDaemon(input.daemon, cliSha, { findings, matched });
+  for (const pin of input.pins) comparePin(pin, input.cli, input.resolveRef, { findings, notes, matched });
+  compareDaemon(input.daemon, input.cli, { findings, matched });
   if (findings.length === 0 && matched.length > 0) {
-    notes.push(`skew: deployment matches this CLI at ${shortSha(cliSha)} (${matched.join(', ')})`);
+    notes.push(`skew: deployment matches this CLI at ${shortSha(input.cli.ref)} (${matched.join(', ')})`);
   }
   return { notes, findings };
 }
 
-/** One unit pin against the CLI's sha: a match, a named gap, or "nothing pinned". */
+/** One unit pin against the CLI's identity: a match, a named gap, or "nothing pinned". */
 function comparePin(
   pin: UnitPin,
-  cliSha: string,
+  cli: SkewInput['cli'],
   resolveRef: SkewInput['resolveRef'],
   out: { findings: string[]; notes: string[]; matched: string[] },
 ): void {
@@ -140,21 +197,23 @@ function comparePin(
     return;
   }
   const refSha = resolveRef(pin.ref);
-  if (sameCommit(refSha ?? pin.ref, cliSha)) {
+  // A pin at the CLI's own tag matches by name — no resolution needed, which
+  // is what lets a version-identified CLI call a tag-pinned deployment clean.
+  if (pin.ref === cli.ref || sameCommit(refSha ?? pin.ref, cli.sha)) {
     out.matched.push(`unit ref ${shortSha(pin.ref)}`);
     return;
   }
   const resolved = refSha !== undefined && refSha !== pin.ref ? ` (${shortSha(refSha)})` : '';
   out.findings.push(
-    `deployment skew: ${pin.provider} unit is applied at ref ${shortSha(pin.ref)}${resolved}, this CLI is at ${shortSha(cliSha)}` +
-      " — run fleet upgrade to re-pin and re-apply it at this CLI's commit (#207)",
+    `deployment skew: ${pin.provider} unit is applied at ref ${shortSha(pin.ref)}${resolved}, this CLI is at ${shortSha(cli.ref)}` +
+      " — run fleet upgrade to re-pin and re-apply it at this CLI's version (#207)",
   );
 }
 
-/** The daemon image's stamp against the CLI's sha; unknown is the tunnel section's story. */
+/** The daemon image's stamp against the CLI's commit; unknown is the tunnel section's story. */
 function compareDaemon(
   daemon: DaemonBuild,
-  cliSha: string,
+  cli: SkewInput['cli'],
   out: { findings: string[]; matched: string[] },
 ): void {
   if (daemon.kind === 'unknown') return;
@@ -164,12 +223,12 @@ function compareDaemon(
     );
     return;
   }
-  if (sameCommit(daemon.sha, cliSha)) {
+  if (sameCommit(daemon.sha, cli.sha)) {
     out.matched.push(`daemon image ${shortSha(daemon.sha)}`);
     return;
   }
   out.findings.push(
-    `deployment skew: daemon image was built at ${shortSha(daemon.sha)}, this CLI is at ${shortSha(cliSha)}` +
+    `deployment skew: daemon image was built at ${shortSha(daemon.sha)}, this CLI is at ${shortSha(cli.ref)}` +
       ' — rebuild it at the applied ref (fleet upgrade --rebuild-images, or images/build.sh --redeploy-daemon from a checkout) and roll the service (#207)',
   );
 }
