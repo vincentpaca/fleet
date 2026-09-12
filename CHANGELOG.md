@@ -5,6 +5,61 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.3.3 — 2026-09-12
+
+The release where the npm install stops being second class: it can stand up
+infrastructure, upgrade what it stood up, and prove the whole path — install,
+setup, doctor clean — is now executed by the test suite exactly as the README
+teaches it.
+
+### What's new for you
+
+- **`npm i -g ownfleet` can now stand up infrastructure.** The setup chain's
+  infra offer used to face-plant on an npm install with `cannot tell which
+  Fleet terraform module to use`. The CLI now derives the module source from
+  its own release: the package's repository at the `v<version>` tag the publish
+  pipeline cut. A checkout still pins its own commit, and `--module-source`
+  still overrides both.
+- **`fleet upgrade` and doctor's skew check work from an npm install.** Both
+  used to decline with "#183 will version releases" — a promise that had
+  already shipped. The CLI now identifies by its release tag (verified against
+  the package's repository, so a prerelease or locally-built package is refused
+  by name rather than pinned at a ref nothing can clone): `upgrade` re-pins the
+  deployment and rebuilds images at that tag, and `doctor` reports a
+  deployment at an older tag as skew, one at the current tag as clean — sha
+  pins from a checkout-era deployment compare correctly against a
+  version-identified CLI.
+- **First contact survives its second step.** `fleet setup repo` writes a
+  no-op readiness gate on repos that have none, and `fleet doctor` — the very
+  next command the chain points at — rejected it (`gate script missing`).
+  Fixed, and the sweep that found it is now a permanent test: the shipped npm
+  layout walks `setup repo → doctor` clean in CI.
+- **The README carries the agent path, and CI executes it.** One copy-pasteable
+  headless sequence — install, the three setups fully flag-driven, connect,
+  `fleet doctor` clean — runs in the test suite exactly as written, so a
+  documented command that drifts from the CLI fails CI as broken onboarding.
+  `fleet setup repo --help` now lists its prompt flags (`--repo`, `--image`,
+  `--setup-command`, `--pickup`, `--sync`, `--env-vars`, `--cli`) the way
+  `setup infra`'s always did.
+
+### Upgrade notes
+
+- None that touch your deployment: no schema, infra or image changes. A 0.3.2
+  deployment works with this CLI unchanged — and for the first time, this CLI
+  installed from npm can run `fleet upgrade` to move that deployment forward.
+
+### Breaking changes
+
+None.
+
+### All merged PRs
+
+- #264: #263: The chain offers infra an npm install cannot stand up — and no longer needs to refuse
+- #266: #265: First contact fails at step two: doctor rejects the no-op gate setup just wrote
+- #267: cli-client's restart test escapes its temp home and hangs on operator machines
+- #268: #239: An npm-installed CLI cannot upgrade or skew-check a deployment — #183 landed and the code still waits for it
+- #269: #184: Make setup agent friendly
+
 ## 0.3.2 — 2026-09-08
 
 The release where onboarding stops lying anywhere: the infra interview joins
