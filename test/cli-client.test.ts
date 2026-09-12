@@ -20,7 +20,11 @@ test("a CLI call succeeds after the daemon socket is restarted under the same ho
 
   const first = new FleetDaemon({ home });
   await first.start();
-  const before = await cliRequest("GET", "/health", undefined, { env });
+  // cwd pinned to the temp home: resolution scans cwd's .fleet/infra/ before
+  // the home socket, and the process cwd is this checkout — on a machine with
+  // a live deployment captured there, the request would leave the test and
+  // knock on the operator's real tunnel port (tests own their state, #136).
+  const before = await cliRequest("GET", "/health", undefined, { env, cwd: home });
   assert.equal(before.status, 200);
 
   // Restart: the old listener closes its sockets and a fresh daemon binds the
@@ -31,7 +35,7 @@ test("a CLI call succeeds after the daemon socket is restarted under the same ho
   await second.start();
   t.after(() => second.stop());
 
-  const after = await cliRequest("GET", "/health", undefined, { env });
+  const after = await cliRequest("GET", "/health", undefined, { env, cwd: home });
   assert.equal(after.status, 200);
 });
 
