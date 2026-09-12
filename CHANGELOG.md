@@ -5,6 +5,52 @@ release playbook (`agents/release.md`), reviewed as a draft release PR, and
 shipped by merging it — the publish workflow uses the merged entry, verbatim,
 as the GitHub Release body.
 
+## 0.3.4 — 2026-09-13
+
+One fix, and it matters: 0.3.3's `fleet connect` was broken on every fresh
+deployment. If you installed 0.3.3 and your tunnel died seconds after opening,
+this release is the cure — and the release process now carries the drill that
+would have caught it.
+
+### What's new for you
+
+- **`fleet connect` holds its tunnel on fresh deployments.** The session was
+  opened with SSM's remote-host port-forward document pointed at `localhost`,
+  which SSM agents in current base images refuse ("Forwarding to IP address
+  localhost is forbidden") — so on any deployment whose daemon image was built
+  recently, the tunnel died about four seconds after opening and `connect`
+  looped reopening it forever. Deployments built from older images kept
+  working, which is how it hid. The session now uses the plain port-forward
+  document, which targets the task itself and works on both agent generations.
+  The tunnel fallback script, the unit's `connect_hint` output, and the drill
+  doc all teach the same corrected invocation.
+- **Releases are now gated on a fresh-deployment drill.** The suite proves the
+  code against itself; before any release PR opens, the candidate must also
+  stand up a from-scratch deployment (fresh images), hold a tunnel, and get a
+  clean `fleet doctor` through it — precisely the check that would have kept
+  the bug above out of 0.3.3. This release is the first one cut under that
+  gate.
+
+### Upgrade notes
+
+- Upgrade the CLI (`npm i -g ownfleet`) and reconnect — the fix is entirely
+  client-side. No image rebuild and no re-apply is needed to get a working
+  tunnel.
+- The `infra/` diff touches only the unit's `connect_hint` output text and the
+  fallback tunnel script's invocation: a `terraform apply` re-run refreshes
+  that hint but changes no deployed resource. Do it with your next planned
+  apply; nothing is waiting on it.
+
+### Breaking changes
+
+None.
+
+### All merged PRs
+
+- #272: #271: fleet connect dies every ~4s on fresh deployments: current SSM agents forbid the RemoteHost document at localhost
+- #273: Release gate: a fresh-deployment drill before every release PR
+- #274: ci: bump codeql-action init and analyze together to 4.37.9
+
 ## 0.3.3 — 2026-09-12
 
 The release where the npm install stops being second class: it can stand up
