@@ -394,8 +394,12 @@ resource "aws_codebuild_project" "images" {
 
     # Inline, not a buildspec file in the repo: the pinned ref may predate any
     # such file, and the build contract belongs beside the role that grants the
-    # push. Build args ride the Dockerfiles' own defaults — the same values
-    # images/build.sh passes explicitly. AWS_REGION is set by CodeBuild itself.
+    # push. Most build args ride the Dockerfiles' own defaults — the values
+    # images/build.sh passes explicitly — but the build stamp has no meaningful
+    # default: an empty FLEET_BUILD_SHA ships an image doctor's skew check can
+    # only call "unstamped" (#275). CODEBUILD_RESOLVED_SOURCE_VERSION is the
+    # commit the pinned source_version resolved to — the same identity
+    # images/build.sh stamps from git. AWS_REGION is set by CodeBuild itself.
     buildspec = <<-EOT
       version: 0.2
       phases:
@@ -404,8 +408,8 @@ resource "aws_codebuild_project" "images" {
             - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$${REPOSITORY_URL%%/*}"
         build:
           commands:
-            - docker build -t "$REPOSITORY_URL:runner" -f images/runner/Dockerfile .
-            - docker build -t "$REPOSITORY_URL:daemon" -f images/daemon/Dockerfile .
+            - docker build --build-arg "FLEET_BUILD_SHA=$CODEBUILD_RESOLVED_SOURCE_VERSION" -t "$REPOSITORY_URL:runner" -f images/runner/Dockerfile .
+            - docker build --build-arg "FLEET_BUILD_SHA=$CODEBUILD_RESOLVED_SOURCE_VERSION" -t "$REPOSITORY_URL:daemon" -f images/daemon/Dockerfile .
         post_build:
           commands:
             - docker push "$REPOSITORY_URL:runner"
