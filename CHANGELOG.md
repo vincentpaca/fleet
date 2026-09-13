@@ -7,10 +7,11 @@ as the GitHub Release body.
 
 ## 0.3.4 — 2026-09-13
 
-One fix, and it matters: 0.3.3's `fleet connect` was broken on every fresh
-deployment. If you installed 0.3.3 and your tunnel died seconds after opening,
-this release is the cure — and the release process now carries the drill that
-would have caught it.
+Two fixes, both found the hard way: 0.3.3's `fleet connect` was broken on
+every fresh deployment, and the images your deployment builds for itself were
+never stamped, so doctor's skew check could not tell you when they aged. The
+release process now carries the drill that caught both — this is the first
+release cut under it, and the second fix is what its first run found.
 
 ### What's new for you
 
@@ -24,22 +25,29 @@ would have caught it.
   document, which targets the task itself and works on both agent generations.
   The tunnel fallback script, the unit's `connect_hint` output, and the drill
   doc all teach the same corrected invocation.
+- **Your deployment's self-built images now carry their build stamp.** The
+  in-account CodeBuild build ran `docker build` with no `FLEET_BUILD_SHA`, so
+  every image it produced reported no build identity and doctor's skew check
+  could only say "unstamped" — pointing at `images/build.sh`, the developer
+  path a released install doesn't have. Both builds now stamp the image with
+  the exact commit CodeBuild checked out, so `fleet doctor` can finally tell a
+  current daemon image from a stale one on a real deployment.
 - **Releases are now gated on a fresh-deployment drill.** The suite proves the
   code against itself; before any release PR opens, the candidate must also
   stand up a from-scratch deployment (fresh images), hold a tunnel, and get a
-  clean `fleet doctor` through it — precisely the check that would have kept
-  the bug above out of 0.3.3. This release is the first one cut under that
-  gate.
+  clean `fleet doctor` through it. This release is the first one cut under
+  that gate — the connect fix is what the gate exists for, and the stamp fix
+  is what its first run found.
 
 ### Upgrade notes
 
-- Upgrade the CLI (`npm i -g ownfleet`) and reconnect — the fix is entirely
-  client-side. No image rebuild and no re-apply is needed to get a working
-  tunnel.
-- The `infra/` diff touches only the unit's `connect_hint` output text and the
-  fallback tunnel script's invocation: a `terraform apply` re-run refreshes
-  that hint but changes no deployed resource. Do it with your next planned
-  apply; nothing is waiting on it.
+- Upgrade the CLI (`npm i -g ownfleet`) and reconnect — the tunnel fix is
+  entirely client-side; nothing needs rebuilding to get a working tunnel.
+- To get stamped images (and a working skew check), run `fleet upgrade`: it
+  re-applies the unit at this release's tag and rebuilds the images in your
+  account, then prints the one command that rolls the daemon service onto the
+  new image. Until you do, doctor's "daemon image is unstamped" finding on an
+  existing deployment is accurate, and this is its fix.
 
 ### Breaking changes
 
@@ -50,6 +58,7 @@ None.
 - #272: #271: fleet connect dies every ~4s on fresh deployments: current SSM agents forbid the RemoteHost document at localhost
 - #273: Release gate: a fresh-deployment drill before every release PR
 - #274: ci: bump codeql-action init and analyze together to 4.37.9
+- #276: #275: In-account image builds are unstamped: doctor's skew check can never work on a user deployment
 
 ## 0.3.3 — 2026-09-12
 
