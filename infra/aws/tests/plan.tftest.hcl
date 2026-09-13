@@ -444,6 +444,17 @@ run "a_pinned_source_ref_provisions_the_image_build" {
     error_message = "the buildspec must build BOTH images from images/ and push the :runner and :daemon tags the task definitions pin"
   }
 
+  # Both builds must stamp the image with the commit CodeBuild resolved (#275):
+  # an empty FLEET_BUILD_SHA ships an image doctor's skew check can only call
+  # "unstamped", on every deployment whose images the unit built — all of them.
+  assert {
+    condition = length(regexall(
+      "--build-arg \"FLEET_BUILD_SHA=\\$CODEBUILD_RESOLVED_SOURCE_VERSION\"",
+      aws_codebuild_project.images[0].source[0].buildspec,
+    )) == 2
+    error_message = "both docker builds must pass --build-arg FLEET_BUILD_SHA=$CODEBUILD_RESOLVED_SOURCE_VERSION — an unstamped image disables doctor's skew check for every user (#275)"
+  }
+
   # `docker build` needs the Docker daemon CodeBuild starts only in privileged
   # builds; without it the first build fails after the apply already succeeded.
   assert {
