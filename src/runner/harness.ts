@@ -86,6 +86,11 @@ type HarnessInputs = {
    */
   continues?: { pr: number; branch: string };
   /**
+   * Host-lost resume (#293): the workspace was checked out from the branch a
+   * lost attempt pushed, so the prompt says the work so far is already there.
+   */
+  resumed?: boolean;
+  /**
    * The work order's `prompt` (#240): what the operator wants done, used
    * verbatim as the launch line. Required: Fleet composes no instruction of its
    * own any more, so an order without one has no job to run. Fleet still
@@ -123,6 +128,15 @@ function continuationClause(continues: { pr: number; branch: string } | undefine
     ` -- continuing PR #${continues.pr} (branch ${continues.branch}):` +
     ` read that PR's review comments and failing checks with gh (gh pr view ${continues.pr} --comments; gh pr checks ${continues.pr})` +
     ` and address them. Push fixes to the same branch so the PR updates in place; never open a new PR.`
+  );
+}
+
+/** The host-lost resume clause (#293), or empty string. Fixed text, no inputs. */
+function resumeClause(resumed: boolean | undefined): string {
+  if (!resumed) return '';
+  return (
+    ' -- resuming: an earlier attempt at this job lost its host mid-run, and the work it pushed is already on this branch.' +
+    ' Read it (git log and git diff against the base branch) and continue from it; do not start over.'
   );
 }
 
@@ -175,7 +189,7 @@ function overridePlan(override: string, prompt: string | undefined): HarnessPlan
 }
 
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, resumed, prompt }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
@@ -206,7 +220,7 @@ export function buildHarnessCommand({ manifest, override, actualVersion, continu
   // operator-written included: a continuation that produces a report instead of
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
-  const promptText = `${prompt}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
+  const promptText = `${prompt}${continuationClause(continues)}${resumeClause(resumed)}\n\n${OUTPUT_CONTRACT}`;
   const model = typeof harness.model === 'string' ? harness.model : undefined;
   if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
   return { ...dialect(promptText, model), shell: false, notes };

@@ -142,6 +142,8 @@ async function main(): Promise<void> {
   // retry). Set by the daemon; the workspace setup renames the previous
   // attempt's branch before creating this attempt's own.
   const retryAttempt = retryAttemptEnv();
+  // Host-lost retry (#293): resume the lost attempt's pushed branch instead.
+  const resumeBranch = process.env.FLEET_RESUME_BRANCH === '1';
   // Event delivery backpressure (#109): when the sink's bounded buffer is
   // near-full, pause the harness stdout reader instead of queueing without
   // bound; resume below the low watermark. The hook is wired to the
@@ -239,6 +241,8 @@ async function main(): Promise<void> {
   // against this SHA, never against base — the adopted branch is always ahead
   // of base with the original job's commits.
   let adoptedTip: string | undefined;
+  // Host-lost resume (#293): the workspace carries the lost attempt's work.
+  let resumed = false;
   if (gitUrl) {
     try {
       const setup = setupWorkspace(workspace, {
@@ -256,9 +260,12 @@ async function main(): Promise<void> {
         ...(continues !== undefined ? { adoptBranch: continues.branch } : {}),
         // Auto-retry (#30): rename the previous attempt's branch first.
         ...(retryAttempt !== undefined ? { retryAttempt } : {}),
+        // Host-lost retry (#293): resume that branch instead, when it exists.
+        ...(resumeBranch ? { resume: true } : {}),
       });
       branch = setup.branch;
       base = setup.base;
+      resumed = setup.resumed === true;
       if (continues !== undefined) adoptedTip = getHeadSha(workspace);
       if (setup.released !== undefined) {
         await sink.emit({
@@ -271,6 +278,7 @@ async function main(): Promise<void> {
         type: 'log',
         text: continues !== undefined
           ? `workspace adopted branch ${branch} (continues PR #${continues.pr})`
+          : resumed ? `workspace resumed branch ${branch} at ${getHeadSha(workspace)} (the lost attempt's pushed work)`
           : `workspace on branch ${branch} (pushed)`,
         who: 'runner',
       });
@@ -379,6 +387,7 @@ async function main(): Promise<void> {
     override: process.env.FLEET_HARNESS_CMD,
     actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
     continues,
+    resumed,
     prompt: orderPrompt,
   });
   if (!plan) {
