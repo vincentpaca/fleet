@@ -17,7 +17,7 @@ import {
   retainedDir,
   type RetainedRecord,
 } from '../shared/retained.ts';
-import { getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch, validBranchName } from '../runner/git.ts';
+import { divertedBranch, getHeadSha, jobBranch, pushWork, remoteHasHead, renameRemoteBranch, validBranchName } from '../runner/git.ts';
 import { request, describeTarget, daemonTarget, daemonHealthy, fleetConfigFiles, DaemonTargetError, OperatorTokenError, type DaemonResponse } from './client.ts';
 import { runConnect, resolveTunnel, tunnelReport } from './connect.ts';
 import { toHttpsGitUrl } from '../shared/giturl.ts';
@@ -2172,7 +2172,7 @@ function cmdResumePush(args: string[]): number {
 
   let outcome: ReturnType<typeof pushWork>;
   try {
-    outcome = pushWork(record.workspace, branch, target, record.jobId, record.ok !== false, record.base);
+    outcome = pushWork(record.workspace, { branch, side: divertedBranch(record.jobId) }, target, record.jobId, record.ok !== false, record.base);
   } catch (err) {
     console.error(`push still failing: ${errorMessage(err).split('\n')[0]}`);
     console.error(`workspace kept at ${record.workspace} — retry when the remote is reachable`);

@@ -29,7 +29,7 @@ import { WallClockTimer } from './wall-clock.ts';
 import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
-import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond, type Diverted } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond, divertedBranch, type Diverted } from './git.ts';
 import { buildHarnessCommand, describeHarnessPlan, parseVersion } from './harness.ts';
 import { authFailureFrom, authFailureIn } from './auth-failure.ts';
 import { materializeWorkspace } from './workspace.ts';
@@ -77,6 +77,62 @@ async function dropOrAbort(sink: EventSink, workspace: string): Promise<void> {
 }
 
 /**
+ * One line for work the job branch refused and the runner diverted (#291):
+ * names the side branch it went to, the job branch it did not, and where the
+ * agent is.
+ */
+function divertedText(what: string, branch: string, d: Omit<Diverted, 'delivered'>): string {
+  return `${what} ${d.moved ? 'pushed to' : 'already on'} ${d.diverted}, not ${branch}: ${d.reason}`;
+}
+
+/** A checkpoint's log line; none when it moved nothing. */
+function checkpointText(outcome: ReturnType<typeof pushCheckpoint>, branch: string): string | undefined {
+  if (typeof outcome === 'object') return outcome.moved ? `checkpoint: ${divertedText('wip', branch, outcome)}` : undefined;
+  return outcome === 'pushed' ? `checkpoint: wip pushed to ${branch}` : undefined;
+}
+
+/** Log text for a WIP push at cancel or park (no base, so never 'delivered'). */
+function wipText(outcome: ReturnType<typeof pushWip>, branch: string, context: string, at: string): string {
+  if (typeof outcome === 'object') return `${divertedText('wip', branch, outcome)} (${context})`;
+  return outcome === 'pushed'
+    ? `wip pushed to ${branch} (${context})`
+    : `workspace clean at ${at}; no new commit beyond ${branch}`;
+}
+
+/**
+ * Judge the settle push. `workPushed` feeds the empty-handed accounting (#81):
+ * work on the side branch counts. `divertedOnly` names the side branch when it
+ * holds the work and the job branch holds none of its own (#291) — the one
+ * case with no PR to grade. An adopted branch (#80) is ahead of base by
+ * construction, so its delivery is judged against the tip this job adopted.
+ */
+function judgeSettlePush(o: {
+  workspace: string;
+  branch: string;
+  outcome: ReturnType<typeof pushWork>;
+  adoptedTip: string | undefined;
+  timeoutMs: number;
+}): { workPushed: boolean; note: string; diverted: boolean; divertedOnly?: string } {
+  const onJob = o.adoptedTip !== undefined && o.outcome !== 'pushed'
+    ? remoteMovedBeyond(o.workspace, o.branch, o.adoptedTip, o.timeoutMs)
+    : o.outcome === 'pushed' || o.outcome === 'delivered' || (typeof o.outcome === 'object' && o.outcome.delivered);
+  if (typeof o.outcome === 'object') {
+    const note = divertedText('work', o.branch, o.outcome);
+    return onJob
+      ? { workPushed: true, diverted: true, note: `${note}; ${o.branch} carries earlier work, so its PR proceeds` }
+      : { workPushed: true, diverted: true, note, divertedOnly: o.outcome.diverted };
+  }
+  return { workPushed: onJob, diverted: false, note: plainPushNote(o.outcome, onJob, o.branch, o.adoptedTip !== undefined) };
+}
+
+/** The settle push's line when nothing was diverted. */
+function plainPushNote(outcome: 'pushed' | 'delivered' | 'clean', onJob: boolean, branch: string, adopted: boolean): string {
+  if (outcome === 'pushed') return `work pushed to ${branch}`;
+  if (onJob) return `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`;
+  return adopted ? `no new commits beyond the adopted tip of ${branch}` : `workspace clean; nothing beyond ${branch} creation`;
+}
+
+/**
  * Grade a delivered branch against reality: an open PR on it is `pr-open`,
  * anything else is `pushed`. Shared by the continuation path (#80), where the
  * adopted branch's PR is detected and never created, and the no-publish path
@@ -85,23 +141,6 @@ async function dropOrAbort(sink: EventSink, workspace: string): Promise<void> {
  * continuation without one is worth a note, a prose dispatch without one is
  * the default. A lookup failure degrades to `pushed`, never to a claim.
  */
-/**
- * One line for work the job branch refused and the runner diverted (#291):
- * names the side branch it went to, the job branch it did not, and where the
- * agent is.
- */
-function divertedText(what: string, branch: string, d: Diverted): string {
-  return `${what} ${d.moved ? 'pushed to' : 'already on'} ${d.diverted}, not ${branch}: ${d.reason}`;
-}
-
-/** Log text for a WIP push at cancel or park. */
-function wipText(outcome: 'pushed' | 'clean' | Diverted, branch: string, context: string, at: string): string {
-  if (typeof outcome === 'object') return `${divertedText('wip', branch, outcome)} (${context})`;
-  return outcome === 'pushed'
-    ? `wip pushed to ${branch} (${context})`
-    : `workspace clean at ${at}; no new commit beyond ${branch}`;
-}
-
 async function gradeBranchPr(opts: {
   workspace: string;
   branch: string;
@@ -128,6 +167,8 @@ async function gradeBranchPr(opts: {
 
 async function main(): Promise<void> {
   const jobId = requireEnv('FLEET_JOB_ID');
+  // Where work the job branch refuses goes instead (#291); runner-built, never read back from git.
+  const side = divertedBranch(jobId);
   const daemonUrl = requireEnv('FLEET_DAEMON_URL');
   const token = requireEnv('FLEET_RUNNER_TOKEN');
   const workspace = requireEnv('FLEET_WORKSPACE');
@@ -252,6 +293,8 @@ async function main(): Promise<void> {
   const gitUrl = process.env.FLEET_GIT_URL;
   let branch: string | undefined;
   let base: string | undefined;
+  // Re-entry (#291): the side branch an earlier generation's park diverted to.
+  let divertedEarlier: string | undefined;
   // Continuation (#80): the adopted branch's tip at setup. Delivery is judged
   // against this SHA, never against base — the adopted branch is always ahead
   // of base with the original job's commits.
@@ -276,6 +319,14 @@ async function main(): Promise<void> {
       });
       branch = setup.branch;
       base = setup.base;
+      divertedEarlier = setup.divertedEarlier;
+      if (divertedEarlier !== undefined) {
+        await sink.emit({
+          type: 'log',
+          text: `RE-ENTRY: an earlier run diverted work to ${divertedEarlier}, which ${branch} does not carry — the agent is told to bring it over; reconcile by hand if it does not`,
+          who: 'runner',
+        });
+      }
       if (continues !== undefined) adoptedTip = getHeadSha(workspace);
       if (setup.released !== undefined) {
         await sink.emit({
@@ -396,6 +447,7 @@ async function main(): Promise<void> {
     override: process.env.FLEET_HARNESS_CMD,
     actualVersion: probe?.stdout ? parseVersion(probe.stdout) : undefined,
     continues,
+    ...(divertedEarlier !== undefined ? { divertedEarlier } : {}),
     prompt: orderPrompt,
   });
   if (!plan) {
@@ -628,10 +680,13 @@ async function main(): Promise<void> {
 
   // Checkpoint WIP pushes (#190): armed only for git-backed jobs, cleared by
   // every teardown path before it makes its own push.
+  const diversions: { side?: string } = {};
   const checkpoints = gitUrl && branch !== undefined
     ? startCheckpoints({
         workspace,
         branch,
+        side,
+        diversions,
         jobId,
         sink,
         forget,
@@ -749,7 +804,7 @@ async function main(): Promise<void> {
   const cancelPushWip = async (signal: NodeJS.Signals): Promise<boolean> => {
     if (!gitUrl || !branch) return false;
     try {
-      const outcome = pushWip(workspace, branch, `cancelled: ${signal}`, cancelPushTimeoutMs);
+      const outcome = pushWip(workspace, { branch, side }, `cancelled: ${signal}`, cancelPushTimeoutMs);
       await sink.emit({
         type: 'log',
         text: wipText(outcome, branch, 'cancelled', 'cancel'),
@@ -908,7 +963,7 @@ async function main(): Promise<void> {
 
     if (gitUrl && branch) {
       try {
-        const wipOutcome = pushWip(workspace, branch, `block_hot expired: ${result.decisionId}`, GIT_TIMEOUT_MS);
+        const wipOutcome = pushWip(workspace, { branch, side }, `block_hot expired: ${result.decisionId}`, GIT_TIMEOUT_MS);
         await sink.emit({
           type: 'log',
           text: wipText(wipOutcome, branch, 'parked', 'park'),
@@ -941,6 +996,7 @@ async function main(): Promise<void> {
         workspace,
         evidence,
         branch: gitUrl ? branch : undefined,
+        side,
         pushTimeoutMs: GIT_TIMEOUT_MS,
         drainOutput,
         endCapture,
@@ -1007,7 +1063,7 @@ async function main(): Promise<void> {
   // partial work included; evidence over tidiness.
   let pushNote: string | undefined;
   let workPushed = false;
-  // The side branch, when the job branch refused HEAD and the work went there (#291).
+  // The side branch, when the work went there and the job branch carries none (#291).
   let divertedTo: string | undefined;
   // Set when the push failed and the workspace is the only copy of the work
   // (#38): the provider keeps the directory instead of deleting it, and the
@@ -1015,20 +1071,18 @@ async function main(): Promise<void> {
   let retainedWorkspace: string | undefined;
   if (gitUrl && branch) {
     try {
-      const outcome = pushWork(workspace, branch, target, jobId, exitCode === 0, base, GIT_TIMEOUT_MS);
-      workPushed = outcome !== 'clean';
-      if (typeof outcome === 'object') divertedTo = outcome.diverted;
-      // Adopted branch (#80): 'delivered' means ahead-of-base, which the
-      // adopted branch is by construction. Delivery on a continuation is real
-      // only when the remote moved beyond the tip this job adopted.
-      if (continues !== undefined && adoptedTip !== undefined && (outcome === 'delivered' || outcome === 'clean')) {
-        workPushed = remoteMovedBeyond(workspace, branch, adoptedTip, GIT_TIMEOUT_MS);
+      const outcome = pushWork(workspace, { branch, side }, target, jobId, exitCode === 0, base, GIT_TIMEOUT_MS);
+      const judged = judgeSettlePush({ workspace, branch, outcome, adoptedTip, timeoutMs: GIT_TIMEOUT_MS });
+      workPushed = judged.workPushed;
+      pushNote = judged.note;
+      divertedTo = judged.divertedOnly;
+      if (!judged.diverted && diversions.side !== undefined) {
+        await sink.emit({
+          type: 'log',
+          text: `an earlier checkpoint diverted work to ${diversions.side}, which ${branch} may not carry — reconcile it by hand`,
+          who: 'runner',
+        });
       }
-      pushNote = typeof outcome === 'object' ? divertedText('work', branch, outcome)
-        : outcome === 'pushed' ? `work pushed to ${branch}`
-        : workPushed ? `work already on ${branch} (agent pushed; runner push unnecessary or rejected)`
-        : continues !== undefined ? `no new commits beyond the adopted tip of ${branch}`
-        : `workspace clean; nothing beyond ${branch} creation`;
     } catch (err) {
       const reason = String(err instanceof Error ? err.message : err).split('\n')[0];
       pushNote = `WORK PUSH FAILED: ${reason}`;
@@ -1068,9 +1122,10 @@ async function main(): Promise<void> {
         who: 'runner',
       });
     } else if (gitUrl && branch && divertedTo !== undefined) {
-      // Diverted (#291): the work is on the side branch, not the job branch,
-      // so a PR from the job branch would present a review of something else.
-      settleRung = 'pushed';
+      // Diverted, and the job branch carries nothing beyond base (#291): a PR
+      // from it would review something else, and `pushed` would overstate a
+      // rung the job branch never reached (D6). The work is done and kept.
+      settleRung = 'implemented';
       await sink.emit({
         type: 'log',
         text: `no PR opened or graded: the work is on ${divertedTo}, not ${branch} — reconcile it by hand`,
@@ -1204,6 +1259,7 @@ async function parkOnAuthFailure(opts: {
   workspace: string;
   evidence: string;
   branch: string | undefined;
+  side: string;
   pushTimeoutMs: number;
   drainOutput: () => Promise<void>;
   endCapture: () => Promise<void>;
@@ -1217,7 +1273,7 @@ async function parkOnAuthFailure(opts: {
 
   if (branch !== undefined) {
     try {
-      const wipOutcome = pushWip(opts.workspace, branch, 'auth failure: parked', opts.pushTimeoutMs);
+      const wipOutcome = pushWip(opts.workspace, { branch, side: opts.side }, 'auth failure: parked', opts.pushTimeoutMs);
       await sink.emit({
         type: 'log',
         text: wipText(wipOutcome, branch, 'parked on auth failure', 'park'),
@@ -1321,6 +1377,9 @@ function startKeepalive(opts: {
 function startCheckpoints(opts: {
   workspace: string;
   branch: string;
+  side: string;
+  /** Set when a checkpoint diverted work (#291), so the settle can say so. */
+  diversions: { side?: string };
   jobId: string;
   sink: EventSink;
   intervalMs: number;
@@ -1338,16 +1397,10 @@ function startCheckpoints(opts: {
     if (now - lastAttemptAt < opts.intervalMs) return;
     lastAttemptAt = now;
     try {
-      const outcome = pushCheckpoint(opts.workspace, opts.branch, `fleet job ${opts.jobId}`, opts.pushTimeoutMs);
-      if (outcome === 'pushed' || (typeof outcome === 'object' && outcome.moved)) {
-        opts.forget(opts.sink.emit({
-          type: 'log',
-          who: 'runner',
-          text: typeof outcome === 'object'
-            ? `checkpoint: ${divertedText('wip', opts.branch, outcome)}`
-            : `checkpoint: wip pushed to ${opts.branch}`,
-        }));
-      }
+      const outcome = pushCheckpoint(opts.workspace, { branch: opts.branch, side: opts.side }, `fleet job ${opts.jobId}`, opts.pushTimeoutMs);
+      if (typeof outcome === 'object') opts.diversions.side = outcome.diverted;
+      const text = checkpointText(outcome, opts.branch);
+      if (text !== undefined) opts.forget(opts.sink.emit({ type: 'log', who: 'runner', text }));
     } catch (err) {
       opts.forget(opts.sink.emit({
         type: 'log',

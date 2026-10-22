@@ -408,7 +408,7 @@ test('cancel: a branch off main AFTER a checkpoint diverts the work to a side br
   const workspace = writeWorkspace({ idle: '60s', checkpoint: '1s' }, '291');
   const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
   const branch = 'fleet/291-job-291c';
-  const side = 'fleet-diverged/291-job-291c';
+  const side = 'fleet-diverged/job-291c';
   const { child, exitCode } = spawnRunner({
     FLEET_JOB_ID: 'job-291c',
     FLEET_DAEMON_URL: daemon.url,
@@ -520,7 +520,7 @@ test('settle: an agent on another PR\'s branch never gets a runner push onto it 
     assert.equal(remoteTip(remote, 'feature'), featureTip, 'no runner push may land on another PR\'s branch');
     assert.equal(remoteTip(remote, branch), remoteTip(remote, 'main'), 'the job branch refuses a HEAD that does not build on it');
     // The work is not dropped: committed and uncommitted alike reach the side branch.
-    const side = 'fleet-diverged/291-job-291b';
+    const side = 'fleet-diverged/job-291b';
     const files = execFileSync('git', ['ls-tree', '-r', '--name-only', side], { cwd: remote, encoding: 'utf8' });
     assert.match(files, /committed-work\.txt/);
     assert.match(files, /uncommitted-work\.txt/, 'the runner\'s WIP commit carries the uncommitted edit');
@@ -528,6 +528,11 @@ test('settle: an agent on another PR\'s branch never gets a runner push onto it 
     const pushed = texts.find((text) => text.startsWith(`work pushed to ${side}, not ${branch}: the agent is on branch feature`));
     assert.ok(pushed, `expected one line naming all three branches; got ${JSON.stringify(texts)}`);
     assert.ok(!texts.some((text) => text.startsWith('WORK PUSH FAILED')), 'a diverted push is a delivery, not a failure');
+    // D6: the job branch holds nothing beyond base, so `pushed` would overstate it.
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle, 'a settle event must be emitted');
+    assert.equal(settle.rung, 'implemented', 'a side-branch-only delivery never claims `pushed`');
+    assert.ok(texts.some((text) => text.startsWith(`no PR opened or graded: the work is on ${side}`)));
     // Nor may the runner commit onto the foreign branch: the agent's next
     // plain `git push` would publish that commit to the other PR.
     const localLog = execFileSync('git', ['log', '--format=%s', 'feature'], { cwd: workspace, encoding: 'utf8' });
