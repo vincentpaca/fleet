@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT } from '../src/runner/harness.ts';
+import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT, PROMPT_OWNS_DELIVERY } from '../src/runner/harness.ts';
 import { startMockDaemon } from './runner-mock-daemon.ts';
 
 const manifest = { harness: { cli: 'claude-code', cli_version: '>=2.1.0' } };
@@ -61,6 +61,15 @@ test('claude-code adapter ships its dialect env default; overrides carry none', 
   assert.equal(plan?.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '64000');
   const override = buildHarnessCommand({ manifest, target: 'APP-14', override: 'node fake.mjs' });
   assert.equal(override?.env, undefined);
+});
+
+test('publish: false (#292): the agent is told the order does not forbid the PR its prompt asks for', () => {
+  const prose = buildHarnessCommand({ manifest, prompt: 'fix the parser and open a PR', actualVersion: '2.1.220', publish: false });
+  assert.equal(prose?.args[1], `fix the parser and open a PR\n\n${OUTPUT_CONTRACT}\n\n${PROMPT_OWNS_DELIVERY}`);
+  assert.match(PROMPT_OWNS_DELIVERY, /open the PR yourself/);
+  // An order that publishes gets its PR from the runner; the note would be noise.
+  const issue = buildHarnessCommand({ manifest, prompt: PROMPT, actualVersion: '2.1.220', publish: true });
+  assert.equal(issue?.args[1], `${PROMPT}\n\n${OUTPUT_CONTRACT}`);
 });
 
 test('continues (#80) rides into the prompt: PR, branch, gh feedback instructions', () => {
@@ -517,7 +526,8 @@ test('an order prompt with shell metacharacters reaches the harness literally (#
     assert.equal(argv[0], '-p', `first arg is not the prompt flag: ${JSON.stringify(argv)}`);
     // The operator's prompt, character for character, at the head of the launch:
     // not composed into `/dev 77`, and not touched by a shell.
-    assert.equal(argv[1], `${prompt}\n\n${OUTPUT_CONTRACT}`, `the order's prompt did not reach the harness intact:\n${argv[1]}`);
+    // The order grants no publish, so the #292 delivery note rides last.
+    assert.equal(argv[1], `${prompt}\n\n${OUTPUT_CONTRACT}\n\n${PROMPT_OWNS_DELIVERY}`, `the order's prompt did not reach the harness intact:\n${argv[1]}`);
     for (const marker of [fromSubst, fromBacktick]) {
       assert.equal(existsSync(marker), false, `a command in the prompt ran inside the job container: ${marker}`);
     }

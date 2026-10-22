@@ -34,6 +34,16 @@ const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', '
 export const OUTPUT_CONTRACT = // contract pin: test-only export, asserted by the suite
   'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.';
 
+/**
+ * Rides on every order with `authority.publish: false` — prose, by shape (#292).
+ * Agents read .fleet/order.json and took `publish: false` / `finish: inspected`
+ * as a ban on the PR the prompt asked for. Prose delivery is prompt-owned (D17,
+ * #208): the field only means the runner composes no PR at settle, so the agent
+ * is told so. Pinned verbatim by test/runner-harness.test.ts.
+ */
+export const PROMPT_OWNS_DELIVERY = // contract pin: test-only export, asserted by the suite
+  'Fleet delivery note: .fleet/order.json records how this job was dispatched. Its authority.publish: false and its finish only mean the runner will not open a PR for you at the end; they do not limit what the instruction above asks for. If it asks for a PR, push your branch and open the PR yourself with gh.';
+
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
 export function parseVersion(output: string): string | undefined {
   return output.match(/\d+\.\d+\.\d+/)?.[0];
@@ -95,6 +105,8 @@ type HarnessInputs = {
    * derived plan is argv and never sees a shell (#241).
    */
   prompt?: string;
+  /** The order's `authority.publish`; false means the prompt owns delivery (#292). */
+  publish?: boolean;
 };
 
 /** Append version-drift notes when an actual version is measurable and required. */
@@ -175,7 +187,7 @@ function overridePlan(override: string, prompt: string | undefined): HarnessPlan
 }
 
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, override, actualVersion, continues, prompt }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, prompt, publish }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
@@ -206,7 +218,8 @@ export function buildHarnessCommand({ manifest, override, actualVersion, continu
   // operator-written included: a continuation that produces a report instead of
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
-  const promptText = `${prompt}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}`;
+  const deliveryNote = publish === false ? `\n\n${PROMPT_OWNS_DELIVERY}` : '';
+  const promptText = `${prompt}${continuationClause(continues)}\n\n${OUTPUT_CONTRACT}${deliveryNote}`;
   const model = typeof harness.model === 'string' ? harness.model : undefined;
   if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
   return { ...dialect(promptText, model), shell: false, notes };
