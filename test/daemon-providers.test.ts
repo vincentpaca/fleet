@@ -33,6 +33,9 @@ import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until, requestJson } from "./daemon-helpers.ts";
 
+/** The env vars the launch payload travelled in before the runner fetched it (#296). */
+const LAUNCH_PAYLOAD_ENV = ["FLEET_MANIFEST_JSON", "FLEET_WORK_ORDER_JSON", "FLEET_SYNC_JSON"];
+
 const SPEC: LaunchSpec = {
   jobId: "job-abc123",
   daemonUrl: "http://127.0.0.1:4646",
@@ -56,7 +59,7 @@ test("DockerProvider builds a docker run command with env via --env-file, never 
   // to every process on the host for the container-create duration (#126).
   assert.equal(args[args.indexOf("--env-file") + 1], "/private/fleet-env/payload");
   assert.ok(!args.includes("-e"));
-  for (const secret of [SPEC.runnerToken, "EXAMPLE_TOKEN=abc", "FLEET_MANIFEST_JSON"]) {
+  for (const secret of [SPEC.runnerToken, "EXAMPLE_TOKEN=abc"]) {
     assert.ok(args.every((arg) => !arg.includes(secret)), `argv leaks ${secret}`);
   }
 
@@ -79,12 +82,10 @@ test("DockerProvider env file carries every FLEET_* var and the operator env", (
   assert.ok(lines.includes("FLEET_WORKSPACE=/workspace"));
   assert.ok(lines.includes("EXAMPLE_TOKEN=abc"));
 
-  // Manifest and sync travel base64-encoded.
-  const manifestLine = lines.find((line) => line.startsWith("FLEET_MANIFEST_JSON="));
-  assert.ok(manifestLine);
-  const decoded = JSON.parse(Buffer.from(manifestLine.split("=")[1], "base64").toString());
-  assert.deepEqual(decoded, MANIFEST);
-  assert.ok(lines.some((line) => line.startsWith("FLEET_SYNC_JSON=")));
+  // Manifest, order and sync do not ride the env (#296): the runner fetches them.
+  for (const name of LAUNCH_PAYLOAD_ENV) {
+    assert.ok(!lines.some((line) => line.startsWith(`${name}=`)), `${name} must not travel in the env file`);
+  }
 });
 
 test("DockerProvider refuses an env value with a newline — --env-file cannot carry it", () => {
@@ -222,11 +223,9 @@ test("EcsProvider builds the run-task input JSON with env overrides; argv carrie
   assert.equal(envByName.FLEET_RUNNER_TOKEN, SPEC.runnerToken);
   assert.equal(envByName.FLEET_DAEMON_URL, SPEC.daemonUrl);
   assert.equal(envByName.EXAMPLE_TOKEN, "abc");
-  assert.ok(envByName.FLEET_MANIFEST_JSON);
-  // The materialisation payload must be provider-complete: the ECS path once
-  // omitted the work order and the runner died at the pickup gate with no
-  // target (first real cloud job, #9).
-  assert.ok(envByName.FLEET_WORK_ORDER_JSON, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
+  // The materialisation payload is fetched by the runner, never sent as
+  // overrides (#296) — RunTask caps the overrides block at 8192 characters.
+  for (const name of LAUNCH_PAYLOAD_ENV) assert.equal(envByName[name], undefined, `${name} must not ride the overrides`);
 
   const network = input.networkConfiguration as {
     awsvpcConfiguration: { subnets: string[]; securityGroups: string[]; assignPublicIp: string };
@@ -259,13 +258,40 @@ test("EcsProvider omits network configuration when no subnets are configured", (
   assert.ok(!("networkConfiguration" in provider.buildRunTaskInput(SPEC)));
 });
 
-test("DockerProvider includes FLEET_WORK_ORDER_JSON in the env file", () => {
-  const provider = new DockerProvider();
-  const lines = provider.envFileContents(SPEC).split("\n");
-  const orderLine = lines.find((line) => line.startsWith("FLEET_WORK_ORDER_JSON="));
-  assert.ok(orderLine, "FLEET_WORK_ORDER_JSON must be present so materializeWorkspace can write order.json");
-  const decoded = JSON.parse(Buffer.from(orderLine.split("=")[1], "base64").toString());
-  assert.deepEqual(decoded, WORK_ORDER);
+const ECS_TEST_CONFIG = {
+  cluster: "c",
+  taskDefinition: "t",
+  containerName: "runner",
+  subnets: ["subnet-aaa"],
+  securityGroups: ["sg-ccc"],
+  launchType: "EC2",
+  assignPublicIp: "DISABLED",
+};
+
+test("EcsProvider keeps a 10,000-character prompt out of the run-task input, under 8192 (#296)", () => {
+  // The bug: the prompt rode the overrides base64-encoded, and RunTask refused
+  // anything past ~2,200 prompt characters with "Container Overrides length
+  // must be at most 8192".
+  const prompt = "p".repeat(10_000);
+  const input = new EcsProvider(ECS_TEST_CONFIG).buildRunTaskInput({
+    ...SPEC,
+    workOrder: { ...WORK_ORDER, prompt },
+    sync: { ".fleet/notes.md": Buffer.from("n".repeat(20_000)).toString("base64") },
+  });
+  const overrides = JSON.stringify(input.overrides);
+  assert.ok(overrides.length < 8192, `overrides are ${overrides.length} characters`);
+  assert.ok(!JSON.stringify(input).includes("pppppppppp"), "the prompt must not ride the run-task input");
+});
+
+test("EcsProvider refuses overrides past 8192 characters, naming the size, before calling AWS (#296)", async () => {
+  // Operator env values still ride the overrides; a huge one must fail in
+  // Fleet's words (both sizes) rather than as a raw InvalidParameterException.
+  const spec = { ...SPEC, env: { BIG_VALUE: "v".repeat(9_000) } };
+  const provider = new EcsProvider(ECS_TEST_CONFIG, {
+    aws: async () => assert.fail("run-task must not be called with oversized overrides"),
+  });
+  assert.throws(() => provider.buildRunTaskInput(spec), /overrides are 9\d{3} characters.*at most 8192.*largest: BIG_VALUE, 9000/);
+  await assert.rejects(provider.launch(spec), /at most 8192/);
 });
 
 test("prepareWorkspace materialises manifest, order, and sync files; refuses path escapes", () => {
@@ -299,7 +325,68 @@ test("prepareWorkspace rejects a sync key naming the workspace root with a reada
   );
 });
 
-test("materializeWorkspace writes manifest, order, and sync files from env vars", () => {
+/**
+ * A daemon nobody listens on: the env-payload and already-staged paths must
+ * never reach for it (port 1 refuses at once if they do).
+ */
+const NO_DAEMON = { daemonUrl: "http://127.0.0.1:1", jobId: "job-abc123", token: "tok-unused" };
+
+test("materializeWorkspace fetches manifest, order, and sync files from the daemon with the runner token (#296)", async (t) => {
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const prompt = "q".repeat(10_000);
+  const workOrder = { ...WORK_ORDER, prompt };
+  const sync = { ".env.development": Buffer.from("A=1\n").toString("base64") };
+  const created = await op(sock, "POST", "/jobs", { workOrder, manifest: MANIFEST, sync });
+  assert.equal(created.status, 201, created.body);
+  const launch = provider.launches[0];
+
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-fetch-"));
+  await materializeWorkspace(workspace, { daemonUrl: daemon.daemonUrl, jobId: launch.jobId, token: launch.runnerToken });
+
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace, ".fleet/manifest.json"), "utf8")), MANIFEST);
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace, ".fleet/order.json"), "utf8")), workOrder);
+  assert.equal(readFileSync(join(workspace, ".env.development"), "utf8"), "A=1\n");
+  assert.ok(existsSync(join(workspace, ".fleet/out")));
+});
+
+test("materializeWorkspace fails at once, naming the status, when the daemon refuses the token (#296)", async (t) => {
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+  assert.equal((await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST })).status, 201);
+
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-refused-"));
+  const started = Date.now();
+  await assert.rejects(
+    materializeWorkspace(workspace, { daemonUrl: daemon.daemonUrl, jobId: provider.launches[0].jobId, token: "not-the-token" }),
+    /HTTP 401/,
+  );
+  // A 4xx is deterministic: no retry backoff before the job learns why.
+  assert.ok(Date.now() - started < 900, "a refused token must not be retried");
+  assert.ok(!existsSync(join(workspace, ".fleet/manifest.json")));
+});
+
+test("materializeWorkspace refuses a null manifest (a lost launch half, D15) instead of writing it", async () => {
+  // The route serves `manifest: null` when launch.json was lost; written out,
+  // "null" parses and the runner dies later on a TypeError with no settle.
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-null-"));
+  const orig = process.env.FLEET_MANIFEST_JSON;
+  try {
+    process.env.FLEET_MANIFEST_JSON = Buffer.from("null").toString("base64");
+    await assert.rejects(materializeWorkspace(workspace, NO_DAEMON), /carries no manifest/);
+    assert.ok(!existsSync(join(workspace, ".fleet/manifest.json")));
+  } finally {
+    if (orig === undefined) delete process.env.FLEET_MANIFEST_JSON;
+    else process.env.FLEET_MANIFEST_JSON = orig;
+  }
+});
+
+test("materializeWorkspace still reads an old daemon's env payload (skew compat, #296)", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
   const origEnv = { ...process.env };
   try {
@@ -308,7 +395,7 @@ test("materializeWorkspace writes manifest, order, and sync files from env vars"
     process.env.FLEET_SYNC_JSON = Buffer.from(
       JSON.stringify({ ".env.development": Buffer.from("A=1\n").toString("base64") }),
     ).toString("base64");
-    materializeWorkspace(workspace);
+    await materializeWorkspace(workspace, NO_DAEMON);
 
     assert.deepEqual(
       JSON.parse(readFileSync(join(workspace, ".fleet/manifest.json"), "utf8")),
@@ -332,7 +419,7 @@ test("materializeWorkspace writes manifest, order, and sync files from env vars"
   }
 });
 
-test("materializeWorkspace drops path-traversal sync entries and logs a warning", () => {
+test("materializeWorkspace drops path-traversal sync entries and logs a warning", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
   const origEnv = { ...process.env };
   const stderrLines: string[] = [];
@@ -343,7 +430,7 @@ test("materializeWorkspace drops path-traversal sync entries and logs a warning"
     process.env.FLEET_SYNC_JSON = Buffer.from(
       JSON.stringify({ "../evil.txt": Buffer.from("x").toString("base64") }),
     ).toString("base64");
-    materializeWorkspace(workspace);
+    await materializeWorkspace(workspace, NO_DAEMON);
 
     // The traversal entry must not have landed outside the workspace.
     assert.ok(!existsSync(join(workspace, "../evil.txt")));
@@ -364,7 +451,7 @@ test("materializeWorkspace drops path-traversal sync entries and logs a warning"
   }
 });
 
-test("materializeWorkspace drops a sync key naming the workspace root instead of crashing EISDIR (#139)", () => {
+test("materializeWorkspace drops a sync key naming the workspace root instead of crashing EISDIR (#139)", async () => {
   // The old guard (`target !== workspace && ...`) admitted the root itself, so
   // a sync key of "." reached writeFileSync(workspace) and threw EISDIR before
   // any EventSink existed — the job died with no readable trace. It must be
@@ -384,7 +471,7 @@ test("materializeWorkspace drops a sync key naming the workspace root instead of
       }),
     ).toString("base64");
 
-    materializeWorkspace(workspace); // must not throw
+    await materializeWorkspace(workspace, NO_DAEMON); // must not throw
 
     assert.equal(readFileSync(join(workspace, ".env.development"), "utf8"), "A=1\n", "good entries still land");
     assert.ok(
@@ -403,7 +490,7 @@ test("materializeWorkspace drops a sync key naming the workspace root instead of
   }
 });
 
-test("materializeWorkspace is a no-op when the manifest file already exists on disk", () => {
+test("materializeWorkspace is a no-op when the manifest file already exists on disk", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-noop-"));
   const fleetDir = join(workspace, ".fleet");
   mkdirSync(fleetDir, { recursive: true });
@@ -413,7 +500,7 @@ test("materializeWorkspace is a no-op when the manifest file already exists on d
   try {
     // FLEET_MANIFEST_JSON is set but should be ignored because the file exists.
     process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
-    materializeWorkspace(workspace);
+    await materializeWorkspace(workspace, NO_DAEMON);
 
     // Original content must be untouched.
     assert.equal(

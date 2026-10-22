@@ -115,8 +115,6 @@ async function main(): Promise<void> {
   const token = requireEnv('FLEET_RUNNER_TOKEN');
   const workspace = requireEnv('FLEET_WORKSPACE');
 
-  materializeWorkspace(workspace);
-
   // Re-entry answer (issue #6): present when the daemon re-launches a parked
   // job after an operator answer. The runner writes it to out/ after the wipe
   // so the status-driven harness finds it immediately on its first check.
@@ -165,6 +163,19 @@ async function main(): Promise<void> {
   const imageStamp = buildStamp();
   if (imageStamp !== undefined) {
     await sink.emit({ type: 'log', text: `runner image built at ${imageStamp}`, who: 'runner' });
+  }
+
+  // Container providers start with an empty workspace: fetch the manifest,
+  // order and synced files from the daemon (#296). After `running` so a fetch
+  // failure lands in the job's own log, with a settle that names it instead
+  // of blaming the manifest.
+  try {
+    await materializeWorkspace(workspace, { daemonUrl, jobId, token });
+  } catch (err) {
+    await sink.emit({ type: 'log', text: `workspace materialisation failed: ${String(err instanceof Error ? err.message : err)}`, who: 'runner' });
+    await settleBlocked(sink, 'the runner could not fetch its launch payload from the daemon (see the log); check the daemon is reachable from the sandbox, then re-dispatch');
+    await sink.emit({ type: 'state', state: 'cancelled', reason: 'manifest' });
+    process.exit(1);
   }
 
   let manifest: Record<string, unknown>;

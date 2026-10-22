@@ -161,13 +161,22 @@ test("POST /jobs creates a queued job, appends first state event with meta, laun
   assert.ok(!("runnerToken" in jobOf(single.json)));
 });
 
-test("launch failure cancels the job and returns 500", async (t) => {
+test("launch failure cancels the job, journals the provider's error, and returns 500 (#296)", async (t) => {
   const ctx = await startDaemon();
   t.after(() => ctx.daemon.stop());
   ctx.provider.failNextLaunch = true;
   const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
   assert.equal(res.status, 500);
-  assert.equal(jobOf(res.json).state, "cancelled");
+  const job = jobOf(res.json);
+  assert.equal(job.state, "cancelled");
+
+  // `fleet logs` reads this journal: the provider's own words must be in it,
+  // ahead of the cancelled state — the 500 body reaches only the dispatcher.
+  const events = parseNdjson((await op(ctx.sock, "GET", `/jobs/${job.id}/events`)).body) as Record<string, unknown>[];
+  assert.deepEqual(events.map((e) => e.type), ["state", "log", "state"]);
+  assert.equal(events[1].who, "daemon");
+  assert.match(String(events[1].text), /launch failed: .*stub launch failure/);
+  assert.equal(events[2].reason, "launch-failed");
 });
 
 test("runner intake: bad token 401, schema violation / wrong job / bad seq / illegal transition 422", async (t) => {
@@ -1168,6 +1177,12 @@ test("re-launch failure after answer cancels the job — not stuck in blocked", 
   const afterFail = jobOf((await op(ctx.sock, "GET", `/jobs/${id}`)).json);
   assert.equal(afterFail.state, "cancelled", "job must be cancelled when re-launch fails");
   assert.equal(afterFail.marker, undefined, "marker must be cleared");
+  // ...and the provider's error is in the journal `fleet logs` reads (#296).
+  const journal = parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Record<string, unknown>[];
+  const [log, cancelled] = journal.slice(-2);
+  assert.equal(log.type, "log");
+  assert.match(String(log.text), /re-launch failed: .*stub launch failure/);
+  assert.equal(cancelled.reason, "launch-failed");
 
   // No open decision remains (job is terminal, second answer attempt returns 409).
   const second = await op(ctx.sock, "POST", `/jobs/${id}/answer`, { option: "flag" });

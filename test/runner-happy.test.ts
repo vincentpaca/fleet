@@ -171,6 +171,36 @@ test('a stamped runner image names its build at job start (#207)', async () => {
   }
 });
 
+test('an empty workspace whose launch fetch fails settles blocked naming the fetch, not the manifest (#296)', async () => {
+  // Container providers start the runner on an empty workspace; the mock
+  // daemon has no launch route, so the fetch answers 404. The job's own log
+  // must say why, and the settle must not send the operator hunting for a
+  // manifest file they never had to provide.
+  const token = 'test-token-fetch-fail';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-happy-empty-'));
+  try {
+    const exitCode = await runRunner({
+      FLEET_JOB_ID: 'job-fetch-fail-1',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+    });
+    assert.equal(exitCode, 1);
+    assert.deepEqual(daemon.rejected, []);
+    assert.deepEqual(daemon.events.map((e) => e.type), ['state', 'log', 'settle', 'state']);
+    const [, log, settle, cancelled] = daemon.events;
+    assert.match(String(log.text), /cannot fetch launch payload .*\/internal\/jobs\/job-fetch-fail-1\/launch: HTTP 404/);
+    const report = settle.report as { status: string; next_action: string };
+    assert.equal(report.status, 'BLOCKED');
+    assert.match(report.next_action, /launch payload/);
+    assert.equal(cancelled.reason, 'manifest');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
 // --- Followthrough continuation (#80): the runner adopts the PR branch end to end ---
 
 /** A bare remote with main plus a delivered job branch (what a settled PR points at). */
