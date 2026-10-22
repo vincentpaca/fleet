@@ -361,6 +361,26 @@ export function renameRemoteBranch(workspace: string, from: string, to: string, 
   return 'renamed';
 }
 
+/**
+ * Bound on the re-entry side-branch check (#291). Generous, because it only
+ * keeps a hung remote from wedging setup; it is informational, so it never
+ * gets to fail setup either.
+ */
+const SIDE_CHECK_TIMEOUT_MS = 30_000;
+
+/**
+ * Should a re-entered run be told about diverted work? Yes unless the remote
+ * proves the job branch already contains it: a check that fails or times out
+ * reminds rather than killing setup over a hint.
+ */
+function sidePending(workspace: string, refs: JobRefs): boolean {
+  try {
+    return !sideMerged(workspace, refs, SIDE_CHECK_TIMEOUT_MS);
+  } catch {
+    return true;
+  }
+}
+
 /** What a retry moved aside: its claim branch, and its side branch (#291). */
 type Released = { released?: string; releasedSide?: string };
 
@@ -417,7 +437,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRef
   // Re-entry (#291): work an earlier generation diverted, and nobody has since
   // brought over, is not on the branch just checked out. Say so, rather than
   // let the run continue without it.
-  const divertedEarlier = existing && !sideMerged(workspace, { branch, side }) ? side : undefined;
+  const divertedEarlier = existing && sidePending(workspace, { branch, side }) ? side : undefined;
   return {
     branch, side, base, ...released,
     ...(divertedEarlier !== undefined ? { divertedEarlier } : {}),

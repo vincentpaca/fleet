@@ -138,7 +138,8 @@ function divertedClause(side: string | undefined): string {
   return (
     ` -- an earlier run of this job left work on branch ${side}, not on the branch you are on:` +
     ` fetch it (git fetch origin ${side}), read every commit it holds that you lack (git log -p HEAD..FETCH_HEAD),` +
-    ` and bring that work onto your current branch before continuing.`
+    ` and merge it into your current branch (git merge FETCH_HEAD) before continuing.` +
+    ` Merge, do not cherry-pick or squash: the reminder stops only once your branch contains that branch's tip.`
   );
 }
 

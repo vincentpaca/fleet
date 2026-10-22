@@ -670,30 +670,39 @@ test('a missing side branch is found absent whatever git prints on stderr (#291)
   writeFileSync(join(ws, 'unsaved.txt'), 'only here\n');
   // A localized git, or one that opens with a redirect warning: every failing
   // fetch says something other than "couldn't find remote ref".
-  const shim = mkdtempSync(join(tmpdir(), 'fleet-localized-git-'));
-  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
-  writeFileSync(join(shim, 'git'), [
-    '#!/bin/sh',
+  withGitShim([
     'if [ "$1" = fetch ]; then',
-    `  "${realGit}" "$@" 2>/dev/null && exit 0`,
+    '  "$REAL_GIT" "$@" 2>/dev/null && exit 0',
     '  code=$?',
     '  echo "warning: redirecting to elsewhere" >&2',
     '  echo "fatal: Remote-Referenz nicht gefunden" >&2',
     '  exit $code',
     'fi',
-    `exec "${realGit}" "$@"`,
-    '',
-  ].join('\n'), { mode: 0o755 });
-  const path = process.env.PATH;
-  process.env.PATH = `${shim}:${path}`;
-  try {
+  ], () => {
     const outcome = pushWip(ws, R(branch), 'cancelled: SIGTERM');
     assert.ok(typeof outcome === 'object' && outcome.moved, `the first diversion must land; got ${JSON.stringify(outcome)}`);
-  } finally {
-    process.env.PATH = path;
-  }
+  });
   assert.match(run(remote, ['ls-tree', '-r', '--name-only', 'fleet-diverged/job-1']), /unsaved\.txt/);
 });
+
+/**
+ * Run `fn` with a `git` shim first on PATH (#291): `body` is sh that runs
+ * before the real git, reachable as "$REAL_GIT"; falling through execs it.
+ * The runner's git calls inherit process.env, so the shim sees every one.
+ */
+function withGitShim(body: string[], fn: () => void): void {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-git-shim-'));
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(dir, 'git'), ['#!/bin/sh', `REAL_GIT="${realGit}"`, ...body, 'exec "$REAL_GIT" "$@"', ''].join('\n'), { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    fn();
+  } finally {
+    process.env.PATH = path;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 test('re-entry names the side branch an earlier park diverted to; a retry moves it aside (#291)', () => {
   const remote = makeRemote();
@@ -825,34 +834,36 @@ test('a push that hangs is SIGKILLed at its bound and throws a timeout that name
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-test('a diverted push against a black-holed remote fits inside ONE bound, not one per network call (#291)', async () => {
+test('the network calls of one diverted push share ONE bound, not one each (#291)', () => {
   const remote = makeRemote();
   const ws = makeWorkspace();
   const { branch } = setupWorkspace(ws, opts(remote));
   writeFileSync(join(ws, 'checkpointed.txt'), 'x\n');
   assert.equal(pushWip(ws, R(branch), 'checkpoint'), 'pushed');
   run(ws, ['checkout', '-q', '-b', 'x', 'origin/main']);
-  writeFileSync(join(ws, 'unsaved.txt'), 'only here\n');
+  writeFileSync(join(ws, 'first.txt'), 'diverted once\n');
+  assert.ok(typeof pushWip(ws, R(branch), 'one') === 'object', 'the side branch exists from here on');
+  writeFileSync(join(ws, 'second.txt'), 'more\n');
 
-  // The divert path makes two network calls (fetch the side tip, then push).
-  // Each used to get the whole bound, and a fetch timeout read as "no side
-  // branch yet" — so the cancel teardown sat through both, past its deadline.
-  const server = createServer(() => { /* hold every request open */ });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const addr = server.address();
-  assert.ok(addr !== null && typeof addr === 'object');
-  run(ws, ['remote', 'set-url', 'origin', `http://127.0.0.1:${addr.port}/repo.git`]);
-  try {
-    const started = Date.now();
+  // With the side branch present the divert path makes three network calls:
+  // ls-remote, fetch, push. Each takes ~1.2s here, so all three fit a 3000ms
+  // bound each but not one shared 3000ms deadline — which is the cancel
+  // teardown's budget, and running past it loses the settle.
+  withGitShim(['case "$1" in ls-remote|fetch|push) sleep 1.2;; esac'], () => {
     assert.throws(() => pushWip(ws, R(branch), 'cancelled: SIGTERM', 3_000), /timed out/);
-    const elapsed = Date.now() - started;
-    // One bound is ~3s; a bound per call (ls-remote, fetch, push) is 6s or more.
-    assert.ok(elapsed < 4_500, `the whole diverted push must fit one 3000ms bound; took ${elapsed}ms`);
-  } finally {
-    // Held-open requests would otherwise keep a failing run alive forever.
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+  });
+});
+
+test('a failing side-branch check never fails re-entry setup; it reminds instead (#291)', () => {
+  const remote = makeRemote();
+  const { branch } = setupWorkspace(makeWorkspace(), opts(remote));
+  // The check is informational: main has no such call, so a remote that will
+  // not list the side branch must not kill a re-entry that worked before.
+  withGitShim(['case "$*" in *ls-remote*fleet-diverged*) echo "fatal: unable to access" >&2; exit 128;; esac'], () => {
+    const reentry = setupWorkspace(makeWorkspace(), { ...opts(remote), reentry: true });
+    assert.equal(reentry.branch, branch);
+    assert.equal(reentry.divertedEarlier, 'fleet-diverged/job-1', 'an unanswered check reminds rather than stays silent');
+  });
 });
 
 // ── Harness-exit auto-retry: claim release by rename (#30) ─────────────────────
