@@ -528,9 +528,11 @@ test('pushWork delivers commits the agent made itself (not just uncommitted chan
   assert.match(remoteLog, /agent commits its own work/);
 });
 
-test('pushWork reports delivered when the agent pushed itself, even after a post-push amend', () => {
+test('pushWork never reads a post-push amend as clean: the amended HEAD is diverted, the pushed one kept', () => {
   // #34's third run: agent committed, pushed, then amended - runner push was
   // rejected and the job was mislabeled "clean" despite the delivery existing.
+  // Since #291 the amended HEAD, which the job branch refuses, is diverted to
+  // the side branch rather than dropped.
   const remote = makeRemote();
   const workspace = mkdtempSync(join(tmpdir(), 'fleet-ws-'));
   const { branch, base } = setupWorkspace(workspace, { url: remote, target: 'APP-8', jobId: 'job-amend', name: 'Operator One', email: 'op@example.com' });
@@ -538,10 +540,57 @@ test('pushWork reports delivered when the agent pushed itself, even after a post
   run(workspace, ['add', '-A']);
   run(workspace, ['commit', '-q', '-m', 'agent work']);
   run(workspace, ['push', '-q']);
-  run(workspace, ['commit', '--amend', '-q', '--no-edit']); // diverge from remote
-  assert.equal(pushWork(workspace, branch, 'APP-8', 'job-amend', true, base), 'delivered');
-  const remoteLog = run(remote, ['log', '--oneline', branch]);
-  assert.match(remoteLog, /agent work/);
+  run(workspace, ['commit', '--amend', '-q', '-m', 'agent work (amended)']); // diverge from remote
+  const outcome = pushWork(workspace, branch, 'APP-8', 'job-amend', true, base);
+  assert.ok(typeof outcome === 'object', `expected a diversion, got ${JSON.stringify(outcome)}`);
+  assert.equal(outcome.diverted, 'fleet-diverged/APP-8-job-amend');
+  assert.match(run(remote, ['log', '--oneline', branch]), /agent work$/m, 'the pushed delivery stays on the job branch');
+  assert.match(run(remote, ['log', '--oneline', outcome.diverted]), /agent work \(amended\)/, 'the amend is not lost');
+});
+
+test('a HEAD the job branch refuses goes to one side branch, chained, payload-free, agent branch untouched (#291)', () => {
+  const remote = makeRemote();
+  const ws = makeWorkspace();
+  const { branch } = setupWorkspace(ws, opts(remote));
+  const side = 'fleet-diverged/APP-7-job-1';
+  writeFileSync(join(ws, 'checkpointed.txt'), 'on the job branch\n');
+  assert.equal(pushWip(ws, branch, 'checkpoint'), 'pushed');
+  const jobTip = run(remote, ['rev-parse', branch]).trim();
+
+  // A fresh branch off main holds nothing beyond the job branch: no side push.
+  run(ws, ['checkout', '-q', '-b', 'x', 'origin/main']);
+  assert.equal(pushWip(ws, branch, 'idle'), 'clean');
+  assert.equal(execFileSync('git', ['ls-remote', '--heads', remote, side], { encoding: 'utf8' }), '', 'no side branch invented for nothing');
+
+  // Agent work, committed and not: diverted without moving x or its index.
+  writeFileSync(join(ws, 'a.txt'), 'a\n');
+  run(ws, ['add', 'a.txt']);
+  run(ws, ['commit', '-q', '-m', 'agent a']);
+  writeFileSync(join(ws, 'dirty.txt'), 'd\n');
+  const xTip = run(ws, ['rev-parse', 'x']).trim();
+  const first = pushWip(ws, branch, 'one');
+  assert.ok(typeof first === 'object' && first.diverted === side && first.moved, `got ${JSON.stringify(first)}`);
+  assert.match(first.reason, /the agent is on branch x, whose history does not contain origin\/fleet\/APP-7-job-1/);
+  assert.equal(run(ws, ['rev-parse', 'x']).trim(), xTip, 'the agent\'s branch must not carry a runner commit');
+  assert.match(run(ws, ['status', '--porcelain']), /^\?\? dirty\.txt$/m, 'the agent\'s index must be untouched');
+
+  // The agent moves on; the next diversion fast-forwards the same side branch
+  // with a plain push (a wrong parent would be rejected here, not forced).
+  run(ws, ['add', 'dirty.txt']);
+  run(ws, ['commit', '-q', '-m', 'agent b']);
+  const second = pushWip(ws, branch, 'two');
+  assert.ok(typeof second === 'object' && second.moved);
+  const third = pushWip(ws, branch, 'three');
+  assert.ok(typeof third === 'object' && !third.moved, 'nothing new is not a push');
+
+  const tree = run(remote, ['ls-tree', '-r', '--name-only', side]);
+  assert.match(tree, /a\.txt/);
+  assert.match(tree, /dirty\.txt/);
+  // The dispatch payload stays out, exactly as on the job branch.
+  assert.ok(!tree.includes('.env.fleet'), 'sync files must never be committed');
+  assert.ok(!tree.includes('.fleet/order.json'), 'order.json must never be committed');
+  assert.match(run(remote, ['show', `${side}:.fleet/manifest.json`]), /repo copy/, 'the dispatched manifest must not replace the tracked one');
+  assert.equal(run(remote, ['rev-parse', branch]).trim(), jobTip, 'the job branch never moves for diverted work');
 });
 
 test('remoteHasHead answers only for this HEAD, not for "the branch moved"', () => {

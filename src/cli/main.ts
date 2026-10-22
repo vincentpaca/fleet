@@ -2170,16 +2170,12 @@ function cmdResumePush(args: string[]): number {
     return EXIT_FAILURE;
   }
 
-  let outcome: 'pushed' | 'delivered' | 'clean';
+  let outcome: ReturnType<typeof pushWork>;
   try {
     outcome = pushWork(record.workspace, branch, target, record.jobId, record.ok !== false, record.base);
   } catch (err) {
-    const reason = errorMessage(err).split('\n')[0];
-    console.error(`push still failing: ${reason}`);
-    // A diverged HEAD is refused every time (#291); only a dead remote heals.
-    console.error(`workspace kept at ${record.workspace} — ${/non-fast-forward/.test(reason)
-      ? 'reconcile the branch by hand'
-      : 'retry when the remote is reachable'}`);
+    console.error(`push still failing: ${errorMessage(err).split('\n')[0]}`);
+    console.error(`workspace kept at ${record.workspace} — retry when the remote is reachable`);
     return EXIT_FAILURE;
   }
   if (outcome === 'clean') {
@@ -2187,19 +2183,24 @@ function cmdResumePush(args: string[]): number {
     console.error('workspace kept — inspect it before dropping the record');
     return EXIT_FAILURE;
   }
+  // A HEAD the job branch refused went to its side branch instead (#291); the
+  // side branch is then where the work must provably be.
+  const landed = typeof outcome === 'object' ? outcome.diverted : branch;
   // 'delivered' only means the remote branch is ahead of base — it can be ahead
   // with a different commit while this HEAD lives nowhere else. Prove it.
   const head = getHeadSha(record.workspace);
-  if (!remoteHasHead(record.workspace, branch)) {
-    console.error(`origin/${branch} does not contain ${head} (push outcome: ${outcome})`);
+  if (!remoteHasHead(record.workspace, landed)) {
+    console.error(`origin/${landed} does not contain ${head} (push outcome: ${typeof outcome === 'object' ? 'diverted' : outcome})`);
     console.error(`workspace kept at ${record.workspace} — reconcile the branch by hand`);
     return EXIT_FAILURE;
   }
 
   console.log(
-    outcome === 'pushed'
-      ? `pushed ${branch} from ${record.workspace} (${head})`
-      : `${branch} already carries ${head} on the remote`,
+    typeof outcome === 'object'
+      ? `pushed ${landed} from ${record.workspace} (${head}), not ${branch}: ${outcome.reason}`
+      : outcome === 'pushed'
+        ? `pushed ${branch} from ${record.workspace} (${head})`
+        : `${branch} already carries ${head} on the remote`,
   );
   fs.rmSync(record.workspace, { recursive: true, force: true });
   clearRetainedRecord(home, jobId);

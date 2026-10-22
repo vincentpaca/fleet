@@ -401,6 +401,79 @@ test('cancel: an agent on its own branch off origin/main still lands the WIP on 
   }
 });
 
+test('cancel: a branch off main AFTER a checkpoint diverts the work to a side branch, leaving the agent\'s branch alone (#291)', async () => {
+  const token = 'cancel-token-291c';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const workspace = writeWorkspace({ idle: '60s', checkpoint: '1s' }, '291');
+  const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
+  const branch = 'fleet/291-job-291c';
+  const side = 'fleet-diverged/291-job-291c';
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-291c',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_GIT_URL: remote,
+    FLEET_GIT_NAME: 'Operator One',
+    FLEET_GIT_EMAIL: 'op@example.com',
+    FLEET_HARNESS_CMD: `node ${committingHarness}`,
+    // A checkpoint has pushed early work, so origin/<jobBranch> is ahead of
+    // main and a branch cut from main no longer builds on it.
+    TEST_CHECKPOINT_FIRST: '1',
+    TEST_SWITCH: JSON.stringify([['checkout', '-q', '-b', 'x', 'origin/main']]),
+    TEST_LEAVE_DIRTY: '1',
+    TEST_NO_ARTIFACTS: '1',
+  });
+  const local = (args: string[]) => execFileSync('git', args, { cwd: workspace, encoding: 'utf8' }).trim();
+  try {
+    await waitFor(
+      () => readFileSyncSafe(join(workspace, '.fleet', 'out', 'work-staged')) !== '',
+      'the harness to checkpoint, switch branches and commit',
+    );
+    const agentTip = local(['rev-parse', 'refs/heads/x']);
+    const jobTip = remoteTip(remote, branch);
+    assert.ok(child.pid !== undefined);
+    process.kill(child.pid, 'SIGTERM');
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(40_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 1', 'the cancel path must terminate the runner within a deadline');
+
+    const files = execFileSync('git', ['ls-tree', '-r', '--name-only', side], { cwd: remote, encoding: 'utf8' });
+    assert.match(files, /committed-work\.txt/, 'the agent\'s commit must reach the side branch');
+    assert.match(files, /uncommitted-work\.txt/, 'and so must its uncommitted edit');
+    assert.equal(remoteTip(remote, branch), jobTip, 'the job branch keeps its checkpointed tip');
+    assert.equal(remoteTip(remote, 'x'), '', 'the agent\'s branch is never created on the remote');
+    // The agent's branch and index are exactly as the agent left them: a
+    // runner commit there would ride out with the agent's own next push.
+    assert.equal(local(['rev-parse', 'refs/heads/x']), agentTip, 'the agent\'s local branch tip must not move');
+    assert.match(local(['status', '--porcelain']), /^\?\? uncommitted-work\.txt$/m, 'the agent\'s index must be untouched');
+
+    const texts = logTexts(daemon.events);
+    const diverted = new RegExp(`^(checkpoint: )?wip (pushed to|already on) ${side}, not ${branch}: the agent is on branch x,`);
+    assert.ok(texts.some((text) => diverted.test(text)), `expected one line naming all three branches; got ${JSON.stringify(texts)}`);
+    assert.ok(
+      texts.some((text) => text.startsWith(`wip pushed to ${side}`) || text.startsWith(`wip already on ${side}`)),
+      `the cancel push must report the side branch; got ${JSON.stringify(texts)}`,
+    );
+    assert.ok(
+      !texts.some((text) => text.startsWith('no deliverable landed')),
+      `work on the side branch is a delivery; got ${JSON.stringify(texts)}`,
+    );
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(dirname(remote), { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
 test('settle: an agent on another PR\'s branch never gets a runner push onto it (#291)', async () => {
   const token = 'cancel-token-291b';
   const daemon = await startMockDaemon({ token });
@@ -440,22 +513,21 @@ test('settle: an agent on another PR\'s branch never gets a runner push onto it 
         ['checkout', '-q', '-b', 'feature', '--track', 'origin/feature'],
       ]),
       TEST_EXIT_AFTER_COMMIT: '1',
-      // A container provider: no host-side retention, so no resume-push hint.
-      FLEET_RESUME_PUSH: '',
+      TEST_LEAVE_DIRTY: '1',
     }).exitCode;
     assert.notEqual(code, -1, 'the runner must exit on its own');
 
-    const jobTip = remoteTip(remote, branch);
     assert.equal(remoteTip(remote, 'feature'), featureTip, 'no runner push may land on another PR\'s branch');
-    assert.equal(jobTip, remoteTip(remote, 'main'), 'the job branch is untouched by a rejected push');
+    assert.equal(remoteTip(remote, branch), remoteTip(remote, 'main'), 'the job branch refuses a HEAD that does not build on it');
+    // The work is not dropped: committed and uncommitted alike reach the side branch.
+    const side = 'fleet-diverged/291-job-291b';
+    const files = execFileSync('git', ['ls-tree', '-r', '--name-only', side], { cwd: remote, encoding: 'utf8' });
+    assert.match(files, /committed-work\.txt/);
+    assert.match(files, /uncommitted-work\.txt/, 'the runner\'s WIP commit carries the uncommitted edit');
     const texts = logTexts(daemon.events);
-    const failed = texts.find((text) => text.startsWith('WORK PUSH FAILED:'));
-    assert.ok(failed, `expected the settle push to fail; got ${JSON.stringify(texts)}`);
-    assert.match(failed, /non-fast-forward/);
-    assert.ok(failed.includes(branch) && failed.includes('feature'), `the line must name both branches: ${failed}`);
-    const retained = texts.find((text) => text.startsWith('workspace retained at'));
-    assert.ok(retained, `expected the retention note; got ${JSON.stringify(texts)}`);
-    assert.doesNotMatch(retained, /resume-push job-291b/, 'no resume-push hint on a provider that cannot retain the workspace');
+    const pushed = texts.find((text) => text.startsWith(`work pushed to ${side}, not ${branch}: the agent is on branch feature`));
+    assert.ok(pushed, `expected one line naming all three branches; got ${JSON.stringify(texts)}`);
+    assert.ok(!texts.some((text) => text.startsWith('WORK PUSH FAILED')), 'a diverted push is a delivery, not a failure');
     // Nor may the runner commit onto the foreign branch: the agent's next
     // plain `git push` would publish that commit to the other PR.
     const localLog = execFileSync('git', ['log', '--format=%s', 'feature'], { cwd: workspace, encoding: 'utf8' });
