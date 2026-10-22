@@ -1395,6 +1395,29 @@ async function readAnswerLine(
 }
 
 /**
+ * Whether a terminal state event is the job's last word (#293). Not every one
+ * is: an auto-retry's attempt 1 ends cancelled(harness-exit) or
+ * cancelled(signal) and the job goes on as attempt 2, and the daemon's own
+ * verdict (host-lost, operator-cancel) can follow the runner's cancelled event.
+ * So the record decides: the event is final when the record rests on the same
+ * state, in the same attempt, for the same reason. A daemon that cannot be
+ * asked ends the follow as before, rather than holding one open on a stream
+ * that may never speak again.
+ */
+async function isFinalTerminal(jobId: string, event: FleetEvent, attempt: number): Promise<boolean> {
+  let res: DaemonResponse;
+  try {
+    res = await request('GET', `/jobs/${encodeURIComponent(jobId)}`);
+  } catch {
+    return true;
+  }
+  const job = (res.json as { job?: { state?: string; reason?: string; attempt?: number } } | null)?.job;
+  if (res.status !== 200 || job === undefined) return true;
+  if (job.state !== event.state || (job.attempt ?? 1) !== attempt) return false;
+  return event.state !== 'cancelled' || event.reason === job.reason;
+}
+
+/**
  * Follow a job to a terminal state, printing events; with answerMode, pending
  * decisions are answered from stdin as they arrive.
  *
@@ -1416,6 +1439,8 @@ async function followJob(jobId: string, answerMode: boolean): Promise<number> {
   const done = new AbortController();
   let pendingDecision: FleetEvent | undefined;
   let prompting = false;
+  // The attempt the stream is in (#30): queued retry events carry it.
+  let attempt = 1;
 
   // The prompt runs beside the stream, not instead of it: events keep printing
   // while the operator types, and an answer landing from another surface (the
@@ -1451,8 +1476,11 @@ async function followJob(jobId: string, answerMode: boolean): Promise<number> {
         if (answerMode) void promptLoop().catch((err) => console.error(errorMessage(err)));
       }
       if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
+      if (event.type === 'state' && typeof event.attempt === 'number') attempt = event.attempt;
       if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
-        done.abort();
+        void isFinalTerminal(jobId, event, attempt).then((final) => {
+          if (final) done.abort();
+        });
       }
     },
     process.env as Record<string, string | undefined>,
