@@ -685,7 +685,10 @@ test('a host-lost retry resumes the lost attempt\'s pushed WIP commit, renaming 
 
   // Attempt 2's work lands on top of attempt 1's, on the same branch.
   writeFileSync(join(second, 'work.txt'), 'finished on attempt 2\n');
-  assert.equal(pushWork(second, 'APP-7', 'job-1', true, 'main'), 'pushed');
+  execFileSync('git', ['add', 'work.txt'], { cwd: second });
+  execFileSync('git', ['commit', '-q', '-m', 'finish'], { cwd: second });
+  // A fast-forward: rejected if attempt 2 had not started from attempt 1's tip.
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`], { cwd: second });
   const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
   assert.match(tree, /partial\.txt/);
   assert.match(tree, /work\.txt/);
