@@ -201,6 +201,81 @@ test('an empty workspace whose launch fetch fails settles blocked naming the fet
   }
 });
 
+test('a re-entering runner on an empty workspace fetches its launch payload and its answer, and stages answer-d1.json (#296)', async () => {
+  // What a resumed container job gets now: the decision id in the env, the
+  // manifest, order and answer from the daemon. The harness copies the answer
+  // file out of .fleet/out so the test can read what the runner staged.
+  const token = 'test-token-reentry';
+  const manifest = {
+    version: 1,
+    setup: { image: 'node:22' },
+    workspace: { repo: 'git@github.com:acme/example.git', strategy: 'branch-per-job' },
+    harness: { cli: 'claude-code', commands: [{ path: '.claude/commands/dev.md', critic: 'code-reviewer' }] },
+    gates: { pickup: 'node -e "process.exit(0)"' },
+  };
+  const daemon = await startMockDaemon({
+    token,
+    launch: { manifest, workOrder: { target: 'APP-125', finish: 'implemented', prompt: 'carry on' }, sync: {} },
+  });
+  const text = 'Rebase first, then renumber. '.repeat(400);
+  daemon.answer('d1', { option: 'rebase', text });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-happy-reentry-'));
+  try {
+    const exitCode = await runRunner({
+      FLEET_JOB_ID: 'job-reentry-1',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_REENTRY_DECISION: 'd1',
+      FLEET_HARNESS_CMD:
+        `node -e "const fs=require('node:fs');fs.copyFileSync('.fleet/out/answer-d1.json','answer-seen.json');` +
+        `fs.writeFileSync('.fleet/out/report.json',JSON.stringify({status:'READY',next_action:'review it',verification:['resumed']}))"`,
+    });
+    assert.equal(exitCode, 0);
+    assert.deepEqual(daemon.rejected, []);
+    assert.deepEqual(JSON.parse(readFileSync(join(workspace, 'answer-seen.json'), 'utf8')), { option: 'rebase', text });
+    assert.equal(JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8')).prompt, 'carry on');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('a re-entry whose answer the daemon does not hold settles blocked naming the answer, reason reentry-answer (#296)', async () => {
+  const token = 'test-token-reentry-missing';
+  const daemon = await startMockDaemon({
+    token,
+    launch: {
+      manifest: { version: 1, setup: { image: 'node:22' }, harness: { cli: 'claude-code' }, gates: { pickup: 'true' } },
+      workOrder: { target: 'APP-126', finish: 'implemented' },
+      sync: {},
+    },
+  });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-happy-reentry-missing-'));
+  try {
+    const exitCode = await runRunner({
+      FLEET_JOB_ID: 'job-reentry-2',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_REENTRY_DECISION: 'd4',
+    });
+    assert.equal(exitCode, 1);
+    assert.deepEqual(daemon.rejected, []);
+    assert.deepEqual(daemon.events.map((e) => e.type), ['state', 'log', 'settle', 'state']);
+    const [, log, settle, cancelled] = daemon.events;
+    assert.match(String(log.text), /re-entry answer fetch failed: daemon holds no answer for re-entry decision d4/);
+    const report = settle.report as { status: string; next_action: string };
+    assert.equal(report.status, 'BLOCKED');
+    assert.match(report.next_action, /answer to re-entry decision d4/);
+    assert.doesNotMatch(report.next_action, /launch payload|manifest/);
+    assert.equal(cancelled.reason, 'reentry-answer');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
 // --- Followthrough continuation (#80): the runner adopts the PR branch end to end ---
 
 /** A bare remote with main plus a delivered job branch (what a settled PR points at). */

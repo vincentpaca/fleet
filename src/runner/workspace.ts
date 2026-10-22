@@ -24,8 +24,22 @@ type LaunchPayload = { manifest?: unknown; workOrder?: unknown; sync?: Record<st
 /** Where the runner fetches its launch payload from. */
 type LaunchSource = { daemonUrl: string; jobId: string; token: string };
 
-const FETCH_ATTEMPTS = 3;
+/** Per-request timeout for the launch fetch. */
 const FETCH_TIMEOUT_MS = 10_000;
+/**
+ * Per-request timeout for the re-entry answer. The answer route long-polls
+ * (the daemon's DEFAULT_LONG_POLL_MS, 25s) before it answers 204, so a shorter
+ * client timeout would abort every "no answer" reply and retry it as an outage.
+ */
+export const ANSWER_FETCH_TIMEOUT_MS = 60_000; // contract pin: test-only export, asserted by the suite
+/**
+ * Transient failures retry with capped exponential backoff for about two
+ * minutes. A runner that cannot stage its workspace is finished either way,
+ * so waiting out a daemon restart or a slow network path costs nothing.
+ */
+const RETRY_BUDGET_MS = 120_000;
+const RETRY_BASE_MS = 1_000;
+const RETRY_MAX_MS = 30_000;
 
 /**
  * Write manifest, work order, and synced files into the workspace. No-op when
@@ -33,18 +47,18 @@ const FETCH_TIMEOUT_MS = 10_000;
  * invoked directly against a staged workspace).
  *
  * Throws when the payload cannot be had; the caller logs it as a job event and
- * the missing manifest then settles the job blocked.
+ * settles the job blocked.
  *
- * Path-traversal guard: any sync path whose resolved target escapes the
- * workspace root is silently dropped and logged to stderr. This mirrors the
- * explicit check in ProcessProvider.prepareWorkspace, but uses a log+skip
- * approach rather than throwing — the container cannot surface a throw to the
- * operator, so a log with a clear message is more useful.
+ * Path-traversal guard: the daemon refuses unsafe sync keys at POST /jobs, and
+ * any sync path whose resolved target still lands outside the workspace is
+ * dropped here rather than written. Dropped entries come back as notes for the
+ * caller to put in the job's log — one bad key should not sink the job, but it
+ * must not vanish into a container's stderr either.
  */
-export async function materializeWorkspace(workspace: string, source: LaunchSource): Promise<void> {
+export async function materializeWorkspace(workspace: string, source: LaunchSource): Promise<string[]> {
   const fleetDir = join(workspace, ".fleet");
   const manifestPath = join(fleetDir, "manifest.json");
-  if (existsSync(manifestPath)) return;
+  if (existsSync(manifestPath)) return [];
 
   const payload = (launchFromEnv() ?? (await getInternal(source, "launch"))) as LaunchPayload;
   // A lost launch half (D15) serves `manifest: null`; anything but an object
@@ -57,11 +71,11 @@ export async function materializeWorkspace(workspace: string, source: LaunchSour
   // The manifest is the marker for "this workspace is already staged", so the
   // create is also the test: if it appeared meanwhile, everything below it
   // belongs to that staging too.
-  if (!createIfAbsent(manifestPath, JSON.stringify(payload.manifest, null, 2))) return;
+  if (!createIfAbsent(manifestPath, JSON.stringify(payload.manifest, null, 2))) return [];
   if (payload.workOrder !== undefined) {
     writeFileSync(join(fleetDir, "order.json"), JSON.stringify(payload.workOrder, null, 2));
   }
-  writeSync(workspace, payload.sync ?? {});
+  return writeSync(workspace, payload.sync ?? {});
 }
 
 /**
@@ -102,39 +116,53 @@ export async function loadReentryAnswer(source: LaunchSource): Promise<ReentryAn
   if (!decisionId) return undefined;
   // Answered before the re-launch, so the poll returns at once; a 204 means
   // the journal has no answer for it.
-  const answer = await getInternal(source, `answer?decision=${encodeURIComponent(decisionId)}`);
+  const answer = await getInternal(source, `answer?decision=${encodeURIComponent(decisionId)}`, ANSWER_FETCH_TIMEOUT_MS);
   if (answer === undefined) throw new Error(`daemon holds no answer for re-entry decision ${decisionId}`);
   return { decisionId, answer: answer as ReentryAnswer["answer"] };
 }
 
-/**
- * GET one of the job's own /internal routes with the runner token; undefined
- * on 204. Transient failures (network, timeout, 5xx) retry briefly — the
- * container can start before its route to the daemon settles; a 4xx is
- * deterministic and fails at once.
- */
-async function getInternal(source: LaunchSource, route: string): Promise<unknown> {
-  const url = `${source.daemonUrl}/internal/jobs/${encodeURIComponent(source.jobId)}/${route}`;
-  let lastError = "";
-  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
-    try {
-      const response = await fetch(url, {
-        headers: { "x-fleet-runner-token": source.token },
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-      if (response.status === 204) return undefined;
-      if (response.ok) return await response.json();
-      lastError = `HTTP ${response.status}: ${(await response.text().catch(() => "")).slice(0, 200)}`;
-      if (response.status < 500) break;
-    } catch (err) {
-      lastError = String(err instanceof Error ? err.message : err);
-    }
-    if (attempt < FETCH_ATTEMPTS) await delay(1_000 * attempt);
+/** One GET's outcome: a value (undefined on 204), or an error and whether to retry it. */
+type Attempt = { value: unknown } | { error: string; transient: boolean };
+
+async function getOnce(url: string, token: string, timeoutMs: number): Promise<Attempt> {
+  try {
+    const response = await fetch(url, {
+      headers: { "x-fleet-runner-token": token },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (response.status === 204) return { value: undefined };
+    if (response.ok) return { value: await response.json() };
+    const detail = (await response.text().catch(() => "")).slice(0, 200);
+    // The same transient set as the event sink's postWithRetry: 5xx and 429.
+    // Any other 4xx is a deterministic refusal and fails at once.
+    return { error: `HTTP ${response.status}: ${detail}`, transient: response.status >= 500 || response.status === 429 };
+  } catch (err) {
+    return { error: String(err instanceof Error ? err.message : err), transient: true };
   }
-  throw new Error(`cannot fetch ${route.split("?")[0]} from ${url}: ${lastError}`);
 }
 
-function writeSync(workspace: string, sync: Record<string, string>): void {
+/**
+ * GET one of the job's own /internal routes with the runner token; undefined
+ * on 204. Transient failures retry under RETRY_BUDGET_MS — the container can
+ * start before its route to the daemon settles, or during a daemon restart.
+ */
+async function getInternal(source: LaunchSource, route: string, timeoutMs = FETCH_TIMEOUT_MS): Promise<unknown> {
+  const url = `${source.daemonUrl}/internal/jobs/${encodeURIComponent(source.jobId)}/${route}`;
+  const deadline = Date.now() + RETRY_BUDGET_MS;
+  for (let attempt = 1; ; attempt++) {
+    const result = await getOnce(url, source.token, timeoutMs);
+    if ("value" in result) return result.value;
+    const wait = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
+    if (!result.transient || Date.now() + wait > deadline) {
+      throw new Error(`cannot fetch ${route.split("?")[0]} from ${url}: ${result.error}`);
+    }
+    await delay(wait);
+  }
+}
+
+/** Write the sync map under the workspace; returns a note per dropped entry. */
+function writeSync(workspace: string, sync: Record<string, string>): string[] {
+  const dropped: string[] = [];
   const root = resolve(workspace);
   for (const [rel, b64] of Object.entries(sync)) {
     const target = resolve(root, rel);
@@ -145,10 +173,11 @@ function writeSync(workspace: string, sync: Record<string, string>): void {
     // pre-running death. Root and escape are the same rejection: neither is
     // a file inside the workspace.
     if (!target.startsWith(root + sep)) {
-      console.error(`runner: materializeWorkspace: dropping sync entry "${rel}" — resolves to the workspace root or escapes it (${target})`);
+      dropped.push(`dropped sync entry "${rel}": it resolves to the workspace root or escapes it (${target})`);
       continue;
     }
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, Buffer.from(b64, "base64"));
   }
+  return dropped;
 }

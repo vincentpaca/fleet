@@ -1,8 +1,9 @@
 /**
- * Tiny in-test daemon implementing the three runner-facing endpoints:
+ * Tiny in-test daemon implementing the runner-facing endpoints:
  *   POST /internal/jobs/:id/events   (single JSON or ndjson batch)
  *   POST /internal/jobs/:id/artifacts
  *   GET  /internal/jobs/:id/answer?decision=<id>
+ *   GET  /internal/jobs/:id/launch   (only when `launch` is given; 404 otherwise)
  *
  * Every incoming event is validated against events.schema.json and seq is
  * checked strictly monotonic; invalid input → 422 and NOT recorded, exactly
@@ -36,6 +37,8 @@ export async function startMockDaemon(opts: {
   token: string;
   /** Hold each artifact upload this long before answering — simulates a slow settle (#139). */
   artifactDelayMs?: number;
+  /** The launch payload to serve, as the real daemon's launch route would (#296). */
+  launch?: unknown;
 }): Promise<MockDaemon> {
   const events: PostedEvent[] = [];
   const artifacts: PostedArtifact[] = [];
@@ -91,6 +94,12 @@ export async function startMockDaemon(opts: {
       }
       artifacts.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as PostedArtifact);
       res.writeHead(200).end(JSON.stringify({ stored: true }));
+      return;
+    }
+
+    if (req.method === 'GET' && opts.launch !== undefined && /^\/internal\/jobs\/[^/]+\/launch$/.test(url.pathname)) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(opts.launch));
       return;
     }
 

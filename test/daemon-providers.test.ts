@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -26,10 +27,10 @@ import {
   parseFleetTasks,
 } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
-import { loadReentryAnswer, materializeWorkspace } from "../src/runner/workspace.ts";
+import { ANSWER_FETCH_TIMEOUT_MS, loadReentryAnswer, materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
 import { runnerEnv, writeSecretTempFile } from "../src/providers/provider.ts";
-import { FleetDaemon } from "../src/daemon/server.ts";
+import { DEFAULT_LONG_POLL_MS, FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until, requestJson } from "./daemon-helpers.ts";
 
@@ -290,7 +291,7 @@ test("EcsProvider refuses overrides past 8192 characters, naming the size, befor
   const provider = new EcsProvider(ECS_TEST_CONFIG, {
     aws: async () => assert.fail("run-task must not be called with oversized overrides"),
   });
-  assert.throws(() => provider.buildRunTaskInput(spec), /overrides are 9\d{3} characters.*at most 8192.*largest: BIG_VALUE, 9000/);
+  assert.throws(() => provider.buildRunTaskInput(spec), /overrides are 9\d{3} bytes.*at most 8192.*largest: BIG_VALUE, 9000/);
   await assert.rejects(provider.launch(spec), /at most 8192/);
 });
 
@@ -456,6 +457,39 @@ test("loadReentryAnswer: nothing on a fresh launch; fails loudly when the daemon
   }
 });
 
+test("the launch fetch rides out a 503 and a 429 with backoff, then stages the payload (#296)", async (t) => {
+  // A daemon restarting or shedding load must not cost the job: transient
+  // statuses retry (the same set the event sink retries), the payload lands.
+  const statuses = [503, 429];
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    const status = statuses.shift();
+    if (status !== undefined) return res.writeHead(status).end("busy");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ manifest: MANIFEST, workOrder: WORK_ORDER, sync: {} }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const { port } = server.address() as { port: number };
+
+  const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-retry-"));
+  await materializeWorkspace(workspace, { daemonUrl: `http://127.0.0.1:${port}`, jobId: "job-retry", token: "tok" });
+  assert.equal(calls, 3);
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace, ".fleet/manifest.json"), "utf8")), MANIFEST);
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace, ".fleet/order.json"), "utf8")), WORK_ORDER);
+});
+
+test("the re-entry answer fetch outwaits the daemon's long poll (#296)", () => {
+  // The answer route holds a miss for DEFAULT_LONG_POLL_MS before its 204. A
+  // client timeout at or under that aborts every miss, so "no answer" would
+  // surface as a two-minute outage instead.
+  assert.ok(
+    ANSWER_FETCH_TIMEOUT_MS > DEFAULT_LONG_POLL_MS,
+    `answer fetch timeout ${ANSWER_FETCH_TIMEOUT_MS}ms must exceed the ${DEFAULT_LONG_POLL_MS}ms long poll`,
+  );
+});
+
 test("materializeWorkspace still reads an old daemon's env payload (skew compat, #296)", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
   const origEnv = { ...process.env };
@@ -489,28 +523,24 @@ test("materializeWorkspace still reads an old daemon's env payload (skew compat,
   }
 });
 
-test("materializeWorkspace drops path-traversal sync entries and logs a warning", async () => {
+test("materializeWorkspace drops path-traversal sync entries and returns a note for the job log", async () => {
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-"));
   const origEnv = { ...process.env };
-  const stderrLines: string[] = [];
-  const origError = console.error;
-  console.error = (...args: unknown[]) => stderrLines.push(args.join(" "));
   try {
     process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
     process.env.FLEET_SYNC_JSON = Buffer.from(
       JSON.stringify({ "../evil.txt": Buffer.from("x").toString("base64") }),
     ).toString("base64");
-    await materializeWorkspace(workspace, NO_DAEMON);
+    const dropped = await materializeWorkspace(workspace, NO_DAEMON);
 
     // The traversal entry must not have landed outside the workspace.
     assert.ok(!existsSync(join(workspace, "../evil.txt")));
     // A warning must have been emitted so operators can diagnose the dropped file.
     assert.ok(
-      stderrLines.some((line) => line.includes("../evil.txt")),
-      `expected a warning mentioning the dropped path; got: ${JSON.stringify(stderrLines)}`,
+      dropped.some((line) => line.includes("../evil.txt")),
+      `expected a warning mentioning the dropped path; got: ${JSON.stringify(dropped)}`,
     );
   } finally {
-    console.error = origError;
     for (const key of ["FLEET_MANIFEST_JSON", "FLEET_SYNC_JSON"]) {
       if (key in origEnv) {
         process.env[key] = origEnv[key];
@@ -529,9 +559,6 @@ test("materializeWorkspace drops a sync key naming the workspace root instead of
   // remaining sync entries must still land.
   const workspace = mkdtempSync(join(tmpdir(), "fleet-mat-root-"));
   const origEnv = { ...process.env };
-  const stderrLines: string[] = [];
-  const origError = console.error;
-  console.error = (...args: unknown[]) => stderrLines.push(args.join(" "));
   try {
     process.env.FLEET_MANIFEST_JSON = Buffer.from(JSON.stringify(MANIFEST)).toString("base64");
     process.env.FLEET_SYNC_JSON = Buffer.from(
@@ -541,15 +568,14 @@ test("materializeWorkspace drops a sync key naming the workspace root instead of
       }),
     ).toString("base64");
 
-    await materializeWorkspace(workspace, NO_DAEMON); // must not throw
+    const dropped = await materializeWorkspace(workspace, NO_DAEMON); // must not throw
 
     assert.equal(readFileSync(join(workspace, ".env.development"), "utf8"), "A=1\n", "good entries still land");
     assert.ok(
-      stderrLines.some((line) => line.includes('"."') && line.includes("workspace root")),
-      `expected a readable warning naming the dropped "." entry; got: ${JSON.stringify(stderrLines)}`,
+      dropped.some((line) => line.includes('"."') && line.includes("workspace root")),
+      `expected a readable warning naming the dropped "." entry; got: ${JSON.stringify(dropped)}`,
     );
   } finally {
-    console.error = origError;
     for (const key of ["FLEET_MANIFEST_JSON", "FLEET_SYNC_JSON"]) {
       if (key in origEnv) {
         process.env[key] = origEnv[key];

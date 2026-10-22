@@ -150,26 +150,10 @@ async function main(): Promise<void> {
     await sink.emit({ type: 'log', text: `runner image built at ${imageStamp}`, who: 'runner' });
   }
 
-  // Container providers start with an empty workspace: fetch the manifest,
-  // order and synced files from the daemon (#296). After `running` so a fetch
-  // failure lands in the job's own log, with a settle that names it instead
-  // of blaming the manifest.
-  // Re-entry answer (issue #6): present when the daemon re-launches a parked
-  // job after an operator answer. The runner writes it to out/ after the wipe
-  // so the status-driven harness finds it immediately on its first check. A
-  // re-entry that cannot get its answer fails here, loudly: carrying on would
-  // treat the job as fresh and branch over its own WIP.
-  let reentryAnswer: ReentryAnswer | undefined;
-  try {
-    const source = { daemonUrl, jobId, token };
-    await materializeWorkspace(workspace, source);
-    reentryAnswer = await loadReentryAnswer(source);
-  } catch (err) {
-    await sink.emit({ type: 'log', text: `workspace materialisation failed: ${String(err instanceof Error ? err.message : err)}`, who: 'runner' });
-    await settleBlocked(sink, 'the runner could not fetch its launch payload from the daemon (see the log); check the daemon is reachable from the sandbox, then re-dispatch');
-    await sink.emit({ type: 'state', state: 'cancelled', reason: 'manifest' });
-    process.exit(1);
-  }
+  // Container providers start with an empty workspace; a re-entry also needs
+  // its operator's answer (#296). After `running` so a failure lands in the
+  // job's own log.
+  const reentryAnswer = await stageLaunch(sink, workspace, { daemonUrl, jobId, token });
 
   let manifest: Record<string, unknown>;
   try {
@@ -1335,6 +1319,42 @@ function startCheckpoints(opts: {
   const timer = setInterval(tick, Math.max(25, Math.min(opts.intervalMs, 1_000)));
   timer.unref();
   return timer;
+}
+
+/**
+ * Fetch what the runner starts without (#296): the manifest, order and synced
+ * files on a container provider, and on a re-entry (issue #6) the operator's
+ * answer, which the runner writes to out/ after the wipe so the status-driven
+ * harness finds it on its first check. Either failure settles blocked and
+ * exits, naming what could not be had — a re-entry carrying on without its
+ * answer would treat the job as fresh and branch over its own WIP.
+ */
+async function stageLaunch(
+  sink: EventSink,
+  workspace: string,
+  source: { daemonUrl: string; jobId: string; token: string },
+): Promise<ReentryAnswer | undefined> {
+  const abort = async (what: string, err: unknown, nextAction: string, reason: string): Promise<never> => {
+    await sink.emit({ type: 'log', text: `${what} failed: ${String(err instanceof Error ? err.message : err)}`, who: 'runner' });
+    await settleBlocked(sink, nextAction);
+    await sink.emit({ type: 'state', state: 'cancelled', reason });
+    process.exit(1);
+  };
+  try {
+    const dropped = await materializeWorkspace(workspace, source);
+    for (const note of dropped) await sink.emit({ type: 'log', text: `workspace: ${note}`, who: 'runner' });
+  } catch (err) {
+    return abort('workspace materialisation', err,
+      'the runner could not fetch its launch payload from the daemon (see the log); check the daemon is reachable from the sandbox, then re-dispatch',
+      'manifest');
+  }
+  try {
+    return await loadReentryAnswer(source);
+  } catch (err) {
+    return abort('re-entry answer fetch', err,
+      `the runner could not read the operator's answer to re-entry decision ${process.env.FLEET_REENTRY_DECISION ?? '(unnamed)'} (see the log); check the answer shows in \`fleet logs\` and the daemon is reachable, then re-dispatch`,
+      'reentry-answer');
+  }
 }
 
 /** Contract shape for aborts before/without a harness result. */

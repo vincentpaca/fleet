@@ -535,13 +535,14 @@ export class EcsProvider implements Provider {
     // plan reaches it — #296). The manifest, order and sync map no longer ride
     // here (the runner fetches them), but env values still can overflow it;
     // say so in Fleet's words instead of AWS's.
-    const size = JSON.stringify(overrides).length;
+    // Bytes, not UTF-16 units: a non-ASCII env value is longer on the wire.
+    const size = Buffer.byteLength(JSON.stringify(overrides));
     if (size > ECS_OVERRIDES_MAX) {
       // Name the biggest entry: only env values ride here now, and an
       // operator-supplied one is the usual culprit.
       const [name, value] = Object.entries(env).sort(([, a], [, b]) => b.length - a.length)[0];
       throw new Error(
-        `ecs run-task container overrides are ${size} characters; the RunTask API allows at most ${ECS_OVERRIDES_MAX} ` +
+        `ecs run-task container overrides are ${size} bytes; the RunTask API allows at most ${ECS_OVERRIDES_MAX} ` +
           `(largest: ${name}, ${value.length} characters)`,
       );
     }
