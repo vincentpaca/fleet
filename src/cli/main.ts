@@ -1044,7 +1044,9 @@ async function dispatchDelegate(req: DelegateRequest): Promise<{ jobId: string; 
   for (const rel of manifest.workspace?.sync ?? []) {
     const file = path.resolve(rel);
     if (!fs.existsSync(file)) fail(`missing sync file: ${rel} (listed in workspace.sync, not found in ${process.cwd()})`);
-    sync[rel] = fs.readFileSync(file).toString('base64');
+    // Keyed by the path relative to the project, normalised: the daemon
+    // refuses "." / ".." segments (#296), and "./.env" names the same file.
+    sync[path.relative(process.cwd(), file)] = fs.readFileSync(file).toString('base64');
   }
 
   // Process env takes precedence over .fleet/.env (per-invocation override, CI-friendly).

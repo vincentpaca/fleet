@@ -179,6 +179,49 @@ test("launch failure cancels the job, journals the provider's error, and returns
   assert.equal(events[2].reason, "launch-failed");
 });
 
+test("POST /jobs refuses sync keys that are not plain relative paths, and creates no job (#296)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const file = Buffer.from("x").toString("base64");
+  for (const key of ["../escape.txt", "/etc/passwd", ".", "a/../../b", "a//b", "./.env", "\\share\\x", ""]) {
+    const res = await op(ctx.sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST, sync: { [key]: file } });
+    assert.equal(res.status, 422, `sync key ${JSON.stringify(key)}: ${res.body}`);
+    assert.match(res.body, /sync path/);
+  }
+  assert.equal(ctx.provider.launches.length, 0, "a refused dispatch launches nothing");
+  assert.equal(((await op(ctx.sock, "GET", "/jobs")).json as { jobs: unknown[] }).jobs.length, 0, "and records no job");
+
+  const ok = await op(ctx.sock, "POST", "/jobs", {
+    workOrder: WORK_ORDER, manifest: MANIFEST, sync: { ".env.fleet": file, ".claude/agents/reviewer.md": file },
+  });
+  assert.equal(ok.status, 201, ok.body);
+});
+
+test("a manifest cancellation from a runner that never fetched its launch payload names the stale runner image (#296)", async (t) => {
+  const ctx = await startDaemon();
+  t.after(() => ctx.daemon.stop());
+  const journal = async (id: string) =>
+    parseNdjson((await op(ctx.sock, "GET", `/jobs/${id}/events`)).body) as Record<string, unknown>[];
+  const SKEW = /never fetched its launch payload.*predates #296.*images\/build\.sh --redeploy-daemon/;
+
+  // An old runner image: no fetch, no materialisation log, straight to the
+  // misleading manifest cancellation.
+  const old = await createJob(ctx);
+  await runnerPost(ctx.sock, old.id, old.token, event(old.id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, old.id, old.token, event(old.id, 1, { type: "state", state: "cancelled", reason: "manifest" }));
+  const oldLog = (await journal(old.id)).filter((e) => e.type === "log");
+  assert.ok(oldLog.some((e) => SKEW.test(String(e.text))), JSON.stringify(oldLog));
+
+  // A current runner whose fetch failed says so itself; the daemon adds nothing.
+  const cur = await createJob(ctx);
+  await runnerPost(ctx.sock, cur.id, cur.token, event(cur.id, 0, { type: "state", state: "running" }));
+  await runnerPost(ctx.sock, cur.id, cur.token, event(cur.id, 1, {
+    type: "log", who: "runner", text: "workspace materialisation failed: cannot fetch launch from http://127.0.0.1:1/x: HTTP 503",
+  }));
+  await runnerPost(ctx.sock, cur.id, cur.token, event(cur.id, 2, { type: "state", state: "cancelled", reason: "manifest" }));
+  assert.ok(!(await journal(cur.id)).some((e) => SKEW.test(String(e.text))));
+});
+
 test("runner intake: bad token 401, schema violation / wrong job / bad seq / illegal transition 422", async (t) => {
   const ctx = await startDaemon();
   t.after(() => ctx.daemon.stop());
