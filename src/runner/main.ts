@@ -732,7 +732,7 @@ async function main(): Promise<void> {
   const cancelPushWip = async (signal: NodeJS.Signals): Promise<boolean> => {
     if (!gitUrl || !branch) return false;
     try {
-      const outcome = pushWip(workspace, `cancelled: ${signal}`, cancelPushTimeoutMs);
+      const outcome = pushWip(workspace, branch, `cancelled: ${signal}`, cancelPushTimeoutMs);
       await sink.emit({
         type: 'log',
         text: outcome === 'pushed'
@@ -893,7 +893,7 @@ async function main(): Promise<void> {
 
     if (gitUrl && branch) {
       try {
-        const wipOutcome = pushWip(workspace, `block_hot expired: ${result.decisionId}`, GIT_TIMEOUT_MS);
+        const wipOutcome = pushWip(workspace, branch, `block_hot expired: ${result.decisionId}`, GIT_TIMEOUT_MS);
         await sink.emit({
           type: 'log',
           text: wipOutcome === 'pushed'
@@ -1000,7 +1000,7 @@ async function main(): Promise<void> {
   let retainedWorkspace: string | undefined;
   if (gitUrl && branch) {
     try {
-      const outcome = pushWork(workspace, target, jobId, exitCode === 0, base, GIT_TIMEOUT_MS);
+      const outcome = pushWork(workspace, branch, target, jobId, exitCode === 0, base, GIT_TIMEOUT_MS);
       workPushed = outcome === 'pushed' || outcome === 'delivered';
       // Adopted branch (#80): 'delivered' means ahead-of-base, which the
       // adopted branch is by construction. Delivery on a continuation is real
@@ -1120,7 +1120,9 @@ async function main(): Promise<void> {
     produced: artifactProduced,
     workPushed,
     ...(settleRung !== undefined ? { rung: settleRung } : {}),
-    ...(retainedWorkspace !== undefined ? { retainedWorkspace } : {}),
+    ...(retainedWorkspace !== undefined
+      ? { retainedWorkspace, resumePush: process.env.FLEET_RESUME_PUSH === '1' }
+      : {}),
     prUrl,
   });
   for (const note of notes) {
@@ -1189,7 +1191,7 @@ async function parkOnAuthFailure(opts: {
 
   if (branch !== undefined) {
     try {
-      const wipOutcome = pushWip(opts.workspace, 'auth failure: parked', opts.pushTimeoutMs);
+      const wipOutcome = pushWip(opts.workspace, branch, 'auth failure: parked', opts.pushTimeoutMs);
       await sink.emit({
         type: 'log',
         text: wipOutcome === 'pushed'
@@ -1312,7 +1314,7 @@ function startCheckpoints(opts: {
     if (now - lastAttemptAt < opts.intervalMs) return;
     lastAttemptAt = now;
     try {
-      const outcome = pushCheckpoint(opts.workspace, `fleet job ${opts.jobId}`, opts.pushTimeoutMs);
+      const outcome = pushCheckpoint(opts.workspace, opts.branch, `fleet job ${opts.jobId}`, opts.pushTimeoutMs);
       if (outcome === 'pushed') {
         opts.forget(opts.sink.emit({
           type: 'log',

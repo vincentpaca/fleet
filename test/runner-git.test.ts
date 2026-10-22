@@ -66,7 +66,7 @@ test('dispatch payload survives the clone and is never committed', () => {
   // ...and order/sync/out never reach the remote even after a full work push.
   writeFileSync(join(workspace, 'feature.txt'), 'real work\n');
   writeFileSync(join(workspace, '.fleet', 'out', 'report.json'), '{}');
-  assert.equal(pushWork(workspace, 'APP-7', 'job-1', true), 'pushed');
+  assert.equal(pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true), 'pushed');
   const files = run(workspace, ['ls-tree', '-r', '--name-only', 'origin/fleet/APP-7-job-1']);
   assert.match(files, /feature\.txt/);
   assert.ok(!files.includes('.fleet/order.json'), 'order.json must never be committed');
@@ -81,9 +81,9 @@ test('pushWork is honest about a clean tree; pushWip lands a park commit', () =>
   const remote = makeRemote();
   const workspace = makeWorkspace();
   const { branch: _branch2 } = setupWorkspace(workspace, opts(remote));
-  assert.equal(pushWork(workspace, 'APP-7', 'job-1', true), 'clean');
+  assert.equal(pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true), 'clean');
   writeFileSync(join(workspace, 'half-done.txt'), 'wip\n');
-  assert.equal(pushWip(workspace, 'block_hot expired'), 'pushed');
+  assert.equal(pushWip(workspace, 'fleet/APP-7-job-1', 'block_hot expired'), 'pushed');
   const subject = run(workspace, ['log', '-1', '--format=%s', 'origin/fleet/APP-7-job-1']);
   assert.match(subject, /^wip\(park\): block_hot expired/);
 });
@@ -93,7 +93,7 @@ test('partial work is pushed with a partial marker — evidence over tidiness', 
   const workspace = makeWorkspace();
   const { branch: _branch3 } = setupWorkspace(workspace, opts(remote));
   writeFileSync(join(workspace, 'attempt.txt'), 'incomplete\n');
-  assert.equal(pushWork(workspace, 'APP-7', 'job-1', false), 'pushed');
+  assert.equal(pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', false), 'pushed');
   const subject = run(workspace, ['log', '-1', '--format=%s', 'origin/fleet/APP-7-job-1']);
   assert.match(subject.trim(), /\(partial\)$/);
 });
@@ -296,7 +296,7 @@ test('getHeadSha returns the current HEAD SHA after a commit', () => {
   const workspace = makeWorkspace();
   setupWorkspace(workspace, opts(remote));
   writeFileSync(join(workspace, 'work.txt'), 'some work\n');
-  pushWork(workspace, 'APP-7', 'job-1', true);
+  pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true);
   const sha = getHeadSha(workspace);
   assert.match(sha, /^[0-9a-f]{40}$/);
   // The SHA matches what git reports for HEAD on the remote.
@@ -369,7 +369,7 @@ test('setupWorkspace reentry: checks out existing branch with WIP, no collision'
 
   // Simulate WIP: commit something and push.
   writeFileSync(join(ws1, 'half-done.txt'), 'wip\n');
-  pushWip(ws1, 'block_hot expired');
+  pushWip(ws1, 'fleet/APP-7-job-1', 'block_hot expired');
 
   // Verify the WIP commit is on the remote.
   const subjects1 = run(ws1, ['log', '--format=%s', `origin/${branch}`]);
@@ -392,7 +392,7 @@ test('setupWorkspace reentry: checks out existing branch with WIP, no collision'
 
   // A subsequent pushWork on re-entry does not trip or duplicate the branch.
   writeFileSync(join(ws2, 'final.txt'), 'done\n');
-  assert.equal(pushWork(ws2, 'APP-7', 'job-1', true), 'pushed');
+  assert.equal(pushWork(ws2, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true), 'pushed');
   const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
   assert.match(files, /half-done\.txt/);
   assert.match(files, /final\.txt/);
@@ -407,7 +407,7 @@ test('setupWorkspace adoption: checks out the adopted branch, never a fresh job 
   const ws1 = makeWorkspace();
   const { branch } = setupWorkspace(ws1, opts(remote)); // fleet/APP-7-job-1
   writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
-  assert.equal(pushWork(ws1, 'APP-7', 'job-1', true), 'pushed');
+  assert.equal(pushWork(ws1, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true), 'pushed');
 
   // The followthrough job adopts that branch.
   const ws2 = makeWorkspace();
@@ -426,7 +426,7 @@ test('setupWorkspace adoption: checks out the adopted branch, never a fresh job 
 
   // Work pushes to the SAME branch, so the PR updates in place.
   writeFileSync(join(ws2, 'fix.txt'), 'review feedback addressed\n');
-  assert.equal(pushWork(ws2, 'APP-7', 'job-2', true), 'pushed');
+  assert.equal(pushWork(ws2, branch, 'APP-7', 'job-2', true), 'pushed');
   const files = run(ws2, ['ls-tree', '-r', '--name-only', `origin/${branch}`]);
   assert.match(files, /delivered\.txt/);
   assert.match(files, /fix\.txt/);
@@ -437,7 +437,7 @@ test('remoteMovedBeyond judges delivery against the adopted tip, not against bas
   const ws1 = makeWorkspace();
   const { branch } = setupWorkspace(ws1, opts(remote));
   writeFileSync(join(ws1, 'delivered.txt'), 'v1\n');
-  pushWork(ws1, 'APP-7', 'job-1', true);
+  pushWork(ws1, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true);
 
   const ws2 = makeWorkspace();
   setupWorkspace(ws2, { url: remote, jobId: 'job-2', target: 'APP-7', name: 'Operator One', email: 'op@example.com', adoptBranch: branch });
@@ -449,7 +449,7 @@ test('remoteMovedBeyond judges delivery against the adopted tip, not against bas
   assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), false, 'nothing pushed yet — no movement');
 
   writeFileSync(join(ws2, 'fix.txt'), 'fix\n');
-  pushWork(ws2, 'APP-7', 'job-2', true);
+  pushWork(ws2, branch, 'APP-7', 'job-2', true);
   assert.equal(remoteMovedBeyond(ws2, branch, adoptedTip), true, 'a pushed fix moves the branch beyond the adopted tip');
 
   // Unknown SHA or unreachable remote: never claim movement it cannot prove.
@@ -523,7 +523,7 @@ test('pushWork delivers commits the agent made itself (not just uncommitted chan
   writeFileSync(join(workspace, 'work.txt'), 'agent work\n');
   run(workspace, ['add', '-A']);
   run(workspace, ['commit', '-q', '-m', 'agent commits its own work']);
-  assert.equal(pushWork(workspace, 'APP-9', 'job-self', true), 'pushed');
+  assert.equal(pushWork(workspace, branch, 'APP-9', 'job-self', true), 'pushed');
   const remoteLog = run(remote, ['log', '--oneline', branch]);
   assert.match(remoteLog, /agent commits its own work/);
 });
@@ -539,7 +539,7 @@ test('pushWork reports delivered when the agent pushed itself, even after a post
   run(workspace, ['commit', '-q', '-m', 'agent work']);
   run(workspace, ['push', '-q']);
   run(workspace, ['commit', '--amend', '-q', '--no-edit']); // diverge from remote
-  assert.equal(pushWork(workspace, 'APP-8', 'job-amend', true, base), 'delivered');
+  assert.equal(pushWork(workspace, branch, 'APP-8', 'job-amend', true, base), 'delivered');
   const remoteLog = run(remote, ['log', '--oneline', branch]);
   assert.match(remoteLog, /agent work/);
 });
@@ -555,7 +555,7 @@ test('remoteHasHead answers only for this HEAD, not for "the branch moved"', () 
   run(workspace, ['commit', '-q', '-m', 'work']);
   assert.equal(remoteHasHead(workspace, branch), false, 'unpushed commit is not on the remote');
 
-  assert.equal(pushWork(workspace, 'APP-7', 'job-1', true), 'pushed');
+  assert.equal(pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', true), 'pushed');
   assert.equal(remoteHasHead(workspace, branch), true, 'pushed commit is on the remote');
 
   // Local history rewritten after the push: the remote has a commit, but not
@@ -577,7 +577,7 @@ test('a push that hangs is SIGKILLed at its bound and throws a timeout that name
   const workspace = makeWorkspace();
   setupWorkspace(workspace, opts(remote));
   writeFileSync(join(workspace, 'half-done.txt'), 'wip\n');
-  assert.equal(pushWip(workspace, 'block_hot expired', 30_000), 'pushed');
+  assert.equal(pushWip(workspace, 'fleet/APP-7-job-1', 'block_hot expired', 30_000), 'pushed');
 
   // Then the black-holed remote from the issue: a server that accepts the
   // connection and never answers. Without the bound, git push waits on it
@@ -592,7 +592,7 @@ test('a push that hangs is SIGKILLed at its bound and throws a timeout that name
   writeFileSync(join(workspace, 'half-done.txt'), 'more wip\n');
   const started = Date.now();
   assert.throws(
-    () => pushWip(workspace, 'cancelled: SIGTERM', 1_500),
+    () => pushWip(workspace, 'fleet/APP-7-job-1', 'cancelled: SIGTERM', 1_500),
     /git push timed out after 1500ms/,
     'the error must name the timeout so the teardown log can distinguish a hang from a rejection',
   );
@@ -607,7 +607,7 @@ test('renameRemoteBranch moves the claim aside and keeps every commit reachable 
   const workspace = makeWorkspace();
   const { branch } = setupWorkspace(workspace, opts(remote));
   writeFileSync(join(workspace, 'partial.txt'), 'half-finished\n');
-  pushWork(workspace, 'APP-7', 'job-1', false);
+  pushWork(workspace, 'fleet/APP-7-job-1', 'APP-7', 'job-1', false);
 
   assert.equal(renameRemoteBranch(workspace, branch, `${branch}-attempt1`), 'renamed');
   const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
@@ -631,7 +631,7 @@ test('a retry attempt renames the previous claim, then creates its fresh branch 
   const first = makeWorkspace();
   const { branch } = setupWorkspace(first, opts(remote));
   writeFileSync(join(first, 'partial.txt'), 'attempt 1 got this far\n');
-  pushWork(first, 'APP-7', 'job-1', false);
+  pushWork(first, 'fleet/APP-7-job-1', 'APP-7', 'job-1', false);
 
   // Attempt 2: same job id, fresh workspace — exactly what the daemon relaunches.
   const second = makeWorkspace();

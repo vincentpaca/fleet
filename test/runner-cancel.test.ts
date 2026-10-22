@@ -23,7 +23,7 @@ import { createServer, type Server, type ServerResponse } from 'node:http';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { startMockDaemon, type PostedEvent } from './runner-mock-daemon.ts';
@@ -332,6 +332,140 @@ function readFileSyncSafe(path: string): string {
     return '';
   }
 }
+
+// --- #291: runner pushes go to the job branch, not the agent's branch -------
+//
+// Every runner push (checkpoint, park, cancel, settle) ran a bare `git push`,
+// so it followed whatever branch the agent had checked out and its upstream.
+
+/** A branch's tip on the bare remote, '' when it does not exist. */
+function remoteTip(remote: string, branch: string): string {
+  return execFileSync('git', ['ls-remote', '--heads', remote, branch], { encoding: 'utf8' }).split('\t')[0];
+}
+
+test('cancel: an agent on its own branch off origin/main still lands the WIP on the job branch (#291)', async () => {
+  const token = 'cancel-token-291a';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const mainTip = remoteTip(remote, 'main');
+  const workspace = writeWorkspace({ idle: '60s' }, '291');
+  const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
+  const { child, exitCode } = spawnRunner({
+    FLEET_JOB_ID: 'job-291a',
+    FLEET_DAEMON_URL: daemon.url,
+    FLEET_RUNNER_TOKEN: token,
+    FLEET_WORKSPACE: workspace,
+    FLEET_GIT_URL: remote,
+    FLEET_GIT_NAME: 'Operator One',
+    FLEET_GIT_EMAIL: 'op@example.com',
+    FLEET_HARNESS_CMD: `node ${committingHarness}`,
+    // The prose prompt said "branch off main": the new branch's upstream is
+    // origin/main under another name, so a bare push refused every time.
+    TEST_SWITCH: JSON.stringify([['checkout', '-q', '-b', 'other', 'origin/main']]),
+    // No artifacts: the settle's "something was delivered" must rest on the push.
+    TEST_NO_ARTIFACTS: '1',
+  });
+  try {
+    await waitFor(
+      () => readFileSyncSafe(join(workspace, '.fleet', 'out', 'work-staged')) !== '',
+      'the harness to switch branches and commit',
+    );
+    assert.ok(child.pid !== undefined);
+    process.kill(child.pid, 'SIGTERM');
+    const outcome = await Promise.race([
+      exitCode.then((code) => `exit ${code}`),
+      sleep(40_000).then(() => 'still running'),
+    ]);
+    assert.equal(outcome, 'exit 1', 'the cancel path must terminate the runner within a deadline');
+
+    const branch = 'fleet/291-job-291a';
+    const texts = logTexts(daemon.events);
+    assert.ok(texts.includes(`wip pushed to ${branch} (cancelled)`), `expected the WIP on the job branch; got ${JSON.stringify(texts)}`);
+    const files = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
+    assert.match(files, /committed-work\.txt/, 'the agent\'s commit must reach origin/<jobBranch>');
+    assert.equal(remoteTip(remote, 'main'), mainTip, 'the runner must never push to the agent\'s upstream');
+    assert.equal(remoteTip(remote, 'other'), '', 'nor create the agent\'s branch on the remote');
+    assert.ok(
+      !texts.some((text) => text.startsWith('no deliverable landed')),
+      `the settle must count the WIP as delivered work; got ${JSON.stringify(texts)}`,
+    );
+  } finally {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(remote, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('settle: an agent on another PR\'s branch never gets a runner push onto it (#291)', async () => {
+  const token = 'cancel-token-291b';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  // Another open PR's branch, cut before main moved on: its history does not
+  // contain the job branch, so a push of it to the job branch is not a
+  // fast-forward.
+  const seed = join(dirname(remote), 'seed');
+  const seedGit = (args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd: seed });
+  seedGit(['checkout', '-q', '-b', 'feature']);
+  writeFileSync(join(seed, 'feature.txt'), 'someone else\'s PR\n');
+  seedGit(['add', '-A']);
+  seedGit(['commit', '-q', '-m', 'feature']);
+  seedGit(['push', '-q', remote, 'feature']);
+  seedGit(['checkout', '-q', 'main']);
+  writeFileSync(join(seed, 'later.txt'), 'main moved on\n');
+  seedGit(['add', '-A']);
+  seedGit(['commit', '-q', '-m', 'later']);
+  seedGit(['push', '-q', remote, 'main']);
+  const featureTip = remoteTip(remote, 'feature');
+  const workspace = writeWorkspace({ idle: '60s' }, '291');
+  const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
+  const branch = 'fleet/291-job-291b';
+  try {
+    const code = await spawnRunner({
+      FLEET_JOB_ID: 'job-291b',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_GIT_URL: remote,
+      FLEET_GIT_NAME: 'Operator One',
+      FLEET_GIT_EMAIL: 'op@example.com',
+      FLEET_HARNESS_CMD: `node ${committingHarness}`,
+      // What `gh pr checkout` does: the other PR's branch, tracking its remote.
+      TEST_SWITCH: JSON.stringify([
+        ['fetch', '-q', 'origin', 'feature'],
+        ['checkout', '-q', '-b', 'feature', '--track', 'origin/feature'],
+      ]),
+      TEST_EXIT_AFTER_COMMIT: '1',
+      // A container provider: no host-side retention, so no resume-push hint.
+      FLEET_RESUME_PUSH: '',
+    }).exitCode;
+    assert.notEqual(code, -1, 'the runner must exit on its own');
+
+    const jobTip = remoteTip(remote, branch);
+    assert.equal(remoteTip(remote, 'feature'), featureTip, 'no runner push may land on another PR\'s branch');
+    assert.equal(jobTip, remoteTip(remote, 'main'), 'the job branch is untouched by a rejected push');
+    const texts = logTexts(daemon.events);
+    const failed = texts.find((text) => text.startsWith('WORK PUSH FAILED:'));
+    assert.ok(failed, `expected the settle push to fail; got ${JSON.stringify(texts)}`);
+    assert.match(failed, /non-fast-forward/);
+    assert.ok(failed.includes(branch) && failed.includes('feature'), `the line must name both branches: ${failed}`);
+    const retained = texts.find((text) => text.startsWith('workspace retained at'));
+    assert.ok(retained, `expected the retention note; got ${JSON.stringify(texts)}`);
+    assert.doesNotMatch(retained, /resume-push job-291b/, 'no resume-push hint on a provider that cannot retain the workspace');
+    // Nor may the runner commit onto the foreign branch: the agent's next
+    // plain `git push` would publish that commit to the other PR.
+    const localLog = execFileSync('git', ['log', '--format=%s', 'feature'], { cwd: workspace, encoding: 'utf8' });
+    assert.doesNotMatch(localLog, /fleet job/, 'no runner commit may sit on the agent\'s foreign branch');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(dirname(remote), { recursive: true, force: true });
+    await daemon.close();
+  }
+});
 
 // --- 2: a failed harness start produces a settle/log, not a crash -----------
 //

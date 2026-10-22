@@ -408,7 +408,7 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
 }
 
 /**
- * Commit everything and push. Outcomes:
+ * Commit everything and push it to the job branch. Outcomes:
  * - 'pushed': this call moved the remote.
  * - 'delivered': the remote branch already carries work beyond base (the agent
  *   pushed itself; possibly our push then failed on a post-push amend). The
@@ -416,35 +416,74 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): { bran
  *   mislabeled "clean" for exactly this.
  * - 'clean': nothing committed anywhere; there is no deliverable.
  *
+ * `branch` is the job branch (or the adopted PR's head, #80), passed in and
+ * never read from the checkout (#291): the agent creates and checks out
+ * branches at will, and a bare `git push` followed its current branch and
+ * upstream — failing outright after `checkout -b x origin/main` (upstream name
+ * mismatch: the work died with the container) or landing a WIP commit on
+ * another PR after `gh pr checkout`. The explicit refspec sends HEAD to the
+ * job branch and nowhere else. A HEAD that does not build on the job branch
+ * is refused before anything is committed: a runner commit left on another
+ * PR's branch would ride out with the agent's own next push to it.
+ *
  * `timeoutMs` bounds the network calls only (the push, and the verification
  * fetch on its failure path) — local add/commit/rev-list cannot hang on a
  * dead connection and a large tree must not trip a bound meant for one (#152).
  */
-function commitAndPush(workspace: string, message: string, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
+function commitAndPush(workspace: string, branch: string, message: string, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
+  if (!buildsOn(workspace, branch)) {
+    // Diverged (another PR's branch, or the agent amended after its own
+    // push): the push is refused either way, so judge delivery by what the
+    // remote already has.
+    if (remoteAheadOfBase(workspace, branch, base, timeoutMs)) return 'delivered';
+    throw nonFastForward(workspace, branch);
+  }
   git(workspace, ['add', '-A']);
   const staged = git(workspace, ['status', '--porcelain']).trim();
   if (staged !== '') git(workspace, ['commit', '-q', '-m', message]);
-  const ahead = git(workspace, ['rev-list', '--count', '@{upstream}..HEAD']).trim();
+  const ahead = git(workspace, ['rev-list', '--count', `origin/${branch}..HEAD`]).trim();
   if (staged !== '' || ahead !== '0') {
     try {
-      git(workspace, ['push', '-q'], timeoutMs);
+      git(workspace, ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`], timeoutMs);
       return 'pushed';
     } catch (err) {
-      // Push rejected (e.g. the agent amended after its own push). Fall through:
-      // judge delivery by what the remote actually has.
-      if (remoteAheadOfBase(workspace, base, timeoutMs)) return 'delivered';
+      // Rejected all the same (the remote moved past our tracking ref). Fall
+      // through: judge delivery by what the remote actually has.
+      if (remoteAheadOfBase(workspace, branch, base, timeoutMs)) return 'delivered';
       throw err;
     }
   }
-  return remoteAheadOfBase(workspace, base, timeoutMs) ? 'delivered' : 'clean';
+  return remoteAheadOfBase(workspace, branch, base, timeoutMs) ? 'delivered' : 'clean';
 }
 
-/** Does the remote branch carry commits beyond the base branch? */
-function remoteAheadOfBase(workspace: string, base?: string, timeoutMs?: number): boolean {
+/** Does HEAD contain the job branch as last seen on the remote? */
+function buildsOn(workspace: string, branch: string): boolean {
+  try {
+    git(workspace, ['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The one clear line for a HEAD the job branch would refuse (#291): the agent
+ * is on another line of history, typically some other PR's branch. Names both
+ * branches, so the log says where the work sits and that it went nowhere.
+ */
+function nonFastForward(workspace: string, branch: string): Error {
+  const current = git(workspace, ['branch', '--show-current']).trim();
+  const on = current === '' ? 'a detached HEAD' : `branch ${current}`;
+  return new Error(
+    `push to ${branch} refused as non-fast-forward: the agent is on ${on}, whose history does not contain origin/${branch} — nothing was committed or pushed by the runner`,
+  );
+}
+
+/** Does the remote job branch carry commits beyond the base branch? */
+function remoteAheadOfBase(workspace: string, branch: string, base?: string, timeoutMs?: number): boolean {
   if (!base) return false;
   try {
     git(workspace, ['fetch', '-q', 'origin'], timeoutMs);
-    const branch = git(workspace, ['branch', '--show-current']).trim();
     const count = git(workspace, ['rev-list', '--count', `origin/${base}..origin/${branch}`]).trim();
     return count !== '0';
   } catch {
@@ -453,13 +492,13 @@ function remoteAheadOfBase(workspace: string, base?: string, timeoutMs?: number)
 }
 
 /** The work commit at settle. Pushes partial work too — evidence over tidiness. */
-export function pushWork(workspace: string, target: string, jobId: string, ok: boolean, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
-  return commitAndPush(workspace, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`, base, timeoutMs);
+export function pushWork(workspace: string, branch: string, target: string, jobId: string, ok: boolean, base?: string, timeoutMs?: number): 'pushed' | 'delivered' | 'clean' {
+  return commitAndPush(workspace, branch, `${target}: fleet job ${jobId}${ok ? '' : ' (partial)'}`, base, timeoutMs);
 }
 
 /** The WIP commit when a blocked job parks (#6 calls this). */
-export function pushWip(workspace: string, reason: string, timeoutMs?: number): 'pushed' | 'clean' {
-  return commitAndPush(workspace, `wip(park): ${reason}`, undefined, timeoutMs);
+export function pushWip(workspace: string, branch: string, reason: string, timeoutMs?: number): 'pushed' | 'clean' {
+  return commitAndPush(workspace, branch, `wip(park): ${reason}`, undefined, timeoutMs);
 }
 
 /**
@@ -468,8 +507,8 @@ export function pushWip(workspace: string, reason: string, timeoutMs?: number): 
  * fully-pushed workspace is a no-op ('clean'); each later checkpoint and the
  * final teardown push then move only the delta since the last one.
  */
-export function pushCheckpoint(workspace: string, note: string, timeoutMs?: number): 'pushed' | 'clean' {
-  return commitAndPush(workspace, `wip(checkpoint): ${note}`, undefined, timeoutMs);
+export function pushCheckpoint(workspace: string, branch: string, note: string, timeoutMs?: number): 'pushed' | 'clean' {
+  return commitAndPush(workspace, branch, `wip(checkpoint): ${note}`, undefined, timeoutMs);
 }
 
 /** HEAD SHA after all commits; used for settle reporting. */
