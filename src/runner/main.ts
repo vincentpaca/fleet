@@ -29,7 +29,7 @@ import { WallClockTimer } from './wall-clock.ts';
 import { IdleTimer } from './idle.ts';
 import { composeSettle } from './settle.ts';
 import { collectArtifacts } from './artifacts.ts';
-import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond, divertedBranch, type Diverted } from './git.ts';
+import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond, divertedBranch, sideMerged, type Diverted } from './git.ts';
 import { buildHarnessCommand, describeHarnessPlan, parseVersion } from './harness.ts';
 import { authFailureFrom, authFailureIn } from './auth-failure.ts';
 import { materializeWorkspace } from './workspace.ts';
@@ -119,10 +119,27 @@ function judgeSettlePush(o: {
   if (typeof o.outcome === 'object') {
     const note = divertedText('work', o.branch, o.outcome);
     return onJob
-      ? { workPushed: true, diverted: true, note: `${note}; ${o.branch} carries earlier work, so its PR proceeds` }
+      ? { workPushed: true, diverted: true, note: `${note}; ${o.branch} carries earlier work, so its PR proceeds — the newer work is on ${o.outcome.diverted} and is not in that PR; reconcile it by hand` }
       : { workPushed: true, diverted: true, note, divertedOnly: o.outcome.diverted };
   }
   return { workPushed: onJob, diverted: false, note: plainPushNote(o.outcome, onJob, o.branch, o.adoptedTip !== undefined) };
+}
+
+/**
+ * The settle's reminder for diverted work nobody brought over (#291), whether
+ * a checkpoint of this run or an earlier run found at re-entry left it.
+ * Undefined when the job branch already contains it; a remote that cannot
+ * answer gets the reminder, since the cost of a needless one is a glance.
+ */
+function unreconciledNote(workspace: string, refs: { branch: string; side: string }, side: string | undefined, timeoutMs: number): string | undefined {
+  if (side === undefined) return undefined;
+  let merged = false;
+  try {
+    merged = sideMerged(workspace, refs, timeoutMs);
+  } catch {
+    // Unknown: remind.
+  }
+  return merged ? undefined : `work diverted earlier is on ${side}, not on ${refs.branch} — reconcile it by hand`;
 }
 
 /** The settle push's line when nothing was diverted. */
@@ -332,6 +349,13 @@ async function main(): Promise<void> {
         await sink.emit({
           type: 'log',
           text: `claim released: previous attempt's branch renamed to ${setup.released}`,
+          who: 'runner',
+        });
+      }
+      if (setup.releasedSide !== undefined) {
+        await sink.emit({
+          type: 'log',
+          text: `diverted work released: previous attempt's side branch renamed to ${setup.releasedSide}`,
           who: 'runner',
         });
       }
@@ -1076,13 +1100,12 @@ async function main(): Promise<void> {
       workPushed = judged.workPushed;
       pushNote = judged.note;
       divertedTo = judged.divertedOnly;
-      if (!judged.diverted && diversions.side !== undefined) {
-        await sink.emit({
-          type: 'log',
-          text: `an earlier checkpoint diverted work to ${diversions.side}, which ${branch} may not carry — reconcile it by hand`,
-          who: 'runner',
-        });
-      }
+      // A checkpoint of this run, or a run before a re-entry, may have diverted
+      // work the job branch still lacks; this settle's own diversion says so itself.
+      const reminder = judged.diverted
+        ? undefined
+        : unreconciledNote(workspace, { branch, side }, diversions.side ?? divertedEarlier, GIT_TIMEOUT_MS);
+      if (reminder !== undefined) await sink.emit({ type: 'log', text: reminder, who: 'runner' });
     } catch (err) {
       const reason = String(err instanceof Error ? err.message : err).split('\n')[0];
       pushNote = `WORK PUSH FAILED: ${reason}`;

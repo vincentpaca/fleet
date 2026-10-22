@@ -361,6 +361,9 @@ export function renameRemoteBranch(workspace: string, from: string, to: string, 
   return 'renamed';
 }
 
+/** What a retry moved aside: its claim branch, and its side branch (#291). */
+type Released = { released?: string; releasedSide?: string };
+
 /**
  * Auto-retry (#30): release the previous attempt's claim before this attempt
  * creates its branch under the same name. Rename, never delete — the partial
@@ -369,11 +372,13 @@ export function renameRemoteBranch(workspace: string, from: string, to: string, 
  * branch, or undefined when this launch is not a retry (or nothing was ever
  * pushed).
  */
-function releaseRetryClaim(workspace: string, refs: JobRefs, existing: boolean, retryAttempt?: number): string | undefined {
-  if (existing || retryAttempt === undefined || retryAttempt <= 1) return undefined;
-  renameRemoteBranch(workspace, refs.side, `${refs.side}-attempt${retryAttempt - 1}`);
-  const attemptName = `${refs.branch}-attempt${retryAttempt - 1}`;
-  return renameRemoteBranch(workspace, refs.branch, attemptName) === 'renamed' ? attemptName : undefined;
+function releaseRetryClaim(workspace: string, refs: JobRefs, existing: boolean, retryAttempt?: number): Released {
+  if (existing || retryAttempt === undefined || retryAttempt <= 1) return {};
+  const sideTo = refs.side + '-attempt' + (retryAttempt - 1);
+  const claimTo = refs.branch + '-attempt' + (retryAttempt - 1);
+  const side = renameRemoteBranch(workspace, refs.side, sideTo) === 'renamed';
+  const claim = renameRemoteBranch(workspace, refs.branch, claimTo) === 'renamed';
+  return { ...(claim ? { released: claimTo } : {}), ...(side ? { releasedSide: sideTo } : {}) };
 }
 
 /**
@@ -381,7 +386,7 @@ function releaseRetryClaim(workspace: string, refs: JobRefs, existing: boolean, 
  * and push the branch immediately. Returns the branch name and base branch,
  * plus the released claim branch when a retry renamed one (#30).
  */
-export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRefs & { base: string; released?: string; divertedEarlier?: string } {
+export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRefs & { base: string; released?: string; releasedSide?: string; divertedEarlier?: string } {
   const branch = opts.adoptBranch ?? jobBranch(opts.target, opts.jobId);
   const side = divertedBranch(opts.jobId);
   // Adoption and re-entry share the checkout path: the branch already exists
@@ -409,14 +414,12 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRef
     // if the container dies before any work is committed.
     git(workspace, ['push', '-q', '-u', 'origin', branch]);
   }
-  // Re-entry (#291): work an earlier generation diverted is not on the branch
-  // just checked out. Say so, rather than let the run continue without it.
-  const divertedEarlier = existing && git(workspace, ['ls-remote', '--heads', 'origin', `refs/heads/${side}`]).trim() !== ''
-    ? side
-    : undefined;
+  // Re-entry (#291): work an earlier generation diverted, and nobody has since
+  // brought over, is not on the branch just checked out. Say so, rather than
+  // let the run continue without it.
+  const divertedEarlier = existing && !sideMerged(workspace, { branch, side }) ? side : undefined;
   return {
-    branch, side, base,
-    ...(released !== undefined ? { released } : {}),
+    branch, side, base, ...released,
     ...(divertedEarlier !== undefined ? { divertedEarlier } : {}),
   };
 }
@@ -452,13 +455,17 @@ export function divertedBranch(jobId: string): string {
 }
 
 /**
- * Commits the runner built with commit-tree and pushed to the job branch from
- * a checkout that was not the job branch (#291). The agent's branch never
- * contains them, by design, so "HEAD builds on the job branch" must forgive
- * exactly these and nothing else. In-process: a fresh runner (re-entry, the
- * host-side `fleet resume-push`) starts with none, and errs toward diverting.
+ * Commits the runner itself built with commit-tree and pushed from a checkout
+ * that was not the job branch (#291), each keyed on the branch the agent was
+ * on when it was built. The agent's branch never contains them, by design, so
+ * "HEAD builds on the job branch" forgives them — but only while the agent is
+ * still on that branch. A commit of the agent's own is never recorded (pushed
+ * as-is, it was in HEAD when pushed): forgiving one would let a later checkout
+ * of an unrelated branch merge over it and drop it from the job branch's tree.
+ * In-process: a fresh runner (re-entry, the host-side `fleet resume-push`)
+ * starts with none, and errs toward diverting.
  */
-const runnerSnapshots = new Set<string>();
+const runnerSnapshots = new Map<string, string>();
 
 /** Milliseconds left for the next network call of one push; undefined = unbounded. */
 type Budget = () => number | undefined;
@@ -504,25 +511,25 @@ function commitAndPush(workspace: string, refs: JobRefs, message: string, base?:
   const { branch } = refs;
   if (!buildsOn(workspace, branch)) {
     const d = divert(workspace, refs, message, left);
-    const delivered = remoteAheadOfBase(workspace, branch, base, left);
+    // Its own bound: the delivery check is the settle's question, not the push's.
+    const delivered = remoteAheadOfBase(workspace, branch, base, timeoutMs);
     if (d === 'clean') return delivered ? 'delivered' : 'clean';
     return { ...d, delivered };
   }
-  const onJobBranch = git(workspace, ['branch', '--show-current']).trim() === branch
-    && isAncestor(workspace, `origin/${branch}`, 'HEAD');
+  const onJobBranch = currentBranch(workspace) === branch && isAncestor(workspace, `origin/${branch}`, 'HEAD');
   let outcome: 'pushed' | 'clean' | 'unmoved';
   try {
     outcome = onJobBranch
       ? commitOnJobBranch(workspace, branch, message, left)
-      : snapshotPush(workspace, branch, git(workspace, ['rev-parse', `origin/${branch}`]).trim(), message, left);
+      : snapshotPush(workspace, branch, git(workspace, ['rev-parse', `origin/${branch}`]).trim(), snapshotTree(workspace), message, left);
   } catch (err) {
     // Rejected (e.g. the agent amended after its own push, or the remote moved
     // past our tracking ref): judge delivery by what the remote actually has.
-    if (remoteAheadOfBase(workspace, branch, base, left)) return 'delivered';
+    if (remoteAheadOfBase(workspace, branch, base, timeoutMs)) return 'delivered';
     throw err;
   }
   if (outcome === 'pushed') return 'pushed';
-  return remoteAheadOfBase(workspace, branch, base, left) ? 'delivered' : 'clean';
+  return remoteAheadOfBase(workspace, branch, base, timeoutMs) ? 'delivered' : 'clean';
 }
 
 /** The agent is on the job branch itself: commit there and push, as always. */
@@ -538,16 +545,22 @@ function commitOnJobBranch(workspace: string, branch: string, message: string, l
 
 /**
  * Does HEAD build on the job branch? Yes when every commit the remote job
- * branch has and HEAD lacks is one of this runner's own snapshots. False for
- * an unknown ref, too.
+ * branch has and HEAD lacks is a snapshot this runner built from the branch
+ * the agent is on now. False for an unknown ref, too.
  */
 function buildsOn(workspace: string, branch: string): boolean {
   try {
     const missing = git(workspace, ['rev-list', `origin/${branch}`, '--not', 'HEAD']).split('\n').filter(Boolean);
-    return missing.every((sha) => runnerSnapshots.has(sha));
+    const current = currentBranch(workspace);
+    return missing.every((sha) => current !== '' && runnerSnapshots.get(sha) === current);
   } catch {
     return false;
   }
+}
+
+/** The checked-out branch's name; '' on a detached HEAD. */
+function currentBranch(workspace: string): string {
+  return git(workspace, ['branch', '--show-current']).trim();
 }
 
 /** Is `ancestor` in the history of `of`? False for an unknown ref, too. */
@@ -561,20 +574,31 @@ function isAncestor(workspace: string, ancestor: string, of: string): boolean {
 }
 
 /**
- * The side branch's tip on the remote, fetched fresh; undefined only when the
- * remote says the branch does not exist. A timeout or a dead remote throws:
- * reading those as "absent" sent the push after them into a second full bound.
+ * A branch's tip on the remote, fetched fresh; undefined when the remote has
+ * no such branch. Absence is an empty `ls-remote` listing — the same test
+ * renameRemoteBranch uses — never a match on git's stderr, which is localized
+ * and can open with a "warning: redirecting" line. A timeout or a dead remote
+ * throws: reading those as "absent" sent the push after them into a second
+ * full bound.
  */
 function fetchedTip(workspace: string, branch: string, left: Budget): string | undefined {
-  try {
-    git(workspace, ['fetch', '-q', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], left());
-  } catch (err) {
-    // A string, not a regex literal: the apostrophe in one opens a string for
-    // Lizard's parse and hides every function after it from the gate.
-    if (String((err as Error).message).includes("couldn't find remote ref")) return undefined;
-    throw err;
-  }
+  if (git(workspace, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], left()).trim() === '') return undefined;
+  git(workspace, ['fetch', '-q', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], left());
   return git(workspace, ['rev-parse', `refs/remotes/origin/${branch}`]).trim();
+}
+
+/**
+ * Is everything on the side branch already on the job branch? True when there
+ * is no side branch. Re-entry and settle ask this before telling anyone to
+ * reconcile diverted work (#291), so work already brought over is not
+ * announced again. Throws when the remote cannot answer.
+ */
+export function sideMerged(workspace: string, refs: JobRefs, timeoutMs?: number): boolean {
+  const left = budget(timeoutMs);
+  const tip = fetchedTip(workspace, refs.side, left);
+  if (tip === undefined) return true;
+  git(workspace, ['fetch', '-q', 'origin', `+refs/heads/${refs.branch}:refs/remotes/origin/${refs.branch}`], left());
+  return isAncestor(workspace, tip, `origin/${refs.branch}`);
 }
 
 /**
@@ -613,9 +637,8 @@ function treeOf(workspace: string, commit: string): string {
  * already holds this work; a tree equal to HEAD's never "reverts" a snapshot
  * that carried uncommitted edits since dropped.
  */
-function snapshotPush(workspace: string, ref: string, seen: string | undefined, message: string, left: Budget): 'pushed' | 'clean' | 'unmoved' {
+function snapshotPush(workspace: string, ref: string, seen: string | undefined, tree: string, message: string, left: Budget): 'pushed' | 'clean' | 'unmoved' {
   const head = git(workspace, ['rev-parse', 'HEAD']).trim();
-  const tree = snapshotTree(workspace);
   const headTree = treeOf(workspace, head);
   const inSeen = seen !== undefined && isAncestor(workspace, head, seen);
   if (inSeen && (tree === headTree || tree === treeOf(workspace, seen as string))) return 'unmoved';
@@ -625,7 +648,8 @@ function snapshotPush(workspace: string, ref: string, seen: string | undefined, 
   const tip = snapshotCommit(workspace, parentsFor(workspace, seen, head), tree, message);
   git(workspace, ['push', '-q', 'origin', `${tip}:refs/heads/${ref}`], left());
   git(workspace, ['update-ref', `refs/remotes/origin/${ref}`, tip]);
-  runnerSnapshots.add(tip);
+  // Only what the runner built; HEAD itself, pushed as-is, is the agent's.
+  if (tip !== head) runnerSnapshots.set(tip, currentBranch(workspace));
   return 'pushed';
 }
 
@@ -646,10 +670,13 @@ function snapshotCommit(workspace: string, parents: string[], tree: string, mess
  * branch, which refuses it, and never to the branch the agent is on.
  */
 function divert(workspace: string, refs: JobRefs, message: string, left: Budget): Omit<Diverted, 'delivered'> | 'clean' {
+  // Local work first: `add -A` on a big tree must not eat the push's deadline,
+  // which starts at the first network call.
+  const tree = snapshotTree(workspace);
   const seen = fetchedTip(workspace, refs.side, left);
-  const pushed = snapshotPush(workspace, refs.side, seen, message, left);
+  const pushed = snapshotPush(workspace, refs.side, seen, tree, message, left);
   if (pushed === 'clean') return 'clean';
-  const current = git(workspace, ['branch', '--show-current']).trim();
+  const current = currentBranch(workspace);
   const on = current === '' ? 'a detached HEAD' : `branch ${current}`;
   return {
     diverted: refs.side,
@@ -659,10 +686,10 @@ function divert(workspace: string, refs: JobRefs, message: string, left: Budget)
 }
 
 /** Does the remote job branch carry commits beyond the base branch? */
-function remoteAheadOfBase(workspace: string, branch: string, base: string | undefined, left: Budget): boolean {
+function remoteAheadOfBase(workspace: string, branch: string, base: string | undefined, timeoutMs?: number): boolean {
   if (!base) return false;
   try {
-    git(workspace, ['fetch', '-q', 'origin'], left());
+    git(workspace, ['fetch', '-q', 'origin'], timeoutMs);
     const count = git(workspace, ['rev-list', '--count', `origin/${base}..origin/${branch}`]).trim();
     return count !== '0';
   } catch {

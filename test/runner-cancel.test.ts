@@ -474,6 +474,125 @@ test('cancel: a branch off main AFTER a checkpoint diverts the work to a side br
   }
 });
 
+/**
+ * Stand-ins for the CLIs a derived launch reaches (#291): a `claude` that
+ * answers the version probe and records the argv it was launched with, and a
+ * `gh` that always fails, so PR grading degrades locally and never reaches
+ * GitHub. Prepend the returned directory to PATH.
+ */
+function fakeCliDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-fake-cli-'));
+  writeFileSync(join(dir, 'claude'), [
+    '#!/bin/sh',
+    'if [ "$1" = "--version" ]; then echo "2.1.220 (Claude Code)"; exit 0; fi',
+    'for a in "$@"; do printf "%s\\n" "$a"; done > "$PWD/.fleet/out/argv.txt"',
+    'exit 0',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  writeFileSync(join(dir, 'gh'), '#!/bin/sh\necho "gh: not available in this test" >&2\nexit 1\n', { mode: 0o755 });
+  return dir;
+}
+
+test('re-entry: the runner logs, prompts and reminds about work an earlier run diverted (#291)', async () => {
+  const token = 'cancel-token-291e';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const branch = 'fleet/291-job-291e';
+  const side = 'fleet-diverged/job-291e';
+  // The parked generation: the job branch, and work its park diverted.
+  const seed = join(dirname(remote), 'seed');
+  const seedGit = (args: string[]) => execFileSync('git', [...IDENTITY, ...args], { cwd: seed });
+  seedGit(['checkout', '-q', '-b', branch]);
+  writeFileSync(join(seed, 'job.txt'), 'on the job branch\n');
+  seedGit(['add', '-A']);
+  seedGit(['commit', '-q', '-m', 'job work']);
+  seedGit(['push', '-q', remote, branch]);
+  seedGit(['checkout', '-q', '-b', 'parked', 'main']);
+  writeFileSync(join(seed, 'parked.txt'), 'diverted at park\n');
+  seedGit(['add', '-A']);
+  seedGit(['commit', '-q', '-m', 'wip(park): diverted']);
+  seedGit(['push', '-q', remote, `parked:refs/heads/${side}`]);
+
+  const workspace = writeWorkspace({ idle: '60s' }, '291');
+  writeFileSync(join(workspace, '.fleet', 'order.json'), JSON.stringify({ target: '291', prompt: '/dev 291' }));
+  const fake = fakeCliDir();
+  try {
+    const code = await spawnRunner({
+      FLEET_JOB_ID: 'job-291e',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_GIT_URL: remote,
+      FLEET_GIT_NAME: 'Operator One',
+      FLEET_GIT_EMAIL: 'op@example.com',
+      FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify({ decisionId: 'd1', answer: { option: 'yes' } })).toString('base64'),
+      PATH: `${fake}:${process.env.PATH}`,
+    }).exitCode;
+    assert.notEqual(code, -1, 'the runner must exit on its own');
+
+    const texts = logTexts(daemon.events);
+    assert.ok(texts.some((t) => t.startsWith(`RE-ENTRY: an earlier run diverted work to ${side}`)), `expected the re-entry line; got ${JSON.stringify(texts)}`);
+    const argv = readFileSyncSafe(join(workspace, '.fleet', 'out', 'argv.txt'));
+    assert.match(argv, new RegExp(`left work on branch ${side}`), `the derived launch must carry the clause; argv: ${argv}`);
+    assert.match(argv, /git log -p HEAD\.\.FETCH_HEAD/, 'the agent is told to read every commit, not just the tip');
+    assert.ok(
+      texts.some((t) => t.startsWith(`work diverted earlier is on ${side}, not on ${branch}`)),
+      `nobody brought the work over, so the settle must remind; got ${JSON.stringify(texts)}`,
+    );
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(dirname(remote), { recursive: true, force: true });
+    rmSync(fake, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
+test('settle: diverted, but the job branch already carries work — the PR path proceeds (#291)', async () => {
+  const token = 'cancel-token-291f';
+  const daemon = await startMockDaemon({ token });
+  const remote = makeRemote();
+  const workspace = writeWorkspace({ idle: '60s', checkpoint: '1s' }, '291');
+  const committingHarness = fileURLToPath(new URL('../fixtures/committing-harness.mjs', import.meta.url));
+  const branch = 'fleet/291-job-291f';
+  const side = 'fleet-diverged/job-291f';
+  const fake = fakeCliDir();
+  try {
+    const code = await spawnRunner({
+      FLEET_JOB_ID: 'job-291f',
+      FLEET_DAEMON_URL: daemon.url,
+      FLEET_RUNNER_TOKEN: token,
+      FLEET_WORKSPACE: workspace,
+      FLEET_GIT_URL: remote,
+      FLEET_GIT_NAME: 'Operator One',
+      FLEET_GIT_EMAIL: 'op@example.com',
+      FLEET_HARNESS_CMD: `node ${committingHarness}`,
+      // Early work reaches the job branch by checkpoint; then the agent
+      // branches off main and finishes there.
+      TEST_CHECKPOINT_FIRST: '1',
+      TEST_SWITCH: JSON.stringify([['checkout', '-q', '-b', 'x', 'origin/main']]),
+      TEST_EXIT_AFTER_COMMIT: '1',
+      TEST_NO_ARTIFACTS: '1',
+      PATH: `${fake}:${process.env.PATH}`,
+    }).exitCode;
+    assert.notEqual(code, -1, 'the runner must exit on its own');
+
+    const texts = logTexts(daemon.events);
+    const note = texts.find((t) => t.startsWith(`work pushed to ${side}, not ${branch}`));
+    assert.ok(note, `expected the diversion line; got ${JSON.stringify(texts)}`);
+    assert.match(note, /carries earlier work, so its PR proceeds — the newer work is on fleet-diverged\/job-291f/);
+    assert.ok(!texts.some((t) => t.startsWith('no PR opened or graded')), 'the job branch has a delivery: its PR is not suppressed');
+    const settle = daemon.events.find((e) => e.type === 'settle');
+    assert.ok(settle);
+    assert.equal(settle.rung, 'pushed', 'graded as a delivered job branch (the fake gh finds no PR), not `implemented`');
+    assert.match(execFileSync('git', ['ls-tree', '-r', '--name-only', side], { cwd: remote, encoding: 'utf8' }), /committed-work\.txt/);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(dirname(remote), { recursive: true, force: true });
+    rmSync(fake, { recursive: true, force: true });
+    await daemon.close();
+  }
+});
+
 test('settle: an agent on another PR\'s branch never gets a runner push onto it (#291)', async () => {
   const token = 'cancel-token-291b';
   const daemon = await startMockDaemon({ token });
