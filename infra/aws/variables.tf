@@ -59,6 +59,26 @@ variable "instance_type" {
   default     = "t3.xlarge"
 }
 
+variable "instance_types" {
+  description = "Spot diversification: instance types the worker ASG may launch, tried by the price-capacity-optimized allocation strategy so a shortage in one Spot pool does not stop every job (#294). Null (the default) launches instance_type alone, exactly as before. When set, instance_type no longer chooses the instance; list types of the same size, each offering at least offered_cpu_units and offered_memory_mib, or a job lands on a box that cannot host it."
+  type        = list(string)
+  default     = null
+
+  # Both hold only when the list is set: null is the single-type default. An
+  # empty list would silently fall back to instance_type, so it is rejected as
+  # the mistake it almost certainly is. The 40-override ceiling is the auto
+  # scaling API's (LaunchTemplate.Overrides), which no plan reaches; a duplicate
+  # entry adds no pool, so it is rejected too rather than sent.
+  validation {
+    condition     = var.instance_types == null ? true : length(var.instance_types) > 0
+    error_message = "instance_types must name at least one type; leave it null to launch instance_type alone."
+  }
+  validation {
+    condition     = var.instance_types == null ? true : length(var.instance_types) <= 40 && length(distinct(var.instance_types)) == length(var.instance_types)
+    error_message = "instance_types takes at most 40 distinct types (the auto scaling group's override limit); remove duplicates."
+  }
+}
+
 variable "max_instances" {
   description = "Maximum size of the ECS container-instance auto scaling group (the minimum is min_instances, default 0, so the cluster scales to zero when idle)."
   type        = number
