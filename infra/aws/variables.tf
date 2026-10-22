@@ -70,8 +70,8 @@ variable "instance_types" {
   # scaling API's (LaunchTemplate.Overrides), which no plan reaches; a duplicate
   # entry adds no pool, so it is rejected too rather than sent.
   validation {
-    condition     = var.instance_types == null ? true : length(var.instance_types) > 0
-    error_message = "instance_types must name at least one type; leave it null to launch instance_type alone."
+    condition     = var.instance_types == null ? true : length(var.instance_types) > 0 && alltrue([for t in var.instance_types : t != null && t != ""])
+    error_message = "instance_types must name at least one type, none of them empty; leave it null to launch instance_type alone."
   }
   validation {
     condition     = var.instance_types == null ? true : length(var.instance_types) <= 40 && length(distinct(var.instance_types)) == length(var.instance_types)

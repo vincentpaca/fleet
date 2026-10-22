@@ -726,9 +726,11 @@ resource "aws_autoscaling_group" "instances" {
   # launches a replacement Spot instance, then terminates the at-risk one. AWS
   # only replaces an instance that is NOT protected from scale-in, and ECS
   # managed termination protection (the capacity provider below) protects every
-  # instance that is running a task, so a running job is never rebalanced away:
-  # it still dies on an actual two-minute Spot interruption, as before. What
+  # instance that is running a task, so busy instances are left alone and a job
+  # still dies only on an actual two-minute Spot interruption, as before. What
   # gets replaced ahead of time is idle capacity, warm-floor instances included.
+  # One gap: protection is set shortly after a task is placed, so a job placed
+  # on a flagged idle instance while its replacement launches can still be lost.
   capacity_rebalance = true
 
   # Mixed instances policy: controls on-demand vs spot split.

@@ -212,9 +212,11 @@ Two settings are always on to keep reclaims rarer (#294):
   the ASG launches a replacement and then terminates the flagged one. AWS only
   does this for instances that are not protected from scale-in, and ECS
   managed termination protection protects every instance that is running a
-  task. So a running job is never moved or killed by a rebalance; it still
-  dies on an actual Spot interruption. What gets replaced ahead of time is
-  idle capacity, warm-floor instances included.
+  task. So busy instances are left alone, and a running job still dies only
+  on an actual Spot interruption. What gets replaced ahead of time is idle
+  capacity, warm-floor instances included. One gap: protection is set shortly
+  after a task is placed, so a job placed on a flagged idle instance while its
+  replacement launches can still be lost.
 
 Six knobs shape the exposure:
 
@@ -264,14 +266,20 @@ Rules for the list:
   deployment and the runner task claims all of it by default; a smaller type
   in the list gives a job a box that cannot host its task, and the task sits
   unplaced. With the defaults (4096 CPU units / 15360 MiB), that means 4 vCPU
-  and 16 GiB types: `t3.xlarge`, `t3a.xlarge`, `m5.xlarge`, `m5a.xlarge`,
-  `m6i.xlarge`, `m6a.xlarge`, `m7i.xlarge`.
+  and 16 GiB types, for example `t3a.xlarge`, `m5.xlarge` or `m6i.xlarge`
+  beside `t3.xlarge`. What counts is the memory ECS registers for the
+  instance, not the nominal size, and only `t3.xlarge` has been measured
+  against the default tier: before relying on another type, check its
+  `registeredResources` with `aws ecs describe-container-instances`.
 - **Keep them the same size.** A larger type is allowed but wasted: the runner
   task still claims one tier, and the rest of the box idles at its price.
 - **Check the CPU architecture.** Graviton types (`m6g`, `m7g`, `t4g`) need an
   arm64 AMI and arm64 images; the unit's AMI and runner image are x86_64.
 - When the list is set it chooses the instances; `instance_type` is then only
   the launch template's default, which the list overrides.
+- **Order matters only for on-demand.** Spot picks among the listed types by
+  pool health and price; on-demand instances (`on_demand_base_capacity` and
+  above) prefer the first type listed.
 
 Leaving `instance_types` unset (`null`) launches `instance_type` alone, as
 before. `fleet setup infra` does not ask for the list yet (#287); set it in

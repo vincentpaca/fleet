@@ -639,3 +639,13 @@ run "registries_do_not_block_teardown" {
     error_message = "every project repository must set force_delete for the same reason"
   }
 }
+
+run "a_blank_instance_type_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    instance_types = ["t3.xlarge", ""]
+  }
+
+  expect_failures = [var.instance_types]
+}
