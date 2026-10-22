@@ -256,7 +256,10 @@ test('resume --answer via fleet-config.json: posts answer and follows to done', 
     const url = new URL(req.url ?? '/', 'http://localhost');
 
     if (req.method === 'GET' && url.pathname === '/jobs/job-ans') {
-      sendJson(res, 200, { job: { id: 'job-ans', state: 'blocked', workOrder: { mode: 'implement', target: '20' } } });
+      // Terminal once the stream has reached done, as a real daemon serves it:
+      // attach confirms a terminal event against the record (#293).
+      const state = phase === 'answered' ? 'done' : 'blocked';
+      sendJson(res, 200, { job: { id: 'job-ans', state, workOrder: { mode: 'implement', target: '20' } } });
       return;
     }
 

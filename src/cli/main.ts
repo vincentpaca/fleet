@@ -1418,6 +1418,49 @@ async function isFinalTerminal(jobId: string, event: FleetEvent, attempt: number
 }
 
 /**
+ * How long a terminal state event the record has not confirmed may sit with
+ * nothing after it before attach takes it as final anyway (#293). A retry's
+ * re-queue lands right behind attempt 1's cancelled event, so a stream that
+ * stays quiet this long after a terminal event means the record is merely
+ * lagging, or a peer never serves it terminal, and a view must not hang on that.
+ */
+const UNCONFIRMED_TERMINAL_MS = 5_000;
+
+/**
+ * Ends a follow at the job's last terminal state event (#293). A terminal event
+ * ends it once the record confirms it (isFinalTerminal), or once the stream has
+ * been quiet for UNCONFIRMED_TERMINAL_MS after it; a non-terminal state event
+ * after it (the retry's re-queue) means the job went on, and the follow does too.
+ */
+function terminalWatch(jobId: string, done: AbortController): (event: FleetEvent) => void {
+  let attempt = 1;
+  let lastSeq = -1;
+  let quiet: ReturnType<typeof setTimeout> | undefined;
+  const settle = (): void => {
+    clearTimeout(quiet);
+    quiet = undefined;
+  };
+  done.signal.addEventListener('abort', settle);
+  return (event) => {
+    // A peer that re-serves events it already sent must not keep re-arming
+    // the quiet timer: only new events count as the stream speaking.
+    if (typeof event.seq === 'number') {
+      if (event.seq <= lastSeq) return;
+      lastSeq = event.seq;
+    }
+    quiet?.refresh();
+    if (event.type !== 'state' || typeof event.state !== 'string') return;
+    if (typeof event.attempt === 'number') attempt = event.attempt;
+    settle();
+    if (!TERMINAL_STATES.includes(event.state)) return;
+    quiet = setTimeout(() => done.abort(), UNCONFIRMED_TERMINAL_MS);
+    void isFinalTerminal(jobId, event, attempt).then((final) => {
+      if (final) done.abort();
+    });
+  };
+}
+
+/**
  * Follow a job to a terminal state, printing events; with answerMode, pending
  * decisions are answered from stdin as they arrive.
  *
@@ -1439,8 +1482,7 @@ async function followJob(jobId: string, answerMode: boolean): Promise<number> {
   const done = new AbortController();
   let pendingDecision: FleetEvent | undefined;
   let prompting = false;
-  // The attempt the stream is in (#30): queued retry events carry it.
-  let attempt = 1;
+  const watchTerminal = terminalWatch(jobId, done);
 
   // The prompt runs beside the stream, not instead of it: events keep printing
   // while the operator types, and an answer landing from another surface (the
@@ -1476,12 +1518,7 @@ async function followJob(jobId: string, answerMode: boolean): Promise<number> {
         if (answerMode) void promptLoop().catch((err) => console.error(errorMessage(err)));
       }
       if (event.type === 'answer') pendingDecision = undefined; // answered elsewhere
-      if (event.type === 'state' && typeof event.attempt === 'number') attempt = event.attempt;
-      if (event.type === 'state' && typeof event.state === 'string' && TERMINAL_STATES.includes(event.state)) {
-        void isFinalTerminal(jobId, event, attempt).then((final) => {
-          if (final) done.abort();
-        });
-      }
+      watchTerminal(event);
     },
     process.env as Record<string, string | undefined>,
     done.signal,

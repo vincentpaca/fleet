@@ -224,6 +224,51 @@ test('attach keeps following past a retried attempt\'s terminal event and stops 
   assert.match(out, /\[4\] state → done/, 'and stopped at the final terminal state');
 });
 
+// #293: the record confirms a final terminal event, but a lagging record (or a
+// peer that never serves one) must not hold a view open forever.
+test('attach still exits on a terminal event the record never confirms', async (t) => {
+  let eventCalls = 0;
+  const daemon = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method === 'GET' && url.pathname === '/jobs/job-4') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ job: { id: 'job-4', state: 'running' } })); // never turns terminal
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/jobs/job-4/events') {
+      eventCalls += 1;
+      res.setHeader('content-type', 'application/x-ndjson');
+      res.end(eventCalls === 1
+        ? ndjson([
+          { job: 'job-4', seq: 0, type: 'state', state: 'running' },
+          { job: 'job-4', seq: 1, type: 'state', state: 'done' },
+        ])
+        : ''); // empty long-poll cycles from here on
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  daemon.listen(0, '127.0.0.1');
+  await once(daemon, 'listening');
+  t.after(() => daemon.close());
+  const address = daemon.address();
+  assert.ok(address && typeof address === 'object');
+
+  const startedAt = Date.now();
+  const child = spawn('node', [cli, 'attach', 'job-4'], {
+    env: { ...process.env, FLEET_DAEMON_URL: `http://127.0.0.1:${address.port}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => child.kill('SIGKILL'));
+  let out = '';
+  child.stdout.on('data', (c) => (out += c));
+  const [code] = (await once(child, 'exit')) as [number];
+  assert.equal(code, 0);
+  assert.match(out, /\[1\] state → done/);
+  assert.ok(Date.now() - startedAt < 30_000, 'exited on the quiet stream, not on some outer timeout');
+});
+
 test('attach on a job the daemon does not know exits 1 with a readable error, not a retry loop', async (t) => {
   const daemon = http.createServer((_req, res) => {
     res.statusCode = 404;
