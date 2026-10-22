@@ -26,9 +26,9 @@ import {
   parseFleetTasks,
 } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
-import { materializeWorkspace } from "../src/runner/workspace.ts";
+import { loadReentryAnswer, materializeWorkspace } from "../src/runner/workspace.ts";
 import type { CloudCliRunner, LaunchSpec } from "../src/providers/provider.ts";
-import { writeSecretTempFile } from "../src/providers/provider.ts";
+import { runnerEnv, writeSecretTempFile } from "../src/providers/provider.ts";
 import { FleetDaemon } from "../src/daemon/server.ts";
 import { parseNdjson } from "../src/shared/ndjson.ts";
 import { MANIFEST, WORK_ORDER, StubProvider, op, tempHome, until, requestJson } from "./daemon-helpers.ts";
@@ -383,6 +383,76 @@ test("materializeWorkspace refuses a null manifest (a lost launch half, D15) ins
   } finally {
     if (orig === undefined) delete process.env.FLEET_MANIFEST_JSON;
     else process.env.FLEET_MANIFEST_JSON = orig;
+  }
+});
+
+test("a parked job resumes on ECS with a 10,000-character answer: overrides stay under 8192, the runner gets it whole (#296)", async (t) => {
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0, longPollMs: 300 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const created = await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST });
+  assert.equal(created.status, 201, created.body);
+  const first = provider.launches[0];
+  const id = first.jobId;
+  const post = (seq: number, ev: Record<string, unknown>) =>
+    requestJson({
+      socketPath: sock, method: "POST", path: `/internal/jobs/${id}/events`,
+      headers: { "x-fleet-runner-token": first.runnerToken }, body: { job: id, seq, ...ev },
+    });
+  assert.equal((await post(0, { type: "state", state: "running" })).status, 200);
+  assert.equal((await post(1, {
+    type: "decision", id: "d1", question: "Which migration order?",
+    options: [{ id: "a", label: "A first", recommended: true }, { id: "b", label: "B first" }],
+  })).status, 200);
+  assert.equal((await post(2, { type: "state", state: "blocked", marker: "parked" })).status, 200);
+
+  const text = "Because ".repeat(1_250);
+  assert.ok(text.length >= 10_000);
+  const answered = await op(sock, "POST", `/jobs/${id}/answer`, { option: "a", text });
+  assert.equal(answered.status, 200, answered.body);
+  const relaunch = provider.launches[1];
+  assert.equal(relaunch.reentryAnswer?.decisionId, "d1");
+
+  // The ECS input for that re-launch: the answer is nowhere in it.
+  const input = new EcsProvider(ECS_TEST_CONFIG).buildRunTaskInput(relaunch);
+  const overrides = JSON.stringify(input.overrides);
+  assert.ok(overrides.length < 8192, `overrides are ${overrides.length} characters`);
+  assert.ok(!overrides.includes("Because Because"), "the answer must not ride the overrides");
+
+  // The runner, given exactly that container env, reads the answer intact.
+  const env = runnerEnv(relaunch, "/workspace");
+  const orig = process.env.FLEET_REENTRY_DECISION;
+  try {
+    process.env.FLEET_REENTRY_DECISION = env.FLEET_REENTRY_DECISION;
+    const got = await loadReentryAnswer({ daemonUrl: env.FLEET_DAEMON_URL, jobId: env.FLEET_JOB_ID, token: env.FLEET_RUNNER_TOKEN });
+    assert.deepEqual(got, { decisionId: "d1", answer: { option: "a", text } });
+  } finally {
+    if (orig === undefined) delete process.env.FLEET_REENTRY_DECISION;
+    else process.env.FLEET_REENTRY_DECISION = orig;
+  }
+});
+
+test("loadReentryAnswer: nothing on a fresh launch; fails loudly when the daemon has no answer for the named decision (#296)", async (t) => {
+  const provider = new StubProvider();
+  const daemon = new FleetDaemon({ home: tempHome(), provider, port: 0, longPollMs: 50 });
+  const { socketPath: sock } = await daemon.start();
+  t.after(() => daemon.stop());
+  assert.equal((await op(sock, "POST", "/jobs", { workOrder: WORK_ORDER, manifest: MANIFEST })).status, 201);
+  const launch = provider.launches[0];
+  const source = { daemonUrl: daemon.daemonUrl, jobId: launch.jobId, token: launch.runnerToken };
+
+  const orig = process.env.FLEET_REENTRY_DECISION;
+  try {
+    delete process.env.FLEET_REENTRY_DECISION;
+    assert.equal(await loadReentryAnswer(source), undefined);
+    // A re-entry without its answer must not quietly run as a fresh job.
+    process.env.FLEET_REENTRY_DECISION = "d9";
+    await assert.rejects(loadReentryAnswer(source), /no answer for re-entry decision d9/);
+  } finally {
+    if (orig === undefined) delete process.env.FLEET_REENTRY_DECISION;
+    else process.env.FLEET_REENTRY_DECISION = orig;
   }
 });
 
@@ -1825,7 +1895,7 @@ test("DockerProvider.launch removes any stale fleet-<jobId> container before run
 });
 
 // Fake runner behind the stub docker: raises a decision, parks, and exits.
-// On re-entry (reentry answer present in the env) it resumes and settles.
+// On re-entry (the re-entered decision named in the env) it resumes and settles.
 const DOCKER_PARK_RUNNER = `
 const base = process.env.FLEET_DAEMON_URL;
 const job = process.env.FLEET_JOB_ID;
@@ -1841,7 +1911,7 @@ const post = async (ev) => {
   if (!res.ok) throw new Error("post failed: " + res.status + " " + (await res.text()));
 };
 await post({ type: "state", state: "running" });
-if (process.env.FLEET_REENTRY_ANSWER_JSON === undefined) {
+if (process.env.FLEET_REENTRY_DECISION === undefined) {
   await post({
     type: "decision",
     id: "d1",

@@ -537,8 +537,8 @@ export class EcsProvider implements Provider {
     // say so in Fleet's words instead of AWS's.
     const size = JSON.stringify(overrides).length;
     if (size > ECS_OVERRIDES_MAX) {
-      // Name the biggest entry: operator env is the usual culprit, but a long
-      // re-entry answer (FLEET_REENTRY_ANSWER_JSON) rides here too.
+      // Name the biggest entry: only env values ride here now, and an
+      // operator-supplied one is the usual culprit.
       const [name, value] = Object.entries(env).sort(([, a], [, b]) => b.length - a.length)[0];
       throw new Error(
         `ecs run-task container overrides are ${size} characters; the RunTask API allows at most ${ECS_OVERRIDES_MAX} ` +

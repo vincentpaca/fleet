@@ -190,7 +190,7 @@ test('an empty workspace whose launch fetch fails settles blocked naming the fet
     assert.deepEqual(daemon.rejected, []);
     assert.deepEqual(daemon.events.map((e) => e.type), ['state', 'log', 'settle', 'state']);
     const [, log, settle, cancelled] = daemon.events;
-    assert.match(String(log.text), /cannot fetch launch payload .*\/internal\/jobs\/job-fetch-fail-1\/launch: HTTP 404/);
+    assert.match(String(log.text), /cannot fetch launch from .*\/internal\/jobs\/job-fetch-fail-1\/launch: HTTP 404/);
     const report = settle.report as { status: string; next_action: string };
     assert.equal(report.status, 'BLOCKED');
     assert.match(report.next_action, /launch payload/);

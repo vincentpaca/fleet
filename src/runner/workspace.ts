@@ -46,7 +46,7 @@ export async function materializeWorkspace(workspace: string, source: LaunchSour
   const manifestPath = join(fleetDir, "manifest.json");
   if (existsSync(manifestPath)) return;
 
-  const payload = launchFromEnv() ?? (await fetchLaunch(source));
+  const payload = (launchFromEnv() ?? (await getInternal(source, "launch"))) as LaunchPayload;
   // A lost launch half (D15) serves `manifest: null`; anything but an object
   // is no manifest, and must fail here rather than as a TypeError later.
   if (typeof payload.manifest !== "object" || payload.manifest === null) {
@@ -84,13 +84,37 @@ function launchFromEnv(): LaunchPayload | undefined {
   };
 }
 
+/** The answer a re-entering runner pre-materialises for its harness (#6). */
+export type ReentryAnswer = { decisionId: string; answer: { option?: string; text?: string } };
+
 /**
- * GET the launch payload with the runner token. Transient failures (network,
- * timeout, 5xx) retry briefly — the container can start before its route to
- * the daemon settles; a 4xx is deterministic and fails at once.
+ * The re-entry answer this launch carries, or undefined on any other launch.
+ * The daemon names the decision (FLEET_REENTRY_DECISION); the answer itself
+ * is read from the journal through the existing answer route, because a
+ * free-text answer of any length cannot ride ECS's 8192-character overrides
+ * (#296). An old daemon still sends the whole answer as base64 env (skew
+ * compat, same expiry as launchFromEnv).
  */
-async function fetchLaunch(source: LaunchSource): Promise<LaunchPayload> {
-  const url = `${source.daemonUrl}/internal/jobs/${encodeURIComponent(source.jobId)}/launch`;
+export async function loadReentryAnswer(source: LaunchSource): Promise<ReentryAnswer | undefined> {
+  const legacy = process.env.FLEET_REENTRY_ANSWER_JSON;
+  if (legacy) return JSON.parse(Buffer.from(legacy, "base64").toString("utf8")) as ReentryAnswer;
+  const decisionId = process.env.FLEET_REENTRY_DECISION;
+  if (!decisionId) return undefined;
+  // Answered before the re-launch, so the poll returns at once; a 204 means
+  // the journal has no answer for it.
+  const answer = await getInternal(source, `answer?decision=${encodeURIComponent(decisionId)}`);
+  if (answer === undefined) throw new Error(`daemon holds no answer for re-entry decision ${decisionId}`);
+  return { decisionId, answer: answer as ReentryAnswer["answer"] };
+}
+
+/**
+ * GET one of the job's own /internal routes with the runner token; undefined
+ * on 204. Transient failures (network, timeout, 5xx) retry briefly — the
+ * container can start before its route to the daemon settles; a 4xx is
+ * deterministic and fails at once.
+ */
+async function getInternal(source: LaunchSource, route: string): Promise<unknown> {
+  const url = `${source.daemonUrl}/internal/jobs/${encodeURIComponent(source.jobId)}/${route}`;
   let lastError = "";
   for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++) {
     try {
@@ -98,7 +122,8 @@ async function fetchLaunch(source: LaunchSource): Promise<LaunchPayload> {
         headers: { "x-fleet-runner-token": source.token },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
-      if (response.ok) return (await response.json()) as LaunchPayload;
+      if (response.status === 204) return undefined;
+      if (response.ok) return await response.json();
       lastError = `HTTP ${response.status}: ${(await response.text().catch(() => "")).slice(0, 200)}`;
       if (response.status < 500) break;
     } catch (err) {
@@ -106,7 +131,7 @@ async function fetchLaunch(source: LaunchSource): Promise<LaunchPayload> {
     }
     if (attempt < FETCH_ATTEMPTS) await delay(1_000 * attempt);
   }
-  throw new Error(`cannot fetch launch payload from ${url}: ${lastError}`);
+  throw new Error(`cannot fetch ${route.split("?")[0]} from ${url}: ${lastError}`);
 }
 
 function writeSync(workspace: string, sync: Record<string, string>): void {

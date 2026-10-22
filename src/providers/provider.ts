@@ -31,6 +31,8 @@ export type LaunchSpec = {
    * Re-entry answer (issue #6): present only when re-launching a parked job.
    * The runner writes the answer to .fleet/out/answer-<decisionId>.json after
    * wiping the out/ channel so the status-driven harness finds it immediately.
+   * Only the decision id reaches the sandbox env; the runner reads the answer
+   * itself from the journal through its answer route (#296).
    */
   reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
   /**
@@ -189,9 +191,11 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     FLEET_DAEMON_URL: spec.daemonUrl,
     FLEET_RUNNER_TOKEN: spec.runnerToken,
     FLEET_WORKSPACE: workspace,
-    // Re-entry answer: runner writes this to out/answer-<id>.json after wiping out/.
+    // Re-entry: the decision id only. The answer is free text of any length,
+    // and ECS caps the overrides at 8192 characters (#296) — the runner GETs
+    // it from /internal/jobs/:id/answer, which already serves it.
     ...(spec.reentryAnswer !== undefined
-      ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
+      ? { FLEET_REENTRY_DECISION: spec.reentryAnswer.decisionId }
       : {}),
     // Re-entry decision seed: keep ids unique across generations (issue #110).
     ...(spec.reentryDecisionSeed !== undefined

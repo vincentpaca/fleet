@@ -32,7 +32,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond } from './git.ts';
 import { buildHarnessCommand, describeHarnessPlan, parseVersion } from './harness.ts';
 import { authFailureFrom, authFailureIn } from './auth-failure.ts';
-import { materializeWorkspace } from './workspace.ts';
+import { loadReentryAnswer, materializeWorkspace, type ReentryAnswer } from './workspace.ts';
 import { runSetupScript, dropPrivileges } from './setup.ts';
 import { parseDurationMs, idleLimitMs, blockHotLimitMs, checkpointLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
@@ -115,21 +115,6 @@ async function main(): Promise<void> {
   const token = requireEnv('FLEET_RUNNER_TOKEN');
   const workspace = requireEnv('FLEET_WORKSPACE');
 
-  // Re-entry answer (issue #6): present when the daemon re-launches a parked
-  // job after an operator answer. The runner writes it to out/ after the wipe
-  // so the status-driven harness finds it immediately on its first check.
-  const reentryAnswerB64 = process.env.FLEET_REENTRY_ANSWER_JSON;
-  let reentryAnswer: { decisionId: string; answer: { option?: string; text?: string } } | undefined;
-  if (reentryAnswerB64) {
-    try {
-      reentryAnswer = JSON.parse(Buffer.from(reentryAnswerB64, 'base64').toString('utf8')) as {
-        decisionId: string;
-        answer: { option?: string; text?: string };
-      };
-    } catch {
-      // Ignore malformed env; proceed without pre-materialised answer.
-    }
-  }
   // Re-entry decision seed (issue #110): the daemon passes the highest decision
   // ordinal already in the job's log so the fresh runner's ids stay unique
   // across park/resume — without this the first new decision would be d1 again
@@ -169,8 +154,16 @@ async function main(): Promise<void> {
   // order and synced files from the daemon (#296). After `running` so a fetch
   // failure lands in the job's own log, with a settle that names it instead
   // of blaming the manifest.
+  // Re-entry answer (issue #6): present when the daemon re-launches a parked
+  // job after an operator answer. The runner writes it to out/ after the wipe
+  // so the status-driven harness finds it immediately on its first check. A
+  // re-entry that cannot get its answer fails here, loudly: carrying on would
+  // treat the job as fresh and branch over its own WIP.
+  let reentryAnswer: ReentryAnswer | undefined;
   try {
-    await materializeWorkspace(workspace, { daemonUrl, jobId, token });
+    const source = { daemonUrl, jobId, token };
+    await materializeWorkspace(workspace, source);
+    reentryAnswer = await loadReentryAnswer(source);
   } catch (err) {
     await sink.emit({ type: 'log', text: `workspace materialisation failed: ${String(err instanceof Error ? err.message : err)}`, who: 'runner' });
     await settleBlocked(sink, 'the runner could not fetch its launch payload from the daemon (see the log); check the daemon is reachable from the sandbox, then re-dispatch');
