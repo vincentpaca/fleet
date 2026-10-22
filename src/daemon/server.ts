@@ -39,10 +39,12 @@ const RETAINED_WORKSPACE_NOTE_PREFIX = "workspace retained at";
  * so this line is how intake tells a stop Fleet asked for from a sandbox the
  * substrate killed under the job (a reclaimed Spot host). In the journal, not
  * in memory, so a daemon restart mid-cancel cannot turn an operator's cancel
- * into an auto-retry. Prompt-level for new call sites: any future path that
- * terminates a LIVE job must journal this note first, or its stop reads as a
- * host loss. Today that is #cancel and #cancelFromBackstop; every other
- * terminate() hits a job already terminal, whose events intake rejects.
+ * into an auto-retry. Any path that terminates a job that is not yet terminal
+ * must journal this note first, or its stop reads as a host loss: #cancel,
+ * #cancelFromBackstop and #resolveLostLaunch do. The remaining terminate()
+ * calls hit a job already terminal, whose late events intake rejects.
+ * test/daemon-stop-note.test.ts classifies every call site, so a new one fails
+ * the suite until someone decides which kind it is.
  */
 const STOP_REQUEST_NOTE = "terminating the container";
 
@@ -1904,6 +1906,14 @@ export class FleetDaemon {
   async #resolveLostLaunch(job: JobRecord): Promise<void> {
     const derived = this.#options.provider.deriveHandle?.(job.id);
     if (derived !== undefined) {
+      // The job is still queued: a runner that did start (docker's terminate
+      // waits out its teardown) reports cancelled(signal) into a live record,
+      // so the stop is journalled first or it reads as a host loss (#293).
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `launch lost in a daemon restart: ${STOP_REQUEST_NOTE} ${derived} if it started`,
+        who: "daemon",
+      });
       await this.#options.provider.terminate(derived).catch(() => {});
     }
     this.registry.appendEvent(job.id, {
