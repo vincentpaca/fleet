@@ -666,8 +666,11 @@ test('a host-lost retry resumes the lost attempt\'s pushed WIP commit, renaming 
   const first = makeWorkspace();
   const { branch } = setupWorkspace(first, opts(remote));
   writeFileSync(join(first, 'partial.txt'), 'attempt 1 got this far\n');
-  // The cancel teardown's push as the host went away.
-  assert.equal(pushWip(first, 'cancelled: SIGTERM'), 'pushed');
+  // The cancel teardown's push as the host went away, as plain git so this
+  // test is independent of the push helpers' signatures (#291 changes them).
+  execFileSync('git', ['add', 'partial.txt'], { cwd: first });
+  execFileSync('git', ['commit', '-q', '-m', 'wip: cancelled: SIGTERM'], { cwd: first });
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`], { cwd: first });
   const wip = execFileSync('git', ['rev-parse', branch], { cwd: remote, encoding: 'utf8' }).trim();
 
   const second = makeWorkspace();
