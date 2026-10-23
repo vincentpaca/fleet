@@ -170,6 +170,7 @@ the right ownership on first mount.
 | `az_count` | `number` | `2` | AZs / subnets per tier for the module-created VPC. |
 | `enable_nat_gateway` | `bool` | `false` | `true`: private subnets behind NAT; `false`: public subnets with public-IP egress. Never any inbound either way. |
 | `instance_type` | `string` | `"t3.xlarge"` | EC2 instance type for container instances. Moves together with `offered_*` and `runner_*` (one tier). 2-vCPU boxes starve suite-heavy jobs into their wall-clock budgets (#191); Spot price difference is cents per job-hour. |
+| `instance_types` | `list(string)` | `null` | Spot diversification: several same-size types the ASG may launch, so a shortage in one Spot pool does not stop every job. `null` launches `instance_type` alone. Every type must offer at least `offered_cpu_units` / `offered_memory_mib`. See [Several instance types](#several-instance-types). |
 | `max_instances` | `number` | `4` | ASG maximum (must be ≥ 1, and ≥ `min_instances`). |
 | `min_instances` | `number` | `0` | Warm capacity floor: instances kept running at idle so a job skips the ~3-4 min cold start. **Each always-on `t3.medium` bills 24/7 — roughly $30/mo, more than the rest of a Fleet deployment combined.** See [Warm capacity floor](#warm-capacity-floor). |
 | `on_demand_base_capacity` | `number` | `0` | Instances always launched on-demand before the Spot split applies. See [Spot by default](#spot-by-default). |
@@ -196,12 +197,28 @@ With the defaults — `on_demand_base_capacity = 0` and
 instance**. That is the cheap end of a real trade-off, and it is deliberate:
 worker capacity exists only while jobs run, and Spot is a fraction of the
 on-demand price for interruptible batch work. The cost is interruption: AWS can
-reclaim a Spot instance with a two-minute warning, and the unit wires no
-lifecycle hook or Capacity Rebalancing, so a reclaim kills any job mid-run. The
-daemon sees the dead task only as a stall and settles the job as cancelled —
-the work is lost and must be re-dispatched by hand.
+reclaim a Spot instance with a two-minute warning, and a reclaim kills any job
+mid-run. The daemon sees the dead task only as a stall and settles the job as
+cancelled — the work is lost and must be re-dispatched by hand.
 
-Five knobs shape the exposure:
+Two settings are always on to keep reclaims rarer (#294):
+
+- **`price-capacity-optimized` allocation.** The API default, `lowest-price`,
+  launches into the cheapest pool even when it is about to run dry. This
+  strategy picks the pools least likely to be reclaimed, then the cheapest of
+  those. Each instance type in each AZ is its own pool, so it helps even with
+  one type.
+- **Capacity Rebalancing.** When EC2 flags an instance as at elevated risk,
+  the ASG launches a replacement and then terminates the flagged one. AWS only
+  does this for instances that are not protected from scale-in, and ECS
+  managed termination protection protects every instance that is running a
+  task. So busy instances are left alone, and a running job still dies only
+  on an actual Spot interruption. What gets replaced ahead of time is idle
+  capacity, warm-floor instances included. One gap: protection is set shortly
+  after a task is placed, so a job placed on a flagged idle instance while its
+  replacement launches can still be lost.
+
+Six knobs shape the exposure:
 
 - `on_demand_base_capacity` — instances that are always on-demand. Set to 1+
   for a guaranteed baseline that reclaims cannot touch.
@@ -215,10 +232,59 @@ Five knobs shape the exposure:
   shrinks.
 - `instance_type` — Spot reclaim rates differ by pool; a less popular type in
   your region is reclaimed less often.
+- `instance_types` — several types, so one pool's shortage is not an outage.
+  See below.
 
 If a lost job costs you more than the on-demand premium — long jobs, jobs that
 are expensive to re-prompt — set `on_demand_percentage_above_base = 100` and
 pay for certainty.
+
+### Several instance types
+
+With one type, a Spot shortage in that type stops everything: the ASG retries
+`InsufficientInstanceCapacity` every minute, dispatched jobs sit `queued`, and
+running ones get reclaimed as the pool drains. List several types and the
+allocation strategy can launch from whichever pool has capacity:
+
+```hcl
+module "fleet" {
+  # ...
+  instance_types = ["t3.xlarge", "m5.xlarge", "m6i.xlarge"]
+}
+```
+
+List several when you run on Spot (the default) and either have seen
+`Could not launch Spot Instances. InsufficientInstanceCapacity` in the ASG's
+activity history, or run jobs long enough (hours) that a reclaim costs you a
+real re-run. On all-on-demand (`on_demand_percentage_above_base = 100`) it
+matters less.
+
+Rules for the list:
+
+- **Every type must offer at least `offered_cpu_units` and
+  `offered_memory_mib`.** The daemon advertises one tier for the whole
+  deployment and the runner task claims all of it by default; a smaller type
+  in the list gives a job a box that cannot host its task, and the task sits
+  unplaced. With the defaults (4096 CPU units / 15360 MiB), that means 4 vCPU
+  and 16 GiB types, for example `t3a.xlarge`, `m5.xlarge` or `m6i.xlarge`
+  beside `t3.xlarge`. What counts is the memory ECS registers for the
+  instance, not the nominal size, and only `t3.xlarge` has been measured
+  against the default tier: before relying on another type, check its
+  `registeredResources` with `aws ecs describe-container-instances`.
+- **Keep them the same size.** A larger type is allowed but wasted: the runner
+  task still claims one tier, and the rest of the box idles at its price.
+- **Check the CPU architecture.** Graviton types (`m6g`, `m7g`, `t4g`) need an
+  arm64 AMI and arm64 images; the unit's AMI and runner image are x86_64.
+- When the list is set it chooses the instances; `instance_type` is then only
+  the launch template's default, which the list overrides.
+- **Order matters only for on-demand.** Spot picks among the listed types by
+  pool health and price; on-demand instances (`on_demand_base_capacity` and
+  above) prefer the first type listed.
+
+Leaving `instance_types` unset (`null`) launches `instance_type` alone, as
+before. `fleet setup infra` does not ask for the list yet (#287); set it in
+the generated `main.tf` by hand. A wizard rerun rewrites that file and drops
+the line, so add it back before the next apply.
 
 ### Warm capacity floor
 

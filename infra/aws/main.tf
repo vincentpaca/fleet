@@ -722,6 +722,17 @@ resource "aws_autoscaling_group" "instances" {
   # Increase if jobs are being terminated mid-run by aggressive scale-in.
   default_cooldown = var.scaling_cooldown_seconds
 
+  # Capacity Rebalancing (#294): on an EC2 rebalance recommendation the ASG
+  # launches a replacement Spot instance, then terminates the at-risk one. AWS
+  # only replaces an instance that is NOT protected from scale-in, and ECS
+  # managed termination protection (the capacity provider below) protects every
+  # instance that is running a task, so busy instances are left alone and a job
+  # still dies only on an actual two-minute Spot interruption, as before. What
+  # gets replaced ahead of time is idle capacity, warm-floor instances included.
+  # One gap: protection is set shortly after a task is placed, so a job placed
+  # on a flagged idle instance while its replacement launches can still be lost.
+  capacity_rebalance = true
+
   # Mixed instances policy: controls on-demand vs spot split.
   # on_demand_base_capacity: instances always on-demand (for baseline reliability).
   # on_demand_percentage_above_base: 0 = all additional capacity is spot; 100 = all on-demand.
@@ -729,12 +740,31 @@ resource "aws_autoscaling_group" "instances" {
     instances_distribution {
       on_demand_base_capacity                  = var.on_demand_base_capacity
       on_demand_percentage_above_base_capacity = var.on_demand_percentage_above_base
+      # The API default, lowest-price, picks the cheapest pool even when it is
+      # about to run dry; price-capacity-optimized picks pools least likely to
+      # be reclaimed, then the cheapest of those (#294). Worth it with one
+      # instance type too: each AZ is its own pool.
+      spot_allocation_strategy = "price-capacity-optimized"
+      # 0 means "not sent". The provider keeps a computed value it read back
+      # from the API (lowest-price groups report 2 pools) unless told
+      # otherwise, and SpotInstancePools is valid only with lowest-price.
+      # Pinned in test/infra-aws.test.ts.
+      spot_instance_pools = 0
     }
 
     launch_template {
       launch_template_specification {
         launch_template_id = aws_launch_template.instances.id
         version            = "$Latest"
+      }
+
+      # No override by default: the launch template's instance_type is the
+      # one type, so an existing deployment's instance selection is unchanged.
+      dynamic "override" {
+        for_each = var.instance_types == null ? [] : var.instance_types
+        content {
+          instance_type = override.value
+        }
       }
     }
   }
