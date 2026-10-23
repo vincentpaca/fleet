@@ -138,6 +138,7 @@ test('a daemon-initiated stall cancel lands the unpushed commit, collects the ar
   );
   const { stdout: log } = await fleet(['logs', jobId]);
   assert.match(log, /stall backstop: terminating the container/, 'the journal must say why the daemon acted');
+  assert.doesNotMatch(log, /host lost/, 'a stop the daemon sent is never mistaken for a host loss (#293)');
   assert.match(log, new RegExp(`wip pushed to ${branch}`), "the runner's teardown push must be in the journal");
 
   // 3. The artifacts are fetchable, byte-identical, through the operator lane.

@@ -25,6 +25,7 @@ import {
   buildDescribeDaemonTaskArgs,
   ecsTunnelOpener,
   parseFleetTasks,
+  parseStopReason,
 } from "../src/providers/ecs.ts";
 import { ProcessProvider, prepareWorkspace } from "../src/providers/process.ts";
 import { ANSWER_FETCH_TIMEOUT_MS, loadReentryAnswer, materializeWorkspace } from "../src/runner/workspace.ts";
@@ -2221,6 +2222,45 @@ test("listJobSandboxes follows the continuation token and batches describe-tasks
   const found = await provider.listJobSandboxes();
   assert.equal(found.length, 250, "an orphan past page one must not be invisible");
   assert.deepEqual(describeBatches, [100, 100, 50], "DescribeTasks accepts at most 100 ARNs per call");
+});
+
+test("parseStopReason reads ECS's stopCode and stoppedReason, and nothing before ECS has them (#293)", () => {
+  assert.equal(
+    parseStopReason(JSON.stringify({ tasks: [{ taskArn: "arn:task/t1", lastStatus: "STOPPED", stopCode: "TerminationNotice", stoppedReason: "Host EC2 (instance i-0abc) terminated." }] })),
+    "TerminationNotice: Host EC2 (instance i-0abc) terminated.",
+  );
+  assert.equal(parseStopReason(JSON.stringify({ tasks: [{ stoppedReason: "Essential container in task exited" }] })), "Essential container in task exited");
+  assert.equal(parseStopReason(JSON.stringify({ tasks: [{ taskArn: "arn:task/t1", lastStatus: "RUNNING" }] })), undefined);
+  assert.equal(parseStopReason(JSON.stringify({ tasks: [], failures: [{ arn: "arn:task/t1", reason: "MISSING" }] })), undefined);
+});
+
+test("describeStop polls describe-tasks for the named task until ECS records a stop (#293)", async () => {
+  const calls: string[][] = [];
+  const provider = new EcsProvider(ECS_CONFIG, {
+    aws: async (args) => {
+      calls.push(args);
+      // The runner reports its SIGTERM before ECS has noticed the host is gone.
+      const stopped = calls.length >= 3;
+      return JSON.stringify({ tasks: [{ taskArn: "arn:task/t1", ...(stopped ? { stopCode: "TerminationNotice", stoppedReason: "Host EC2 (instance i-0abc) terminated." } : {}) }] });
+    },
+    stopReasonPoll: { attempts: 5, intervalMs: 0 },
+  });
+  assert.equal(await provider.describeStop("arn:task/t1"), "TerminationNotice: Host EC2 (instance i-0abc) terminated.");
+  assert.equal(calls.length, 3, "stops polling once ECS has an answer");
+  assert.deepEqual(calls[0]!.slice(0, 6), ["ecs", "describe-tasks", "--cluster", "fleet-cluster", "--tasks", "arn:task/t1"]);
+});
+
+test("describeStop gives up at its bound with undefined rather than polling forever (#293)", async () => {
+  let calls = 0;
+  const provider = new EcsProvider(ECS_CONFIG, {
+    aws: async () => {
+      calls++;
+      return JSON.stringify({ tasks: [{ taskArn: "arn:task/t1", lastStatus: "RUNNING" }] });
+    },
+    stopReasonPoll: { attempts: 3, intervalMs: 0 },
+  });
+  assert.equal(await provider.describeStop("arn:task/t1"), undefined);
+  assert.equal(calls, 3);
 });
 
 // Fake `aws` for the end-to-end reconcile test: an on-disk ECS control plane.

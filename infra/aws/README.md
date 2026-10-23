@@ -197,9 +197,15 @@ With the defaults — `on_demand_base_capacity = 0` and
 instance**. That is the cheap end of a real trade-off, and it is deliberate:
 worker capacity exists only while jobs run, and Spot is a fraction of the
 on-demand price for interruptible batch work. The cost is interruption: AWS can
-reclaim a Spot instance with a two-minute warning, and a reclaim kills any job
-mid-run. The daemon sees the dead task only as a stall and settles the job as
-cancelled — the work is lost and must be re-dispatched by hand.
+reclaim a Spot instance with a two-minute warning, and a reclaim kills any
+job mid-run. The runner's SIGTERM teardown pushes the work in progress to the job branch and
+reports a signal the daemon never sent, which the daemon records as
+`host-lost` (#293), journalling ECS's `stopCode`/`stoppedReason` beside it. A
+first host loss with no answered decisions and wall-clock budget left is
+re-queued once, and the retry resumes the pushed branch. A second loss, or one
+past that policy, settles `cancelled(host-lost)` and needs an operator. All of
+this rests on the teardown getting its events out inside the task's stop
+grace; a host that dies harder than that is seen only as a stall.
 
 Two settings are always on to keep reclaims rarer (#294):
 

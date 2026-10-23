@@ -52,6 +52,36 @@ function isSafeRelativePath(relPath: string): boolean {
  */
 const MATERIALISATION_FAILED_PREFIX = "workspace materialisation failed";
 
+/**
+ * What every daemon log line announcing a stop it is about to send contains
+ * (#293). Journalled BEFORE provider.terminate(): the runner's cancel teardown
+ * can only report `cancelled(signal)` — it cannot tell who sent the signal —
+ * so this line is how intake tells a stop Fleet asked for from a sandbox the
+ * substrate killed under the job (a reclaimed Spot host). In the journal, not
+ * in memory, so a daemon restart mid-cancel cannot turn an operator's cancel
+ * into an auto-retry. Any path that terminates a job that is not yet terminal
+ * must journal this note first, or its stop reads as a host loss: #cancel,
+ * #cancelFromBackstop and #resolveLostLaunch do. The remaining terminate()
+ * calls hit a job already terminal, whose late events intake rejects.
+ * test/daemon-stop-note.test.ts classifies every call site, so a new one fails
+ * the suite until someone decides which kind it is.
+ */
+const STOP_REQUEST_NOTE = "terminating the container";
+
+/**
+ * The auto-retry causes (#30, #293). One policy; what differs is what the
+ * journal calls it, the reason on the re-queue event, and — derived from that
+ * reason in #launchFresh — whether the retry resumes the lost attempt's branch
+ * (host-lost: the work was fine, the host was not) or renames it and starts
+ * clean (harness-exit: a crashed harness may have left the tree broken).
+ */
+type RetryCause = { said: string; requeueReason: string };
+const HARNESS_EXIT: RetryCause = { said: "harness exited", requeueReason: "retry" };
+const HOST_LOST: RetryCause = {
+  said: "host lost: the runner was signalled but Fleet never asked for a stop",
+  requeueReason: "host-lost",
+};
+
 /** Blocked-first ordering: anything waiting on the operator sorts first. */
 const RANK: Record<JobState, number> = {
   blocked: 0,
@@ -891,10 +921,11 @@ export class FleetDaemon {
    *   off. Used by the parked/stale answer path, the answered-park recovery
    *   (#151), and boot recovery (#115). The state stays blocked until the new
    *   runner emits state:running (blocked → running is a valid transition).
-   * - `retryAttempt`: a harness-exit auto-retry (#30) re-launching a re-queued
-   *   job from scratch. The runner sees FLEET_RETRY_ATTEMPT and renames the
-   *   previous attempt's branch (claim released, evidence retained) before
-   *   creating its own.
+   * - `retryAttempt`: an auto-retry re-launching a re-queued job. After a
+   *   harness exit (#30) it starts from scratch: the runner sees
+   *   FLEET_RETRY_ATTEMPT and renames the previous attempt's branch (claim
+   *   released, evidence retained) before creating its own. After a host loss
+   *   (#293) it resumes that branch instead.
    *
    * Either way the runner seq resets so the fresh container starts at 0, and
    * the decision seed keeps ids unique across generations (#110).
@@ -934,6 +965,10 @@ export class FleetDaemon {
       resources: storedManifest?.limits?.resources,
       ...(opts.reentry !== undefined ? { reentryAnswer: opts.reentry } : {}),
       ...(opts.retryAttempt !== undefined ? { retryAttempt: opts.retryAttempt } : {}),
+      // A host-lost retry (#293) resumes the branch the lost attempt pushed.
+      // The re-queue event's reason is the journalled fact that says so, which
+      // is how boot recovery's relaunch of the same retry resumes too.
+      ...(opts.retryAttempt !== undefined && job.reason === HOST_LOST.requeueReason ? { resumeBranch: true } : {}),
       // Seed the new runner's decision counter past prior ids (issue #110).
       reentryDecisionSeed: this.registry.decisionSeed(job.id),
     });
@@ -1032,9 +1067,15 @@ export class FleetDaemon {
     if (isTerminal(job.state)) {
       return sendJson(res, 409, { error: `job already ${job.state}` });
     }
-    if (job.handle) {
+    // Captured now: the record is live, and a relaunch during the await rewrites its handle.
+    const signalled = job.handle;
+    if (signalled) {
+      // Before the signal (#293): on docker, terminate() waits out the
+      // runner's whole teardown, whose cancelled(signal) lands mid-await — and
+      // without this line that reads as a host loss and gets auto-retried.
+      this.registry.appendEvent(job.id, { type: "log", text: `operator cancel: ${STOP_REQUEST_NOTE}`, who: "daemon" });
       try {
-        await this.#options.provider.terminate(job.handle);
+        await this.#options.provider.terminate(signalled);
       } catch (error) {
         this.registry.appendEvent(job.id, {
           type: "log",
@@ -1047,16 +1088,30 @@ export class FleetDaemon {
     // have landed during the await. Copy #cancelFromBackstop's guard — a
     // done event landing during provider.terminate must not be overwritten
     // with cancelled.
+    // One exception: a runner cancelled(signal) that landed mid-await was
+    // answering THIS cancel's signal (docker's terminate waits out the whole
+    // teardown), so the cancel is still the operator's (#293).
     const afterTerminate = this.registry.getJob(job.id);
-    if (!afterTerminate || isTerminal(afterTerminate.state)) {
+    const answeredOurSignal = afterTerminate?.state === "cancelled" && afterTerminate.reason === "signal";
+    if (!afterTerminate || (isTerminal(afterTerminate.state) && !answeredOurSignal)) {
       return sendJson(res, 409, { error: `job already ${afterTerminate?.state ?? "gone"}` });
     }
-    this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "operator-cancel" });
-    this.registry.setOpenDecision(job.id, null);
-    this.registry.setDecisionBlockedAt(job.id, null);
-    this.registry.clearMarker(job.id);
-    const updated = this.registry.updateJob(job.id, { state: "cancelled", reason: "operator-cancel" });
+    const updated = this.#settleOperatorCancel(job.id);
+    // A retry relaunch (#30, #293) that finished during the await stored a new
+    // attempt's handle: that sandbox is the one still running, so stop it too.
+    if (updated.handle !== undefined && updated.handle !== signalled) {
+      this.#options.provider.terminate(updated.handle).catch(() => {});
+    }
     return sendJson(res, 200, { job: publicJob(updated) });
+  }
+
+  /** The operator-cancel terminal event and its record, journalled by the daemon. */
+  #settleOperatorCancel(id: string): JobRecord {
+    this.registry.appendEvent(id, { type: "state", state: "cancelled", reason: "operator-cancel" });
+    this.registry.setOpenDecision(id, null);
+    this.registry.setDecisionBlockedAt(id, null);
+    this.registry.clearMarker(id);
+    return this.registry.updateJob(id, { state: "cancelled", reason: "operator-cancel" });
   }
 
   async #intakeEvents(job: JobRecord, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1276,11 +1331,11 @@ export class FleetDaemon {
     // Schema-validated at intake.
     const nextState = event.state as JobState;
     const marker = event.marker as Marker | undefined;
-    // Auto-retry (#30): a first harness-exit with no human context and budget
-    // left is re-queued instead of settled. Intake-only — the retry appends its
-    // own queued event to the journal, so replay derives the same record from
-    // the events alone and must not re-launch anything.
-    if (mode === "intake" && this.#interceptHarnessExitRetry(job, event, nextState)) return;
+    // Auto-retry (#30, #293): a first harness-exit or host loss with no human
+    // context and budget left is re-queued instead of settled. Intake-only —
+    // the retry appends its own events to the journal, so replay derives the
+    // same record from the events alone and must not re-launch anything.
+    if (mode === "intake" && this.#interceptRetry(job, event, nextState)) return;
     // Cancellation reason (wall-clock, stall, pickup-gate, ...) is part of the
     // record so status/board can distinguish kinds of cancellation.
     const reason = typeof event.reason === "string" ? { reason: event.reason } : {};
@@ -1370,16 +1425,16 @@ export class FleetDaemon {
     }
   }
 
-  // ---- Harness-exit auto-retry (#30) ----
+  // ---- Auto-retry: harness exit (#30) and host loss (#293) ----
 
   /**
-   * Why a harness-exit cancellation is NOT auto-retried, or null when it is.
-   * The policy (settled in #30): retry exactly once, only when zero decisions
-   * were answered (no human context to lose), and only within the remaining
-   * wall-clock budget. Anything past that is an operator's call, surfaced
-   * loudly rather than retried quietly.
+   * Why a retryable cancellation is NOT auto-retried, or null when it is.
+   * The policy (settled in #30, applied to host loss by #293): retry exactly
+   * once, only when zero decisions were answered (no human context to lose),
+   * and only within the remaining wall-clock budget. Anything past that is an
+   * operator's call, surfaced loudly rather than retried quietly.
    */
-  #harnessExitRetryBlocker(job: JobRecord): string | null {
+  #retryBlocker(job: JobRecord): string | null {
     if ((job.attempt ?? 1) >= 2) return "this was already the retry";
     const answered = this.registry
       .eventsAfter(job.id, -1)
@@ -1393,35 +1448,97 @@ export class FleetDaemon {
   }
 
   /**
-   * Intercept a runner `state: cancelled, reason: harness-exit` at intake.
-   * True means the retry took over: the record never rests on cancelled — the
-   * daemon appends its own queued event (reason "retry", absolute attempt
-   * count) so the journal stays authoritative and replay derives the same
-   * record, then re-launches outside the intake batch. False means policy said
-   * no: the caller settles the cancellation for real, and the refusal is
-   * journalled with the `fleet reclaim` incantation so "needs operator" is a
-   * line in the transcript, not tribal knowledge.
+   * The auto-retry cause a runner cancellation is, or null when it is none.
+   * A `signal` cancel is a host loss exactly when the journal holds no stop
+   * request (#293): the daemon knows what it asked for, so the verdict never
+   * waits on the provider — whose account is journalled as evidence when it
+   * arrives, and decides nothing.
    */
-  #interceptHarnessExitRetry(job: JobRecord, event: StoredEvent, nextState: JobState): boolean {
-    if (nextState !== "cancelled" || event.reason !== "harness-exit") return false;
-    const blocker = this.#harnessExitRetryBlocker(job);
-    if (blocker !== null) {
-      this.registry.appendEvent(job.id, {
-        type: "log",
-        text: `harness exited (attempt ${job.attempt ?? 1}); not auto-retrying: ${blocker}. ` +
-          `Needs operator — \`fleet reclaim ${orderTarget(job.workOrder)}\` releases the branch claim for re-dispatch`,
-        who: "daemon",
-      });
-      return false;
+  #retryCause(job: JobRecord, event: StoredEvent, nextState: JobState): RetryCause | null {
+    if (nextState !== "cancelled") return null;
+    if (event.reason === "harness-exit") return HARNESS_EXIT;
+    if (event.reason === "signal" && !this.#stopWasRequested(job.id)) return HOST_LOST;
+    return null;
+  }
+
+  /**
+   * Whether the daemon journalled a stop request for this job (#293). The
+   * whole journal, not the current attempt: every path that writes one goes
+   * terminal right after, so a request never outlives its attempt.
+   */
+  #stopWasRequested(id: string): boolean {
+    return this.registry.eventsAfter(id, -1).some(
+      (e) => e.type === "log" && e.who === "daemon" && typeof e.text === "string" && e.text.includes(STOP_REQUEST_NOTE),
+    );
+  }
+
+  /**
+   * Intercept a runner cancellation that qualifies for an auto-retry at intake.
+   * True means the daemon took over the record: either the retry (the record
+   * never rests on cancelled — the daemon appends its own queued event with an
+   * absolute attempt count, so the journal stays authoritative and replay
+   * derives the same record, then re-launches outside the intake batch) or a
+   * refused host loss, settled under its own reason. False means a refused
+   * harness-exit: the caller settles the runner's cancellation for real. Every
+   * refusal is journalled with the `fleet reclaim` incantation so "needs
+   * operator" is a line in the transcript, not tribal knowledge.
+   */
+  #interceptRetry(job: JobRecord, event: StoredEvent, nextState: JobState): boolean {
+    const cause = this.#retryCause(job, event, nextState);
+    if (cause === null) return false;
+    if (cause === HOST_LOST) this.#journalStopReason(job);
+    const blocker = this.#retryBlocker(job);
+    if (blocker === null) {
+      this.#requeueForRetry(job, cause);
+      return true;
     }
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      text: `${cause.said} (attempt ${job.attempt ?? 1}); not auto-retrying: ${blocker}. ` +
+        `Needs operator — \`fleet reclaim ${orderTarget(job.workOrder)}\` releases the branch claim for re-dispatch`,
+      who: "daemon",
+    });
+    if (cause !== HOST_LOST) return false;
+    // The runner said `signal`; the record says what the daemon knows. The
+    // daemon's own event, so replay lands on the same reason.
+    const settled = this.registry.appendEvent(job.id, { type: "state", state: "cancelled", reason: "host-lost" });
+    this.#applyStateEvent(job, settled, "intake");
+    return true;
+  }
+
+  /**
+   * The substrate's account of a host loss, journalled once the provider has
+   * one (#293) — the `describe-tasks` an operator would otherwise run by hand.
+   * Off the intake batch, and best-effort: evidence, never policy.
+   */
+  #journalStopReason(job: JobRecord): void {
+    const provider = this.#options.provider;
+    const handle = job.handle;
+    // "stop reason:", not "host lost:" — the substrate may say something else
+    // (a hand-run stop-task reads UserInitiated), and the line must not
+    // contradict its own label. The verdict is the re-queue/refusal line's.
+    const note = (text: string) => this.registry.appendEvent(job.id, { type: "log", text: `stop reason: ${text}`, who: "daemon" });
+    if (handle === undefined || provider.describeStop === undefined) {
+      note(`provider ${provider.name} keeps no record of why a sandbox stopped`);
+      return;
+    }
+    provider.describeStop(handle).then(
+      (reason) => note(reason !== undefined ? `${provider.name} stopped the sandbox — ${reason}` : `${provider.name} recorded no stop reason for ${handle}`),
+      (error: unknown) => note(`could not ask ${provider.name} why ${handle} stopped: ${String(error)}`),
+    ).catch(() => {});
+  }
+
+  /** Re-queue a retryable cancellation as the next attempt (#30, #293). */
+  #requeueForRetry(job: JobRecord, cause: RetryCause): void {
     const attempt = (job.attempt ?? 1) + 1;
     this.registry.appendEvent(job.id, {
       type: "log",
-      text: `harness exited (attempt ${attempt - 1}); auto-retrying once — re-queueing as attempt ${attempt}`,
+      text: `${cause.said} (attempt ${attempt - 1}); auto-retrying once — re-queueing as attempt ${attempt}` +
+        (cause === HOST_LOST ? ", asking the runner to resume the branch it pushed" : ""),
       who: "daemon",
     });
     const queued = this.registry.appendEvent(job.id, {
-      type: "state", state: "queued", reason: "retry", attempt,
+      type: "state", state: "queued", reason: cause.requeueReason, attempt,
     });
     // The queued event runs through the same effects derivation as any other
     // state event (one path; replaying this journal does exactly this).
@@ -1434,7 +1551,6 @@ export class FleetDaemon {
     setImmediate(() => {
       this.#launchRetry(job.id, attempt).catch(() => {});
     });
-    return true;
   }
 
   /** The deferred re-launch of a retry (#30): re-check, then one fresh launch. */
@@ -1626,7 +1742,7 @@ export class FleetDaemon {
       // would leave a transcript that never says why the job was killed.
       this.registry.appendEvent(job.id, {
         type: "log",
-        text: `${cause.reason} backstop: terminating the container — ${cause.nextAction}`,
+        text: `${cause.reason} backstop: ${STOP_REQUEST_NOTE} — ${cause.nextAction}`,
         who: "daemon",
       });
       try {
@@ -1866,6 +1982,14 @@ export class FleetDaemon {
   async #resolveLostLaunch(job: JobRecord): Promise<void> {
     const derived = this.#options.provider.deriveHandle?.(job.id);
     if (derived !== undefined) {
+      // The job is still queued: a runner that did start (docker's terminate
+      // waits out its teardown) reports cancelled(signal) into a live record,
+      // so the stop is journalled first or it reads as a host loss (#293).
+      this.registry.appendEvent(job.id, {
+        type: "log",
+        text: `launch lost in a daemon restart: ${STOP_REQUEST_NOTE} ${derived} if it started`,
+        who: "daemon",
+      });
       await this.#options.provider.terminate(derived).catch(() => {});
     }
     this.registry.appendEvent(job.id, {
