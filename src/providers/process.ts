@@ -221,7 +221,10 @@ export class ProcessProvider implements Provider {
     const workspace = prepareWorkspace(spec, this.#workspaceRoot);
     const child = spawn(process.execPath, [this.#runnerPath], {
       cwd: workspace,
-      env: { ...process.env, ...runnerEnv(spec, workspace) },
+      // FLEET_RESUME_PUSH (#291): this is the one provider whose kept workspace
+      // is a host directory `fleet resume-push` can reach (disposeWorkspace),
+      // so it is the one whose runner may print that hint.
+      env: { ...process.env, ...runnerEnv(spec, workspace), FLEET_RESUME_PUSH: "1" },
       stdio: "ignore",
       detached: false,
     });

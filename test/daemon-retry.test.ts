@@ -177,6 +177,12 @@ test("a failed retry launch cancels loudly instead of stranding the job queued",
   await until(() => daemon.registry.getJob(id)!.state === "cancelled");
   const job = daemon.registry.getJob(id)!;
   assert.equal(job.reason, "launch-failed", "the failure is a terminal fact, not a silent queued forever");
+  // The provider's words are journalled, not just the reason (#296).
+  const logs = daemon.registry.eventsAfter(id, -1).filter((e) => e.type === "log");
+  assert.ok(
+    logs.some((e) => /re-launch failed: .*stub launch failure/.test(String(e.text))),
+    `expected the launch error in the journal; got ${JSON.stringify(logs)}`,
+  );
 });
 
 test("boot recovery finishes a retry whose launch died with the old daemon", async (t) => {

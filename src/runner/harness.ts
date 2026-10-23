@@ -91,6 +91,12 @@ type HarnessInputs = {
    */
   resumed?: boolean;
   /**
+   * Re-entry after a park whose push was diverted (#291): the side branch that
+   * holds work the job branch, now checked out, does not. Runner-built from the
+   * job id (divertedBranch), so it is never externally chosen text.
+   */
+  divertedEarlier?: string;
+  /**
    * The work order's `prompt` (#240): what the operator wants done, used
    * verbatim as the launch line. Required: Fleet composes no instruction of its
    * own any more, so an order without one has no job to run. Fleet still
@@ -137,6 +143,17 @@ function resumeClause(resumed: boolean | undefined): string {
   return (
     ' -- resuming: an earlier attempt at this job lost its host mid-run, and the work it pushed is already on this branch.' +
     ' Read it (git log and git diff against the base branch) and continue from it; do not start over.'
+  );
+}
+
+/** The re-entry clause for work an earlier generation diverted (#291). */
+function divertedClause(side: string | undefined): string {
+  if (side === undefined) return '';
+  return (
+    ` -- an earlier run of this job left work on branch ${side}, not on the branch you are on:` +
+    ` fetch it (git fetch origin ${side}), read every commit it holds that you lack (git log -p HEAD..FETCH_HEAD),` +
+    ` and merge it into your current branch (git merge FETCH_HEAD) before continuing.` +
+    ` Merge, do not cherry-pick or squash: the reminder stops only once your branch contains that branch's tip.`
   );
 }
 
@@ -189,7 +206,7 @@ function overridePlan(override: string, prompt: string | undefined): HarnessPlan
 }
 
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, override, actualVersion, continues, resumed, prompt }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, divertedEarlier, resumed, prompt }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
@@ -220,7 +237,7 @@ export function buildHarnessCommand({ manifest, override, actualVersion, continu
   // operator-written included: a continuation that produces a report instead of
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
-  const promptText = `${prompt}${continuationClause(continues)}${resumeClause(resumed)}\n\n${OUTPUT_CONTRACT}`;
+  const promptText = `${prompt}${continuationClause(continues)}${divertedClause(divertedEarlier)}${resumeClause(resumed)}\n\n${OUTPUT_CONTRACT}`;
   const model = typeof harness.model === 'string' ? harness.model : undefined;
   if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
   return { ...dialect(promptText, model), shell: false, notes };

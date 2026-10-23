@@ -31,6 +31,8 @@ export type LaunchSpec = {
    * Re-entry answer (issue #6): present only when re-launching a parked job.
    * The runner writes the answer to .fleet/out/answer-<decisionId>.json after
    * wiping the out/ channel so the status-driven harness finds it immediately.
+   * Only the decision id reaches the sandbox env; the runner reads the answer
+   * itself from the journal through its answer route (#296).
    */
   reentryAnswer?: { decisionId: string; answer: { option?: string; text?: string } };
   /**
@@ -204,9 +206,11 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     FLEET_DAEMON_URL: spec.daemonUrl,
     FLEET_RUNNER_TOKEN: spec.runnerToken,
     FLEET_WORKSPACE: workspace,
-    // Re-entry answer: runner writes this to out/answer-<id>.json after wiping out/.
+    // Re-entry: the decision id only. The answer is free text of any length,
+    // and ECS caps the overrides at 8192 characters (#296) — the runner GETs
+    // it from /internal/jobs/:id/answer, which already serves it.
     ...(spec.reentryAnswer !== undefined
-      ? { FLEET_REENTRY_ANSWER_JSON: Buffer.from(JSON.stringify(spec.reentryAnswer)).toString('base64') }
+      ? { FLEET_REENTRY_DECISION: spec.reentryAnswer.decisionId }
       : {}),
     // Re-entry decision seed: keep ids unique across generations (issue #110).
     ...(spec.reentryDecisionSeed !== undefined
@@ -219,23 +223,4 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     // Host-lost retry (#293): resume the lost attempt's branch instead.
     ...(spec.resumeBranch === true ? { FLEET_RESUME_BRANCH: "1" } : {}),
   };
-}
-
-/**
- * Workspace materialisation payload (#5): manifest, work order, and sync
- * files travel as base64 env vars; the runner writes them into
- * FLEET_WORKSPACE before any file reads. One builder for every container
- * provider — the Docker/ECS paths once assembled this by hand and diverged:
- * the ECS copy omitted the work order, and #9's first real cloud job died
- * at the pickup gate with no target.
- */
-export function materializationEnv(spec: LaunchSpec): Record<string, string> {
-  const env: Record<string, string> = {
-    FLEET_MANIFEST_JSON: Buffer.from(JSON.stringify(spec.manifest)).toString('base64'),
-    FLEET_WORK_ORDER_JSON: Buffer.from(JSON.stringify(spec.workOrder)).toString('base64'),
-  };
-  if (Object.keys(spec.sync).length > 0) {
-    env.FLEET_SYNC_JSON = Buffer.from(JSON.stringify(spec.sync)).toString('base64');
-  }
-  return env;
 }

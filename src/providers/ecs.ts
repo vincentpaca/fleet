@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { CloudCliRunner, JobSandbox, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
-import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempFile } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, writeSecretTempFile } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -469,6 +469,9 @@ const STARTED_BY_PREFIX = "fleet:";
  */
 const DESCRIBE_TASKS_BATCH = 100;
 
+/** RunTask's cap on the serialized overrides block (API constraint, #296). */
+const ECS_OVERRIDES_MAX = 8192;
+
 /**
  * The fleet-launched tasks in an `ecs describe-tasks --output json` response:
  * every task whose startedBy carries the fleet stamp, mapped to the job id it
@@ -532,17 +535,14 @@ export class EcsProvider implements Provider {
   /**
    * The `--cli-input-json` payload for run-task — pure function, unit-tested
    * without AWS. Every parameter, including the overrides block that carries
-   * the manifest env and the runner token, rides in this JSON: on argv the
+   * the operator env and the runner token, rides in this JSON: on argv the
    * values would be world-readable in `ps` for the CLI's lifetime and land in
    * shell/audit logs (#126). Field names follow the RunTask API shape.
    * `startedBy: fleet:<jobId>` must survive exactly — #147's reconcile sweep
    * keys on it to tell fleet tasks from everything else on the cluster.
    */
   buildRunTaskInput(spec: LaunchSpec): Record<string, unknown> {
-    const env: Record<string, string> = {
-      ...runnerEnv(spec, CONTAINER_WORKSPACE),
-      ...materializationEnv(spec),
-    };
+    const env = runnerEnv(spec, CONTAINER_WORKSPACE);
     const overrides: Record<string, unknown> = {
       containerOverrides: [
         {
@@ -558,6 +558,21 @@ export class EcsProvider implements Provider {
     // ECS task-level override values must be strings.
     if (spec.resources?.cpu != null) overrides.cpu = String(spec.resources.cpu);
     if (spec.resources?.memory != null) overrides.memory = String(spec.resources.memory);
+    // RunTask caps the overrides block at 8192 characters (API constraint, no
+    // plan reaches it — #296). The manifest, order and sync map no longer ride
+    // here (the runner fetches them), but env values still can overflow it;
+    // say so in Fleet's words instead of AWS's.
+    // Bytes, not UTF-16 units: a non-ASCII env value is longer on the wire.
+    const size = Buffer.byteLength(JSON.stringify(overrides));
+    if (size > ECS_OVERRIDES_MAX) {
+      // Name the biggest entry: only env values ride here now, and an
+      // operator-supplied one is the usual culprit.
+      const [name, value] = Object.entries(env).sort(([, a], [, b]) => b.length - a.length)[0];
+      throw new Error(
+        `ecs run-task container overrides are ${size} bytes; the RunTask API allows at most ${ECS_OVERRIDES_MAX} ` +
+          `(largest: ${name}, ${value.length} characters)`,
+      );
+    }
     const input: Record<string, unknown> = {
       cluster: this.config.cluster,
       taskDefinition: this.config.taskDefinition,
