@@ -33,6 +33,25 @@ import type { Provider } from "../providers/provider.ts";
  */
 const RETAINED_WORKSPACE_NOTE_PREFIX = "workspace retained at";
 
+/**
+ * A path that names a file strictly inside some root: non-empty, not absolute,
+ * and no empty, "." or ".." segment under either separator. The artifact lane
+ * and the sync map at POST /jobs share this one rule (#296), so no path that
+ * reaches a filesystem write through the daemon was not checked by it.
+ */
+function isSafeRelativePath(relPath: string): boolean {
+  if (!relPath || relPath.startsWith("/") || relPath.startsWith("\\")) return false;
+  return relPath.split(/[/\\]/).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+/**
+ * Prefix of the runner's log line when it could not stage its workspace
+ * (src/runner/main.ts, stageLaunch). Its absence before a manifest
+ * cancellation is how the daemon tells a runner that never asked for its
+ * launch payload from one whose fetch failed (#296).
+ */
+const MATERIALISATION_FAILED_PREFIX = "workspace materialisation failed";
+
 /** Blocked-first ordering: anything waiting on the operator sorts first. */
 const RANK: Record<JobState, number> = {
   blocked: 0,
@@ -488,7 +507,7 @@ export class FleetDaemon {
    * Handle /internal/* routes. Unknown id and bad token answer identically
    * (issue #133): a distinguishable 404 would let a token holder probe job ids.
    * Runner: POST /internal/jobs/:id/events | GET /internal/jobs/:id/answer
-   *         POST /internal/jobs/:id/artifacts
+   *         POST /internal/jobs/:id/artifacts | GET /internal/jobs/:id/launch
    */
   async #routeInternal(method: string, parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (parts[1] !== "jobs" || parts.length !== 4) {
@@ -498,13 +517,30 @@ export class FleetDaemon {
     if (!job || !this.#runnerAuthorized(req, job)) {
       return sendJson(res, 401, { error: "invalid runner token" });
     }
-    // Combine sub-path and method into a single key to avoid compound && conditions.
+    // Sub-path and method form one key: a table, not a chain of conditions.
     const url = new URL(req.url ?? "/", "http://fleet.invalid");
-    const key = `${parts[3]}:${method}`;
-    if (key === "events:POST") return this.#intakeEvents(job, req, res);
-    if (key === "answer:GET") return this.#answerPoll(job, url, res);
-    if (key === "artifacts:POST") return this.#receiveArtifact(job, req, res);
+    const handlers = new Map<string, () => Promise<void> | void>([
+      ["events:POST", () => this.#intakeEvents(job, req, res)],
+      ["answer:GET", () => this.#answerPoll(job, url, res)],
+      ["artifacts:POST", () => this.#receiveArtifact(job, req, res)],
+      ["launch:GET", () => this.#launchPayload(job, res)],
+    ]);
+    const handler = handlers.get(`${parts[3]}:${method}`);
+    if (handler) return handler();
     sendJson(res, 404, { error: `no internal route: ${method} ${parts[3]}` });
+  }
+
+  /**
+   * GET /internal/jobs/:id/launch (#296): what the runner materialises into an
+   * empty container workspace — the same manifest, work order and sync map
+   * POST /jobs validated, read back from the launch half. They used to travel
+   * as base64 container env, and ECS caps the whole overrides block at 8192
+   * characters: a ~2KB prompt was enough to fail run-task. Operator env is not
+   * here; it is already the container's environment.
+   */
+  #launchPayload(job: JobRecord, res: ServerResponse): void {
+    const { manifest, sync } = this.registry.getLaunchDetails(job.id);
+    sendJson(res, 200, { manifest, workOrder: job.workOrder, sync });
   }
 
   /** Constant-time check of the x-fleet-operator-token header against the boot secret. */
@@ -567,6 +603,12 @@ export class FleetDaemon {
     try {
       env = stringRecord("env" in body ? body.env : undefined, "env");
       sync = stringRecord("sync" in body ? body.sync : undefined, "sync");
+      // Sync keys become file paths in the job's workspace: refuse, never
+      // coerce, anything that is not a plain relative path (#296, D18).
+      const unsafe = Object.keys(sync).find((key) => !isSafeRelativePath(key));
+      if (unsafe !== undefined) {
+        throw new Error(`sync path "${unsafe}" must be relative to the workspace, with no "." or ".." segment`);
+      }
     } catch (error) {
       sendJson(res, 422, { errors: [{ instancePath: "", message: String(error) }] });
       return null;
@@ -661,6 +703,10 @@ export class FleetDaemon {
       const updated = this.registry.updateJob(id, { handle });
       return sendJson(res, 201, { job: publicJob(updated) });
     } catch (error) {
+      // The provider's own words go in the journal (#296): the HTTP 500 body
+      // below reaches only the dispatching CLI, and `fleet logs` read
+      // "cancelled reason=launch-failed" with nothing saying why.
+      this.registry.appendEvent(id, { type: "log", text: `launch failed: ${String(error)}`, who: "daemon" });
       this.registry.appendEvent(id, { type: "state", state: "cancelled", reason: "launch-failed" });
       const updated = this.registry.updateJob(id, { state: "cancelled", reason: "launch-failed" });
       return sendJson(res, 500, { error: `launch failed: ${String(error)}`, job: publicJob(updated) });
@@ -902,13 +948,16 @@ export class FleetDaemon {
     return this.registry.updateJob(job.id, { handle });
   }
 
-  /** A failed re-entry launch ends the job loudly instead of stranding it blocked. */
+  /**
+   * A failed re-launch (re-entry after an answer, or the #30 retry) ends the
+   * job loudly instead of stranding it, with the provider's words journalled.
+   */
   #cancelAfterFailedRelaunch(jobId: string, error: unknown): void {
     const current = this.registry.getJob(jobId);
     if (!current || isTerminal(current.state)) return;
     this.registry.appendEvent(jobId, {
       type: "log",
-      text: `re-launch failed after answer: ${String(error)}`,
+      text: `re-launch failed: ${String(error)}`,
       who: "daemon",
     });
     this.registry.appendEvent(jobId, { type: "state", state: "cancelled", reason: "launch-failed" });
@@ -1259,8 +1308,34 @@ export class FleetDaemon {
       // A park landing on an already-answered decision means the runner parked
       // through #151's gap; the guard and the recovery live in the helper.
       this.#maybeRecoverAnsweredPark(job, nextState, marker);
+      this.#noteRunnerPredatesLaunchFetch(job, event);
     }
     if (isTerminal(nextState)) this.#applyTerminalState(job, mode);
+  }
+
+  /**
+   * Deployment skew (#296): a runner image predating the launch fetch finds an
+   * empty workspace under this daemon and cancels with reason `manifest`,
+   * telling the operator to add a manifest they never had to provide. A
+   * current runner that could not fetch logs MATERIALISATION_FAILED_PREFIX
+   * first; a manifest cancellation without that line came from a runner that
+   * never asked, so say what is actually wrong. Read from the journal, not
+   * daemon memory, so a restart between the two cannot change the verdict.
+   * On the process provider the runner never fetches, so the note hedges.
+   */
+  #noteRunnerPredatesLaunchFetch(job: JobRecord, event: StoredEvent): void {
+    if (event.state !== "cancelled" || event.reason !== "manifest") return;
+    const fetchFailed = this.registry
+      .eventsAfter(job.id, -1)
+      .some((e) => e.type === "log" && typeof e.text === "string" && e.text.startsWith(MATERIALISATION_FAILED_PREFIX));
+    if (fetchFailed) return;
+    this.registry.appendEvent(job.id, {
+      type: "log",
+      who: "daemon",
+      text: "the runner never fetched its launch payload (GET /internal/jobs/:id/launch). On docker or ECS that means " +
+        "its image predates #296 and cannot start jobs under this daemon: rebuild the runner image with the daemon — " +
+        "`images/build.sh --redeploy-daemon` builds and pushes both, runner first — then re-dispatch.",
+    });
   }
 
   /** Rung verification and the clean-settle container reap. */
@@ -1926,14 +2001,9 @@ export class FleetDaemon {
    * Returns the path as-is if safe, or null if unsafe.
    */
   static #safeArtifactPath(relPath: string): string | null {
-    if (!relPath || relPath.startsWith("/") || relPath.startsWith("\\")) return null;
     // Reserved for in-flight writes (#119): a crashed upload's leftover must
     // not be fetchable, and no upload may collide with a tmp name.
-    if (relPath.endsWith(ARTIFACT_TMP_SUFFIX)) return null;
-    const parts = relPath.split(/[/\\]/);
-    for (const part of parts) {
-      if (part === "" || part === "." || part === "..") return null;
-    }
+    if (!isSafeRelativePath(relPath) || relPath.endsWith(ARTIFACT_TMP_SUFFIX)) return null;
     return relPath;
   }
 

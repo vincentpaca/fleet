@@ -32,7 +32,7 @@ import { collectArtifacts } from './artifacts.ts';
 import { setupWorkspace, pushWork, pushWip, pushCheckpoint, getHeadSha, createDraftPr, composeDraftPrText, gitCredentialEnv, findOpenPr, remoteMovedBeyond, divertedBranch, sideMerged, type Diverted } from './git.ts';
 import { buildHarnessCommand, describeHarnessPlan, parseVersion } from './harness.ts';
 import { authFailureFrom, authFailureIn } from './auth-failure.ts';
-import { materializeWorkspace } from './workspace.ts';
+import { loadReentryAnswer, materializeWorkspace, type ReentryAnswer } from './workspace.ts';
 import { runSetupScript, dropPrivileges } from './setup.ts';
 import { parseDurationMs, idleLimitMs, blockHotLimitMs, checkpointLimitMs, mergedLimits, heartbeatMs, toMinutes, SETTLE_HEARTBEAT_MS } from '../shared/time.ts';
 import { writeRetainRequest } from '../shared/retained.ts';
@@ -190,23 +190,6 @@ async function main(): Promise<void> {
   const token = requireEnv('FLEET_RUNNER_TOKEN');
   const workspace = requireEnv('FLEET_WORKSPACE');
 
-  materializeWorkspace(workspace);
-
-  // Re-entry answer (issue #6): present when the daemon re-launches a parked
-  // job after an operator answer. The runner writes it to out/ after the wipe
-  // so the status-driven harness finds it immediately on its first check.
-  const reentryAnswerB64 = process.env.FLEET_REENTRY_ANSWER_JSON;
-  let reentryAnswer: { decisionId: string; answer: { option?: string; text?: string } } | undefined;
-  if (reentryAnswerB64) {
-    try {
-      reentryAnswer = JSON.parse(Buffer.from(reentryAnswerB64, 'base64').toString('utf8')) as {
-        decisionId: string;
-        answer: { option?: string; text?: string };
-      };
-    } catch {
-      // Ignore malformed env; proceed without pre-materialised answer.
-    }
-  }
   // Re-entry decision seed (issue #110): the daemon passes the highest decision
   // ordinal already in the job's log so the fresh runner's ids stay unique
   // across park/resume — without this the first new decision would be d1 again
@@ -241,6 +224,11 @@ async function main(): Promise<void> {
   if (imageStamp !== undefined) {
     await sink.emit({ type: 'log', text: `runner image built at ${imageStamp}`, who: 'runner' });
   }
+
+  // Container providers start with an empty workspace; a re-entry also needs
+  // its operator's answer (#296). After `running` so a failure lands in the
+  // job's own log.
+  const reentryAnswer = await stageLaunch(sink, workspace, { daemonUrl, jobId, token });
 
   let manifest: Record<string, unknown>;
   try {
@@ -1435,6 +1423,42 @@ function startCheckpoints(opts: {
   const timer = setInterval(tick, Math.max(25, Math.min(opts.intervalMs, 1_000)));
   timer.unref();
   return timer;
+}
+
+/**
+ * Fetch what the runner starts without (#296): the manifest, order and synced
+ * files on a container provider, and on a re-entry (issue #6) the operator's
+ * answer, which the runner writes to out/ after the wipe so the status-driven
+ * harness finds it on its first check. Either failure settles blocked and
+ * exits, naming what could not be had — a re-entry carrying on without its
+ * answer would treat the job as fresh and branch over its own WIP.
+ */
+async function stageLaunch(
+  sink: EventSink,
+  workspace: string,
+  source: { daemonUrl: string; jobId: string; token: string },
+): Promise<ReentryAnswer | undefined> {
+  const abort = async (what: string, err: unknown, nextAction: string, reason: string): Promise<never> => {
+    await sink.emit({ type: 'log', text: `${what} failed: ${String(err instanceof Error ? err.message : err)}`, who: 'runner' });
+    await settleBlocked(sink, nextAction);
+    await sink.emit({ type: 'state', state: 'cancelled', reason });
+    process.exit(1);
+  };
+  try {
+    const dropped = await materializeWorkspace(workspace, source);
+    for (const note of dropped) await sink.emit({ type: 'log', text: `workspace: ${note}`, who: 'runner' });
+  } catch (err) {
+    return abort('workspace materialisation', err,
+      'the runner could not fetch its launch payload from the daemon (see the log); check the daemon is reachable from the sandbox, then re-dispatch',
+      'manifest');
+  }
+  try {
+    return await loadReentryAnswer(source);
+  } catch (err) {
+    return abort('re-entry answer fetch', err,
+      `the runner could not read the operator's answer to re-entry decision ${process.env.FLEET_REENTRY_DECISION ?? '(unnamed)'} (see the log); check the answer shows in \`fleet logs\` and the daemon is reachable, then re-dispatch`,
+      'reentry-answer');
+  }
 }
 
 /** Contract shape for aborts before/without a harness result. */

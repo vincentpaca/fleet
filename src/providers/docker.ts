@@ -1,10 +1,10 @@
 // DockerProvider: `docker run` with env-injected config, no mounts. The
-// runner clones/materialises the workspace inside the container (manifest and
-// synced files travel as env: FLEET_MANIFEST_JSON / FLEET_SYNC_JSON, base64).
+// runner clones/materialises the workspace inside the container (manifest,
+// work order and synced files are fetched from the daemon at boot, #296).
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { LaunchSpec, Provider } from "./provider.ts";
-import { isMissingResourceError, runnerEnv, materializationEnv, writeSecretTempFile } from "./provider.ts";
+import { isMissingResourceError, runnerEnv, writeSecretTempFile } from "./provider.ts";
 
 const run = promisify(execFile);
 
@@ -58,15 +58,11 @@ export class DockerProvider implements Provider {
    * The `--env-file` payload: one KEY=VALUE line per var, sorted. Docker's
    * env-file format is line-delimited with no quoting, so a value containing a
    * newline cannot travel through it — refuse loudly rather than silently
-   * truncate into a bogus second entry. Fleet's own payloads are base64 or
+   * truncate into a bogus second entry. Fleet's own payloads are base64, ids or
    * URLs (never multiline); only operator-supplied env could trip this.
    */
   envFileContents(spec: LaunchSpec): string {
-    const env: Record<string, string> = {
-      ...runnerEnv(spec, CONTAINER_WORKSPACE),
-      ...materializationEnv(spec),
-    };
-    const lines = Object.entries(env)
+    const lines = Object.entries(runnerEnv(spec, CONTAINER_WORKSPACE))
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => {
         if (value.includes("\n") || value.includes("\r")) {

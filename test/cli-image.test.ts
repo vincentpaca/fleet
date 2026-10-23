@@ -514,8 +514,8 @@ describe('Docker integration', { skip: !WITH_DOCKER ? 'set FLEET_TEST_DOCKER=1 t
   //
   // The fake harness is delivered as a synced file (.fleet/fake-harness.mjs)
   // so no shell-quoting of JSON is needed. FLEET_HARNESS_CMD points at it.
-  // FLEET_SYNC_JSON carries the file to the container; materializeWorkspace()
-  // in the runner writes it to /workspace before anything else runs.
+  // The runner's materializeWorkspace() fetches it from the daemon's launch
+  // route (#296) and writes it to /workspace before anything else runs.
   test('docker-provider job runs gate → fake harness → decision → answer → settle', async (t) => {
     const manifest: ImageManifest = {
       harness: { cli: TEST_CLI, cli_version: TEST_CLI_VER },
