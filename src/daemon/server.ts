@@ -28,7 +28,8 @@ import type { Provider } from "../providers/provider.ts";
  * Prefix of the log note the runner posts when a work push failed and the
  * workspace is retained (issue #38). The daemon uses it to suppress the
  * clean-settle container reap: a retained workspace keeps its stopped
- * container so `fleet resume-push` can retry the push from inside it.
+ * container so the work can be recovered from it by hand. `fleet resume-push`
+ * reaches only the process provider's host workspaces (#291).
  */
 const RETAINED_WORKSPACE_NOTE_PREFIX = "workspace retained at";
 
