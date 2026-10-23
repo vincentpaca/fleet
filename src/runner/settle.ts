@@ -54,6 +54,13 @@ type SettleOpts = {
    */
   retainedWorkspace?: string;
   /**
+   * True when the provider keeps a failed push's workspace on the host where
+   * `fleet resume-push` can reach it (FLEET_RESUME_PUSH=1, the process
+   * provider). Container providers keep it inside the sandbox at best (#291):
+   * printing the resume-push hint there points the operator at a dead end.
+   */
+  resumePush?: boolean;
+  /**
    * Cumulative count of events dropped by the runner's delivery sink
    * (issue #109): exhausted retries or buffer shedding. Any nonzero count
    * becomes a settle note so transcript gaps are visible to the operator.
@@ -66,7 +73,10 @@ function addPushNotes(opts: SettleOpts, notes: string[]): void {
   if (opts.retainedWorkspace !== undefined) {
     notes.push(
       'workspace retained at ' + opts.retainedWorkspace + ' (work push failed) — ' +
-      'retry the push with: fleet resume-push ' + opts.jobId,
+      (opts.resumePush
+        ? 'retry the push with: fleet resume-push ' + opts.jobId
+        : 'inside the sandbox only, where fleet resume-push cannot reach it; ' +
+          'recover by hand before the sandbox is removed (docs/architecture.md#job-lifecycle)'),
     );
   }
   if ((opts.droppedEvents ?? 0) > 0) {

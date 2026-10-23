@@ -175,6 +175,7 @@ test('a retained workspace rides out as a settle note carrying the path and the 
       decisions: 0,
       workspace,
       retainedWorkspace: workspace,
+      resumePush: true,
     });
     assert.equal(notes.length, 1, `expected exactly the retention note, got: ${JSON.stringify(notes)}`);
     assert.match(notes[0], /retained/);
@@ -183,6 +184,30 @@ test('a retained workspace rides out as a settle note carrying the path and the 
     // The settle event itself stays inside the schema — no new field.
     const { ok } = validateEvent({ job: 'job-s7', seq: 0, ...body });
     assert.ok(ok, 'settle with a retention note validates');
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('no resume-push hint where the provider cannot hand the workspace to resume-push (#291)', () => {
+  // On ECS the task stops and nothing registers a host record, so "retry with
+  // fleet resume-push" sent operators to a command that can only fail. The
+  // note must still start "workspace retained at": the daemon keys the
+  // keep-the-container decision on that prefix (src/daemon/server.ts).
+  const workspace = makeWorkspace();
+  try {
+    const { notes } = composeSettle({
+      jobId: 'job-s8',
+      workPushed: false,
+      startedAt: Date.now(),
+      decisions: 0,
+      workspace,
+      retainedWorkspace: '/workspace',
+    });
+    const note = notes.find((n) => n.startsWith('workspace retained at /workspace'));
+    assert.ok(note, `expected the retention note; got ${JSON.stringify(notes)}`);
+    assert.doesNotMatch(note, /resume-push job-s8/, 'no resume-push hint on a provider that cannot retain');
+    assert.match(note, /recover by hand/);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }

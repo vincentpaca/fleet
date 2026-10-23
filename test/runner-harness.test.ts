@@ -145,6 +145,24 @@ test('continues (#80) rides into the prompt: PR, branch, gh feedback instruction
   assert.doesNotMatch(plain.args[1], /continuing PR/);
 });
 
+test('a re-entry after a diverted park tells the agent where its earlier work is (#291)', () => {
+  const plan = buildHarnessCommand({
+    manifest,
+    prompt: '/dev 77',
+    actualVersion: '2.1.220',
+    divertedEarlier: 'fleet-diverged/job-abc',
+  });
+  assert.ok(plan);
+  assert.match(plan.args[1], /left work on branch fleet-diverged\/job-abc/);
+  assert.match(plan.args[1], /git fetch origin fleet-diverged\/job-abc/);
+  // The reminder stops on ancestry, so only a merge ever ends it.
+  assert.match(plan.args[1], /git merge FETCH_HEAD/);
+  assert.match(plan.args[1], /do not cherry-pick or squash/);
+  const plain = buildHarnessCommand({ manifest, prompt: '/dev 77', actualVersion: '2.1.220' });
+  assert.ok(plain);
+  assert.doesNotMatch(plain.args[1], /fleet-diverged/, 'no clause without a diversion');
+});
+
 test('version violations become notes, not failures', () => {
   const plan = buildHarnessCommand({ manifest, target: 'APP-14', prompt: PROMPT, actualVersion: '2.0.9' });
   assert.ok(plan);

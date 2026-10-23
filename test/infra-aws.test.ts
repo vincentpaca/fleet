@@ -350,3 +350,27 @@ test('the daemon SSM policy grants the boot-time token publish, scoped to one pa
     'the operator-token path must be the sibling of fleet-config under the same prefix (#188)',
   );
 });
+
+// #294: SpotInstancePools is valid only with the lowest-price allocation
+// strategy, and AWS, not the provider schema, is what says so. The field is
+// Optional+Computed: a group created on the API default reads back 2 pools,
+// and with the line absent the provider keeps that 2 in the update it sends
+// alongside price-capacity-optimized (a mocked old-apply then new-plan shows
+// spot_instance_pools staying 2 without the pin and going 2 -> 0 with it; the
+// provider leaves a 0 out of the request). No plan reaches the API's verdict,
+// so the pairing is pinned at the source.
+test('a non-lowest-price Spot strategy sends no SpotInstancePools', () => {
+  const text = readFileSync(join(INFRA, 'aws', 'main.tf'), 'utf8');
+  const open = /^\s*instances_distribution\s*\{/m.exec(text);
+  assert.ok(open, 'the worker ASG must declare instances_distribution');
+  const body = braceBlock(text, text.indexOf('{', open.index));
+  const strategy = /^\s*spot_allocation_strategy\s*=\s*"([^"]+)"/m.exec(body);
+  assert.ok(strategy, 'spot_allocation_strategy must be set explicitly (#294): the API default is lowest-price');
+  if (strategy[1] !== 'lowest-price') {
+    assert.match(
+      body,
+      /^\s*spot_instance_pools\s*=\s*0\s*$/m,
+      `spot_allocation_strategy = "${strategy[1]}" needs spot_instance_pools = 0, or an upgrade sends the read-back 2 pools with it (#294)`,
+    );
+  }
+});

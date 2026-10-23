@@ -7,15 +7,43 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { FleetDaemon } from '../src/daemon/server.ts';
 import { ProcessProvider } from '../src/providers/process.ts';
+import { runnerEnv } from '../src/providers/provider.ts';
+import type { LaunchSpec, Provider } from '../src/providers/provider.ts';
 
 const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const cli = join(here, '..', 'src', 'cli', 'main.ts');
 const harness = join(here, '..', 'fixtures', 'e2e-harness.mjs');
+const runnerMain = join(here, '..', 'src', 'runner', 'main.ts');
+
+/**
+ * What a container provider hands the runner (#296): an empty workspace and
+ * runnerEnv only — no staged files. The real runner must fetch its manifest,
+ * order and synced files from the daemon before anything else. Workspaces are
+ * kept so the test can read what landed.
+ */
+class EmptyWorkspaceProvider implements Provider {
+  readonly name = 'container-sim';
+  readonly workspaces: string[] = [];
+
+  async launch(spec: LaunchSpec): Promise<{ handle: string }> {
+    const workspace = mkdtempSync(join(tmpdir(), 'fleet-e2e-empty-ws-'));
+    this.workspaces.push(workspace);
+    const child = spawn(process.execPath, [runnerMain], {
+      cwd: workspace,
+      env: { ...process.env, ...runnerEnv(spec, workspace) },
+      stdio: 'ignore',
+    });
+    child.unref();
+    return { handle: `sim:${child.pid}` };
+  }
+
+  async terminate(): Promise<void> {}
+}
 
 // Integration test against real child processes and a live HTTP long-poll:
 // deterministic/fake timers cannot drive an external process's clock, so a
@@ -203,4 +231,60 @@ test('job children inherit the git credential helper env when a token ships', as
     assert.ok(Date.now() < doneBy, `timed out waiting for done; last status:\n${stdout}`);
     await delay(250);
   }
+});
+
+test('a container-shaped runner fetches a 10,000-character order into an empty workspace (#296)', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'fleet-e2e-home-'));
+  const project = mkdtempSync(join(tmpdir(), 'fleet-e2e-proj-'));
+  const remote = makeRemote(mkdtempSync(join(tmpdir(), 'fleet-e2e-git-')));
+  mkdirSync(join(project, '.fleet'), { recursive: true });
+  const m = manifest(remote);
+  delete (m.setup as { script?: string }).script;
+  writeFileSync(join(project, '.fleet', 'manifest.json'), JSON.stringify(m, null, 2));
+  writeFileSync(join(project, '.env.fleet'), 'EXAMPLE=1\n');
+
+  const provider = new EmptyWorkspaceProvider();
+  const daemon = new FleetDaemon({ home, provider, port: 0, longPollMs: 1_000 });
+  const { port } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const env = {
+    ...process.env,
+    FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
+    FLEET_HARNESS_CMD: `node ${harness}`,
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
+  };
+  const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
+
+  // Past ECS's old ceiling by a factor of four: it rode the env, base64'd.
+  const prompt = `Implement the change. ${'context '.repeat(1_250)}`;
+  assert.ok(prompt.length >= 10_000);
+  const delegated = await fleet(['delegate', 'APP-125', '--prompt', prompt, '--finish', 'implemented']);
+  const jobId = delegated.stdout.trim().split(/\s+/).find((w) => w.startsWith('job-'));
+  assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
+
+  const waitFor = async (pattern: RegExp, what: string) => {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const { stdout } = await fleet(['status', jobId]);
+      if (pattern.test(stdout)) return;
+      assert.ok(!/cancelled/i.test(stdout), `job cancelled before ${what}:\n${stdout}`);
+      assert.ok(Date.now() < deadline, `timed out waiting for ${what}; last status:\n${stdout}`);
+      await delay(250);
+    }
+  };
+  await waitFor(/blocked/i, 'blocked');
+  await fleet(['answer', jobId, '--option', 'rebase']);
+  await waitFor(/\bdone\b/i, 'done');
+
+  // What landed in the empty workspace came from the daemon, whole.
+  const [workspace] = provider.workspaces;
+  const order = JSON.parse(readFileSync(join(workspace, '.fleet', 'order.json'), 'utf8')) as { prompt: string };
+  assert.equal(order.prompt, prompt);
+  assert.deepEqual(JSON.parse(readFileSync(join(workspace, '.fleet', 'manifest.json'), 'utf8')).workspace.repo, remote);
+  assert.equal(readFileSync(join(workspace, '.env.fleet'), 'utf8'), 'EXAMPLE=1\n');
 });

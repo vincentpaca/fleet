@@ -398,6 +398,74 @@ run "worker_tier_is_coherent" {
   }
 }
 
+# --- Spot diversification (#294) -------------------------------------------------
+
+# The default must leave an existing deployment's instance selection alone: no
+# override, so the launch template's one type is what the ASG launches. The
+# allocation strategy and rebalancing are on regardless — they are the point of
+# #294 even for one type, and both are in-place ASG updates.
+run "default_spot_launches_the_one_instance_type" {
+  command = plan
+
+  assert {
+    condition = (
+      length(aws_autoscaling_group.instances.mixed_instances_policy[0].launch_template[0].override) == 0 &&
+      aws_launch_template.instances.instance_type == "t3.xlarge"
+    )
+    error_message = "with instance_types unset the ASG must launch instance_type alone, with no override — anything else changes an existing deployment's instances"
+  }
+  assert {
+    condition = (
+      aws_autoscaling_group.instances.mixed_instances_policy[0].instances_distribution[0].spot_allocation_strategy == "price-capacity-optimized" &&
+      aws_autoscaling_group.instances.capacity_rebalance == true
+    )
+    error_message = "Spot must default to price-capacity-optimized with capacity rebalancing (#294); lowest-price drains one pool until no job can start"
+  }
+}
+
+run "listed_instance_types_each_become_an_override" {
+  command = plan
+
+  variables {
+    instance_types = ["m5.xlarge", "m6i.xlarge", "t3.xlarge"]
+  }
+
+  assert {
+    condition = (
+      aws_autoscaling_group.instances.mixed_instances_policy[0].launch_template[0].override[*].instance_type ==
+      tolist(["m5.xlarge", "m6i.xlarge", "t3.xlarge"])
+    )
+    error_message = "each listed instance type must render as one override, in order"
+  }
+  assert {
+    condition = (
+      aws_autoscaling_group.instances.mixed_instances_policy[0].instances_distribution[0].spot_allocation_strategy == "price-capacity-optimized" &&
+      aws_autoscaling_group.instances.capacity_rebalance == true
+    )
+    error_message = "a diversified list must be allocated price-capacity-optimized with capacity rebalancing"
+  }
+}
+
+run "an_empty_instance_type_list_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    instance_types = []
+  }
+
+  expect_failures = [var.instance_types]
+}
+
+run "a_duplicate_instance_type_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    instance_types = ["m5.xlarge", "m5.xlarge"]
+  }
+
+  expect_failures = [var.instance_types]
+}
+
 run "runner_default_exceeding_tier_fails_at_plan" {
   command = plan
 
@@ -570,4 +638,14 @@ run "registries_do_not_block_teardown" {
     condition     = alltrue([for r in aws_ecr_repository.project : r.force_delete])
     error_message = "every project repository must set force_delete for the same reason"
   }
+}
+
+run "a_blank_instance_type_fails_its_own_validation" {
+  command = plan
+
+  variables {
+    instance_types = ["t3.xlarge", ""]
+  }
+
+  expect_failures = [var.instance_types]
 }

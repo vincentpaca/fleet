@@ -218,6 +218,42 @@ test("a container-equivalent caller (valid runner token, daemon URL) cannot answ
   assert.equal(answered.status, 200, answered.body);
 });
 
+test("launch payload route serves only the job's own runner token, and opens nothing else (#296)", async (t) => {
+  const ctx = await startSecuredDaemon();
+  t.after(() => ctx.daemon.stop());
+  const own = await createJob(ctx);
+  const other = await createJob(ctx);
+  const launchPath = `/internal/jobs/${own.id}/launch`;
+
+  // Own token: the validated manifest and order, read back for the runner.
+  const served = await tcp(ctx, "GET", launchPath, { "x-fleet-runner-token": own.token });
+  assert.equal(served.status, 200, served.body);
+  const payload = served.json as { manifest: unknown; workOrder: unknown; sync: unknown };
+  assert.deepEqual(payload.manifest, MANIFEST);
+  assert.deepEqual(payload.workOrder, WORK_ORDER);
+  assert.deepEqual(payload.sync, {});
+
+  // Another job's token (a valid token, just not this job's), no token, and
+  // the operator secret all get the same uniform 401 a bad token does.
+  const refusals = [
+    { "x-fleet-runner-token": other.token },
+    {},
+    authed(),
+  ];
+  for (const headers of refusals) {
+    const res = await tcp(ctx, "GET", launchPath, headers);
+    assert.equal(res.status, 401, `${JSON.stringify(headers)}: ${res.body}`);
+    assert.deepEqual(res.json, { error: "invalid runner token" });
+  }
+
+  // Holding the runner token reaches no operator surface: not the answer API,
+  // not the job's own record.
+  const answer = await tcp(ctx, "POST", `/jobs/${own.id}/answer`, { "x-fleet-runner-token": own.token }, { option: "flag" });
+  assert.equal(answer.status, 401, answer.body);
+  const record = await tcp(ctx, "GET", `/jobs/${own.id}`, { "x-fleet-runner-token": own.token });
+  assert.equal(record.status, 401, record.body);
+});
+
 test("loadOrCreateOperatorToken persists 0600 and reuses the existing secret", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "fleet-op-token-"));
 
