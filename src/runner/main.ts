@@ -461,6 +461,7 @@ async function main(): Promise<void> {
     continues,
     ...(divertedEarlier !== undefined ? { divertedEarlier } : {}),
     prompt: orderPrompt,
+    publish: authorityPublish,
   });
   if (!plan) {
     await settleBlocked(sink, `nothing to run: the work order carries no prompt and cli "${cli}" has no launch plan without one. Dispatch with an instruction (fleet delegate "/your-command"), or set FLEET_HARNESS_CMD.`);

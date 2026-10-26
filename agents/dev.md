@@ -4,7 +4,7 @@ Canonical playbook, harness-neutral. Per-harness command files under `.claude/`
 (and other harness dirs) are pointers to this file and carry no content.
 The issue number is provided by the invoking harness as the command argument.
 
-Implement the given GitHub issue on this repository. **The finish line is a draft pull request against `main`** — the runner opens it at settle from your report when your work is committed on the job branch and the suite is green. A pushed branch with no PR is an unfinished job, not a deliverable.
+Implement the given GitHub issue on this repository. **The finish line is a draft pull request against `main`.** On an issue dispatch (`fleet delegate 42`) the runner opens it at settle from your report when your work is committed on the job branch and the suite is green; on a prose dispatch (`fleet delegate "/dev 42"`) the runner opens none, so push the job branch and open the draft PR yourself (`gh pr create --draft`). A pushed branch with no PR is an unfinished job, not a deliverable.
 
 ## Steps
 

@@ -34,6 +34,19 @@ const CLAUDE_ALLOWED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', '
 export const OUTPUT_CONTRACT = // contract pin: test-only export, asserted by the suite
   'Fleet output contract: write every deliverable and any text answer as files under .fleet/out/artifacts/ (an answer is a file, e.g. answer.md). Files anywhere else are not collected.';
 
+/**
+ * Rides on every order that does not grant publish and is not an adoption
+ * (#292) — prose by shape, plus an issue dispatched with a deprecated read-only
+ * `--mode`. Agents read .fleet/order.json and took `publish: false` /
+ * `finish: inspected` as a ban on the PR the prompt asked for. Prose delivery
+ * is prompt-owned (D17, #208): the field only means the runner composes no PR
+ * at settle, so the agent is told so — and told that merge/deploy still bind
+ * (D5), because loosening one authority field must not read as loosening all.
+ * Its clauses are asserted by test/runner-harness.test.ts.
+ */
+export const PROMPT_OWNS_DELIVERY = // contract pin: test-only export, asserted by the suite
+  'Fleet delivery note: .fleet/order.json records how this job was dispatched. Its authority.publish: false only means the runner will not open a PR for you at the end, and its finish is only the rung this job is graded against; neither limits what the instruction above asks for. If it asks for a PR, push your branch and open the PR yourself as a draft (gh pr create --draft) unless the instruction says otherwise. Its merge: false and deploy: false do bind: never merge a PR or deploy, whatever the instruction says.';
+
 /** Leading semver from CLI output like "2.1.220 (Claude Code)". */
 export function parseVersion(output: string): string | undefined {
   return output.match(/\d+\.\d+\.\d+/)?.[0];
@@ -101,6 +114,8 @@ type HarnessInputs = {
    * derived plan is argv and never sees a shell (#241).
    */
   prompt?: string;
+  /** The order's `authority.publish`; false means the prompt owns delivery (#292). */
+  publish?: boolean;
 };
 
 /** Append version-drift notes when an actual version is measurable and required. */
@@ -123,6 +138,14 @@ function checkVersionNotes(actualVersion: string | undefined, required: string |
  * not on origin, so the job dies before the clause exists. The reach is a branch
  * pushed to origin (anyone with push access) plus targets an operator types.
  */
+/**
+ * The #292 delivery note, or empty string. An adoption already says "never
+ * open a new PR" in its continuation clause, so it never gets the note.
+ */
+function deliveryNote(publish: boolean | undefined, continues: unknown): string {
+  return publish === false && !continues ? `\n\n${PROMPT_OWNS_DELIVERY}` : '';
+}
+
 function continuationClause(continues: { pr: number; branch: string } | undefined): string {
   if (!continues) return '';
   return (
@@ -192,7 +215,7 @@ function overridePlan(override: string, prompt: string | undefined): HarnessPlan
 }
 
 /** Build the launch plan, or undefined when no command can be derived. */
-export function buildHarnessCommand({ manifest, override, actualVersion, continues, divertedEarlier, prompt }: HarnessInputs): HarnessPlan | undefined {
+export function buildHarnessCommand({ manifest, override, actualVersion, continues, divertedEarlier, prompt, publish }: HarnessInputs): HarnessPlan | undefined {
   // The two paths diverge here, deliberately. FLEET_HARNESS_CMD is a command
   // line an operator wrote — pipes, redirects and `node -e "..."` are the point
   // of it — so it stays a shell string and runs verbatim. The derived plan
@@ -223,7 +246,7 @@ export function buildHarnessCommand({ manifest, override, actualVersion, continu
   // operator-written included: a continuation that produces a report instead of
   // commits still owes its deliverables to the artifact lane, and an adoption is
   // still an adoption whoever wrote the instruction.
-  const promptText = `${prompt}${continuationClause(continues)}${divertedClause(divertedEarlier)}\n\n${OUTPUT_CONTRACT}`;
+  const promptText = `${prompt}${continuationClause(continues)}${divertedClause(divertedEarlier)}\n\n${OUTPUT_CONTRACT}${deliveryNote(publish, continues)}`;
   const model = typeof harness.model === 'string' ? harness.model : undefined;
   if (cli !== 'claude-code') notes.push(`harness ${cli}: only claude-code streams a transcript; expect events at settle only`);
   return { ...dialect(promptText, model), shell: false, notes };

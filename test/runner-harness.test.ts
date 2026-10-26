@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT } from '../src/runner/harness.ts';
+import { buildHarnessCommand, describeHarnessPlan, versionSatisfies, parseVersion, OUTPUT_CONTRACT, PROMPT_OWNS_DELIVERY } from '../src/runner/harness.ts';
 import { startMockDaemon } from './runner-mock-daemon.ts';
 
 const manifest = { harness: { cli: 'claude-code', cli_version: '>=2.1.0' } };
@@ -61,6 +61,67 @@ test('claude-code adapter ships its dialect env default; overrides carry none', 
   assert.equal(plan?.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '64000');
   const override = buildHarnessCommand({ manifest, target: 'APP-14', override: 'node fake.mjs' });
   assert.equal(override?.env, undefined);
+});
+
+test('publish: false (#292): the agent is told the order does not forbid the PR its prompt asks for', () => {
+  const prose = buildHarnessCommand({ manifest, prompt: 'fix the parser and open a PR', actualVersion: '2.1.220', publish: false });
+  assert.equal(prose?.args[1], `fix the parser and open a PR\n\n${OUTPUT_CONTRACT}\n\n${PROMPT_OWNS_DELIVERY}`);
+  // The clauses that carry the fix: no runner PR, the agent opens a draft,
+  // and merge/deploy still bind (D5) — loosening publish must not loosen those.
+  assert.match(PROMPT_OWNS_DELIVERY, /runner will not open a PR/);
+  assert.match(PROMPT_OWNS_DELIVERY, /gh pr create --draft/);
+  assert.match(PROMPT_OWNS_DELIVERY, /never merge a PR or deploy/);
+  // An order that publishes gets its PR from the runner; the note would be noise.
+  const issue = buildHarnessCommand({ manifest, prompt: PROMPT, actualVersion: '2.1.220', publish: true });
+  assert.equal(issue?.args[1], `${PROMPT}\n\n${OUTPUT_CONTRACT}`);
+  // An adoption says "never open a new PR"; the note must not contradict it.
+  const adoption = buildHarnessCommand({ manifest, prompt: PROMPT, actualVersion: '2.1.220', publish: false, continues: { pr: 41, branch: 'fleet/77-job-old' } });
+  assert.ok(!adoption?.args[1].includes(PROMPT_OWNS_DELIVERY), 'an adoption got the prose delivery note');
+});
+
+/** Run the real runner on a staged order with a stub claude; return the argv it launched. */
+async function launchedArgv(order: Record<string, unknown>): Promise<string[]> {
+  const token = 'test-token-292';
+  const daemon = await startMockDaemon({ token });
+  const workspace = mkdtempSync(join(tmpdir(), 'fleet-292-ws-'));
+  const loot = mkdtempSync(join(tmpdir(), 'fleet-292-loot-'));
+  const argvOut = join(loot, 'argv.rs');
+  const bin = stubClaudeOnPath();
+  try {
+    mkdirSync(join(workspace, '.fleet', 'out'), { recursive: true });
+    writeFileSync(join(workspace, '.fleet', 'manifest.json'), JSON.stringify({
+      version: 1,
+      setup: { image: 'node:22', script: '.fleet/setup.sh' },
+      workspace: { repo: 'git@github.com:acme/example.git', strategy: 'branch-per-job' },
+      harness: { cli: 'claude-code' },
+      gates: { pickup: `node -e "process.exit(0)"` },
+    }));
+    writeFileSync(join(workspace, '.fleet', 'order.json'), JSON.stringify(order));
+    const { FLEET_GIT_URL: _u, FLEET_GIT_NAME: _n, FLEET_GIT_EMAIL: _e, ...parentEnv } = process.env;
+    const child = spawn(process.execPath, [runnerMain], {
+      env: { ...parentEnv, FLEET_JOB_ID: 'job-292', FLEET_DAEMON_URL: daemon.url, FLEET_RUNNER_TOKEN: token, FLEET_WORKSPACE: workspace, PATH: `${bin}:${process.env.PATH ?? ''}`, HARNESS_ARGV_OUT: argvOut },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const exited = Promise.withResolvers<number>();
+    child.on('close', (code) => exited.resolve(code ?? -1));
+    await exited.promise;
+    return readFileSync(argvOut, 'utf8').split('\x1e').slice(0, -1);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(loot, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+    await daemon.close();
+  }
+}
+
+test('the runner reads authority.publish off the order: the note rides on prose, never on an issue (#292)', async () => {
+  const authority = (publish: boolean) => ({ publish, merge: false, deploy: false });
+  const prose = await launchedArgv({ target: 'fix it', prompt: 'fix it and open a PR', finish: 'inspected', authority: authority(false) });
+  assert.ok(prose[1].endsWith(`\n\n${PROMPT_OWNS_DELIVERY}`), `prose order lost the delivery note:\n${prose[1]}`);
+  // Hardcoding publish at the call site would tell every issue job the runner
+  // opens no PR; the agent would open one and the runner's own then fail.
+  const issue = await launchedArgv({ target: '77', prompt: '/dev 77', finish: 'merge-ready', authority: authority(true) });
+  assert.equal(issue[1], `/dev 77\n\n${OUTPUT_CONTRACT}`);
 });
 
 test('continues (#80) rides into the prompt: PR, branch, gh feedback instructions', () => {
@@ -535,7 +596,8 @@ test('an order prompt with shell metacharacters reaches the harness literally (#
     assert.equal(argv[0], '-p', `first arg is not the prompt flag: ${JSON.stringify(argv)}`);
     // The operator's prompt, character for character, at the head of the launch:
     // not composed into `/dev 77`, and not touched by a shell.
-    assert.equal(argv[1], `${prompt}\n\n${OUTPUT_CONTRACT}`, `the order's prompt did not reach the harness intact:\n${argv[1]}`);
+    // The order grants no publish, so the #292 delivery note rides last.
+    assert.equal(argv[1], `${prompt}\n\n${OUTPUT_CONTRACT}\n\n${PROMPT_OWNS_DELIVERY}`, `the order's prompt did not reach the harness intact:\n${argv[1]}`);
     for (const marker of [fromSubst, fromBacktick]) {
       assert.equal(existsSync(marker), false, `a command in the prompt ran inside the job container: ${marker}`);
     }
