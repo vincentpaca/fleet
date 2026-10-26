@@ -14,3 +14,10 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: 'ci'
+    # init and analyze refuse to run at different versions, so a bump that
+    # moves one alone fails CodeQL on its own PR (#236/#237, then #289/#290).
+    # Grouped, they arrive as one PR that can pass.
+    groups:
+      codeql-action:
+        patterns:
+          - 'github/codeql-action*'
