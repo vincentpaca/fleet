@@ -5,7 +5,7 @@
 // launch, both attempts in the transcript, attempt count on the record.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,7 @@ const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const cli = join(here, '..', 'src', 'cli', 'main.ts');
 const harness = join(here, '..', 'fixtures', 'retry-harness.mjs');
+const hostLostHarness = join(here, '..', 'fixtures', 'host-lost-harness.mjs');
 
 // Integration test against real child processes: a short real polling delay is
 // the only workable wait (same trade as e2e-delegate.test.ts).
@@ -128,4 +129,79 @@ test('harness-exit auto-retry over the real wire: rename, relaunch, succeed on a
   const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
   assert.match(tree, /work\.txt/, 'attempt 2 work delivered on the claim branch');
   assert.ok(!tree.includes('partial.txt'), 'the retry started clean — attempt 1 work is not on the final branch');
+});
+
+test('host loss over the real wire (#293): a SIGTERM Fleet never sent re-queues once and resumes the pushed WIP', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'fleet-hostlost-home-'));
+  const project = mkdtempSync(join(tmpdir(), 'fleet-hostlost-proj-'));
+  const scratch = mkdtempSync(join(tmpdir(), 'fleet-hostlost-marker-'));
+  const remote = makeRemote(mkdtempSync(join(tmpdir(), 'fleet-hostlost-git-')));
+  mkdirSync(join(project, '.fleet'), { recursive: true });
+  writeFileSync(join(project, '.fleet', 'manifest.json'), JSON.stringify(manifest(remote), null, 2));
+
+  const daemon = new FleetDaemon({ home, provider: new ProcessProvider(), port: 0, longPollMs: 1_000 });
+  const { port } = await daemon.start();
+  t.after(() => daemon.stop());
+
+  const marker = join(scratch, 'attempt-1-waiting');
+  const env = {
+    ...process.env,
+    FLEET_DAEMON_URL: `http://127.0.0.1:${port}`,
+    FLEET_HARNESS_CMD: `node ${hostLostHarness} ${marker}`,
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'user.name',
+    GIT_CONFIG_VALUE_0: 'Operator One',
+    GIT_CONFIG_KEY_1: 'user.email',
+    GIT_CONFIG_VALUE_1: 'op@example.com',
+  };
+  const fleet = (args: string[]) => run('node', [cli, ...args], { cwd: project, env });
+
+  const delegated = await fleet(['delegate', 'APP-123', '--mode', 'implement', '--finish', 'implemented']);
+  const jobId = delegated.stdout.trim().split(/\s+/).find((w) => w.startsWith('job-'));
+  assert.ok(jobId, `no job id in delegate output: ${delegated.stdout}`);
+
+  // Attempt 1 is mid-run with uncommitted work. Take its host away: SIGTERM
+  // to the runner from outside Fleet — no cancel, no backstop.
+  const deadline = Date.now() + 60_000;
+  while (!existsSync(marker)) {
+    assert.ok(Date.now() < deadline, 'attempt 1 never started its harness');
+    await delay(100);
+  }
+  const handle = daemon.registry.getJob(jobId)!.handle ?? '';
+  const pid = Number(/^pid:(\d+)/.exec(handle)?.[1]);
+  assert.ok(pid > 0, `no runner pid in handle ${handle}`);
+  process.kill(pid, 'SIGTERM');
+
+  let status = '';
+  while (!/\bdone\b/.test(status)) {
+    assert.ok(Date.now() < deadline + 60_000, `timed out waiting for done after the host loss; last status:\n${status}`);
+    await delay(250);
+    status = (await fleet(['status', jobId])).stdout;
+  }
+  assert.match(status, /\[attempt 2\]/, 'status must show the attempt count');
+
+  const { stdout: log } = await fleet(['logs', jobId]);
+  const markers = [
+    'wip pushed to',              // attempt 1's cancel teardown saved the work
+    'reason=signal',              // what the runner could say
+    'host lost',                  // what the daemon knows
+    'reason=host-lost attempt=2', // the re-queue event
+    'workspace resumed branch',   // attempt 2 picked up the pushed WIP
+    'status=READY',
+    'done',
+  ];
+  let lastIndex = -1;
+  for (const m of markers) {
+    const index = log.indexOf(m, lastIndex + 1);
+    assert.ok(index !== -1, `transcript missing "${m}" after position ${lastIndex}:\n${log}`);
+    lastIndex = index;
+  }
+
+  // One branch, carrying both attempts' work; nothing renamed aside.
+  const heads = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  const branch = `fleet/APP-123-${jobId}`;
+  assert.ok(!heads.includes('-attempt1'), `a host-lost retry must not rename the branch:\n${heads}`);
+  const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
+  assert.match(tree, /partial\.txt/, 'attempt 1 work is kept on the branch');
+  assert.match(tree, /work\.txt/, 'attempt 2 finished on top of it');
 });

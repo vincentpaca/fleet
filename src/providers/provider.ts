@@ -48,6 +48,12 @@ export type LaunchSpec = {
    * evidence retained. Absent on first launches and re-entries.
    */
   retryAttempt?: number;
+  /**
+   * Host-lost auto-retry (#293): check out the job branch the lost attempt
+   * pushed and continue from it, instead of renaming it the way a
+   * harness-exit retry does. Rides with retryAttempt; absent otherwise.
+   */
+  resumeBranch?: boolean;
 };
 
 export interface Provider {
@@ -110,6 +116,15 @@ export interface Provider {
    * no such listing omit it and the daemon's reconcile is a no-op.
    */
   listJobSandboxes?(): Promise<JobSandbox[]>;
+  /**
+   * Optional: why the substrate stopped the sandbox named by `handle`, in the
+   * substrate's own words (#293) — e.g. ECS's stopCode and stoppedReason for a
+   * reclaimed Spot host. Called when a runner reports a signal the daemon never
+   * sent; the answer is journalled as evidence and never decides policy.
+   * Resolves undefined when the substrate has nothing to say. Providers whose
+   * substrate keeps no such record (process, docker) omit it.
+   */
+  describeStop?(handle: string): Promise<string | undefined>;
 }
 
 /**
@@ -205,5 +220,7 @@ export function runnerEnv(spec: LaunchSpec, workspace: string): Record<string, s
     ...(spec.retryAttempt !== undefined
       ? { FLEET_RETRY_ATTEMPT: String(spec.retryAttempt) }
       : {}),
+    // Host-lost retry (#293): resume the lost attempt's branch instead.
+    ...(spec.resumeBranch === true ? { FLEET_RESUME_BRANCH: "1" } : {}),
   };
 }

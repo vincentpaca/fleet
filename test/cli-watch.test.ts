@@ -25,9 +25,10 @@ test('attach --answer posts the stdin answer and exits on done', async (t) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/jobs/job-1') {
       // attach probes the job before following (#124): a typo'd id must fail
-      // fast rather than reconnect forever.
+      // fast rather than reconnect forever. It asks again at a terminal state
+      // event, to tell a final one from a retried attempt's (#293).
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ job: { id: 'job-1', state: 'running' } }));
+      res.end(JSON.stringify({ job: { id: 'job-1', state: phase === 'answered' ? 'done' : 'running' } }));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/jobs/job-1/events') {
@@ -116,7 +117,7 @@ test('attach survives a mid-stream socket drop, reconnects, and resumes from the
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/jobs/job-2') {
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ job: { id: 'job-2', state: 'running' } }));
+      res.end(JSON.stringify({ job: { id: 'job-2', state: eventCalls.length >= 2 ? 'done' : 'running' } }));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/jobs/job-2/events') {
@@ -160,6 +161,112 @@ test('attach survives a mid-stream socket drop, reconnects, and resumes from the
   assert.match(eventCalls[1], /after=1/, 'the reconnect resumed from the last daemon seq seen');
   assert.match(out, /\[1\] phase implementing/, 'events before the drop were printed');
   assert.match(out, /\[2\] state → done/, 'events after the reconnect were printed');
+});
+
+// #293: a host loss ends attempt 1 with the runner's cancelled(signal) while
+// the job goes on as attempt 2. attach must keep following, not exit there.
+test('attach keeps following past a retried attempt\'s terminal event and stops at the final one', async (t) => {
+  const eventCalls: string[] = [];
+  const daemon = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method === 'GET' && url.pathname === '/jobs/job-3') {
+      // The record as a live daemon serves it: re-queued as attempt 2 right
+      // after attempt 1's cancelled(signal), then done.
+      const job = eventCalls.length >= 2
+        ? { id: 'job-3', state: 'done', reason: 'host-lost', attempt: 2 }
+        : { id: 'job-3', state: 'queued', reason: 'host-lost', attempt: 2 };
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ job }));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/jobs/job-3/events') {
+      eventCalls.push(url.search);
+      res.setHeader('content-type', 'application/x-ndjson');
+      if (eventCalls.length === 1) {
+        res.end(ndjson([
+          { job: 'job-3', seq: 0, type: 'state', state: 'running' },
+          { job: 'job-3', seq: 1, type: 'state', state: 'cancelled', reason: 'signal' },
+        ]));
+        return;
+      }
+      if (eventCalls.length === 2) {
+        res.end(ndjson([
+          { job: 'job-3', seq: 2, type: 'state', state: 'queued', reason: 'host-lost', attempt: 2 },
+          { job: 'job-3', seq: 3, type: 'state', state: 'running' },
+          { job: 'job-3', seq: 4, type: 'state', state: 'done' },
+        ]));
+        return;
+      }
+      res.end('');
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  daemon.listen(0, '127.0.0.1');
+  await once(daemon, 'listening');
+  t.after(() => daemon.close());
+  const address = daemon.address();
+  assert.ok(address && typeof address === 'object');
+
+  const child = spawn('node', [cli, 'attach', 'job-3'], {
+    env: { ...process.env, FLEET_DAEMON_URL: `http://127.0.0.1:${address.port}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (c) => (out += c));
+  let err = '';
+  child.stderr.on('data', (c) => (err += c));
+  const [code] = (await once(child, 'exit')) as [number];
+  assert.equal(code, 0, `stderr:\n${err}\nstdout:\n${out}`);
+  assert.match(out, /\[1\] state → cancelled/);
+  assert.match(out, /\[2\] state → queued/, 'attach followed into attempt 2');
+  assert.match(out, /\[4\] state → done/, 'and stopped at the final terminal state');
+});
+
+// #293: the record confirms a final terminal event, but a lagging record (or a
+// peer that never serves one) must not hold a view open forever.
+test('attach still exits on a terminal event the record never confirms', async (t) => {
+  let eventCalls = 0;
+  const daemon = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method === 'GET' && url.pathname === '/jobs/job-4') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ job: { id: 'job-4', state: 'running' } })); // never turns terminal
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/jobs/job-4/events') {
+      eventCalls += 1;
+      res.setHeader('content-type', 'application/x-ndjson');
+      res.end(eventCalls === 1
+        ? ndjson([
+          { job: 'job-4', seq: 0, type: 'state', state: 'running' },
+          { job: 'job-4', seq: 1, type: 'state', state: 'done' },
+        ])
+        : ''); // empty long-poll cycles from here on
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  daemon.listen(0, '127.0.0.1');
+  await once(daemon, 'listening');
+  t.after(() => daemon.close());
+  const address = daemon.address();
+  assert.ok(address && typeof address === 'object');
+
+  const startedAt = Date.now();
+  const child = spawn('node', [cli, 'attach', 'job-4'], {
+    env: { ...process.env, FLEET_DAEMON_URL: `http://127.0.0.1:${address.port}` },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => child.kill('SIGKILL'));
+  let out = '';
+  child.stdout.on('data', (c) => (out += c));
+  const [code] = (await once(child, 'exit')) as [number];
+  assert.equal(code, 0);
+  assert.match(out, /\[1\] state → done/);
+  assert.ok(Date.now() - startedAt < 30_000, 'exited on the quiet stream, not on some outer timeout');
 });
 
 test('attach on a job the daemon does not know exits 1 with a readable error, not a retry loop', async (t) => {

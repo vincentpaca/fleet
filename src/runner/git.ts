@@ -66,6 +66,14 @@ type GitSetupOptions = {
    * creation push cannot collide, while the pushed evidence stays reachable.
    */
   retryAttempt?: number;
+  /**
+   * Host-lost auto-retry (#293): the previous attempt was killed under the
+   * agent and its cancel teardown pushed WIP to this job's branch. Resume it —
+   * re-entry's checkout, no rename — so the work so far is kept. A lost
+   * attempt that never got as far as its creation push has no branch to
+   * resume, and this attempt creates one as usual.
+   */
+  resume?: boolean;
 };
 
 const STAGED_ALWAYS = ['.fleet/manifest.json', '.fleet/order.json'];
@@ -351,14 +359,18 @@ function mergeExcludes(workspace: string, excludes: string[]): void {
  * a prior attempt that died before its creation push).
  */
 export function renameRemoteBranch(workspace: string, from: string, to: string, timeoutMs?: number): 'renamed' | 'absent' {
-  const listed = git(workspace, ['ls-remote', '--heads', 'origin', from], timeoutMs);
-  if (listed.trim() === '') return 'absent';
+  if (!remoteHasBranch(workspace, from, timeoutMs)) return 'absent';
   // Fetch the ref so the local repo holds the object FETCH_HEAD names — a
   // push can only send commits it has.
   git(workspace, ['fetch', '-q', 'origin', from], timeoutMs);
   git(workspace, ['push', '-q', 'origin', `FETCH_HEAD:refs/heads/${to}`], timeoutMs);
   git(workspace, ['push', '-q', 'origin', `:refs/heads/${from}`], timeoutMs);
   return 'renamed';
+}
+
+/** Whether origin carries `branch` — one ls-remote, no fetch. */
+function remoteHasBranch(workspace: string, branch: string, timeoutMs?: number): boolean {
+  return git(workspace, ['ls-remote', '--heads', 'origin', branch], timeoutMs).trim() !== '';
 }
 
 /**
@@ -401,25 +413,36 @@ function releaseRetryClaim(workspace: string, refs: JobRefs, existing: boolean, 
   return { ...(claim ? { released: claimTo } : {}), ...(side ? { releasedSide: sideTo } : {}) };
 }
 
-/**
- * Turn the staged workspace into a checkout of the repo on the job branch,
- * and push the branch immediately. Returns the branch name and base branch,
- * plus the released claim branch when a retry renamed one (#30).
- */
-export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRefs & { base: string; released?: string; releasedSide?: string; divertedEarlier?: string } {
-  const branch = opts.adoptBranch ?? jobBranch(opts.target, opts.jobId);
-  const side = divertedBranch(opts.jobId);
-  // Adoption and re-entry share the checkout path: the branch already exists
-  // on the remote, so neither creates nor pushes anything at setup.
-  const existing = opts.reentry === true || opts.adoptBranch !== undefined;
-
-  const preserved = preserveDispatchFiles(workspace);
-
+/** An empty repo with the job's identity and origin, ready to fetch. */
+function initRepo(workspace: string, opts: GitSetupOptions): void {
   git(workspace, ['init', '-q']);
   if (opts.name) git(workspace, ['config', 'user.name', opts.name]);
   if (opts.email) git(workspace, ['config', 'user.email', opts.email]);
   git(workspace, ['remote', 'add', 'origin', opts.url]);
+}
+
+/**
+ * Turn the staged workspace into a checkout of the repo on the job branch,
+ * and push the branch immediately. Returns the branch name and base branch,
+ * plus the released claim branch when a retry renamed one (#30), and
+ * `resumed` when a host-lost retry picked up the lost attempt's branch (#293).
+ */
+export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRefs & { base: string; released?: string; releasedSide?: string; divertedEarlier?: string; resumed?: true } {
+  const branch = opts.adoptBranch ?? jobBranch(opts.target, opts.jobId);
+  const side = divertedBranch(opts.jobId);
+  // Adoption and re-entry share the checkout path: the branch already exists
+  // on the remote, so neither creates nor pushes anything at setup.
+  const declared = opts.reentry === true || opts.adoptBranch !== undefined;
+
+  const preserved = preserveDispatchFiles(workspace);
+
+  initRepo(workspace, opts);
   const base = defaultRef(workspace, opts.url);
+
+  // A host-lost resume (#293) takes re-entry's path when there is a branch to
+  // resume — and then nothing is renamed, which is the point.
+  const resumed = !declared && opts.resume === true && remoteHasBranch(workspace, branch);
+  const existing = declared || resumed;
 
   const released = releaseRetryClaim(workspace, { branch, side }, existing, opts.retryAttempt);
 
@@ -434,13 +457,14 @@ export function setupWorkspace(workspace: string, opts: GitSetupOptions): JobRef
     // if the container dies before any work is committed.
     git(workspace, ['push', '-q', '-u', 'origin', branch]);
   }
-  // Re-entry (#291): work an earlier generation diverted, and nobody has since
-  // brought over, is not on the branch just checked out. Say so, rather than
-  // let the run continue without it.
+  // Re-entry (#291) or a host-lost resume (#293): work an earlier generation
+  // diverted, and nobody has since brought over, is not on the branch just
+  // checked out. Say so, rather than let the run continue without it.
   const divertedEarlier = existing && sidePending(workspace, { branch, side }) ? side : undefined;
   return {
     branch, side, base, ...released,
     ...(divertedEarlier !== undefined ? { divertedEarlier } : {}),
+    ...(resumed ? { resumed: true as const } : {}),
   };
 }
 

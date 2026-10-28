@@ -169,3 +169,28 @@ bug wearing a familiar name.
 `js/stack-trace-exposure` on `sendJson` is a separate matter and is fixed in
 code: the daemon no longer echoes an error's text to a client.
 
+## D19 — A signal the daemon did not send is a host loss, and gets the one retry
+
+A runner's cancel teardown can only report `cancelled(signal)`: it cannot tell
+who sent the SIGTERM. The daemon can. Every path that stops a job that is not
+yet terminal journals a stop request first (`STOP_REQUEST_NOTE` in
+`src/daemon/server.ts`, checked call site by call site in
+`test/daemon-stop-note.test.ts`), so a `cancelled(signal)` with no stop request
+in the journal means the substrate killed the sandbox: a reclaimed Spot host,
+an ASG replacing an instance (#293). The record says `host-lost`, and the job
+gets the #30 policy unchanged: one retry, only with no answered decisions and
+wall-clock budget left. Unlike a harness exit, the retry resumes the job branch
+the lost attempt pushed instead of renaming it, because the work was fine and
+the host was not.
+
+The provider's account of the stop (ECS `stopCode`/`stoppedReason`) is
+journalled as evidence and never decides. The verdict rests on what the daemon
+knows it did, which a provider that keeps no record (process, docker), or an
+ECS that has not written its stop code yet, cannot change.
+
+The accepted consequence: a stop nobody told Fleet about counts as a host
+loss. A hand-run `aws ecs stop-task`, a `docker stop`, or a Ctrl-C on a
+process-provider runner is therefore retried once. That is accepted because it
+happens at most once per job and keeps the work on the branch. An operator who
+wants a job stopped for good uses `fleet cancel`, which is never retried.
+

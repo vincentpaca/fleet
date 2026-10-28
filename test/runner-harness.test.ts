@@ -145,6 +145,16 @@ test('continues (#80) rides into the prompt: PR, branch, gh feedback instruction
   assert.doesNotMatch(plain.args[1], /continuing PR/);
 });
 
+test('a host-lost resume (#293) tells the agent the work so far is already on the branch', () => {
+  const plan = buildHarnessCommand({ manifest, target: '77', prompt: '/dev 77', actualVersion: '2.1.220', resumed: true });
+  assert.ok(plan);
+  assert.match(plan.args[1], /^\/dev 77 -- resuming: /, 'appended to the operator prompt, never replacing it');
+  assert.match(plan.args[1], /continue from it; do not start over/);
+  const plain = buildHarnessCommand({ manifest, target: '77', prompt: '/dev 77', actualVersion: '2.1.220', resumed: false });
+  assert.ok(plain);
+  assert.doesNotMatch(plain.args[1], /resuming/, 'a fresh run is never told it is resuming');
+});
+
 test('a re-entry after a diverted park tells the agent where its earlier work is (#291)', () => {
   const plan = buildHarnessCommand({
     manifest,

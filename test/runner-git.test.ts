@@ -924,3 +924,72 @@ test('a retry whose previous attempt never pushed proceeds without a rename', ()
   const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
   assert.ok(refs.includes(`refs/heads/${setup.branch}`), 'the branch is still created and pushed');
 });
+
+// ── Host-lost auto-retry: resume, never rename (#293) ─────────────────────────
+
+test('a host-lost retry resumes the lost attempt\'s pushed WIP commit, renaming nothing (#293)', () => {
+  const remote = makeRemote();
+  const first = makeWorkspace();
+  const { branch } = setupWorkspace(first, opts(remote));
+  writeFileSync(join(first, 'partial.txt'), 'attempt 1 got this far\n');
+  // The cancel teardown's push as the host went away, as plain git so this
+  // test is independent of the push helpers' signatures (#291 changes them).
+  execFileSync('git', ['add', 'partial.txt'], { cwd: first });
+  execFileSync('git', ['commit', '-q', '-m', 'wip: cancelled: SIGTERM'], { cwd: first });
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`], { cwd: first });
+  const wip = execFileSync('git', ['rev-parse', branch], { cwd: remote, encoding: 'utf8' }).trim();
+
+  const second = makeWorkspace();
+  const setup = setupWorkspace(second, { ...opts(remote), retryAttempt: 2, resume: true });
+  assert.equal(setup.branch, branch);
+  assert.equal(setup.resumed, true, 'the setup reports the resume');
+  assert.equal(setup.released, undefined, 'nothing renamed: the claim is still this job\'s');
+  assert.equal(getHeadSha(second), wip, 'attempt 2 starts from attempt 1\'s pushed WIP commit');
+  assert.equal(readFileSync(join(second, 'partial.txt'), 'utf8'), 'attempt 1 got this far\n');
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(!refs.includes('-attempt1'), 'no evidence branch: the work continues in place');
+
+  // Attempt 2's work lands on top of attempt 1's, on the same branch.
+  writeFileSync(join(second, 'work.txt'), 'finished on attempt 2\n');
+  execFileSync('git', ['add', 'work.txt'], { cwd: second });
+  execFileSync('git', ['commit', '-q', '-m', 'finish'], { cwd: second });
+  // A fast-forward: rejected if attempt 2 had not started from attempt 1's tip.
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`], { cwd: second });
+  const tree = execFileSync('git', ['ls-tree', '-r', '--name-only', branch], { cwd: remote, encoding: 'utf8' });
+  assert.match(tree, /partial\.txt/);
+  assert.match(tree, /work\.txt/);
+});
+
+test('a host-lost resume finds the lost attempt\'s diverted work and renames nothing (#291 with #293)', () => {
+  const remote = makeRemote();
+  const first = makeWorkspace();
+  const { branch } = setupWorkspace(first, opts(remote));
+  // Attempt 1's agent left the job branch's history; its WIP went to the side branch.
+  const side = 'fleet-diverged/job-1';
+  writeFileSync(join(first, 'diverted.txt'), 'attempt 1, off the job branch\n');
+  execFileSync('git', ['checkout', '-q', '--orphan', 'elsewhere'], { cwd: first });
+  execFileSync('git', ['add', 'diverted.txt'], { cwd: first });
+  execFileSync('git', ['commit', '-q', '-m', 'wip: diverted'], { cwd: first });
+  execFileSync('git', ['push', '-q', 'origin', `HEAD:refs/heads/${side}`], { cwd: first });
+
+  const second = makeWorkspace();
+  const setup = setupWorkspace(second, { ...opts(remote), retryAttempt: 2, resume: true });
+  assert.equal(setup.branch, branch);
+  assert.equal(setup.resumed, true);
+  // Keyed on `existing`, not on the declared re-entry/adoption alone: a resume
+  // that missed this would continue without the lost attempt's diverted work.
+  assert.equal(setup.divertedEarlier, side, 'the resumed attempt is told where the diverted work is');
+  assert.equal(setup.releasedSide, undefined, 'a resume renames no side branch');
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${side}\n`), 'the side branch is still under its own name');
+  assert.ok(!refs.includes('-attempt1'), 'nothing renamed aside');
+});
+
+test('a host-lost retry whose lost attempt never pushed creates its branch as usual (#293)', () => {
+  const remote = makeRemote();
+  const workspace = makeWorkspace();
+  const setup = setupWorkspace(workspace, { ...opts(remote), retryAttempt: 2, resume: true });
+  assert.equal(setup.resumed, undefined, 'nothing to resume');
+  const refs = execFileSync('git', ['ls-remote', '--heads', remote], { encoding: 'utf8' });
+  assert.ok(refs.includes(`refs/heads/${setup.branch}`), 'the branch is created and pushed, not a git failure');
+});

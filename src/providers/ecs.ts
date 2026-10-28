@@ -4,6 +4,7 @@
 //   2. ecsConfigFromSsm()   — SSM parameter written by the infra unit (production)
 // The unit-tested surface is command construction; everything here shells out.
 import { execFile } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { CloudCliRunner, JobSandbox, LaunchSpec, Provider, ResourceRequest, TunnelEndpoint, TunnelOpener } from "./provider.ts";
 import { isMissingResourceError, runnerEnv, writeSecretTempFile } from "./provider.ts";
@@ -489,20 +490,46 @@ export function parseFleetTasks(describeJson: string): JobSandbox[] { // contrac
   return found;
 }
 
+/**
+ * Why ECS stopped a task, from an `ecs describe-tasks --output json` response:
+ * `stopCode: stoppedReason` (#293), e.g. "TerminationNotice: Host EC2 (instance
+ * i-0abc) terminated." Undefined while ECS has not recorded a stop yet, or when
+ * the task is gone from the API. Pure function — testable without AWS.
+ */
+export function parseStopReason(describeJson: string): string | undefined { // contract pin: test-only export, asserted by the suite
+  const parsed = JSON.parse(describeJson) as { tasks?: { stopCode?: string; stoppedReason?: string }[] };
+  const task = parsed.tasks?.[0];
+  const said = [task?.stopCode, task?.stoppedReason].filter((s) => typeof s === "string" && s !== "");
+  return said.length > 0 ? said.join(": ") : undefined;
+}
+
+/**
+ * How long describeStop waits for ECS to record a stop (#293). The runner
+ * reports its SIGTERM from a host that is still shutting down, and ECS writes
+ * the task's stopCode only once it has noticed — so the first describe can
+ * find nothing yet. ponytail: a fixed ~2 minute bound; widen it if real
+ * reclaims log "no stop reason" while describe-tasks by hand later has one.
+ */
+const STOP_REASON_POLL = { attempts: 12, intervalMs: 10_000 };
+
 /** EcsProvider construction options. */
 type EcsProviderOptions = {
   /** Shell-out to `aws`; defaults to the budget-killing awsCli. Injectable for tests. */
   aws?: CloudCliRunner;
+  /** describeStop's poll bound; injectable so tests need not wait out ECS's lag. */
+  stopReasonPoll?: { attempts: number; intervalMs: number };
 };
 
 export class EcsProvider implements Provider {
   readonly name = "ecs";
   readonly config: EcsConfig;
   readonly #aws: CloudCliRunner;
+  readonly #stopReasonPoll: { attempts: number; intervalMs: number };
 
   constructor(config: EcsConfig, options: EcsProviderOptions = {}) {
     this.config = config;
     this.#aws = options.aws ?? awsCli;
+    this.#stopReasonPoll = options.stopReasonPoll ?? STOP_REASON_POLL;
   }
 
   /**
@@ -713,6 +740,19 @@ export class EcsProvider implements Provider {
       found.push(...parseFleetTasks(await this.#cli(this.buildDescribeTasksArgs(batch), AWS_CLI_TIMEOUT_MS)));
     }
     return found;
+  }
+
+  /**
+   * ECS's own account of why a task stopped (#293), polled until ECS has one
+   * or the bound runs out. A describe failure throws; the daemon journals it.
+   */
+  async describeStop(handle: string): Promise<string | undefined> {
+    for (let i = 0; i < this.#stopReasonPoll.attempts; i++) {
+      if (i > 0) await sleep(this.#stopReasonPoll.intervalMs);
+      const reason = parseStopReason(await this.#cli(this.buildDescribeTasksArgs([handle]), AWS_CLI_TIMEOUT_MS));
+      if (reason !== undefined) return reason;
+    }
+    return undefined;
   }
 
   async launch(spec: LaunchSpec): Promise<{ handle: string }> {
